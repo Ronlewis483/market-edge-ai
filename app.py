@@ -1,50 +1,38 @@
 import streamlit as st
-st.set_page_config(page_title="Market Edge AI V3",page_icon="📊",layout="wide")
-from dual_agent.stock import train_all,scan as stock_scan,metrics_all
-from dual_agent.sports import scan as sports_scan
-from dual_agent.db import history
-st.title("📊 Market Edge AI V3")
-st.caption("Calibrated multi-horizon stock models + sports market scanner • research/paper mode")
-with st.sidebar:
-    page=st.radio("Navigation",["Overview","Stocks","Sports","Prediction History"])
-    st.info("Research/paper mode. No real-money orders or wagers.")
-if page=="Overview":
-    st.markdown("### Stronger V3 engine\nSeparate **1-day, 5-day and 20-day** models; date-separated train/calibration/test periods; calibrated probabilities; SPY/QQQ regime context; relative strength; RSI; ATR; volatility; drawdown; and benchmark comparisons.")
-elif page=="Stocks":
-    st.subheader("📈 Multi-Horizon Stock Scanner")
-    txt=st.text_input("Symbols","SPY,QQQ,AAPL,MSFT,NVDA,AMZN,META,GOOGL,TSLA")
-    syms=[x.strip().upper() for x in txt.split(",") if x.strip()]
-    a,b=st.columns(2)
-    if a.button("Train All Horizons",use_container_width=True):
+st.set_page_config(page_title="Market Edge AI V4",page_icon="📊",layout="wide")
+from dual_agent.research import DEFAULT_UNIVERSE,run_research,latest_scan
+st.title("📊 Market Edge AI V4 — Research Lab")
+st.caption("Walk-forward validation • larger cross-sector universe • target testing • feature ablation")
+page=st.sidebar.radio("Navigation",["Research Lab","Experimental Scanner"])
+default=[x for x in DEFAULT_UNIVERSE.split(",") if x]
+if page=="Research Lab":
+    st.subheader("🧪 5-Day Model Research")
+    st.write("This tests multiple prediction targets and feature sets using repeated walk-forward out-of-sample periods.")
+    txt=st.text_area("Training universe",",".join(default),height=150)
+    universe=[x.strip().upper() for x in txt.split(",") if x.strip()]
+    st.metric("Training symbols",len(universe))
+    if st.button("Run Walk-Forward Research",type="primary"):
         try:
-            with st.spinner("Training 1d, 5d and 20d models..."): result=train_all(syms)
-            st.success("Training complete."); st.json(result)
+            with st.spinner("Downloading history and running repeated historical simulations..."):
+                df=run_research(universe)
+            st.session_state["research"]=df
         except Exception as e: st.error(str(e))
-    if b.button("Run Multi-Horizon Scan",type="primary",use_container_width=True):
+    if "research" in st.session_state:
+        df=st.session_state["research"].copy()
+        show=df.copy()
+        for c in ["base_rate","auc","model_brier","baseline_brier","model_log_loss","baseline_log_loss","high_conf_accuracy"]:
+            if c in show: show[c]=show[c].map(lambda x:"" if x!=x else f"{x:.4f}")
+        st.dataframe(show,use_container_width=True,hide_index=True)
+        st.info("Lower Brier/log loss is better. AUC above .50 indicates discrimination, but promotion to the live scanner should require repeated benchmark wins—not AUC alone.")
+elif page=="Experimental Scanner":
+    st.subheader("🔬 Experimental 5-Day Relative-Performance Scanner")
+    st.warning("This scanner is experimental. Validate the corresponding research configuration before interpreting its probabilities.")
+    scan_txt=st.text_input("Stocks to scan","AAPL,MSFT,NVDA,AMZN,META,GOOGL,TSLA")
+    scan=[x.strip().upper() for x in scan_txt.split(",") if x.strip()]
+    if st.button("Run Experimental Scan",type="primary"):
         try:
-            with st.spinner("Scanning..."): df=stock_scan(syms)
-            show=df.copy()
-            for c in ["Raw P","Calibrated P","Historical base","Model vs base"]: show[c]=show[c].map(lambda x:f"{x:.1%}")
-            st.dataframe(show,use_container_width=True,hide_index=True)
-            st.subheader("Calibrated probability by horizon")
-            st.dataframe(df.pivot(index="Symbol",columns="Horizon",values="Calibrated P").style.format("{:.1%}"),use_container_width=True)
-        except Exception as e: st.error(str(e))
-    ms=metrics_all()
-    if ms:
-        with st.expander("Out-of-sample validation"):
-            for h,m in ms.items():
-                st.markdown(f"**{h}-day — {'PASSES benchmark' if m['passes_benchmarks'] else 'does NOT yet pass benchmark'}**"); st.json(m)
-elif page=="Sports":
-    st.subheader("🏀 Sports Market Scanner")
-    leagues={"NBA":"basketball_nba","NFL":"americanfootball_nfl","MLB":"baseball_mlb","NHL":"icehockey_nhl"}; league=st.selectbox("League",list(leagues))
-    st.warning("Sports remains a no-vig bookmaker consensus scanner until we add historical pregame data.")
-    if st.button("Scan Current Moneylines",type="primary"):
-        try:
-            df=sports_scan(leagues[league]); d=df.copy()
-            for c in ["Market P(Home)","Market P(Away)","Book disagreement"]: d[c]=d[c].map(lambda x:f"{x:.1%}")
+            with st.spinner("Training on broad universe and scanning..."):
+                df=latest_scan(default,scan)
+            d=df.copy(); d["P"]=d["P"].map(lambda x:f"{x:.1%}")
             st.dataframe(d,use_container_width=True,hide_index=True)
         except Exception as e: st.error(str(e))
-else:
-    df=history(); st.subheader("🧾 Prediction History")
-    if df.empty: st.info("No predictions logged yet.")
-    else: st.dataframe(df,use_container_width=True,hide_index=True)
