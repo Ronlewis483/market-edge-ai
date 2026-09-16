@@ -5,6 +5,7 @@ from sklearn.metrics import brier_score_loss,log_loss,roc_auc_score
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
+from alpaca.data.enums import DataFeed
 from .config import secret,MODEL_DIR
 from .db import log_prediction
 MODEL_PATH=MODEL_DIR/"stock_model.joblib"
