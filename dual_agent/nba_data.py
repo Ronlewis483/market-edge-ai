@@ -1,112 +1,295 @@
-
+import requests
+import pandas as pd
 import streamlit as st
-st.set_page_config(page_title="Market Edge AI V5", page_icon="📊", layout="wide")
 
-from dual_agent.research import DEFAULT_UNIVERSE, latest_scan, run_research
-from dual_agent.signal_engine import clean_symbols, stock_decision, sports_decision, GATES
-from dual_agent.validated_model import VALIDATED_STOCK_MODEL as M
 
-st.title("📊 Market Edge AI — V5")
-st.caption("Persistent validated model • lightweight daily inference • research/paper mode")
+SPORTSDATA_BASE_URL = "https://api.sportsdata.io/v3/nba"
+ODDS_BASE_URL = "https://api.the-odds-api.com/v4"
+NBA_SPORT_KEY = "basketball_nba"
 
-with st.sidebar:
-    page=st.radio("Navigation",["Command Center","Saved Model","Research Lab"])
-    st.success("Persistence enabled")
-    st.caption("Validated configuration loads automatically. Daily use does not require walk-forward retraining.")
 
-default=clean_symbols(DEFAULT_UNIVERSE)
+# ============================================================
+# API KEYS
+# ============================================================
 
-if page=="Command Center":
-    st.success(f"VALIDATED MODEL LOADED — {M['target']} • {M['features']} • AUC {M['auc']:.3f}")
-    c1,c2=st.columns(2)
-    with c1:
-        st.subheader("📈 Best Stock Signal")
-        txt=st.text_input("Symbols to scan", "AAPL,MSFT,NVDA,AMZN,META,GOOGL,TSLA,AVGO,AMD,JPM,LLY,XOM")
-        syms=clean_symbols(txt)
-        if st.button("Scan Today's Market",type="primary",use_container_width=True):
-            try:
-                with st.spinner("Loading recent market data and scoring stocks — no retraining..."):
-                    # Keep existing V4 model/data implementation, but do NOT run walk-forward research.
-                    df=latest_scan(default,syms)
-                    st.session_state["daily"]=stock_decision(df)
-            except Exception as e:
-                st.error(f"Daily scan failed: {e}")
+def get_sportsdata_key():
+    try:
+        return st.secrets["SPORTSDATA_API_KEY"]
+    except Exception:
+        return None
 
-        d=st.session_state.get("daily")
-        if d:
-            if d["status"]=="MAKE THIS TRADE":
-                st.success("MAKE THIS TRADE")
-                st.markdown(f"## {d['symbol']}")
-                a,b=st.columns(2)
-                a.metric("Model probability",f"{d['probability']:.1%}")
-                b.metric("Edge vs base rate",f"+{d['edge']:.1%}")
-                st.write(f"**Direction:** {d['direction']}")
-                st.write(f"**Horizon:** {d['horizon']}")
-                st.write(f"**Target:** {d['target']}")
-            else:
-                st.warning("NO QUALIFYING TRADE")
-                st.caption(d["reason"])
-                top=d.get("top",{})
-                if top:
-                    st.write(f"Top candidate: **{top.get('Symbol','—')}** • probability {float(top.get('P',0)):.1%} • required {GATES['min_probability']:.0%}")
 
-            ranked=d.get("ranked")
-            if ranked is not None and len(ranked):
-                show=ranked.head(10).copy()
-                cols=[x for x in ["Symbol","Close","P","edge"] if x in show.columns]
-                show=show[cols].rename(columns={"P":"Model probability","edge":"Edge vs base"})
-                st.markdown("#### Today's top candidates")
-                st.dataframe(show,use_container_width=True,hide_index=True)
+def get_odds_api_key():
+    try:
+        return st.secrets["ODDS_API_KEY"]
+    except Exception:
+        return None
 
-    with c2:
-        st.subheader("🏀 Best Sports Signal")
-        sd=sports_decision()
-        st.warning(sd["status"])
-        st.caption(sd["reason"])
-        st.code("PICK THIS TEAM / PICK THIS PLAYER PROP\nor\nNO QUALIFYING SPORTS PICK")
 
-elif page=="Saved Model":
-    st.subheader("💾 Saved Validated Model")
-    st.success("This configuration is bundled with the app and survives Streamlit restarts.")
-    st.json(M)
-    st.write("Daily Command Center scans load this approved configuration automatically; they do not rerun the 90-symbol walk-forward experiment.")
+# ============================================================
+# SPORTSDATAIO
+# ============================================================
 
-else:
-    st.subheader("🧪 Research Lab — Optional Revalidation")
+def _sportsdata_get(path, params=None):
+    key = get_sportsdata_key()
 
-    st.markdown("### 🏀 NBA Data Connection Test")
+    if not key:
+        raise RuntimeError(
+            "SPORTSDATA_API_KEY is missing from Streamlit Secrets."
+        )
 
-    if st.button("Test NBA Data Sources"):
-        with st.spinner("Testing SportsDataIO and The Odds API..."):
-            nba_status = test_nba_connections()
+    url = f"{SPORTSDATA_BASE_URL}/{path.lstrip('/')}"
 
-        for provider, info in nba_status.items():
-            if info["working"]:
-                st.success(f"✅ {provider}: {info['message']}")
-            elif info["configured"]:
-                st.error(f"❌ {provider}: {info['message']}")
-            else:
-                st.warning(f"⚠️ {provider}: {info['message']}")
+    headers = {
+        "Ocp-Apim-Subscription-Key": key
+    }
 
-    st.divider()
+    response = requests.get(
+        url,
+        headers=headers,
+        params=params or {},
+        timeout=30,
+    )
 
-    st.warning("CPU-intensive. This is for periodic model research, not daily use.")
-    txt = st.text_area("Training universe", ",".join(default), height=150)
-    universe = clean_symbols(txt)
-    st.metric("Training symbols", len(universe))
-    confirm = st.checkbox("I understand this is CPU-intensive")
-    st.warning("CPU-intensive. This is for periodic model research, not daily use.")
-    txt=st.text_area("Training universe",",".join(default),height=150)
-    universe=clean_symbols(txt)
-    st.metric("Training symbols",len(universe))
-    confirm=st.checkbox("I understand this is CPU-intensive")
-    if st.button("Run Full Walk-Forward Revalidation",disabled=not confirm):
+    if not response.ok:
+        raise RuntimeError(
+            f"SportsDataIO error {response.status_code}: "
+            f"{response.text[:300]}"
+        )
+
+    return response.json()
+
+
+def get_historical_games(season):
+    data = _sportsdata_get(
+        f"scores/json/Games/{season}"
+    )
+    return pd.DataFrame(data)
+
+
+def get_team_season_stats(season):
+    data = _sportsdata_get(
+        f"stats/json/TeamSeasonStats/{season}"
+    )
+    return pd.DataFrame(data)
+
+
+def get_player_season_stats(season):
+    data = _sportsdata_get(
+        f"stats/json/PlayerSeasonStats/{season}"
+    )
+    return pd.DataFrame(data)
+
+
+# ============================================================
+# THE ODDS API
+# ============================================================
+
+def _odds_get(path, params=None):
+    key = get_odds_api_key()
+
+    if not key:
+        raise RuntimeError(
+            "ODDS_API_KEY is missing from Streamlit Secrets."
+        )
+
+    url = f"{ODDS_BASE_URL}/{path.lstrip('/')}"
+
+    query = dict(params or {})
+    query["apiKey"] = key
+
+    response = requests.get(
+        url,
+        params=query,
+        timeout=30,
+    )
+
+    if not response.ok:
+        raise RuntimeError(
+            f"The Odds API error {response.status_code}: "
+            f"{response.text[:300]}"
+        )
+
+    return response
+
+
+def get_current_nba_events():
+    response = _odds_get(
+        f"sports/{NBA_SPORT_KEY}/events"
+    )
+
+    return response.json()
+
+
+def get_current_nba_odds(
+    markets="h2h,spreads,totals",
+    regions="us",
+):
+    response = _odds_get(
+        f"sports/{NBA_SPORT_KEY}/odds",
+        params={
+            "regions": regions,
+            "markets": markets,
+            "oddsFormat": "american",
+            "dateFormat": "iso",
+        },
+    )
+
+    return response.json()
+
+
+def get_nba_player_props(
+    event_id,
+    markets="player_points,player_rebounds,player_assists",
+    regions="us",
+):
+    response = _odds_get(
+        f"sports/{NBA_SPORT_KEY}/events/{event_id}/odds",
+        params={
+            "regions": regions,
+            "markets": markets,
+            "oddsFormat": "american",
+            "dateFormat": "iso",
+        },
+    )
+
+    return response.json()
+
+
+# ============================================================
+# ODDS UTILITIES
+# ============================================================
+
+def american_to_probability(odds):
+    odds = float(odds)
+
+    if odds < 0:
+        return abs(odds) / (abs(odds) + 100.0)
+
+    return 100.0 / (odds + 100.0)
+
+
+def no_vig_two_way(prob_a, prob_b):
+    total = prob_a + prob_b
+
+    if total <= 0:
+        return None, None
+
+    return (
+        prob_a / total,
+        prob_b / total,
+    )
+
+
+# ============================================================
+# MONEYLINE DATAFRAME
+# ============================================================
+
+def current_moneyline_dataframe():
+    games = get_current_nba_odds(markets="h2h")
+
+    rows = []
+
+    for game in games:
+        event_id = game.get("id")
+        commence_time = game.get("commence_time")
+        home_team = game.get("home_team")
+        away_team = game.get("away_team")
+
+        for bookmaker in game.get("bookmakers", []):
+            book_name = bookmaker.get("title")
+            book_key = bookmaker.get("key")
+
+            for market in bookmaker.get("markets", []):
+                if market.get("key") != "h2h":
+                    continue
+
+                for outcome in market.get("outcomes", []):
+                    price = outcome.get("price")
+
+                    if price is None:
+                        continue
+
+                    rows.append(
+                        {
+                            "event_id": event_id,
+                            "commence_time": commence_time,
+                            "home_team": home_team,
+                            "away_team": away_team,
+                            "bookmaker": book_name,
+                            "bookmaker_key": book_key,
+                            "team": outcome.get("name"),
+                            "american_odds": price,
+                            "implied_probability":
+                                american_to_probability(price),
+                        }
+                    )
+
+    return pd.DataFrame(rows)
+
+
+# ============================================================
+# CONNECTION TEST
+# ============================================================
+
+def test_nba_connections():
+
+    results = {
+        "SportsDataIO": {
+            "configured": bool(get_sportsdata_key()),
+            "working": False,
+            "message": "",
+        },
+        "The Odds API": {
+            "configured": bool(get_odds_api_key()),
+            "working": False,
+            "message": "",
+        },
+    }
+
+    # Test SportsDataIO
+    if results["SportsDataIO"]["configured"]:
         try:
-            with st.spinner("Running full historical revalidation..."):
-                result=run_research(universe)
-                st.session_state["research_result"]=result
-            st.success("Revalidation complete. Review results before changing the persisted production candidate.")
+            _sportsdata_get(
+                "scores/json/AreAnyGamesInProgress"
+            )
+
+            results["SportsDataIO"]["working"] = True
+            results["SportsDataIO"]["message"] = (
+                "Historical NBA provider connected."
+            )
+
         except Exception as e:
-            st.error(str(e))
-    if "research_result" in st.session_state:
-        st.dataframe(st.session_state["research_result"],use_container_width=True,hide_index=True)
+            results["SportsDataIO"]["message"] = str(e)
+
+    else:
+        results["SportsDataIO"]["message"] = (
+            "SPORTSDATA_API_KEY not configured."
+        )
+
+    # Test The Odds API
+    if results["The Odds API"]["configured"]:
+        try:
+            response = _odds_get("sports")
+
+            results["The Odds API"]["working"] = True
+
+            remaining = response.headers.get(
+                "x-requests-remaining",
+                "unknown",
+            )
+
+            results["The Odds API"]["message"] = (
+                f"Current odds provider connected. "
+                f"Requests remaining: {remaining}"
+            )
+
+        except Exception as e:
+            results["The Odds API"]["message"] = str(e)
+
+    else:
+        results["The Odds API"]["message"] = (
+            "ODDS_API_KEY not configured."
+        )
+
+    return results
