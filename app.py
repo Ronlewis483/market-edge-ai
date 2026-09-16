@@ -219,18 +219,21 @@ if "multi_nba_research_result" in st.session_state:
 
 st.divider()
 
-st.markdown("### 🏀 NBA Historical Validation")
+    st.divider()
+
+    st.markdown("### 🏀 NBA Historical Validation")
+
     nba_season = st.text_input(
         "NBA season",
         value="2025",
         help="SportsDataIO season to use for historical NBA research.",
+        key="single_nba_season",
     )
 
-    if st.button("Run NBA Historical Validation"):
+    if st.button("Run NBA Historical Validation", key="run_single_nba_validation"):
         try:
             with st.spinner(
-                "Building historical NBA features and running "
-                "walk-forward validation..."
+                "Building historical NBA features and running walk-forward validation..."
             ):
                 nba_result = run_nba_research(
                     nba_season,
@@ -238,40 +241,23 @@ st.markdown("### 🏀 NBA Historical Validation")
                     test_block_size=100,
                 )
 
-                st.session_state["nba_research_result"] = nba_result
-
+            st.session_state["nba_research_result"] = nba_result
             st.success("NBA historical validation complete.")
 
         except Exception as e:
             st.error(f"NBA validation error: {e}")
 
     if "nba_research_result" in st.session_state:
-
         r = st.session_state["nba_research_result"]
 
         st.markdown("#### Dataset")
 
         n1, n2, n3, n4 = st.columns(4)
 
-        n1.metric(
-            "Raw games",
-            r["raw_games"],
-        )
-
-        n2.metric(
-            "Completed games",
-            r["completed_games"],
-        )
-
-        n3.metric(
-            "Feature rows",
-            r["feature_rows"],
-        )
-
-        n4.metric(
-            "Home win rate",
-            f"{r['home_win_rate']:.1%}",
-        )
+        n1.metric("Raw games", r["raw_games"])
+        n2.metric("Completed games", r["completed_games"])
+        n3.metric("Feature rows", r["feature_rows"])
+        n4.metric("Home win rate", f"{r['home_win_rate']:.1%}")
 
         st.markdown("#### Walk-Forward Performance")
 
@@ -280,25 +266,10 @@ st.markdown("### 🏀 NBA Historical Validation")
 
         m1, m2, m3, m4 = st.columns(4)
 
-        m1.metric(
-            "AUC",
-            f"{model['auc']:.3f}",
-        )
-
-        m2.metric(
-            "Accuracy",
-            f"{model['accuracy']:.1%}",
-        )
-
-        m3.metric(
-            "Brier Score",
-            f"{model['brier']:.4f}",
-        )
-
-        m4.metric(
-            "Log Loss",
-            f"{model['logloss']:.4f}",
-        )
+        m1.metric("AUC", f"{model['auc']:.3f}")
+        m2.metric("Accuracy", f"{model['accuracy']:.1%}")
+        m3.metric("Brier Score", f"{model['brier']:.4f}")
+        m4.metric("Log Loss", f"{model['logloss']:.4f}")
 
         st.markdown("#### Model vs Baseline")
 
@@ -338,9 +309,7 @@ st.markdown("### 🏀 NBA Historical Validation")
                 hide_index=True,
             )
         else:
-            st.info(
-                "No confidence-band results were generated."
-            )
+            st.info("No confidence-band results were generated.")
 
         with st.expander("Walk-Forward Folds"):
             st.dataframe(
@@ -350,26 +319,3 @@ st.markdown("### 🏀 NBA Historical Validation")
             )
 
     st.divider()
-
-    
-
-    st.warning("CPU-intensive. This is for periodic model research, not daily use.")
-    txt = st.text_area("Training universe", ",".join(default), height=150)
-    universe = clean_symbols(txt)
-    st.metric("Training symbols", len(universe))
-    confirm = st.checkbox("I understand this is CPU-intensive")
-    st.warning("CPU-intensive. This is for periodic model research, not daily use.")
-    txt=st.text_area("Training universe",",".join(default),height=150)
-    universe=clean_symbols(txt)
-    st.metric("Training symbols",len(universe))
-    confirm=st.checkbox("I understand this is CPU-intensive")
-    if st.button("Run Full Walk-Forward Revalidation",disabled=not confirm):
-        try:
-            with st.spinner("Running full historical revalidation..."):
-                result=run_research(universe)
-                st.session_state["research_result"]=result
-            st.success("Revalidation complete. Review results before changing the persisted production candidate.")
-        except Exception as e:
-            st.error(str(e))
-    if "research_result" in st.session_state:
-        st.dataframe(st.session_state["research_result"],use_container_width=True,hide_index=True)
