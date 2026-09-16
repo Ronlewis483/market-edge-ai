@@ -217,7 +217,6 @@ if "multi_nba_research_result" in st.session_state:
             hide_index=True,
         )
 
-st.divider()
 
     st.divider()
 
