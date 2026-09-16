@@ -1,4 +1,4 @@
-
+from dual_agent.nba_data import test_nba_connections
 import streamlit as st
 st.set_page_config(page_title="Market Edge AI V5", page_icon="📊", layout="wide")
 
@@ -73,6 +73,21 @@ elif page=="Saved Model":
 
 else:
     st.subheader("🧪 Research Lab — Optional Revalidation")
+        st.markdown("### 🏀 NBA Data Connection Test")
+
+    if st.button("Test NBA Data Sources"):
+        with st.spinner("Testing SportsDataIO and The Odds API..."):
+            nba_status = test_nba_connections()
+
+        for provider, info in nba_status.items():
+            if info["working"]:
+                st.success(f"✅ {provider}: {info['message']}")
+            elif info["configured"]:
+                st.error(f"❌ {provider}: {info['message']}")
+            else:
+                st.warning(f"⚠️ {provider}: {info['message']}")
+
+    st.divider()
     st.warning("CPU-intensive. This is for periodic model research, not daily use.")
     txt=st.text_area("Training universe",",".join(default),height=150)
     universe=clean_symbols(txt)
