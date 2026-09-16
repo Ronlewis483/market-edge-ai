@@ -1,7 +1,9 @@
 import pandas as pd
 from dual_agent.nba_data import test_nba_connections
-from dual_agent.nba_research import run_nba_research
-import streamlit as st
+from dual_agent.nba_research import (
+    run_nba_research,
+    run_multi_season_nba_research,
+)import streamlit as st
 st.set_page_config(page_title="Market Edge AI V5", page_icon="📊", layout="wide")
 
 from dual_agent.research import DEFAULT_UNIVERSE, latest_scan, run_research
