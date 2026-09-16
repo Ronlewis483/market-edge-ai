@@ -795,3 +795,185 @@ def run_nba_research(
             validation["predictions"],
         "confidence": confidence,
     }
+
+    st.markdown("### 🏀 Multi-Season NBA Validation")
+
+    nba_seasons_text = st.text_input(
+        "NBA seasons to validate",
+        value="2022,2023,2024,2025",
+        help=(
+            "Enter SportsDataIO NBA seasons separated "
+            "by commas."
+        ),
+    )
+
+    if st.button("Run Multi-Season NBA Validation"):
+
+        seasons = [
+            x.strip()
+            for x in nba_seasons_text.split(",")
+            if x.strip()
+        ]
+
+        try:
+            with st.spinner(
+                "Downloading multiple NBA seasons and "
+                "running chronological walk-forward validation..."
+            ):
+
+                multi_result = (
+                    run_multi_season_nba_research(
+                        seasons,
+                        minimum_training_games=500,
+                        test_block_size=150,
+                    )
+                )
+
+                st.session_state[
+                    "nba_multi_research_result"
+                ] = multi_result
+
+            st.success(
+                "Multi-season NBA validation complete."
+            )
+
+        except Exception as e:
+            st.error(
+                f"Multi-season validation error: {e}"
+            )
+
+    if (
+        "nba_multi_research_result"
+        in st.session_state
+    ):
+
+        mr = st.session_state[
+            "nba_multi_research_result"
+        ]
+
+        st.markdown("#### Multi-Season Dataset")
+
+        s1, s2, s3, s4 = st.columns(4)
+
+        s1.metric(
+            "Seasons",
+            len(mr["seasons"]),
+        )
+
+        s2.metric(
+            "Completed games",
+            mr["completed_games"],
+        )
+
+        s3.metric(
+            "Feature rows",
+            mr["feature_rows"],
+        )
+
+        s4.metric(
+            "Home win rate",
+            f"{mr['home_win_rate']:.1%}",
+        )
+
+        st.markdown("#### Season Coverage")
+
+        st.dataframe(
+            mr["season_summary"],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        model = mr["overall"]
+        baseline = mr["baseline"]
+
+        st.markdown(
+            "#### Multi-Season Walk-Forward Performance"
+        )
+
+        p1, p2, p3, p4 = st.columns(4)
+
+        p1.metric(
+            "AUC",
+            f"{model['auc']:.3f}",
+        )
+
+        p2.metric(
+            "Accuracy",
+            f"{model['accuracy']:.1%}",
+        )
+
+        p3.metric(
+            "Brier Score",
+            f"{model['brier']:.4f}",
+        )
+
+        p4.metric(
+            "Log Loss",
+            f"{model['logloss']:.4f}",
+        )
+
+        st.markdown(
+            "#### Multi-Season Model vs Baseline"
+        )
+
+        multi_comparison = pd.DataFrame(
+            [
+                {
+                    "Model": "NBA Model",
+                    "Accuracy":
+                        model["accuracy"],
+                    "Brier":
+                        model["brier"],
+                    "Log Loss":
+                        model["logloss"],
+                    "AUC":
+                        model["auc"],
+                },
+                {
+                    "Model":
+                        "Home Win Base Rate",
+                    "Accuracy":
+                        baseline["accuracy"],
+                    "Brier":
+                        baseline["brier"],
+                    "Log Loss":
+                        baseline["logloss"],
+                    "AUC":
+                        baseline["auc"],
+                },
+            ]
+        )
+
+        st.dataframe(
+            multi_comparison,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.markdown(
+            "#### Multi-Season Confidence Analysis"
+        )
+
+        if len(mr["confidence"]):
+
+            st.dataframe(
+                mr["confidence"],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        else:
+            st.info(
+                "No confidence-band results "
+                "were generated."
+            )
+
+        with st.expander(
+            "Multi-Season Walk-Forward Folds"
+        ):
+
+            st.dataframe(
+                mr["folds"],
+                use_container_width=True,
+                hide_index=True,
+            )
