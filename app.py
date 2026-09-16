@@ -1,8 +1,8 @@
 import streamlit as st
 st.set_page_config(page_title="Market Edge AI",page_icon="📊",layout="wide")
-from src.dual_agent.stock import train,scan as stock_scan
-from src.dual_agent.sports import scan as sports_scan
-from src.dual_agent.db import history
+from dual_agent.stock import train, scan as stock_scan
+from dual_agent.sports import scan as sports_scan
+from dual_agent.db import history
 st.title("📊 Market Edge AI")
 st.caption("Stocks + sports probability dashboard • research/paper mode")
 with st.sidebar:
