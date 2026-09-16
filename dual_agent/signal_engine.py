@@ -1,82 +1,47 @@
 
-import pandas as pd
 import re
+import pandas as pd
+from .validated_model import VALIDATED_STOCK_MODEL
 
-STOCK_GATES = {
-    "min_auc": 0.515,
-    "require_brier_win": True,
-    "require_logloss_win": True,
-    "min_probability": 0.60,
-    "min_edge_vs_base": 0.055,
-}
+GATES = {"min_probability": 0.60, "min_edge_vs_base": 0.055}
 
 def clean_symbols(symbols):
-    """Normalize tickers and remove whitespace/newline contamination."""
-    if symbols is None:
-        return []
+    if symbols is None: return []
     if isinstance(symbols, str):
-        # Accept commas, newlines, tabs and spaces as separators.
         symbols = re.split(r"[\s,]+", symbols)
-    out = []
-    seen = set()
-    for s in symbols:
-        s = re.sub(r"\s+", "", str(s)).strip().upper()
-        if s and s not in seen:
-            seen.add(s)
-            out.append(s)
+    out=[]; seen=set()
+    for x in symbols:
+        x=re.sub(r"\s+","",str(x)).strip().upper()
+        if x and x not in seen:
+            seen.add(x); out.append(x)
     return out
 
-def research_passes(row):
-    if row is None:
-        return False
-    return (
-        float(row.get("auc", 0) or 0) >= STOCK_GATES["min_auc"]
-        and (bool(row.get("beats_brier", False)) if STOCK_GATES["require_brier_win"] else True)
-        and (bool(row.get("beats_logloss", False)) if STOCK_GATES["require_logloss_win"] else True)
-    )
-
-def select_research_model(research_df):
-    if research_df is None or len(research_df) == 0:
-        return None
-    d = research_df.copy()
-    d = d[
-        (d["Target"] == "Beat SPY in 5d")
-        & (d["beats_brier"] == True)
-        & (d["beats_logloss"] == True)
-        & (d["auc"] >= STOCK_GATES["min_auc"])
-    ].copy()
-    if d.empty:
-        return None
-    d["brier_gain"] = d["baseline_brier"] - d["model_brier"]
-    d["logloss_gain"] = d["baseline_log_loss"] - d["model_log_loss"]
-    return d.sort_values(["brier_gain","logloss_gain","auc"], ascending=False).iloc[0].to_dict()
-
-def stock_decision(scan_df, research_row):
-    if not research_passes(research_row) or scan_df is None or scan_df.empty:
-        return {"status":"NO QUALIFYING TRADE","reason":"No validated model/signal clears the research gates."}
-    d = scan_df.copy()
-    base = float(research_row["base_rate"])
-    d["edge"] = d["P"].astype(float) - base
-    d = d[
-        (d["P"].astype(float) >= STOCK_GATES["min_probability"])
-        & (d["edge"] >= STOCK_GATES["min_edge_vs_base"])
-    ].sort_values(["edge","P"], ascending=False)
-    if d.empty:
-        return {"status":"NO QUALIFYING TRADE","reason":"Validated model is active, but no stock clears today's probability and edge thresholds."}
-    r = d.iloc[0]
-    return {
-        "status":"MAKE THIS TRADE",
-        "symbol":r["Symbol"],
-        "direction":"LONG / RELATIVE OUTPERFORMANCE",
-        "probability":float(r["P"]),
-        "edge":float(r["edge"]),
-        "close":float(r["Close"]),
-        "horizon":"5 trading days",
-        "target":"Outperform SPY over the next 5 trading days",
-        "research_auc":float(research_row["auc"]),
-        "feature_set":research_row["Features"],
-    }
+def stock_decision(df):
+    m=VALIDATED_STOCK_MODEL
+    if not m.get("validated") or df is None or df.empty:
+        return {"status":"NO QUALIFYING TRADE","reason":"No usable validated signal."}
+    d=df.copy()
+    # V4 research/latest_scan convention uses P, Symbol, Close.
+    if "P" not in d.columns:
+        raise ValueError("Scanner output is missing probability column P.")
+    d["P"]=pd.to_numeric(d["P"],errors="coerce")
+    d["edge"]=d["P"]-float(m["base_rate"])
+    ranked=d.sort_values(["P","edge"],ascending=False).copy()
+    q=ranked[(ranked["P"]>=GATES["min_probability"]) &
+             (ranked["edge"]>=GATES["min_edge_vs_base"])]
+    if q.empty:
+        top=ranked.iloc[0].to_dict() if len(ranked) else {}
+        return {"status":"NO QUALIFYING TRADE",
+                "reason":"No stock clears the validated probability/edge gates.",
+                "top":top,"ranked":ranked}
+    r=q.iloc[0]
+    return {"status":"MAKE THIS TRADE","symbol":r["Symbol"],
+            "direction":"LONG / RELATIVE OUTPERFORMANCE",
+            "probability":float(r["P"]),"edge":float(r["edge"]),
+            "close":float(r["Close"]),"horizon":"5 trading days",
+            "target":"Outperform SPY over the next 5 trading days",
+            "ranked":ranked}
 
 def sports_decision():
     return {"status":"NO QUALIFYING SPORTS PICK",
-            "reason":"Sports signal engine is locked until the NBA historical model passes its validation gates."}
+            "reason":"NBA model has not yet passed historical validation."}
