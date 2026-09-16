@@ -96,22 +96,130 @@ else:
     st.divider()
 
 
-    # NEW CODE
-    st.markdown("### 🏀 Multi-Season NBA Validation")
     
-    # ...all the new multi-season code...
-    
-    st.divider()
 
 
-    # EXISTING CODE — KEEP THIS
-    st.markdown("### 🏀 NBA Historical Validation")
+  st.divider()
 
-    nba_season = st.text_input(
-        "NBA season",
-        value="2025",
-    st.markdown("### 🏀 NBA Historical Validation")
+# ============================================================
+# MULTI-SEASON NBA VALIDATION
+# ============================================================
 
+st.markdown("### 🏀 Multi-Season NBA Validation")
+
+nba_seasons_text = st.text_input(
+    "NBA seasons to validate",
+    value="2022,2023,2024,2025",
+    help="Enter SportsDataIO NBA seasons separated by commas.",
+)
+
+if st.button("Run Multi-Season NBA Validation"):
+
+    seasons = [
+        x.strip()
+        for x in nba_seasons_text.split(",")
+        if x.strip()
+    ]
+
+    try:
+        with st.spinner(
+            "Downloading multiple NBA seasons and running walk-forward validation..."
+        ):
+            multi_nba_result = run_multi_season_nba_research(
+                seasons,
+                minimum_training_games=250,
+                test_block_size=100,
+            )
+
+            st.session_state["multi_nba_research_result"] = multi_nba_result
+
+        st.success("Multi-season NBA validation complete.")
+
+    except Exception as e:
+        st.error(f"Multi-season NBA validation error: {e}")
+
+if "multi_nba_research_result" in st.session_state:
+
+    mr = st.session_state["multi_nba_research_result"]
+
+    st.markdown("#### 🏀 Multi-Season Dataset")
+
+    m1, m2, m3, m4 = st.columns(4)
+
+    m1.metric("Raw games", mr["raw_games"])
+    m2.metric("Completed games", mr["completed_games"])
+    m3.metric("Feature rows", mr["feature_rows"])
+    m4.metric("Home win rate", f"{mr['home_win_rate']:.1%}")
+
+    st.markdown("#### Walk-Forward Performance")
+
+    p1, p2, p3, p4 = st.columns(4)
+
+    overall = mr["overall"]
+
+    p1.metric("AUC", f"{overall['auc']:.3f}")
+    p2.metric("Accuracy", f"{overall['accuracy']:.1%}")
+    p3.metric("Brier Score", f"{overall['brier']:.4f}")
+    p4.metric("Log Loss", f"{overall['logloss']:.4f}")
+
+    st.markdown("#### Model vs Baseline")
+
+    baseline = mr["baseline"]
+
+    multi_comparison = pd.DataFrame(
+        [
+            {
+                "Model": "NBA Multi-Season Model",
+                "Accuracy": overall["accuracy"],
+                "Brier": overall["brier"],
+                "Log Loss": overall["logloss"],
+                "AUC": overall["auc"],
+            },
+            {
+                "Model": "Home Win Base Rate",
+                "Accuracy": baseline["accuracy"],
+                "Brier": baseline["brier"],
+                "Log Loss": baseline["logloss"],
+                "AUC": baseline["auc"],
+            },
+        ]
+    )
+
+    st.dataframe(
+        multi_comparison,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.markdown("#### Multi-Season Confidence Analysis")
+
+    if len(mr["confidence"]):
+        st.dataframe(
+            mr["confidence"],
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.info("No confidence-band results were generated.")
+
+    st.markdown("#### Season Breakdown")
+
+    st.dataframe(
+        mr["season_summary"],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    with st.expander("Multi-Season Walk-Forward Folds"):
+        st.dataframe(
+            mr["folds"],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+st.divider()
+
+st.markdown("### 🏀 NBA Historical Validation")
     nba_season = st.text_input(
         "NBA season",
         value="2025",
