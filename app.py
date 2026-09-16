@@ -1,4 +1,6 @@
+import pandas as pd
 from dual_agent.nba_data import test_nba_connections
+from dual_agent.nba_research import run_nba_research
 import streamlit as st
 st.set_page_config(page_title="Market Edge AI V5", page_icon="📊", layout="wide")
 
@@ -89,6 +91,143 @@ else:
                 st.warning(f"⚠️ {provider}: {info['message']}")
 
     st.divider()
+
+
+
+    st.markdown("### 🏀 NBA Historical Validation")
+
+    nba_season = st.text_input(
+        "NBA season",
+        value="2025",
+        help="SportsDataIO season to use for historical NBA research.",
+    )
+
+    if st.button("Run NBA Historical Validation"):
+        try:
+            with st.spinner(
+                "Building historical NBA features and running "
+                "walk-forward validation..."
+            ):
+                nba_result = run_nba_research(
+                    nba_season,
+                    minimum_training_games=250,
+                    test_block_size=100,
+                )
+
+                st.session_state["nba_research_result"] = nba_result
+
+            st.success("NBA historical validation complete.")
+
+        except Exception as e:
+            st.error(f"NBA validation error: {e}")
+
+    if "nba_research_result" in st.session_state:
+
+        r = st.session_state["nba_research_result"]
+
+        st.markdown("#### Dataset")
+
+        n1, n2, n3, n4 = st.columns(4)
+
+        n1.metric(
+            "Raw games",
+            r["raw_games"],
+        )
+
+        n2.metric(
+            "Completed games",
+            r["completed_games"],
+        )
+
+        n3.metric(
+            "Feature rows",
+            r["feature_rows"],
+        )
+
+        n4.metric(
+            "Home win rate",
+            f"{r['home_win_rate']:.1%}",
+        )
+
+        st.markdown("#### Walk-Forward Performance")
+
+        model = r["overall"]
+        baseline = r["baseline"]
+
+        m1, m2, m3, m4 = st.columns(4)
+
+        m1.metric(
+            "AUC",
+            f"{model['auc']:.3f}",
+        )
+
+        m2.metric(
+            "Accuracy",
+            f"{model['accuracy']:.1%}",
+        )
+
+        m3.metric(
+            "Brier Score",
+            f"{model['brier']:.4f}",
+        )
+
+        m4.metric(
+            "Log Loss",
+            f"{model['logloss']:.4f}",
+        )
+
+        st.markdown("#### Model vs Baseline")
+
+        comparison = pd.DataFrame(
+            [
+                {
+                    "Model": "NBA Model",
+                    "Accuracy": model["accuracy"],
+                    "Brier": model["brier"],
+                    "Log Loss": model["logloss"],
+                    "AUC": model["auc"],
+                },
+                {
+                    "Model": "Home Win Base Rate",
+                    "Accuracy": baseline["accuracy"],
+                    "Brier": baseline["brier"],
+                    "Log Loss": baseline["logloss"],
+                    "AUC": baseline["auc"],
+                },
+            ]
+        )
+
+        st.dataframe(
+            comparison,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.markdown("#### Confidence Analysis")
+
+        confidence = r["confidence"]
+
+        if len(confidence):
+            st.dataframe(
+                confidence,
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info(
+                "No confidence-band results were generated."
+            )
+
+        with st.expander("Walk-Forward Folds"):
+            st.dataframe(
+                r["folds"],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    st.divider()
+
+    
 
     st.warning("CPU-intensive. This is for periodic model research, not daily use.")
     txt = st.text_area("Training universe", ",".join(default), height=150)
