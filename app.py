@@ -99,7 +99,7 @@ else:
     
 
 
-  st.divider()
+    st.divider()
 
 # ============================================================
 # MULTI-SEASON NBA VALIDATION
