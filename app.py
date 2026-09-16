@@ -20,7 +20,7 @@ if page=="Command Center":
     f"{VALIDATED_STOCK_MODEL['features']} • "
     f"AUC {VALIDATED_STOCK_MODEL['auc']:.3f}"
 )
-        st.subheader("📈 Best Stock Signal")
+st.subheader("📈 Best Stock Signal")
         txt=st.text_input("Symbols to scan", "AAPL,MSFT,NVDA,AMZN,META,GOOGL,TSLA,AVGO,AMD,JPM,LLY,XOM")
         syms=clean_symbols(txt)
         if st.button("Scan Today's Market",type="primary",use_container_width=True):
