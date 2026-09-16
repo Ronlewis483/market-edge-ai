@@ -4,8 +4,7 @@ st.set_page_config(page_title="Market Edge AI V5", page_icon="📊", layout="wid
 
 from dual_agent.research import DEFAULT_UNIVERSE, latest_scan, run_research
 from dual_agent.signal_engine import clean_symbols, stock_decision, sports_decision
-st.title("📊 Market Edge AI — V5")
-st.caption("Persistent validated model • lightweight daily inference • research/paper mode")
+from dual_agent.validated_model import VALIDATED_STOCK_MODELst.caption("Persistent validated model • lightweight daily inference • research/paper mode")
 
 with st.sidebar:
     page=st.radio("Navigation",["Command Center","Saved Model","Research Lab"])
@@ -15,9 +14,12 @@ with st.sidebar:
 default=clean_symbols(DEFAULT_UNIVERSE)
 
 if page=="Command Center":
-    st.success(f"VALIDATED MODEL LOADED — {M['target']} • {M['features']} • AUC {M['auc']:.3f}")
-    c1,c2=st.columns(2)
-    with c1:
+    st.success(
+    f"VALIDATED MODEL LOADED — "
+    f"{VALIDATED_STOCK_MODEL['target']} • "
+    f"{VALIDATED_STOCK_MODEL['features']} • "
+    f"AUC {VALIDATED_STOCK_MODEL['auc']:.3f}"
+)
         st.subheader("📈 Best Stock Signal")
         txt=st.text_input("Symbols to scan", "AAPL,MSFT,NVDA,AMZN,META,GOOGL,TSLA,AVGO,AMD,JPM,LLY,XOM")
         syms=clean_symbols(txt)
