@@ -1,4 +1,4 @@
-from dual_agent.nba_data import test_nba_connections
+
 import streamlit as st
 st.set_page_config(page_title="Market Edge AI V5", page_icon="📊", layout="wide")
 
