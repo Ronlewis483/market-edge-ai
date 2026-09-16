@@ -76,6 +76,7 @@ def scan(symbols):
             rows.append({"Symbol":sym,"Horizon":f"{h}d","Close":float(r.close),"Raw P":raw,"Calibrated P":p,"Historical base":base,"Model vs base":edge,"Direction":"Bullish" if edge>=0 else "Bearish"})
             log_prediction("stock_v3",sym,p,f"{h} trading days",base,edge,{"raw":raw,"close":float(r.close)})
     if not rows: raise RuntimeError("Train all horizons first.")
+        # V3 deployment refresh
     return pd.DataFrame(rows)
 def metrics_all():
     return {str(h):joblib.load(path(h))["metrics"] for h in HORIZONS if path(h).exists()}
