@@ -73,7 +73,8 @@ elif page=="Saved Model":
 
 else:
     st.subheader("🧪 Research Lab — Optional Revalidation")
-        st.markdown("### 🏀 NBA Data Connection Test")
+
+    st.markdown("### 🏀 NBA Data Connection Test")
 
     if st.button("Test NBA Data Sources"):
         with st.spinner("Testing SportsDataIO and The Odds API..."):
@@ -88,6 +89,12 @@ else:
                 st.warning(f"⚠️ {provider}: {info['message']}")
 
     st.divider()
+
+    st.warning("CPU-intensive. This is for periodic model research, not daily use.")
+    txt = st.text_area("Training universe", ",".join(default), height=150)
+    universe = clean_symbols(txt)
+    st.metric("Training symbols", len(universe))
+    confirm = st.checkbox("I understand this is CPU-intensive")
     st.warning("CPU-intensive. This is for periodic model research, not daily use.")
     txt=st.text_area("Training universe",",".join(default),height=150)
     universe=clean_symbols(txt)
