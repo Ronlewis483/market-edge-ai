@@ -4,8 +4,8 @@ st.set_page_config(page_title="Market Edge AI V5", page_icon="📊", layout="wid
 
 from dual_agent.research import DEFAULT_UNIVERSE, latest_scan, run_research
 from dual_agent.signal_engine import clean_symbols, stock_decision, sports_decision
-from dual_agent.validated_model import VALIDATED_STOCK_MODELst.caption("Persistent validated model • lightweight daily inference • research/paper mode")
-
+from dual_agent.validated_model import VALIDATED_STOCK_MODEL
+st.caption("Persistent validated model • lightweight daily inference • research/paper mode")
 with st.sidebar:
     page=st.radio("Navigation",["Command Center","Saved Model","Research Lab"])
     st.success("Persistence enabled")
