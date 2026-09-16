@@ -16,7 +16,7 @@ def client():
     return StockHistoricalDataClient(k,s)
 def bars(symbols,years=6):
     end=datetime.now(timezone.utc); start=end-timedelta(days=int(years*365.25))
-    req=StockBarsRequest(symbol_or_symbols=symbols,timeframe=TimeFrame.Day,start=start,end=end)
+    req=StockBarsRequest(symbol_or_symbols=symbols,timeframe=TimeFrame.Day,start=start,end=end,feed=DataFeed.IEX)
     d=client().get_stock_bars(req).df.reset_index(); d["timestamp"]=pd.to_datetime(d["timestamp"],utc=True)
     return d.sort_values(["symbol","timestamp"])
 def feat(g,h):
