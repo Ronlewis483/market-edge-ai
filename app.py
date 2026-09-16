@@ -96,7 +96,20 @@ else:
     st.divider()
 
 
+    # NEW CODE
+    st.markdown("### 🏀 Multi-Season NBA Validation")
+    
+    # ...all the new multi-season code...
+    
+    st.divider()
 
+
+    # EXISTING CODE — KEEP THIS
+    st.markdown("### 🏀 NBA Historical Validation")
+
+    nba_season = st.text_input(
+        "NBA season",
+        value="2025",
     st.markdown("### 🏀 NBA Historical Validation")
 
     nba_season = st.text_input(
