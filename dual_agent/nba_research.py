@@ -795,3 +795,113 @@ def run_nba_research(
             validation["predictions"],
         "confidence": confidence,
     }
+
+# ============================================================
+# MULTI-SEASON NBA RESEARCH
+# ============================================================
+
+def run_multi_season_nba_research(
+    seasons,
+    minimum_training_games=500,
+    test_block_size=150,
+):
+    """
+    Combine multiple NBA seasons and run chronological
+    walk-forward validation across the full dataset.
+    """
+
+    if not seasons:
+        raise ValueError(
+            "At least one NBA season is required."
+        )
+
+    all_games = []
+    season_summary = []
+
+    for season in seasons:
+        season = str(season).strip()
+
+        raw = get_historical_games(season)
+        games = normalize_games(raw)
+
+        if games.empty:
+            continue
+
+        games = games.copy()
+        games["season"] = season
+
+        all_games.append(games)
+
+        season_summary.append(
+            {
+                "season": season,
+                "raw_games": int(len(raw)),
+                "completed_games": int(len(games)),
+                "home_win_rate": float(
+                    games["home_win"].mean()
+                ),
+            }
+        )
+
+    if not all_games:
+        raise ValueError(
+            "No historical NBA games were returned "
+            "for the requested seasons."
+        )
+
+    combined_games = pd.concat(
+        all_games,
+        ignore_index=True,
+    )
+
+    combined_games = (
+        combined_games
+        .sort_values(["date", "game_id"])
+        .reset_index(drop=True)
+    )
+
+    features = build_feature_table(
+        combined_games
+    )
+
+    validation = walk_forward_validate(
+        features,
+        minimum_training_games=minimum_training_games,
+        test_block_size=test_block_size,
+    )
+
+    confidence = confidence_report(
+        validation["predictions"]
+    )
+
+    return {
+        "seasons": [
+            str(x).strip()
+            for x in seasons
+        ],
+        "season_summary": pd.DataFrame(
+            season_summary
+        ),
+        "raw_games": int(
+            sum(
+                x["raw_games"]
+                for x in season_summary
+            )
+        ),
+        "completed_games": int(
+            len(combined_games)
+        ),
+        "feature_rows": int(
+            len(features)
+        ),
+        "home_win_rate": float(
+            combined_games["home_win"].mean()
+        ),
+        "features": features,
+        "overall": validation["overall"],
+        "baseline": validation["baseline"],
+        "base_rate": validation["base_rate"],
+        "folds": validation["folds"],
+        "predictions": validation["predictions"],
+        "confidence": confidence,
+    }
