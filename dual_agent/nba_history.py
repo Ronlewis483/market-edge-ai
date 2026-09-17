@@ -163,28 +163,3 @@ def test_nba_history(season="2024-25"):
         "sample": games.head(5),
     }
 
-# ============================================================
-# SPORTSBOOK ODDS UTILITIES
-# ============================================================
-
-def american_odds_to_implied_probability(odds):
-    """
-    Convert American sportsbook odds into implied probability.
-
-    Examples:
-        -110 -> 52.38%
-        +150 -> 40.00%
-        -200 -> 66.67%
-    """
-
-    odds = float(odds)
-
-    if odds == 0:
-        raise ValueError("American odds cannot be zero.")
-
-    if odds > 0:
-        probability = 100.0 / (odds + 100.0)
-    else:
-        probability = abs(odds) / (abs(odds) + 100.0)
-
-    return float(probability)
