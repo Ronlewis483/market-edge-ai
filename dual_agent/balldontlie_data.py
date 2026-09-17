@@ -1,5 +1,7 @@
-import requests
+import time
+
 import pandas as pd
+import requests
 import streamlit as st
 
 
@@ -44,30 +46,10 @@ def _balldontlie_get(endpoint, params=None):
     return response.json()
 
 
-def get_historical_games(season=2023, per_page=100):
+def _games_to_dataframe(games):
     """
-    Retrieve one page of historical NBA games.
-
-    This is intentionally small for the first connection test.
-    We will add full pagination after confirming the API works
-    from Streamlit Cloud.
+    Convert BALLDONTLIE game records into our standard format.
     """
-
-    payload = _balldontlie_get(
-        "games",
-        params={
-            "seasons[]": season,
-            "per_page": per_page,
-        },
-    )
-
-    games = payload.get("data", [])
-
-    if not games:
-        raise ValueError(
-            f"No games were returned for NBA season {season}."
-        )
-
     rows = []
 
     for game in games:
@@ -91,6 +73,9 @@ def get_historical_games(season=2023, per_page=100):
 
     df = pd.DataFrame(rows)
 
+    if df.empty:
+        return df
+
     df["game_date"] = pd.to_datetime(
         df["game_date"],
         errors="coerce",
@@ -106,33 +91,149 @@ def get_historical_games(season=2023, per_page=100):
         errors="coerce",
     )
 
-    completed = df.dropna(
-        subset=["home_points", "away_points"]
+    df = df.dropna(
+        subset=[
+            "game_id",
+            "game_date",
+            "home_team",
+            "away_team",
+            "home_points",
+            "away_points",
+        ]
     ).copy()
 
-    completed["home_win"] = (
-        completed["home_points"] >
-        completed["away_points"]
+    df["home_win"] = (
+        df["home_points"] > df["away_points"]
     ).astype(int)
 
-    return completed
+    df = df.drop_duplicates(
+        subset=["game_id"]
+    )
+
+    df = df.sort_values(
+        ["game_date", "game_id"]
+    ).reset_index(drop=True)
+
+    return df
+
+
+def get_historical_games(
+    season=2023,
+    per_page=100,
+    fetch_all=True,
+):
+    """
+    Retrieve historical NBA games for one season.
+
+    When fetch_all=True, pagination continues until the
+    entire available season has been downloaded.
+
+    The pause between requests protects the free-tier
+    BALLDONTLIE rate limit.
+    """
+
+    all_games = []
+    cursor = None
+    request_count = 0
+
+    while True:
+        params = {
+            "seasons[]": season,
+            "per_page": per_page,
+        }
+
+        if cursor is not None:
+            params["cursor"] = cursor
+
+        payload = _balldontlie_get(
+            "games",
+            params=params,
+        )
+
+        request_count += 1
+
+        batch = payload.get("data", [])
+
+        if not batch:
+            break
+
+        all_games.extend(batch)
+
+        if not fetch_all:
+            break
+
+        meta = payload.get("meta") or {}
+
+        next_cursor = meta.get("next_cursor")
+
+        if next_cursor is None:
+            break
+
+        cursor = next_cursor
+
+        # Free tier allows only a small number of requests
+        # per minute, so wait before requesting the next page.
+        time.sleep(13)
+
+    if not all_games:
+        raise ValueError(
+            f"No games were returned for NBA season {season}."
+        )
+
+    games_df = _games_to_dataframe(all_games)
+
+    if games_df.empty:
+        raise ValueError(
+            f"No completed games were found for NBA season {season}."
+        )
+
+    return games_df, request_count
 
 
 def test_balldontlie_connection():
     """
-    Test an older season to prove historical access works.
+    Quick connection test.
+
+    Only retrieves a small page so testing does not require
+    downloading an entire season.
     """
 
-    games = get_historical_games(
+    games, request_count = get_historical_games(
         season=2023,
         per_page=25,
+        fetch_all=False,
     )
 
     return {
         "success": True,
         "season": 2023,
         "games_returned": len(games),
+        "requests_used": request_count,
         "first_game": games["game_date"].min(),
         "last_game": games["game_date"].max(),
         "sample": games.head(5),
+    }
+
+
+def test_full_historical_season(season=2023):
+    """
+    Download one complete NBA season to verify pagination.
+    """
+
+    games, request_count = get_historical_games(
+        season=season,
+        per_page=100,
+        fetch_all=True,
+    )
+
+    return {
+        "success": True,
+        "season": season,
+        "games_returned": len(games),
+        "requests_used": request_count,
+        "first_game": games["game_date"].min(),
+        "last_game": games["game_date"].max(),
+        "home_win_rate": float(games["home_win"].mean()),
+        "sample": games.head(5),
+        "games": games,
     }
