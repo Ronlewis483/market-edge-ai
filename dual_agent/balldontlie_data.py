@@ -349,3 +349,139 @@ def test_multiple_historical_seasons(
         "sample": games.head(10),
         "games": games,
     }
+def audit_historical_games(games):
+    """
+    Audit a BALLDONTLIE historical NBA dataset before
+    allowing it into model training.
+    """
+
+    if games is None or games.empty:
+        raise ValueError("No games were supplied for audit.")
+
+    df = games.copy()
+
+    # Make sure dates and scores have usable types.
+    df["game_date"] = pd.to_datetime(
+        df["game_date"],
+        errors="coerce",
+    )
+
+    df["home_points"] = pd.to_numeric(
+        df["home_points"],
+        errors="coerce",
+    )
+
+    df["away_points"] = pd.to_numeric(
+        df["away_points"],
+        errors="coerce",
+    )
+
+    total_rows = len(df)
+
+    unique_game_ids = (
+        df["game_id"].nunique()
+        if "game_id" in df.columns
+        else total_rows
+    )
+
+    duplicate_game_ids = (
+        total_rows - unique_game_ids
+    )
+
+    missing_dates = int(
+        df["game_date"].isna().sum()
+    )
+
+    missing_scores = int(
+        (
+            df["home_points"].isna()
+            | df["away_points"].isna()
+        ).sum()
+    )
+
+    tied_games = int(
+        (
+            df["home_points"]
+            == df["away_points"]
+        ).sum()
+    )
+
+    # Look for unusual team abbreviations.
+    normal_nba_teams = {
+        "ATL", "BOS", "BKN", "CHA", "CHI",
+        "CLE", "DAL", "DEN", "DET", "GSW",
+        "HOU", "IND", "LAC", "LAL", "MEM",
+        "MIA", "MIL", "MIN", "NOP", "NYK",
+        "OKC", "ORL", "PHI", "PHX", "POR",
+        "SAC", "SAS", "TOR", "UTA", "WAS",
+    }
+
+    teams_found = set()
+
+    if "home_team" in df.columns:
+        teams_found.update(
+            df["home_team"]
+            .dropna()
+            .astype(str)
+            .str.upper()
+            .unique()
+        )
+
+    if "away_team" in df.columns:
+        teams_found.update(
+            df["away_team"]
+            .dropna()
+            .astype(str)
+            .str.upper()
+            .unique()
+        )
+
+    unusual_teams = sorted(
+        teams_found - normal_nba_teams
+    )
+
+    # Count games by month. This helps expose preseason,
+    # All-Star, postseason, or other unusual records.
+    games_by_month = (
+        df.dropna(subset=["game_date"])
+        .assign(
+            month=lambda x:
+            x["game_date"].dt.to_period("M").astype(str)
+        )
+        .groupby("month")
+        .size()
+        .reset_index(name="games")
+    )
+
+    # Show status values returned by the API.
+    if "status" in df.columns:
+        status_summary = (
+            df["status"]
+            .fillna("MISSING")
+            .astype(str)
+            .value_counts()
+            .rename_axis("status")
+            .reset_index(name="games")
+        )
+    else:
+        status_summary = pd.DataFrame()
+
+    # Find games with zero/missing-looking scores.
+    suspicious_scores = df[
+        (df["home_points"].fillna(0) <= 0)
+        | (df["away_points"].fillna(0) <= 0)
+    ].copy()
+
+    return {
+        "total_rows": int(total_rows),
+        "unique_game_ids": int(unique_game_ids),
+        "duplicate_game_ids": int(duplicate_game_ids),
+        "missing_dates": missing_dates,
+        "missing_scores": missing_scores,
+        "tied_games": tied_games,
+        "teams_found": len(teams_found),
+        "unusual_teams": unusual_teams,
+        "games_by_month": games_by_month,
+        "status_summary": status_summary,
+        "suspicious_scores": suspicious_scores,
+    }
