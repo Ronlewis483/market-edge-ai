@@ -442,12 +442,11 @@ else:
         
         
         
-            
-           except Exception as e:
-               st.error(
-                   f"Multi-season BALLDONTLIE error: {e}
-               )  
 
+        except Exception as e:
+        st.error(
+            f"Multi-season BALLDONTLIE error: {e}"
+        )
 
     
     st.divider()
