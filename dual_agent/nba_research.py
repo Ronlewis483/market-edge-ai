@@ -1642,3 +1642,265 @@ def audit_balldontlie_pregame_features(feature_games):
         "suspicious_model_features": suspicious_columns,
         "missing_feature_values": missing_values,
     }
+# ============================================================
+# BALLDONTLIE WALK-FORWARD NBA MODEL
+# ============================================================
+
+def run_balldontlie_walkforward_model(feature_games):
+    """
+    Chronological walk-forward validation for the BALLDONTLIE
+    pre-game NBA feature dataset.
+
+    The model is trained only on games that occurred before
+    the games being predicted.
+    """
+
+    import numpy as np
+
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.metrics import (
+        accuracy_score,
+        roc_auc_score,
+        brier_score_loss,
+        log_loss,
+    )
+    from sklearn.preprocessing import StandardScaler
+
+    if feature_games is None or len(feature_games) == 0:
+        raise ValueError("No feature games supplied.")
+
+    df = feature_games.copy()
+
+    df["game_date"] = pd.to_datetime(
+        df["game_date"],
+        errors="coerce",
+    )
+
+    df = df.sort_values(
+        ["game_date", "game_id"]
+    ).reset_index(drop=True)
+
+    # --------------------------------------------------------
+    # Explicit pre-game feature list
+    # --------------------------------------------------------
+
+    feature_columns = [
+        "home_games_played",
+        "away_games_played",
+        "home_win_pct",
+        "away_win_pct",
+        "home_win_pct_5",
+        "away_win_pct_5",
+        "home_win_pct_10",
+        "away_win_pct_10",
+        "home_avg_points",
+        "away_avg_points",
+        "home_avg_points_allowed",
+        "away_avg_points_allowed",
+        "home_avg_margin",
+        "away_avg_margin",
+        "home_venue_win_pct",
+        "away_venue_win_pct",
+        "home_rest_days",
+        "away_rest_days",
+        "win_pct_diff",
+        "recent_5_diff",
+        "recent_10_diff",
+        "margin_diff",
+        "venue_win_pct_diff",
+        "rest_days_diff",
+    ]
+
+    missing_columns = [
+        column
+        for column in feature_columns + ["home_win"]
+        if column not in df.columns
+    ]
+
+    if missing_columns:
+        raise ValueError(
+            "Walk-forward model is missing columns: "
+            + ", ".join(missing_columns)
+        )
+
+    df = df.dropna(
+        subset=feature_columns + ["home_win", "game_date"]
+    ).copy()
+
+    if len(df) < 500:
+        raise ValueError(
+            "Not enough games for reliable walk-forward testing."
+        )
+
+    # --------------------------------------------------------
+    # Expanding chronological test windows
+    # --------------------------------------------------------
+
+    initial_train_size = 800
+    test_window_size = 200
+
+    prediction_rows = []
+
+    train_end = initial_train_size
+
+    while train_end < len(df):
+
+        test_end = min(
+            train_end + test_window_size,
+            len(df),
+        )
+
+        train_df = df.iloc[:train_end].copy()
+        test_df = df.iloc[train_end:test_end].copy()
+
+        if test_df.empty:
+            break
+
+        X_train = train_df[feature_columns].astype(float)
+        y_train = train_df["home_win"].astype(int)
+
+        X_test = test_df[feature_columns].astype(float)
+        y_test = test_df["home_win"].astype(int)
+
+        scaler = StandardScaler()
+
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_test_scaled = scaler.transform(X_test)
+
+        model = LogisticRegression(
+            max_iter=2000,
+            random_state=42,
+        )
+
+        model.fit(
+            X_train_scaled,
+            y_train,
+        )
+
+        probabilities = model.predict_proba(
+            X_test_scaled
+        )[:, 1]
+
+        predictions = (
+            probabilities >= 0.50
+        ).astype(int)
+
+        for position, (_, game) in enumerate(
+            test_df.iterrows()
+        ):
+            prediction_rows.append(
+                {
+                    "game_id": game["game_id"],
+                    "game_date": game["game_date"],
+                    "season": game["season"],
+                    "home_team": game["home_team"],
+                    "away_team": game["away_team"],
+                    "actual": int(y_test.iloc[position]),
+                    "probability": float(
+                        probabilities[position]
+                    ),
+                    "prediction": int(
+                        predictions[position]
+                    ),
+                    "train_games": int(train_end),
+                }
+            )
+
+        train_end = test_end
+
+    predictions_df = pd.DataFrame(
+        prediction_rows
+    )
+
+    if predictions_df.empty:
+        raise ValueError(
+            "Walk-forward model produced no predictions."
+        )
+
+    y_true = predictions_df["actual"].astype(int)
+
+    probabilities = predictions_df[
+        "probability"
+    ].astype(float)
+
+    predicted_classes = predictions_df[
+        "prediction"
+    ].astype(int)
+
+    accuracy = accuracy_score(
+        y_true,
+        predicted_classes,
+    )
+
+    auc = roc_auc_score(
+        y_true,
+        probabilities,
+    )
+
+    brier = brier_score_loss(
+        y_true,
+        probabilities,
+    )
+
+    logloss = log_loss(
+        y_true,
+        probabilities,
+    )
+
+    # --------------------------------------------------------
+    # Naive home-team baseline
+    # --------------------------------------------------------
+
+    baseline_probability = float(
+        df.iloc[:initial_train_size]["home_win"].mean()
+    )
+
+    baseline_probabilities = np.full(
+        len(y_true),
+        baseline_probability,
+    )
+
+    baseline_predictions = (
+        baseline_probabilities >= 0.50
+    ).astype(int)
+
+    baseline_accuracy = accuracy_score(
+        y_true,
+        baseline_predictions,
+    )
+
+    baseline_brier = brier_score_loss(
+        y_true,
+        baseline_probabilities,
+    )
+
+    baseline_logloss = log_loss(
+        y_true,
+        baseline_probabilities,
+    )
+
+    return {
+        "feature_columns": feature_columns,
+        "feature_count": len(feature_columns),
+        "total_feature_games": len(df),
+        "initial_train_games": initial_train_size,
+        "test_window_size": test_window_size,
+        "predictions": predictions_df,
+        "games_predicted": len(predictions_df),
+
+        "accuracy": float(accuracy),
+        "auc": float(auc),
+        "brier": float(brier),
+        "log_loss": float(logloss),
+
+        "baseline_probability": baseline_probability,
+        "baseline_accuracy": float(
+            baseline_accuracy
+        ),
+        "baseline_brier": float(
+            baseline_brier
+        ),
+        "baseline_log_loss": float(
+            baseline_logloss
+        ),
+    }
