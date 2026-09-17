@@ -264,46 +264,49 @@ else:
                 "Verified home-win rate:",
                 f"{research_games['home_win'].mean():.1%}",
         )
-         st.markdown("#### 🧮 Pre-Game Feature Engine Test")
 
-        feature_games = build_balldontlie_pregame_features(
-            multi_bdl_test["games"],
-            min_games=5,
-        )
+            st.markdown("#### 🧮 Pre-Game Feature Engine Test")
 
-        st.success(
-            f"Feature engine successful — "
-            f"{len(feature_games)} model-ready rows created."
-        )
+                feature_games = build_balldontlie_pregame_features(
+        multi_bdl_test["games"],
+        min_games=5,
+    )
+    
+    st.success(
+        f"Feature engine successful — "
+        f"{len(feature_games)} model-ready rows created."
+    )
+    
+    feature_col1, feature_col2, feature_col3 = st.columns(3)
+    
+    feature_col1.metric(
+        "Feature Rows",
+        len(feature_games),
+    )
+    
+    feature_col2.metric(
+        "First Feature Date",
+        feature_games["game_date"].min().strftime("%Y-%m-%d"),
+    )
+    
+    feature_col3.metric(
+        "Last Feature Date",
+        feature_games["game_date"].max().strftime("%Y-%m-%d"),
+    )
+    
+    st.write(
+        "Feature columns:",
+        len(feature_games.columns),
+    )
+    
+    st.dataframe(
+        feature_games.head(10),
+        use_container_width=True,
+        hide_index=True,
+    )       
 
-        feature_col1, feature_col2, feature_col3 = st.columns(3)
-
-        feature_col1.metric(
-            "Feature Rows",
-            len(feature_games),
-        )
-
-        feature_col2.metric(
-            "First Feature Date",
-            feature_games["game_date"].min().strftime("%Y-%m-%d"),
-        )
-
-        feature_col3.metric(
-            "Last Feature Date",
-            feature_games["game_date"].max().strftime("%Y-%m-%d"),
-        )
-
-        st.write(
-            "Feature columns:",
-            len(feature_games.columns),
-        )
-
-        st.dataframe(
-            feature_games.head(10),
-            use_container_width=True,
-            hide_index=True,
-        )
-
+            
+            
             
             audit = audit_historical_games(
                 multi_bdl_test["games"]
