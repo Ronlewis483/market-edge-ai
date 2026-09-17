@@ -11,6 +11,8 @@ from dual_agent.nba_research import (
     run_nba_research,
     run_multi_season_nba_research,
     nba_calibration_summary,
+    prepare_balldontlie_games_for_research,
+)
 )
 import streamlit as st
 
@@ -229,6 +231,41 @@ else:
                 use_container_width=True,
                 hide_index=True,
             )
+        st.markdown("#### 🧠 Research Pipeline Bridge Test")
+
+        research_games = prepare_balldontlie_games_for_research(
+            multi_bdl_test["games"]
+        )
+
+        st.success(
+            f"Research bridge successful — "
+            f"{len(research_games)} games ready for modeling."
+        )
+
+        bridge_col1, bridge_col2, bridge_col3 = st.columns(3)
+
+        bridge_col1.metric(
+            "Model-Ready Games",
+            len(research_games),
+        )
+
+        bridge_col2.metric(
+            "First Game",
+            research_games["game_date"].min().strftime("%Y-%m-%d"),
+        )
+
+        bridge_col3.metric(
+            "Last Game",
+            research_games["game_date"].max().strftime("%Y-%m-%d"),
+        )
+
+        st.write(
+            "Verified home-win rate:",
+            f"{research_games['home_win'].mean():.1%}",
+        )
+
+
+            
             audit = audit_historical_games(
                 multi_bdl_test["games"]
             )
