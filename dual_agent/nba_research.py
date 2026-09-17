@@ -2248,3 +2248,47 @@ def american_odds_to_implied_probability(odds):
         probability = abs(odds) / (abs(odds) + 100.0)
 
     return float(probability)
+
+# ============================================================
+# MODEL VS SPORTSBOOK EDGE
+# ============================================================
+
+def calculate_model_edge(model_probability, american_odds):
+    """
+    Compare Market Edge AI probability against sportsbook
+    implied probability.
+
+    Returns probabilities as decimals.
+
+    Example:
+        Model probability: 0.71
+        Sportsbook odds: -150
+        Sportsbook implied probability: 0.60
+        Model edge: +0.11
+    """
+
+    model_probability = float(model_probability)
+
+    if not 0.0 <= model_probability <= 1.0:
+        raise ValueError(
+            "Model probability must be between 0 and 1."
+        )
+
+    sportsbook_probability = (
+        american_odds_to_implied_probability(
+            american_odds
+        )
+    )
+
+    model_edge = (
+        model_probability - sportsbook_probability
+    )
+
+    return {
+        "model_probability": model_probability,
+        "american_odds": float(american_odds),
+        "sportsbook_probability": float(
+            sportsbook_probability
+        ),
+        "model_edge": float(model_edge),
+    }
