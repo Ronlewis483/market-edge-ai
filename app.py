@@ -462,6 +462,91 @@ else:
                 "Baseline Log Loss",
                 f"{walkforward_results['baseline_log_loss']:.4f}",
             )
+            st.markdown("##### 🎚️ Walk-Forward Confidence Calibration")
+    
+            calibration_predictions = (
+                walkforward_results["predictions"].copy()
+            )
+    
+            calibration_predictions["confidence"] = (
+                calibration_predictions[
+                    "predicted_probability"
+                ]
+                .where(
+                    calibration_predictions["prediction"] == 1,
+                    1.0
+                    - calibration_predictions[
+                        "predicted_probability"
+                    ],
+                )
+            )
+    
+            calibration_predictions["correct"] = (
+                calibration_predictions["prediction"]
+                == calibration_predictions["actual"]
+            ).astype(int)
+    
+            calibration_predictions["confidence_band"] = pd.cut(
+                calibration_predictions["confidence"],
+                bins=[
+                    0.50,
+                    0.55,
+                    0.60,
+                    0.65,
+                    0.70,
+                    0.75,
+                    0.80,
+                    0.85,
+                    0.90,
+                    0.95,
+                    1.01,
+                ],
+                labels=[
+                    "50–55%",
+                    "55–60%",
+                    "60–65%",
+                    "65–70%",
+                    "70–75%",
+                    "75–80%",
+                    "80–85%",
+                    "85–90%",
+                    "90–95%",
+                    "95–100%",
+                ],
+                include_lowest=True,
+            )
+    
+            calibration_table = (
+                calibration_predictions
+                .groupby(
+                    "confidence_band",
+                    observed=False,
+                )
+                .agg(
+                    games=("correct", "size"),
+                    actual_accuracy=("correct", "mean"),
+                    average_confidence=("confidence", "mean"),
+                )
+                .reset_index()
+            )
+    
+            calibration_table["actual_accuracy"] = (
+                calibration_table["actual_accuracy"]
+                .map(lambda value: f"{value:.1%}")
+            )
+    
+            calibration_table["average_confidence"] = (
+                calibration_table["average_confidence"]
+                .map(lambda value: f"{value:.1%}")
+            )
+    
+            st.dataframe(
+                calibration_table,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            
             st.markdown("#### 🔮 Future Matchup Feature Test")
     
             historical_test_game = feature_games.iloc[-1]
