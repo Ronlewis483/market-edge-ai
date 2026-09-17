@@ -445,7 +445,7 @@ else:
             
            except Exception as e:
                st.error(
-                   f"Multi-season BALLDONTLIE error: {e}"
+                   f"Multi-season BALLDONTLIE error: {e}
                )  
 
 
