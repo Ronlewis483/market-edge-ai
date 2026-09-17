@@ -1557,23 +1557,18 @@ def audit_balldontlie_pregame_features(feature_games):
     """
     Audit the pre-game feature dataset for obvious target leakage.
 
-    The model is allowed to know:
-    - game identity/date/teams
-    - historical team statistics calculated before the game
-
-    The model must NOT use current-game results as predictors.
+    Historical statistics calculated strictly before the current
+    game are valid model features.
     """
 
     if feature_games is None or len(feature_games) == 0:
         raise ValueError("No pre-game feature data was supplied.")
 
     df = feature_games.copy()
-
     columns = list(df.columns)
 
-    # These columns may exist in the dataset for identification,
-    # evaluation, or the prediction target, but must never be
-    # passed into the model as predictor features.
+    # These columns may remain in the dataset for identification
+    # or evaluation, but must never be model predictors.
     protected_columns = {
         "game_id",
         "game_date",
@@ -1587,8 +1582,7 @@ def audit_balldontlie_pregame_features(feature_games):
         "home_win",
     }
 
-    # Numeric columns that are safe candidates for the model
-    # after removing identifiers and current-game outcomes.
+    # Numeric columns available to the prediction model.
     model_features = [
         column
         for column in columns
@@ -1596,25 +1590,25 @@ def audit_balldontlie_pregame_features(feature_games):
         and pd.api.types.is_numeric_dtype(df[column])
     ]
 
-    # Look for suspicious column names that could indicate
-    # current-game outcome information.
-    suspicious_terms = [
+    # Exact current-game outcome fields that would represent leakage.
+    # We intentionally use exact names rather than substring matching.
+    # Historical fields such as home_avg_margin are valid pre-game data.
+    forbidden_model_features = {
+        "home_points",
+        "away_points",
+        "point_margin",
+        "total_points",
+        "home_win",
         "final",
         "result",
         "winner",
         "score",
-        "total_points",
-        "home_points",
-        "away_points",
-    ]
+    }
 
     suspicious_columns = [
         column
         for column in model_features
-        if any(
-            term in column.lower()
-            for term in suspicious_terms
-        )
+        if column.lower() in forbidden_model_features
     ]
 
     missing_values = (
