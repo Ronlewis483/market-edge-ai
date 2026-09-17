@@ -2114,3 +2114,112 @@ def build_balldontlie_future_matchup_features(
     )
 
     return pd.DataFrame([features])
+
+# ============================================================
+# BALLDONTLIE LIVE NBA PREDICTION MODEL
+# ============================================================
+
+def predict_balldontlie_matchup(feature_games, matchup_features):
+    """
+    Train the NBA model on historical pre-game features and
+    generate probabilities for one future matchup.
+    """
+
+    if feature_games is None or len(feature_games) == 0:
+        raise ValueError("No historical feature games supplied.")
+
+    if matchup_features is None or len(matchup_features) == 0:
+        raise ValueError("No future matchup features supplied.")
+
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.pipeline import Pipeline
+
+    df = feature_games.copy()
+    future = matchup_features.copy()
+
+    protected_columns = {
+        "game_id",
+        "game_date",
+        "season",
+        "home_team",
+        "away_team",
+        "home_points",
+        "away_points",
+        "point_margin",
+        "total_points",
+        "home_win",
+    }
+
+    feature_columns = [
+        column
+        for column in df.columns
+        if column not in protected_columns
+        and pd.api.types.is_numeric_dtype(df[column])
+    ]
+
+    if not feature_columns:
+        raise ValueError("No model feature columns were found.")
+
+    missing_future_columns = [
+        column
+        for column in feature_columns
+        if column not in future.columns
+    ]
+
+    if missing_future_columns:
+        raise ValueError(
+            "Future matchup is missing model features: "
+            + ", ".join(missing_future_columns)
+        )
+
+    train_df = df.dropna(
+        subset=feature_columns + ["home_win"]
+    ).copy()
+
+    X_train = train_df[feature_columns]
+    y_train = train_df["home_win"].astype(int)
+
+    X_future = future[feature_columns]
+
+    model = Pipeline(
+        [
+            ("scaler", StandardScaler()),
+            (
+                "model",
+                LogisticRegression(
+                    max_iter=2000,
+                    random_state=42,
+                ),
+            ),
+        ]
+    )
+
+    model.fit(X_train, y_train)
+
+    home_probability = float(
+        model.predict_proba(X_future)[0][1]
+    )
+
+    away_probability = 1.0 - home_probability
+
+    predicted_side = (
+        "HOME"
+        if home_probability >= 0.50
+        else "AWAY"
+    )
+
+    confidence = max(
+        home_probability,
+        away_probability,
+    )
+
+    return {
+        "home_win_probability": home_probability,
+        "away_win_probability": away_probability,
+        "predicted_side": predicted_side,
+        "confidence": confidence,
+        "feature_columns": feature_columns,
+        "feature_count": len(feature_columns),
+        "training_games": len(train_df),
+    }
