@@ -1170,3 +1170,116 @@ def nba_calibration_summary(predictions):
         "high_confidence": high_confidence,
         "weighted_calibration_error": weighted_error,
     }
+# ============================================================
+# BALLDONTLIE -> NBA RESEARCH BRIDGE
+# ============================================================
+
+def prepare_balldontlie_games_for_research(games):
+    """
+    Convert the clean BALLDONTLIE historical dataset into
+    a standardized chronological game dataset for NBA research.
+
+    This function does NOT train the model.
+    """
+
+    if games is None or len(games) == 0:
+        raise ValueError("No BALLDONTLIE games were supplied.")
+
+    df = games.copy()
+
+    required_columns = [
+        "game_id",
+        "game_date",
+        "season",
+        "home_team",
+        "away_team",
+        "home_points",
+        "away_points",
+        "home_win",
+    ]
+
+    missing_columns = [
+        column
+        for column in required_columns
+        if column not in df.columns
+    ]
+
+    if missing_columns:
+        raise ValueError(
+            "BALLDONTLIE dataset is missing required columns: "
+            + ", ".join(missing_columns)
+        )
+
+    # --------------------------------------------------------
+    # Clean core fields
+    # --------------------------------------------------------
+
+    df["game_date"] = pd.to_datetime(
+        df["game_date"],
+        errors="coerce",
+    )
+
+    df["home_points"] = pd.to_numeric(
+        df["home_points"],
+        errors="coerce",
+    )
+
+    df["away_points"] = pd.to_numeric(
+        df["away_points"],
+        errors="coerce",
+    )
+
+    df["home_win"] = pd.to_numeric(
+        df["home_win"],
+        errors="coerce",
+    )
+
+    df = df.dropna(
+        subset=[
+            "game_date",
+            "home_team",
+            "away_team",
+            "home_points",
+            "away_points",
+            "home_win",
+        ]
+    ).copy()
+
+    # --------------------------------------------------------
+    # Sort chronologically
+    # --------------------------------------------------------
+
+    df = df.sort_values(
+        ["game_date", "game_id"]
+    ).reset_index(drop=True)
+
+    # --------------------------------------------------------
+    # Basic outcome fields
+    # --------------------------------------------------------
+
+    df["point_margin"] = (
+        df["home_points"] - df["away_points"]
+    )
+
+    df["total_points"] = (
+        df["home_points"] + df["away_points"]
+    )
+
+    # Verify target
+    calculated_home_win = (
+        df["home_points"] > df["away_points"]
+    ).astype(int)
+
+    target_mismatches = int(
+        (calculated_home_win != df["home_win"]).sum()
+    )
+
+    if target_mismatches:
+        raise ValueError(
+            f"{target_mismatches} home_win values do not match "
+            "the actual game scores."
+        )
+
+    df["home_win"] = calculated_home_win
+
+    return df
