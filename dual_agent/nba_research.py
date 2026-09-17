@@ -2138,6 +2138,27 @@ def predict_balldontlie_matchup(feature_games, matchup_features):
     df = feature_games.copy()
     future = matchup_features.copy()
 
+# Prevent look-ahead leakage when testing historical matchups.
+# Only games strictly before the matchup date may be used
+# to train the prediction model.
+if "game_date" in future.columns:
+    prediction_date = pd.to_datetime(
+        future["game_date"].iloc[0]
+    )
+
+    df["game_date"] = pd.to_datetime(
+        df["game_date"]
+    )
+
+    df = df[
+        df["game_date"] < prediction_date
+    ].copy()
+
+    if len(df) == 0:
+        raise ValueError(
+            "No historical games exist before the prediction date."
+        )
+    
     protected_columns = {
         "game_id",
         "game_date",
