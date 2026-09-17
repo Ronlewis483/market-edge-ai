@@ -200,8 +200,7 @@ if "multi_nba_research_result" in st.session_state:
             use_container_width=True,
             hide_index=True,
         )
-    else:
-        st.info("No confidence-band results were generated.")
+  
     else:
         st.info("No confidence-band results were generated.")
 
