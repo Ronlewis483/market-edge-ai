@@ -4,6 +4,7 @@ from dual_agent.nba_history import test_nba_history
 from dual_agent.balldontlie_data import (
     test_balldontlie_connection,
     test_full_historical_season,
+    test_multiple_historical_seasons,
 )
 from dual_agent.nba_research import (
     run_nba_research,
@@ -188,7 +189,50 @@ else:
 
 
 
-    
+        if st.button("Test 2022 + 2023 NBA Seasons"):
+        try:
+            with st.spinner(
+                "Downloading 2022 and 2023 NBA seasons. "
+                "This will take several minutes..."
+            ):
+                multi_bdl_test = test_multiple_historical_seasons(
+                    [2022, 2023]
+                )
+
+            st.success(
+                f"Multi-season download successful — "
+                f"{multi_bdl_test['games_returned']} total games."
+            )
+
+            st.write(
+                "API requests used:",
+                multi_bdl_test["total_requests"],
+            )
+
+            st.write(
+                "Overall date range:",
+                multi_bdl_test["first_game"],
+                "to",
+                multi_bdl_test["last_game"],
+            )
+
+            st.write(
+                "Overall home win rate:",
+                f"{multi_bdl_test['home_win_rate']:.1%}",
+            )
+
+            st.markdown("#### Season Summary")
+
+            st.dataframe(
+                multi_bdl_test["season_summary"],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        except Exception as e:
+            st.error(
+                f"Multi-season BALLDONTLIE error: {e}"
+            )
     st.divider()
     
 
