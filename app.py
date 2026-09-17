@@ -3,6 +3,7 @@ from dual_agent.nba_data import test_nba_connections
 from dual_agent.nba_research import (
     run_nba_research,
     run_multi_season_nba_research,
+    nba_calibration_summary,
 )
 import streamlit as st
 
@@ -201,7 +202,98 @@ if "multi_nba_research_result" in st.session_state:
         )
     else:
         st.info("No confidence-band results were generated.")
+    else:
+        st.info("No confidence-band results were generated.")
 
+    st.markdown("#### 🎯 Probability Calibration")
+
+    calibration_result = nba_calibration_summary(
+        mr["predictions"]
+    )
+
+    calibration_table = calibration_result["calibration"]
+
+    if len(calibration_table):
+        calibration_display = calibration_table.copy()
+
+        calibration_display["avg_predicted_probability"] = (
+            calibration_display["avg_predicted_probability"]
+            .map(lambda x: f"{x:.1%}")
+        )
+
+        calibration_display["actual_win_rate"] = (
+            calibration_display["actual_win_rate"]
+            .map(lambda x: f"{x:.1%}")
+        )
+
+        calibration_display["calibration_gap"] = (
+            calibration_display["calibration_gap"]
+            .map(lambda x: f"{x:+.1%}")
+        )
+
+        calibration_display["absolute_calibration_error"] = (
+            calibration_display["absolute_calibration_error"]
+            .map(lambda x: f"{x:.1%}")
+        )
+
+        st.dataframe(
+            calibration_display,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        weighted_error = calibration_result[
+            "weighted_calibration_error"
+        ]
+
+        if weighted_error is not None:
+            st.metric(
+                "Weighted Calibration Error",
+                f"{weighted_error:.1%}",
+            )
+
+    else:
+        st.info("No calibration results were generated.")
+
+    st.markdown("#### 🔬 High-Confidence Threshold Analysis")
+
+    high_confidence = calibration_result["high_confidence"]
+
+    if len(high_confidence):
+        threshold_display = high_confidence.copy()
+
+        threshold_display["minimum_probability"] = (
+            threshold_display["minimum_probability"]
+            .map(lambda x: f"{x:.0%}")
+        )
+
+        threshold_display["accuracy"] = (
+            threshold_display["accuracy"]
+            .map(lambda x: f"{x:.1%}")
+        )
+
+        threshold_display["avg_model_probability"] = (
+            threshold_display["avg_model_probability"]
+            .map(lambda x: f"{x:.1%}")
+        )
+
+        threshold_display["calibration_gap"] = (
+            threshold_display["calibration_gap"]
+            .map(lambda x: f"{x:+.1%}")
+        )
+
+        st.dataframe(
+            threshold_display,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    else:
+        st.info(
+            "No high-confidence threshold results were generated."
+        )
+
+    st.markdown("#### Season Breakdown")
     st.markdown("#### Season Breakdown")
 
     st.dataframe(
