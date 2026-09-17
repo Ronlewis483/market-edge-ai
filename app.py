@@ -507,7 +507,40 @@ else:
                 hide_index=True,
             )
 
-
+            st.markdown("#### 🎯 NBA Matchup Prediction")
+    
+            live_prediction = predict_balldontlie_matchup(
+                feature_games,
+                future_test_features,
+            )
+    
+            pred_col1, pred_col2, pred_col3 = st.columns(3)
+    
+            pred_col1.metric(
+                "Home Win Probability",
+                f"{live_prediction['home_win_probability']:.1%}",
+            )
+    
+            pred_col2.metric(
+                "Away Win Probability",
+                f"{live_prediction['away_win_probability']:.1%}",
+            )
+    
+            pred_col3.metric(
+                "Model Confidence",
+                f"{live_prediction['confidence']:.1%}",
+            )
+    
+            st.write(
+                "Predicted side:",
+                live_prediction["predicted_side"],
+            )
+    
+            st.caption(
+                f"Model trained on "
+                f"{live_prediction['training_games']} historical games "
+                f"using {live_prediction['feature_count']} features."
+            )
             
             # ==================================================
             # HISTORICAL DATASET AUDIT
