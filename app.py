@@ -461,6 +461,53 @@ else:
                 "Baseline Log Loss",
                 f"{walkforward_results['baseline_log_loss']:.4f}",
             )
+            st.markdown("#### 🔮 Future Matchup Feature Test")
+    
+            historical_test_game = feature_games.iloc[-1]
+    
+            future_test_features = (
+                build_balldontlie_future_matchup_features(
+                    multi_bdl_test["games"],
+                    historical_test_game["home_team"],
+                    historical_test_game["away_team"],
+                    historical_test_game["game_date"],
+                )
+            )
+    
+            st.success(
+                "Future matchup feature builder successful."
+            )
+    
+            future_col1, future_col2, future_col3 = st.columns(3)
+    
+            future_col1.metric(
+                "Home Team",
+                historical_test_game["home_team"],
+            )
+    
+            future_col2.metric(
+                "Away Team",
+                historical_test_game["away_team"],
+            )
+    
+            future_col3.metric(
+                "Feature Count",
+                len(future_test_features.columns),
+            )
+    
+            st.write(
+                "Prediction date:",
+                historical_test_game["game_date"].strftime("%Y-%m-%d"),
+            )
+    
+            st.dataframe(
+                future_test_features,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+
+            
             # ==================================================
             # HISTORICAL DATASET AUDIT
             # ==================================================
