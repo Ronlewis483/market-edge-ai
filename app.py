@@ -15,6 +15,7 @@ from dual_agent.nba_research import (
     build_balldontlie_pregame_features,
     audit_balldontlie_pregame_features,
     run_balldontlie_walkforward_model,
+    build_balldontlie_future_matchup_features,
 )
 
 import streamlit as st
