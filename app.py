@@ -13,6 +13,7 @@ from dual_agent.nba_research import (
     nba_calibration_summary,
     prepare_balldontlie_games_for_research,
     build_balldontlie_pregame_features,
+    audit_balldontlie_pregame_features,
 )
 
 import streamlit as st
@@ -305,7 +306,63 @@ else:
                 feature_games.head(10),
                 use_container_width=True,
                 hide_index=True,
-            )       
+            )
+
+                    st.markdown("#### 🔒 Pre-Game Leakage Audit")
+
+        leakage_audit = audit_balldontlie_pregame_features(
+            feature_games
+        )
+
+        leak_col1, leak_col2, leak_col3 = st.columns(3)
+
+        leak_col1.metric(
+            "Rows Audited",
+            leakage_audit["total_rows"],
+        )
+
+        leak_col2.metric(
+            "Model Features",
+            leakage_audit["model_feature_count"],
+        )
+
+        leak_col3.metric(
+            "Suspicious Features",
+            len(leakage_audit["suspicious_model_features"]),
+        )
+
+        st.write(
+            "Model feature columns:",
+            leakage_audit["model_features"],
+        )
+
+        if leakage_audit["suspicious_model_features"]:
+            st.error(
+                "Possible leakage detected: "
+                + ", ".join(
+                    leakage_audit["suspicious_model_features"]
+                )
+            )
+        else:
+            st.success(
+                "No obvious current-game outcome leakage "
+                "detected in the proposed model features."
+            )
+
+        if len(leakage_audit["missing_feature_values"]) > 0:
+            st.warning("Missing values found in model features.")
+            st.dataframe(
+                leakage_audit["missing_feature_values"]
+                .rename("missing_values")
+                .reset_index()
+                .rename(columns={"index": "feature"}),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.success(
+                "No missing values found in model features."
+            )
 
             
             
