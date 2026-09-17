@@ -905,3 +905,268 @@ def run_multi_season_nba_research(
         "predictions": validation["predictions"],
         "confidence": confidence,
     }
+
+
+# ============================================================
+# MARKET EDGE AI - NBA CALIBRATION ANALYSIS
+# ============================================================
+
+def nba_calibration_report(predictions, bins=None):
+    """
+    Evaluate whether the NBA model's predicted probabilities
+    match the actual observed win rates.
+
+    This is research/validation only.
+    """
+
+    if predictions is None or len(predictions) == 0:
+        return pd.DataFrame()
+
+    df = predictions.copy()
+
+    # Support the probability/target column names used by
+    # different versions of the NBA research engine.
+    probability_candidates = [
+        "probability",
+        "predicted_probability",
+        "pred_prob",
+        "home_win_probability",
+        "p",
+        "P",
+    ]
+
+    target_candidates = [
+        "actual",
+        "target",
+        "home_win",
+        "y_true",
+        "result",
+    ]
+
+    probability_col = next(
+        (c for c in probability_candidates if c in df.columns),
+        None,
+    )
+
+    target_col = next(
+        (c for c in target_candidates if c in df.columns),
+        None,
+    )
+
+    if probability_col is None:
+        raise ValueError(
+            "Calibration could not find the model probability column. "
+            f"Available columns: {list(df.columns)}"
+        )
+
+    if target_col is None:
+        raise ValueError(
+            "Calibration could not find the actual-result column. "
+            f"Available columns: {list(df.columns)}"
+        )
+
+    df = df[[probability_col, target_col]].copy()
+
+    df[probability_col] = pd.to_numeric(
+        df[probability_col],
+        errors="coerce",
+    )
+
+    df[target_col] = pd.to_numeric(
+        df[target_col],
+        errors="coerce",
+    )
+
+    df = df.dropna()
+
+    if len(df) == 0:
+        return pd.DataFrame()
+
+    if bins is None:
+        bins = [
+            0.00,
+            0.50,
+            0.55,
+            0.60,
+            0.65,
+            0.70,
+            0.75,
+            0.80,
+            0.85,
+            0.90,
+            1.000001,
+        ]
+
+    labels = [
+        "Below 50%",
+        "50%-55%",
+        "55%-60%",
+        "60%-65%",
+        "65%-70%",
+        "70%-75%",
+        "75%-80%",
+        "80%-85%",
+        "85%-90%",
+        "90%-100%",
+    ]
+
+    df["probability_band"] = pd.cut(
+        df[probability_col],
+        bins=bins,
+        labels=labels,
+        include_lowest=True,
+        right=False,
+    )
+
+    rows = []
+
+    for band, group in df.groupby(
+        "probability_band",
+        observed=True,
+    ):
+        if len(group) == 0:
+            continue
+
+        avg_probability = float(group[probability_col].mean())
+        actual_win_rate = float(group[target_col].mean())
+
+        rows.append(
+            {
+                "probability_band": str(band),
+                "games": int(len(group)),
+                "avg_predicted_probability": avg_probability,
+                "actual_win_rate": actual_win_rate,
+                "calibration_gap": actual_win_rate - avg_probability,
+                "absolute_calibration_error": abs(
+                    actual_win_rate - avg_probability
+                ),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def nba_high_confidence_report(predictions):
+    """
+    Measure performance at increasingly strict model-confidence
+    thresholds.
+
+    This helps determine an evidence-based qualification gate
+    instead of choosing an arbitrary probability threshold.
+    """
+
+    if predictions is None or len(predictions) == 0:
+        return pd.DataFrame()
+
+    df = predictions.copy()
+
+    probability_candidates = [
+        "probability",
+        "predicted_probability",
+        "pred_prob",
+        "home_win_probability",
+        "p",
+        "P",
+    ]
+
+    target_candidates = [
+        "actual",
+        "target",
+        "home_win",
+        "y_true",
+        "result",
+    ]
+
+    probability_col = next(
+        (c for c in probability_candidates if c in df.columns),
+        None,
+    )
+
+    target_col = next(
+        (c for c in target_candidates if c in df.columns),
+        None,
+    )
+
+    if probability_col is None or target_col is None:
+        return pd.DataFrame()
+
+    df[probability_col] = pd.to_numeric(
+        df[probability_col],
+        errors="coerce",
+    )
+
+    df[target_col] = pd.to_numeric(
+        df[target_col],
+        errors="coerce",
+    )
+
+    df = df.dropna(
+        subset=[probability_col, target_col]
+    )
+
+    thresholds = [
+        0.55,
+        0.60,
+        0.65,
+        0.70,
+        0.75,
+        0.80,
+        0.85,
+        0.90,
+    ]
+
+    rows = []
+
+    for threshold in thresholds:
+
+        subset = df[
+            df[probability_col] >= threshold
+        ].copy()
+
+        if len(subset) == 0:
+            continue
+
+        accuracy = float(
+            subset[target_col].mean()
+        )
+
+        average_probability = float(
+            subset[probability_col].mean()
+        )
+
+        rows.append(
+            {
+                "minimum_probability": threshold,
+                "games": int(len(subset)),
+                "accuracy": accuracy,
+                "avg_model_probability": average_probability,
+                "calibration_gap": accuracy - average_probability,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def nba_calibration_summary(predictions):
+    """
+    Produce the complete calibration package used by the
+    Research Lab.
+    """
+
+    calibration = nba_calibration_report(predictions)
+
+    high_confidence = nba_high_confidence_report(predictions)
+
+    if len(calibration):
+        weighted_error = (
+            calibration["absolute_calibration_error"]
+            * calibration["games"]
+        ).sum() / calibration["games"].sum()
+    else:
+        weighted_error = None
+
+    return {
+        "calibration": calibration,
+        "high_confidence": high_confidence,
+        "weighted_calibration_error": weighted_error,
+    }
