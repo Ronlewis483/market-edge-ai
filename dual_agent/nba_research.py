@@ -1897,3 +1897,220 @@ def run_balldontlie_walkforward_model(feature_games):
             baseline_logloss
         ),
     }
+    # ============================================================
+# BALLDONTLIE LIVE / FUTURE MATCHUP FEATURE BUILDER
+# ============================================================
+
+def build_balldontlie_future_matchup_features(
+    historical_games,
+    home_team,
+    away_team,
+    game_date,
+):
+    """
+    Build pre-game features for a future NBA matchup using ONLY
+    games played before game_date.
+
+    No current/future game result is required.
+    """
+
+    if historical_games is None or len(historical_games) == 0:
+        raise ValueError("No historical games were supplied.")
+
+    history = historical_games.copy()
+
+    history["game_date"] = pd.to_datetime(
+        history["game_date"],
+        errors="coerce",
+    )
+
+    target_date = pd.to_datetime(game_date)
+
+    # Absolutely no games from the target date or future may be used.
+    history = history[
+        history["game_date"] < target_date
+    ].copy()
+
+    history = history.sort_values(
+        ["game_date", "game_id"]
+    ).reset_index(drop=True)
+
+    def get_team_history(team):
+        team_games = history[
+            (history["home_team"] == team)
+            | (history["away_team"] == team)
+        ].copy()
+
+        team_games = team_games.sort_values(
+            ["game_date", "game_id"]
+        )
+
+        records = []
+
+        for _, game in team_games.iterrows():
+
+            if game["home_team"] == team:
+                points = game["home_points"]
+                points_allowed = game["away_points"]
+                win = int(
+                    game["home_points"] > game["away_points"]
+                )
+                venue = "home"
+
+            else:
+                points = game["away_points"]
+                points_allowed = game["home_points"]
+                win = int(
+                    game["away_points"] > game["home_points"]
+                )
+                venue = "away"
+
+            records.append(
+                {
+                    "game_date": game["game_date"],
+                    "win": win,
+                    "points": points,
+                    "points_allowed": points_allowed,
+                    "margin": points - points_allowed,
+                    "venue": venue,
+                }
+            )
+
+        return pd.DataFrame(records)
+
+    home_history = get_team_history(home_team)
+    away_history = get_team_history(away_team)
+
+    if len(home_history) < 5:
+        raise ValueError(
+            f"{home_team} does not have at least 5 prior games."
+        )
+
+    if len(away_history) < 5:
+        raise ValueError(
+            f"{away_team} does not have at least 5 prior games."
+        )
+
+    def summarize_team(team_history, venue):
+
+        last_5 = team_history.tail(5)
+        last_10 = team_history.tail(10)
+
+        venue_history = team_history[
+            team_history["venue"] == venue
+        ]
+
+        last_game_date = team_history[
+            "game_date"
+        ].max()
+
+        rest_days = (
+            target_date - last_game_date
+        ).days
+
+        return {
+            "games_played": len(team_history),
+
+            "win_pct":
+                team_history["win"].mean(),
+
+            "win_pct_5":
+                last_5["win"].mean(),
+
+            "win_pct_10":
+                last_10["win"].mean(),
+
+            "avg_points":
+                team_history["points"].mean(),
+
+            "avg_points_allowed":
+                team_history["points_allowed"].mean(),
+
+            "avg_margin":
+                team_history["margin"].mean(),
+
+            "venue_win_pct":
+                venue_history["win"].mean()
+                if len(venue_history) > 0
+                else 0.5,
+
+            "rest_days":
+                rest_days,
+        }
+
+    home = summarize_team(
+        home_history,
+        "home",
+    )
+
+    away = summarize_team(
+        away_history,
+        "away",
+    )
+
+    features = {
+        "home_games_played": home["games_played"],
+        "away_games_played": away["games_played"],
+
+        "home_win_pct": home["win_pct"],
+        "away_win_pct": away["win_pct"],
+
+        "home_win_pct_5": home["win_pct_5"],
+        "away_win_pct_5": away["win_pct_5"],
+
+        "home_win_pct_10": home["win_pct_10"],
+        "away_win_pct_10": away["win_pct_10"],
+
+        "home_avg_points": home["avg_points"],
+        "away_avg_points": away["avg_points"],
+
+        "home_avg_points_allowed":
+            home["avg_points_allowed"],
+
+        "away_avg_points_allowed":
+            away["avg_points_allowed"],
+
+        "home_avg_margin": home["avg_margin"],
+        "away_avg_margin": away["avg_margin"],
+
+        "home_venue_win_pct":
+            home["venue_win_pct"],
+
+        "away_venue_win_pct":
+            away["venue_win_pct"],
+
+        "home_rest_days": home["rest_days"],
+        "away_rest_days": away["rest_days"],
+    }
+
+    features["win_pct_diff"] = (
+        features["home_win_pct"]
+        - features["away_win_pct"]
+    )
+
+    features["recent_5_diff"] = (
+        features["home_win_pct_5"]
+        - features["away_win_pct_5"]
+    )
+
+    features["recent_10_diff"] = (
+        features["home_win_pct_10"]
+        - features["away_win_pct_10"]
+    )
+
+    features["margin_diff"] = (
+        features["home_avg_margin"]
+        - features["away_avg_margin"]
+    )
+
+    features["venue_win_pct_diff"] = (
+        features["home_venue_win_pct"]
+        - features["away_venue_win_pct"]
+    )
+
+    features["rest_days_diff"] = (
+        features["home_rest_days"]
+        - features["away_rest_days"]
+    )
+
+    return pd.DataFrame([features])
