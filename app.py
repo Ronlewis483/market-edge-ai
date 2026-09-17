@@ -1,5 +1,6 @@
 import pandas as pd
 from dual_agent.nba_data import test_nba_connections
+from dual_agent.nba_history import test_nba_history
 from dual_agent.nba_research import (
     run_nba_research,
     run_multi_season_nba_research,
@@ -105,6 +106,38 @@ else:
 # ============================================================
 # MULTI-SEASON NBA VALIDATION
 # ============================================================
+
+    st.markdown("### 🧪 NBA.com Historical Data Test")
+
+    if st.button("Test NBA.com Historical Data"):
+        try:
+            with st.spinner("Downloading 2024-25 NBA games from NBA.com..."):
+                history_test = test_nba_history("2024-25")
+
+            st.success(
+                f"NBA.com connection successful — "
+                f"{history_test['games']} games loaded."
+            )
+
+            st.write(
+                "Date range:",
+                history_test["first_game"],
+                "to",
+                history_test["last_game"],
+            )
+
+            st.dataframe(
+                history_test["sample"],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        except Exception as e:
+            st.error(f"NBA.com historical data error: {e}")
+
+    st.divider()
+
+
 
 st.markdown("### 🏀 Multi-Season NBA Validation")
 
