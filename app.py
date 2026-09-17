@@ -1,7 +1,10 @@
 import pandas as pd
 from dual_agent.nba_data import test_nba_connections
 from dual_agent.nba_history import test_nba_history
-from dual_agent.balldontlie_data import test_balldontlie_connection
+from dual_agent.balldontlie_data import (
+    test_balldontlie_connection,
+    test_full_historical_season,
+)
 from dual_agent.nba_research import (
     run_nba_research,
     run_multi_season_nba_research,
@@ -142,7 +145,50 @@ else:
             st.error(
                 f"BALLDONTLIE historical data error: {e}"
             )
+    if st.button("Download Full 2023 NBA Season"):
+        try:
+            with st.spinner(
+                "Downloading the full 2023 NBA season. "
+                "This may take a couple of minutes..."
+            ):
+                full_season_test = test_full_historical_season(2023)
 
+            st.success(
+                f"Full season downloaded — "
+                f"{full_season_test['games_returned']} games."
+            )
+
+            st.write(
+                "API requests used:",
+                full_season_test["requests_used"],
+            )
+
+            st.write(
+                "Date range:",
+                full_season_test["first_game"],
+                "to",
+                full_season_test["last_game"],
+            )
+
+            st.write(
+                "Home win rate:",
+                f"{full_season_test['home_win_rate']:.1%}",
+            )
+
+            st.dataframe(
+                full_season_test["sample"],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        except Exception as e:
+            st.error(
+                f"Full-season download error: {e}"
+            )
+
+
+
+    
     st.divider()
     
 
