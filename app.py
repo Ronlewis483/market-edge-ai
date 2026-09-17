@@ -308,7 +308,7 @@ else:
                 hide_index=True,
             )
 
-                    st.markdown("#### 🔒 Pre-Game Leakage Audit")
+            st.markdown("#### 🔒 Pre-Game Leakage Audit")
 
         leakage_audit = audit_balldontlie_pregame_features(
             feature_games
