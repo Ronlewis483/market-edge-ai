@@ -1,6 +1,7 @@
 import pandas as pd
 from dual_agent.nba_data import test_nba_connections
 from dual_agent.nba_history import test_nba_history
+from dual_agent.balldontlie_data import test_balldontlie_connection
 from dual_agent.nba_research import (
     run_nba_research,
     run_multi_season_nba_research,
@@ -107,6 +108,46 @@ else:
 # MULTI-SEASON NBA VALIDATION
 # ============================================================
 
+    st.markdown("### 🏀 BALLDONTLIE Historical Data Test")
+
+    if st.button("Test BALLDONTLIE Historical Data"):
+        try:
+            with st.spinner("Downloading 2023 NBA games from BALLDONTLIE..."):
+                bdl_test = test_balldontlie_connection()
+
+            st.success(
+                f"BALLDONTLIE connection successful — "
+                f"{bdl_test['games_returned']} historical games returned."
+            )
+
+            st.write(
+                "Season:",
+                bdl_test["season"],
+            )
+
+            st.write(
+                "Date range:",
+                bdl_test["first_game"],
+                "to",
+                bdl_test["last_game"],
+            )
+
+            st.dataframe(
+                bdl_test["sample"],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        except Exception as e:
+            st.error(
+                f"BALLDONTLIE historical data error: {e}"
+            )
+
+    st.divider()
+    
+
+
+    
     st.markdown("### 🧪 NBA.com Historical Data Test")
 
     if st.button("Test NBA.com Historical Data"):
