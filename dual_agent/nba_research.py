@@ -2371,3 +2371,100 @@ def calculate_no_vig_probabilities(
             sportsbook_hold
         ),
     }
+
+# ============================================================
+# MODEL VS NO-VIG MARKET EDGE
+# ============================================================
+
+def calculate_no_vig_model_edge(
+    home_model_probability,
+    home_american_odds,
+    away_american_odds,
+):
+    """
+    Compare the NBA model probability against the sportsbook's
+    normalized no-vig market probability for both teams.
+    """
+
+    home_model_probability = float(
+        home_model_probability
+    )
+
+    if not 0.0 <= home_model_probability <= 1.0:
+        raise ValueError(
+            "Home model probability must be between 0 and 1."
+        )
+
+    away_model_probability = (
+        1.0 - home_model_probability
+    )
+
+    market = calculate_no_vig_probabilities(
+        home_american_odds,
+        away_american_odds,
+    )
+
+    home_market_probability = (
+        market["home_no_vig_probability"]
+    )
+
+    away_market_probability = (
+        market["away_no_vig_probability"]
+    )
+
+    home_edge = (
+        home_model_probability
+        - home_market_probability
+    )
+
+    away_edge = (
+        away_model_probability
+        - away_market_probability
+    )
+
+    if home_edge >= away_edge:
+        best_side = "HOME"
+        best_edge = home_edge
+        best_model_probability = (
+            home_model_probability
+        )
+        best_market_probability = (
+            home_market_probability
+        )
+    else:
+        best_side = "AWAY"
+        best_edge = away_edge
+        best_model_probability = (
+            away_model_probability
+        )
+        best_market_probability = (
+            away_market_probability
+        )
+
+    return {
+        "home_model_probability": float(
+            home_model_probability
+        ),
+        "away_model_probability": float(
+            away_model_probability
+        ),
+        "home_market_probability": float(
+            home_market_probability
+        ),
+        "away_market_probability": float(
+            away_market_probability
+        ),
+        "home_edge": float(home_edge),
+        "away_edge": float(away_edge),
+        "best_side": best_side,
+        "best_edge": float(best_edge),
+        "best_model_probability": float(
+            best_model_probability
+        ),
+        "best_market_probability": float(
+            best_market_probability
+        ),
+        "sportsbook_hold": float(
+            market["sportsbook_hold"]
+        ),
+    }
