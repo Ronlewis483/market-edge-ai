@@ -627,6 +627,42 @@ else:
                 f"{live_prediction['training_games']} historical games "
                 f"using {live_prediction['feature_count']} features."
             )
+            st.markdown("##### 🧪 No-Vig Edge Test")
+
+            test_edge = calculate_no_vig_model_edge(
+                home_model_probability=0.71,
+                home_american_odds=-150,
+                away_american_odds=130,
+            )
+            
+            edge_col1, edge_col2, edge_col3 = st.columns(3)
+            
+            with edge_col1:
+                st.metric(
+                    "Model Home Probability",
+                    f"{test_edge['home_model_probability']:.1%}",
+                )
+            
+            with edge_col2:
+                st.metric(
+                    "No-Vig Market Probability",
+                    f"{test_edge['home_market_probability']:.1%}",
+                )
+            
+            with edge_col3:
+                st.metric(
+                    "Model Edge",
+                    f"{test_edge['home_edge']:+.1%}",
+                )
+            
+            st.write(
+                f"Best model side: **{test_edge['best_side']}**"
+            )
+            
+            st.write(
+                f"Sportsbook hold: "
+                f"**{test_edge['sportsbook_hold']:.2%}**"
+            )
             
             # ==================================================
             # HISTORICAL DATASET AUDIT
