@@ -206,7 +206,7 @@ else:
                 )
 
             st.success(
-                f"Multi-season download successful — "
+                f"Multi-season download successful - "
                 f"{multi_bdl_test['games_returned']} total games."
             )
 
@@ -234,229 +234,272 @@ else:
                 use_container_width=True,
                 hide_index=True,
             )
+
+            # ==================================================
+            # RESEARCH PIPELINE BRIDGE
+            # ==================================================
+
             st.markdown("#### 🧠 Research Pipeline Bridge Test")
-    
+
             research_games = prepare_balldontlie_games_for_research(
                 multi_bdl_test["games"]
             )
-    
+
             st.success(
-                f"Research bridge successful — "
+                f"Research bridge successful - "
                 f"{len(research_games)} games ready for modeling."
             )
-    
+
             bridge_col1, bridge_col2, bridge_col3 = st.columns(3)
-    
+
             bridge_col1.metric(
                 "Model-Ready Games",
                 len(research_games),
             )
-    
+
             bridge_col2.metric(
                 "First Game",
-                research_games["game_date"].min().strftime("%Y-%m-%d"),
+                research_games["game_date"]
+                .min()
+                .strftime("%Y-%m-%d"),
             )
-    
+
             bridge_col3.metric(
                 "Last Game",
-                research_games["game_date"].max().strftime("%Y-%m-%d"),
+                research_games["game_date"]
+                .max()
+                .strftime("%Y-%m-%d"),
             )
-    
+
             st.write(
                 "Verified home-win rate:",
                 f"{research_games['home_win'].mean():.1%}",
-        )
-        st.markdown("#### 🧮 Pre-Game Feature Engine Test")
-
-        feature_games = build_balldontlie_pregame_features(
-            multi_bdl_test["games"],
-            min_games=5,
-        )
-
-        st.success(
-            f"Feature engine successful - "
-            f"{len(feature_games)} model-ready rows created."
-        )
-
-        feature_col1, feature_col2, feature_col3 = st.columns(3)
-
-        feature_col1.metric(
-            "Feature Rows",
-            len(feature_games),
-        )
-
-        feature_col2.metric(
-            "First Feature Date",
-            feature_games["game_date"].min().strftime("%Y-%m-%d"),
-        )
-
-        feature_col3.metric(
-            "Last Feature Date",
-            feature_games["game_date"].max().strftime("%Y-%m-%d"),
-        )
-
-        st.write(
-            "Feature columns:",
-            len(feature_games.columns),
-        )
-
-        st.dataframe(
-            feature_games.head(10),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        st.markdown("#### 🔒 Pre-Game Leakage Audit")
-
-        leakage_audit = audit_balldontlie_pregame_features(
-            feature_games
-        )
-
-        leak_col1, leak_col2, leak_col3 = st.columns(3)
-
-        leak_col1.metric(
-            "Rows Audited",
-            leakage_audit["total_rows"],
-        )
-
-        leak_col2.metric(
-            "Model Features",
-            leakage_audit["model_feature_count"],
-        )
-
-        leak_col3.metric(
-            "Suspicious Features",
-            len(leakage_audit["suspicious_model_features"]),
-        )
-
-        st.write(
-            "Model feature columns:",
-            leakage_audit["model_features"],
-        )
-
-        if leakage_audit["suspicious_model_features"]:
-            st.error(
-                "Possible leakage detected: "
-                + ", ".join(
-                    leakage_audit["suspicious_model_features"]
-                )
             )
-        else:
+
+            # ==================================================
+            # PRE-GAME FEATURE ENGINE
+            # ==================================================
+
+            st.markdown("#### 🧮 Pre-Game Feature Engine Test")
+
+            feature_games = build_balldontlie_pregame_features(
+                multi_bdl_test["games"],
+                min_games=5,
+            )
+
             st.success(
-                "No obvious current-game outcome leakage "
-                "detected in the proposed model features."
+                f"Feature engine successful - "
+                f"{len(feature_games)} model-ready rows created."
             )
 
-        if len(leakage_audit["missing_feature_values"]) > 0:
-            st.warning(
-                "Missing values found in model features."
+            feature_col1, feature_col2, feature_col3 = st.columns(3)
+
+            feature_col1.metric(
+                "Feature Rows",
+                len(feature_games),
+            )
+
+            feature_col2.metric(
+                "First Feature Date",
+                feature_games["game_date"]
+                .min()
+                .strftime("%Y-%m-%d"),
+            )
+
+            feature_col3.metric(
+                "Last Feature Date",
+                feature_games["game_date"]
+                .max()
+                .strftime("%Y-%m-%d"),
+            )
+
+            st.write(
+                "Feature columns:",
+                len(feature_games.columns),
             )
 
             st.dataframe(
-                leakage_audit["missing_feature_values"]
-                .rename("missing_values")
-                .reset_index()
-                .rename(columns={"index": "feature"}),
+                feature_games.head(10),
                 use_container_width=True,
                 hide_index=True,
             )
-        else:
-            st.success(
-                "No missing values found in model features."
+
+            # ==================================================
+            # LEAKAGE AUDIT
+            # ==================================================
+
+            st.markdown("#### 🔒 Pre-Game Leakage Audit")
+
+            leakage_audit = audit_balldontlie_pregame_features(
+                feature_games
             )
 
-        st.markdown("#### 🧠 Walk-Forward Model Test")
+            leak_col1, leak_col2, leak_col3 = st.columns(3)
 
-        walkforward_results = run_balldontlie_walkforward_model(
-            feature_games
-        )
-
-        st.success(
-            f"Walk-forward validation successful - "
-            f"{walkforward_results['games_predicted']} "
-            f"unseen games predicted."
-        )
-
-        audit = audit_historical_games(
-            multi_bdl_test["games"]
-        )
-
-        st.markdown("#### 🔎 Historical Dataset Audit")
-
-        col1, col2, col3 = st.columns(3)
-
-        col1.metric(
-            "Total Rows",
-            audit["total_rows"],
-        )
-
-        col2.metric(
-            "Unique Game IDs",
-            audit["unique_game_ids"],
-        )
-
-        col3.metric(
-            "Duplicate Game IDs",
-            audit["duplicate_game_ids"],
-        )
-
-        col4, col5, col6 = st.columns(3)
-
-        col4.metric(
-            "Missing Scores",
-            audit["missing_scores"],
-        )
-
-        col5.metric(
-            "Tied Games",
-            audit["tied_games"],
-        )
-
-        col6.metric(
-            "Teams Found",
-            audit["teams_found"],
-        )
-
-        st.write(
-            "Unusual teams:",
-            audit["unusual_teams"]
-            if audit["unusual_teams"]
-            else "None",
-        )
-
-        st.markdown("##### Games by Month")
-
-        st.dataframe(
-            audit["games_by_month"],
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        st.markdown("##### Game Status")
-
-        st.dataframe(
-            audit["status_summary"],
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        if len(audit["suspicious_scores"]):
-            st.warning(
-                f"{len(audit['suspicious_scores'])} "
-                "games have suspicious scores."
+            leak_col1.metric(
+                "Rows Audited",
+                leakage_audit["total_rows"],
             )
-        else:
+
+            leak_col2.metric(
+                "Model Features",
+                leakage_audit["model_feature_count"],
+            )
+
+            leak_col3.metric(
+                "Suspicious Features",
+                len(
+                    leakage_audit[
+                        "suspicious_model_features"
+                    ]
+                ),
+            )
+
+            st.write(
+                "Model feature columns:",
+                leakage_audit["model_features"],
+            )
+
+            if leakage_audit["suspicious_model_features"]:
+                st.error(
+                    "Possible leakage detected: "
+                    + ", ".join(
+                        leakage_audit[
+                            "suspicious_model_features"
+                        ]
+                    )
+                )
+            else:
+                st.success(
+                    "No obvious current-game outcome leakage "
+                    "detected in the proposed model features."
+                )
+
+            if len(
+                leakage_audit["missing_feature_values"]
+            ) > 0:
+                st.warning(
+                    "Missing values found in model features."
+                )
+
+                st.dataframe(
+                    leakage_audit[
+                        "missing_feature_values"
+                    ]
+                    .rename("missing_values")
+                    .reset_index()
+                    .rename(
+                        columns={
+                            "index": "feature"
+                        }
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            else:
+                st.success(
+                    "No missing values found in model features."
+                )
+
+            # ==================================================
+            # WALK-FORWARD MODEL
+            # ==================================================
+
+            st.markdown("#### 🧠 Walk-Forward Model Test")
+
+            walkforward_results = (
+                run_balldontlie_walkforward_model(
+                    feature_games
+                )
+            )
+
             st.success(
-                "No suspicious zero or missing scores found."
-            )        
-        
-        
+                f"Walk-forward validation successful - "
+                f"{walkforward_results['games_predicted']} "
+                f"unseen games predicted."
+            )
+
+            # ==================================================
+            # HISTORICAL DATASET AUDIT
+            # ==================================================
+
+            st.markdown("#### 🔎 Historical Dataset Audit")
+
+            audit = audit_historical_games(
+                multi_bdl_test["games"]
+            )
+
+            audit_col1, audit_col2, audit_col3 = st.columns(3)
+
+            audit_col1.metric(
+                "Total Rows",
+                audit["total_rows"],
+            )
+
+            audit_col2.metric(
+                "Unique Game IDs",
+                audit["unique_game_ids"],
+            )
+
+            audit_col3.metric(
+                "Duplicate Game IDs",
+                audit["duplicate_game_ids"],
+            )
+
+            audit_col4, audit_col5, audit_col6 = st.columns(3)
+
+            audit_col4.metric(
+                "Missing Scores",
+                audit["missing_scores"],
+            )
+
+            audit_col5.metric(
+                "Tied Games",
+                audit["tied_games"],
+            )
+
+            audit_col6.metric(
+                "Teams Found",
+                audit["teams_found"],
+            )
+
+            st.write(
+                "Unusual teams:",
+                audit["unusual_teams"]
+                if audit["unusual_teams"]
+                else "None",
+            )
+
+            st.markdown("##### Games by Month")
+
+            st.dataframe(
+                audit["games_by_month"],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            st.markdown("##### Game Status")
+
+            st.dataframe(
+                audit["status_summary"],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            if len(audit["suspicious_scores"]):
+                st.warning(
+                    f"{len(audit['suspicious_scores'])} "
+                    f"games have suspicious scores."
+                )
+            else:
+                st.success(
+                    "No suspicious zero or missing scores found."
+                )
 
         except Exception as e:
             st.error(
-        f"Multi-season BALLDONTLIE error: {e}"
-    )
-
+                f"Multi-season BALLDONTLIE error: {e}"
+            )
     
     st.divider()
     
