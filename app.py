@@ -348,7 +348,7 @@ else:
                 st.success(
                     "No obvious current-game outcome leakage "
                     "detected in the proposed model features."
-                )
+                 )
     
             if len(leakage_audit["missing_feature_values"]) > 0:
                 st.warning("Missing values found in model features.")
