@@ -377,78 +377,78 @@ else:
                 f"unseen games predicted."
             )
                     
-                    audit = audit_historical_games(
-                        multi_bdl_test["games"]
+                audit = audit_historical_games(
+                    multi_bdl_test["games"]
+                )
+        
+                st.markdown("#### 🔎 Historical Dataset Audit")
+        
+                col1, col2, col3 = st.columns(3)
+        
+                col1.metric(
+                    "Total Rows",
+                    audit["total_rows"],
+                )
+        
+                col2.metric(
+                    "Unique Game IDs",
+                    audit["unique_game_ids"],
+                )
+        
+                col3.metric(
+                    "Duplicate Game IDs",
+                    audit["duplicate_game_ids"],
+                )
+        
+                col4, col5, col6 = st.columns(3)
+        
+                col4.metric(
+                    "Missing Scores",
+                    audit["missing_scores"],
+                )
+        
+                col5.metric(
+                    "Tied Games",
+                    audit["tied_games"],
+                )
+        
+                col6.metric(
+                    "Teams Found",
+                    audit["teams_found"],
+                )
+        
+                st.write(
+                    "Unusual teams:",
+                    audit["unusual_teams"]
+                    if audit["unusual_teams"]
+                    else "None",
+                )
+        
+                st.markdown("##### Games by Month")
+        
+                st.dataframe(
+                    audit["games_by_month"],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+        
+                st.markdown("##### Game Status")
+        
+                st.dataframe(
+                    audit["status_summary"],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+        
+                if len(audit["suspicious_scores"]):
+                    st.warning(
+                        f"{len(audit['suspicious_scores'])} "
+                        "games have suspicious scores."
                     )
-            
-                    st.markdown("#### 🔎 Historical Dataset Audit")
-            
-                    col1, col2, col3 = st.columns(3)
-            
-                    col1.metric(
-                        "Total Rows",
-                        audit["total_rows"],
+                else:
+                    st.success(
+                        "No suspicious zero or missing scores found."
                     )
-            
-                    col2.metric(
-                        "Unique Game IDs",
-                        audit["unique_game_ids"],
-                    )
-            
-                    col3.metric(
-                        "Duplicate Game IDs",
-                        audit["duplicate_game_ids"],
-                    )
-            
-                    col4, col5, col6 = st.columns(3)
-            
-                    col4.metric(
-                        "Missing Scores",
-                        audit["missing_scores"],
-                    )
-            
-                    col5.metric(
-                        "Tied Games",
-                        audit["tied_games"],
-                    )
-            
-                    col6.metric(
-                        "Teams Found",
-                        audit["teams_found"],
-                    )
-            
-                    st.write(
-                        "Unusual teams:",
-                        audit["unusual_teams"]
-                        if audit["unusual_teams"]
-                        else "None",
-                    )
-            
-                    st.markdown("##### Games by Month")
-            
-                    st.dataframe(
-                        audit["games_by_month"],
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-            
-                    st.markdown("##### Game Status")
-            
-                    st.dataframe(
-                        audit["status_summary"],
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-            
-                    if len(audit["suspicious_scores"]):
-                        st.warning(
-                            f"{len(audit['suspicious_scores'])} "
-                            "games have suspicious scores."
-                        )
-                    else:
-                        st.success(
-                            "No suspicious zero or missing scores found."
-                        )
         
         
         
