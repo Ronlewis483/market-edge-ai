@@ -418,7 +418,48 @@ else:
                 f"{walkforward_results['games_predicted']} "
                 f"unseen games predicted."
             )
-
+            st.markdown("#### 📊 Walk-Forward Model Performance")
+    
+            perf_col1, perf_col2, perf_col3, perf_col4 = st.columns(4)
+    
+            perf_col1.metric(
+                "Accuracy",
+                f"{walkforward_results['accuracy']:.1%}",
+            )
+    
+            perf_col2.metric(
+                "AUC",
+                f"{walkforward_results['auc']:.3f}",
+            )
+    
+            perf_col3.metric(
+                "Brier Score",
+                f"{walkforward_results['brier']:.4f}",
+            )
+    
+            perf_col4.metric(
+                "Log Loss",
+                f"{walkforward_results['log_loss']:.4f}",
+            )
+    
+            st.markdown("##### Baseline Comparison")
+    
+            base_col1, base_col2, base_col3 = st.columns(3)
+    
+            base_col1.metric(
+                "Baseline Accuracy",
+                f"{walkforward_results['baseline_accuracy']:.1%}",
+            )
+    
+            base_col2.metric(
+                "Baseline Brier",
+                f"{walkforward_results['baseline_brier']:.4f}",
+            )
+    
+            base_col3.metric(
+                "Baseline Log Loss",
+                f"{walkforward_results['baseline_log_loss']:.4f}",
+            )
             # ==================================================
             # HISTORICAL DATASET AUDIT
             # ==================================================
