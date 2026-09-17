@@ -470,13 +470,13 @@ else:
     
             calibration_predictions["confidence"] = (
                 calibration_predictions[
-                    "predicted_probability"
+                    "probability"
                 ]
                 .where(
                     calibration_predictions["prediction"] == 1,
                     1.0
                     - calibration_predictions[
-                        "predicted_probability"
+                        "probability"
                     ],
                 )
             )
