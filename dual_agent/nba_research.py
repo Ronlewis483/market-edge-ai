@@ -1603,7 +1603,6 @@ def audit_balldontlie_pregame_features(feature_games):
         "result",
         "winner",
         "score",
-        "margin",
         "total_points",
         "home_points",
         "away_points",
