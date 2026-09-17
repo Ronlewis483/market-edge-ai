@@ -367,18 +367,17 @@ else:
 
 
 
-            st.markdown("#### 🧠 Walk-Forward Model Test")
+st.markdown("#### 🧠 Walk-Forward Model Test")
 
-            walkforward_results = run_balldontlie_walkforward_model(
-                feature_games
-            )
+walkforward_results = run_balldontlie_walkforward_model(
+    feature_games
+)
 
-           st.success(
-                f"Walk-forward validation successful — "
-                f"{walkforward_results['games_predicted']} "
-                f"unseen games predicted."
-           )
-    
+st.success(
+    f"Walk-forward validation successful — "
+    f"{walkforward_results['games_predicted']} "
+    f"unseen games predicted."
+)    
                 
                 
                 
