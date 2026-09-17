@@ -189,7 +189,7 @@ else:
 
 
 
-        if st.button("Test 2022 + 2023 NBA Seasons"):
+    if st.button("Test 2022 + 2023 NBA Seasons"):
         try:
             with st.spinner(
                 "Downloading 2022 and 2023 NBA seasons. "
@@ -233,6 +233,10 @@ else:
             st.error(
                 f"Multi-season BALLDONTLIE error: {e}"
             )
+
+
+
+    
     st.divider()
     
 
