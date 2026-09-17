@@ -237,3 +237,115 @@ def test_full_historical_season(season=2023):
         "sample": games.head(5),
         "games": games,
     }
+def get_multiple_historical_seasons(
+    seasons,
+    per_page=100,
+):
+    """
+    Download and combine multiple NBA seasons.
+
+    Example:
+        seasons = [2022, 2023, 2024, 2025]
+
+    Returns:
+        combined_games: DataFrame containing all seasons
+        season_summary: DataFrame with one row per season
+        total_requests: number of BALLDONTLIE API requests used
+    """
+
+    season_frames = []
+    summary_rows = []
+    total_requests = 0
+
+    for season in seasons:
+        games, request_count = get_historical_games(
+            season=int(season),
+            per_page=per_page,
+            fetch_all=True,
+        )
+
+        total_requests += request_count
+
+        if games.empty:
+            continue
+
+        games = games.copy()
+
+        games["requested_season"] = int(season)
+
+        season_frames.append(games)
+
+        summary_rows.append(
+            {
+                "season": int(season),
+                "games": int(len(games)),
+                "first_game": games["game_date"].min(),
+                "last_game": games["game_date"].max(),
+                "home_win_rate": float(
+                    games["home_win"].mean()
+                ),
+                "api_requests": int(request_count),
+            }
+        )
+
+        # Give the free API tier extra breathing room
+        # before beginning another season.
+        time.sleep(13)
+
+    if not season_frames:
+        raise ValueError(
+            "No historical NBA seasons were downloaded."
+        )
+
+    combined_games = pd.concat(
+        season_frames,
+        ignore_index=True,
+    )
+
+    combined_games = combined_games.drop_duplicates(
+        subset=["game_id"]
+    )
+
+    combined_games = combined_games.sort_values(
+        ["game_date", "game_id"]
+    ).reset_index(drop=True)
+
+    season_summary = pd.DataFrame(summary_rows)
+
+    return (
+        combined_games,
+        season_summary,
+        total_requests,
+    )
+
+
+def test_multiple_historical_seasons(
+    seasons=None,
+):
+    """
+    Test multi-season historical NBA access.
+    """
+
+    if seasons is None:
+        seasons = [2022, 2023]
+
+    (
+        games,
+        season_summary,
+        total_requests,
+    ) = get_multiple_historical_seasons(seasons)
+
+    return {
+        "success": True,
+        "seasons": seasons,
+        "games_returned": int(len(games)),
+        "total_requests": int(total_requests),
+        "first_game": games["game_date"].min(),
+        "last_game": games["game_date"].max(),
+        "home_win_rate": float(
+            games["home_win"].mean()
+        ),
+        "season_summary": season_summary,
+        "sample": games.head(10),
+        "games": games,
+    }
