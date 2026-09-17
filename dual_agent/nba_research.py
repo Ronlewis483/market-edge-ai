@@ -2292,3 +2292,82 @@ def calculate_model_edge(model_probability, american_odds):
         ),
         "model_edge": float(model_edge),
     }
+
+# ============================================================
+# NO-VIG SPORTSBOOK PROBABILITIES
+# ============================================================
+
+def calculate_no_vig_probabilities(
+    home_american_odds,
+    away_american_odds,
+):
+    """
+    Convert both sides of an American moneyline market into
+    normalized no-vig probabilities.
+
+    Example:
+        Home: -110
+        Away: -110
+
+        Raw implied probabilities:
+            Home = 52.38%
+            Away = 52.38%
+
+        No-vig probabilities:
+            Home = 50.00%
+            Away = 50.00%
+    """
+
+    home_raw_probability = (
+        american_odds_to_implied_probability(
+            home_american_odds
+        )
+    )
+
+    away_raw_probability = (
+        american_odds_to_implied_probability(
+            away_american_odds
+        )
+    )
+
+    total_raw_probability = (
+        home_raw_probability
+        + away_raw_probability
+    )
+
+    if total_raw_probability <= 0:
+        raise ValueError(
+            "Sportsbook probabilities must total more than zero."
+        )
+
+    home_no_vig_probability = (
+        home_raw_probability
+        / total_raw_probability
+    )
+
+    away_no_vig_probability = (
+        away_raw_probability
+        / total_raw_probability
+    )
+
+    sportsbook_hold = (
+        total_raw_probability - 1.0
+    )
+
+    return {
+        "home_raw_probability": float(
+            home_raw_probability
+        ),
+        "away_raw_probability": float(
+            away_raw_probability
+        ),
+        "home_no_vig_probability": float(
+            home_no_vig_probability
+        ),
+        "away_no_vig_probability": float(
+            away_no_vig_probability
+        ),
+        "sportsbook_hold": float(
+            sportsbook_hold
+        ),
+    }
