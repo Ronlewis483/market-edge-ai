@@ -1549,3 +1549,96 @@ def build_balldontlie_pregame_features(games, min_games=5):
     ).reset_index(drop=True)
 
     return features
+    # ============================================================
+# PRE-GAME FEATURE LEAKAGE AUDIT
+# ============================================================
+
+def audit_balldontlie_pregame_features(feature_games):
+    """
+    Audit the pre-game feature dataset for obvious target leakage.
+
+    The model is allowed to know:
+    - game identity/date/teams
+    - historical team statistics calculated before the game
+
+    The model must NOT use current-game results as predictors.
+    """
+
+    if feature_games is None or len(feature_games) == 0:
+        raise ValueError("No pre-game feature data was supplied.")
+
+    df = feature_games.copy()
+
+    columns = list(df.columns)
+
+    # These columns may exist in the dataset for identification,
+    # evaluation, or the prediction target, but must never be
+    # passed into the model as predictor features.
+    protected_columns = {
+        "game_id",
+        "game_date",
+        "season",
+        "home_team",
+        "away_team",
+        "home_points",
+        "away_points",
+        "point_margin",
+        "total_points",
+        "home_win",
+    }
+
+    # Numeric columns that are safe candidates for the model
+    # after removing identifiers and current-game outcomes.
+    model_features = [
+        column
+        for column in columns
+        if column not in protected_columns
+        and pd.api.types.is_numeric_dtype(df[column])
+    ]
+
+    # Look for suspicious column names that could indicate
+    # current-game outcome information.
+    suspicious_terms = [
+        "final",
+        "result",
+        "winner",
+        "score",
+        "margin",
+        "total_points",
+        "home_points",
+        "away_points",
+    ]
+
+    suspicious_columns = [
+        column
+        for column in model_features
+        if any(
+            term in column.lower()
+            for term in suspicious_terms
+        )
+    ]
+
+    missing_values = (
+        df[model_features]
+        .isna()
+        .sum()
+        .sort_values(ascending=False)
+    )
+
+    missing_values = missing_values[
+        missing_values > 0
+    ]
+
+    return {
+        "total_rows": len(df),
+        "total_columns": len(columns),
+        "model_feature_count": len(model_features),
+        "model_features": model_features,
+        "protected_columns_present": [
+            column
+            for column in protected_columns
+            if column in columns
+        ],
+        "suspicious_model_features": suspicious_columns,
+        "missing_feature_values": missing_values,
+    }
