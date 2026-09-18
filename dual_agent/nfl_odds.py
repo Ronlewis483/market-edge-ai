@@ -151,4 +151,3 @@ def get_live_nfl_moneylines():
 
     return list(games.values())
 
-    return rows
