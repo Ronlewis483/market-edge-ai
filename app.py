@@ -810,12 +810,24 @@ if st.button("Run Multi-Season NBA Validation"):
         with st.spinner(
             "Downloading multiple NBA seasons and running walk-forward validation..."
         ):
-            multi_nba_result = run_multi_season_nba_research(
-                seasons,
-                minimum_training_games=250,
-                test_block_size=100,
-            )
+            multi_bdl_result = test_multiple_historical_seasons(
+    [int(season) for season in seasons]
+)
 
+historical_games = multi_bdl_result["games"]
+
+prepared_games = prepare_balldontlie_games_for_research(
+    historical_games
+)
+
+feature_games = build_balldontlie_pregame_features(
+    prepared_games
+)
+
+multi_nba_result = run_balldontlie_walkforward_model(
+    feature_games
+)
+            
             st.session_state["multi_nba_research_result"] = multi_nba_result
 
         st.success("Multi-season NBA validation complete.")
@@ -831,62 +843,74 @@ if "multi_nba_research_result" in st.session_state:
 
     m1, m2, m3, m4 = st.columns(4)
 
-    m1.metric("Raw games", mr["raw_games"])
-    m2.metric("Completed games", mr["completed_games"])
-    m3.metric("Feature rows", mr["feature_rows"])
-    m4.metric("Home win rate", f"{mr['home_win_rate']:.1%}")
+    m1.metric(
+        "Games predicted",
+        mr["games_predicted"],
+    )
 
-    st.markdown("#### Walk-Forward Performance")
+    m2.metric(
+        "Accuracy",
+        f"{mr['accuracy']:.1%}",
+    )
+
+    m3.metric(
+        "AUC",
+        f"{mr['auc']:.3f}",
+    )
+
+    m4.metric(
+        "Features",
+        mr["feature_count"],
+    )
+
+    st.markdown("#### 📊 Walk-Forward Performance")
 
     p1, p2, p3, p4 = st.columns(4)
 
-    overall = mr["overall"]
+    p1.metric(
+        "Accuracy",
+        f"{mr['accuracy']:.1%}",
+    )
 
-    p1.metric("AUC", f"{overall['auc']:.3f}")
-    p2.metric("Accuracy", f"{overall['accuracy']:.1%}")
-    p3.metric("Brier Score", f"{overall['brier']:.4f}")
-    p4.metric("Log Loss", f"{overall['logloss']:.4f}")
+    p2.metric(
+        "AUC",
+        f"{mr['auc']:.3f}",
+    )
 
-    st.markdown("#### Model vs Baseline")
+    p3.metric(
+        "Brier Score",
+        f"{mr['brier']:.4f}",
+    )
 
-    baseline = mr["baseline"]
+    p4.metric(
+        "Log Loss",
+        f"{mr['log_loss']:.4f}",
+    )
 
-    multi_comparison = pd.DataFrame(
+    st.markdown("#### ⚖️ Model vs Baseline")
+
+    comparison_df = pd.DataFrame(
         [
             {
-                "Model": "NBA Multi-Season Model",
-                "Accuracy": overall["accuracy"],
-                "Brier": overall["brier"],
-                "Log Loss": overall["logloss"],
-                "AUC": overall["auc"],
+                "Model": "NBA Walk-Forward Model",
+                "Accuracy": mr["accuracy"],
+                "Brier Score": mr["brier"],
+                "Log Loss": mr["log_loss"],
             },
             {
-                "Model": "Home Win Base Rate",
-                "Accuracy": baseline["accuracy"],
-                "Brier": baseline["brier"],
-                "Log Loss": baseline["logloss"],
-                "AUC": baseline["auc"],
+                "Model": "Home Win Baseline",
+                "Accuracy": mr["baseline_accuracy"],
+                "Brier Score": mr["baseline_brier"],
+                "Log Loss": mr["baseline_log_loss"],
             },
         ]
     )
 
     st.dataframe(
-        multi_comparison,
+        comparison_df,
         use_container_width=True,
         hide_index=True,
     )
-
-    st.markdown("#### Multi-Season Confidence Analysis")
-
-    if len(mr["confidence"]):
-        st.dataframe(
-            mr["confidence"],
-            use_container_width=True,
-            hide_index=True,
-        )
-  
-    else:
-        st.info("No confidence-band results were generated.")
 
     st.markdown("#### 🎯 Probability Calibration")
 
@@ -897,27 +921,20 @@ if "multi_nba_research_result" in st.session_state:
     calibration_table = calibration_result["calibration"]
 
     if len(calibration_table):
+
         calibration_display = calibration_table.copy()
 
-        calibration_display["avg_predicted_probability"] = (
-            calibration_display["avg_predicted_probability"]
-            .map(lambda x: f"{x:.1%}")
-        )
-
-        calibration_display["actual_win_rate"] = (
-            calibration_display["actual_win_rate"]
-            .map(lambda x: f"{x:.1%}")
-        )
-
-        calibration_display["calibration_gap"] = (
-            calibration_display["calibration_gap"]
-            .map(lambda x: f"{x:+.1%}")
-        )
-
-        calibration_display["absolute_calibration_error"] = (
-            calibration_display["absolute_calibration_error"]
-            .map(lambda x: f"{x:.1%}")
-        )
+        for column in [
+            "avg_predicted_probability",
+            "actual_win_rate",
+            "calibration_gap",
+            "absolute_calibration_error",
+        ]:
+            if column in calibration_display.columns:
+                calibration_display[column] = (
+                    calibration_display[column]
+                    .map(lambda x: f"{x:.1%}")
+                )
 
         st.dataframe(
             calibration_display,
@@ -925,9 +942,9 @@ if "multi_nba_research_result" in st.session_state:
             hide_index=True,
         )
 
-        weighted_error = calibration_result[
+        weighted_error = calibration_result.get(
             "weighted_calibration_error"
-        ]
+        )
 
         if weighted_error is not None:
             st.metric(
@@ -936,34 +953,33 @@ if "multi_nba_research_result" in st.session_state:
             )
 
     else:
-        st.info("No calibration results were generated.")
+        st.info(
+            "No calibration results were generated."
+        )
 
     st.markdown("#### 🔬 High-Confidence Threshold Analysis")
 
-    high_confidence = calibration_result["high_confidence"]
+    high_confidence = calibration_result.get(
+        "high_confidence"
+    )
 
-    if len(high_confidence):
+    if (
+        high_confidence is not None
+        and len(high_confidence)
+    ):
         threshold_display = high_confidence.copy()
 
-        threshold_display["minimum_probability"] = (
-            threshold_display["minimum_probability"]
-            .map(lambda x: f"{x:.0%}")
-        )
-
-        threshold_display["accuracy"] = (
-            threshold_display["accuracy"]
-            .map(lambda x: f"{x:.1%}")
-        )
-
-        threshold_display["avg_model_probability"] = (
-            threshold_display["avg_model_probability"]
-            .map(lambda x: f"{x:.1%}")
-        )
-
-        threshold_display["calibration_gap"] = (
-            threshold_display["calibration_gap"]
-            .map(lambda x: f"{x:+.1%}")
-        )
+        for column in [
+            "minimum_probability",
+            "accuracy",
+            "avg_model_probability",
+            "calibration_gap",
+        ]:
+            if column in threshold_display.columns:
+                threshold_display[column] = (
+                    threshold_display[column]
+                    .map(lambda x: f"{x:.1%}")
+                )
 
         st.dataframe(
             threshold_display,
@@ -975,23 +991,6 @@ if "multi_nba_research_result" in st.session_state:
         st.info(
             "No high-confidence threshold results were generated."
         )
-
-    st.markdown("#### Season Breakdown")
-    st.markdown("#### Season Breakdown")
-
-    st.dataframe(
-        mr["season_summary"],
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    with st.expander("Multi-Season Walk-Forward Folds"):
-        st.dataframe(
-            mr["folds"],
-            use_container_width=True,
-            hide_index=True,
-        )
-
 
     st.divider()
 
