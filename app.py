@@ -26,6 +26,7 @@ from dual_agent.nfl_data import (
     test_sportradar_connection,
     get_nfl_seasons,
     get_nfl_season_games,
+    audit_nfl_games,
 )
 
 import streamlit as st
@@ -1234,6 +1235,76 @@ if st.button("Load 2024–25 NFL Games"):
                 use_container_width=True,
                 hide_index=True,
             )
+
+            nfl_audit = audit_nfl_games(nfl_games_df)
+
+            st.markdown("#### 🔍 NFL Dataset Audit")
+
+            col1, col2, col3, col4 = st.columns(4)
+
+            with col1:
+                st.metric(
+                    "Total Games",
+                    nfl_audit["total_games"],
+                )
+
+            with col2:
+                st.metric(
+                    "Unique Games",
+                    nfl_audit["unique_game_ids"],
+                )
+
+            with col3:
+                st.metric(
+                    "Duplicates",
+                    nfl_audit["duplicate_games"],
+                )
+
+            with col4:
+                st.metric(
+                    "Teams",
+                    nfl_audit["team_count"],
+                )
+
+            col5, col6, col7, col8 = st.columns(4)
+
+            with col5:
+                st.metric(
+                    "Completed Games",
+                    nfl_audit["completed_games"],
+                )
+
+            with col6:
+                st.metric(
+                    "Missing Scores",
+                    nfl_audit["missing_home_scores"]
+                    + nfl_audit["missing_away_scores"],
+                )
+
+            with col7:
+                st.metric(
+                    "Ties",
+                    nfl_audit["ties"],
+                )
+
+            with col8:
+                home_win_rate = nfl_audit["home_win_rate"]
+
+                st.metric(
+                    "Home Win Rate",
+                    (
+                        f"{home_win_rate:.1%}"
+                        if home_win_rate is not None
+                        else "N/A"
+                    ),
+                )
+
+            st.write(
+                "Date range:",
+                nfl_audit["start_date"],
+                "→",
+                nfl_audit["end_date"],
+            ) 
         else:
             st.warning(
                 "Connection succeeded, but no NFL games were returned."
