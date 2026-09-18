@@ -806,33 +806,32 @@ if st.button("Run Multi-Season NBA Validation"):
         if x.strip()
     ]
 
-try:
-    with st.spinner(
-        "Downloading multiple NBA seasons and running walk-forward validation..."
-    ):
-        multi_bdl_result = test_multiple_historical_seasons(seasons)
-        
+    try:
+        with st.spinner(
+            "Downloading multiple NBA seasons and running walk-forward validation..."
+        ):
+            multi_bdl_result = test_multiple_historical_seasons(seasons)
 
-        historical_games = multi_bdl_result["games"]
+            historical_games = multi_bdl_result["games"]
 
-        prepared_games = prepare_balldontlie_games_for_research(
-            historical_games
-        )
+            prepared_games = prepare_balldontlie_games_for_research(
+                historical_games
+            )
 
-        feature_games = build_balldontlie_pregame_features(
-            prepared_games
-        )
+            feature_games = build_balldontlie_pregame_features(
+                prepared_games
+            )
 
-        multi_nba_result = run_balldontlie_walkforward_model(
-            feature_games
-        )
+            multi_nba_result = run_balldontlie_walkforward_model(
+                feature_games
+            )
 
-        st.session_state["multi_nba_research_result"] = multi_nba_result
+            st.session_state["multi_nba_research_result"] = multi_nba_result
 
-    st.success("Multi-season NBA validation complete.")
+        st.success("Multi-season NBA validation complete.")
 
-except Exception as e:
-    st.error(f"Multi-season NBA validation error: {e}")
+    except Exception as e:
+        st.error(f"Multi-season NBA validation error: {e}")
 if "multi_nba_research_result" in st.session_state:
 
     mr = st.session_state["multi_nba_research_result"]
