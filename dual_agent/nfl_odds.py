@@ -98,7 +98,10 @@ def get_live_nfl_moneylines():
                         }
                     )
 
-    def get_best_nfl_moneylines(odds_rows):
+    return rows
+
+
+def get_best_nfl_moneylines(odds_rows):
     """
     Reduce sportsbook-level NFL odds into one row per game.
 
@@ -131,8 +134,8 @@ def get_live_nfl_moneylines():
         home_line = row["home_moneyline"]
         away_line = row["away_moneyline"]
 
-        # With American odds, the numerically larger line is
-        # always better for the bettor:
+        # With American odds, the numerically larger line
+        # is always better for the bettor:
         # +130 is better than +120
         # -140 is better than -150
         if (
@@ -150,4 +153,3 @@ def get_live_nfl_moneylines():
             game["best_away_sportsbook"] = row["sportsbook"]
 
     return list(games.values())
-
