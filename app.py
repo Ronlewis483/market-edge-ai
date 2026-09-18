@@ -1814,7 +1814,7 @@ if "nfl_walkforward_result" in st.session_state:
                 ].mean(),
             }
         )
-
+    
     threshold_df = pd.DataFrame(
         threshold_rows
     )
@@ -1861,3 +1861,105 @@ if "nfl_walkforward_result" in st.session_state:
     st.session_state[
         "nfl_calibration_summary"
     ] = calibration_summary
+
+# ---------------------------------------------------------
+# NFL DECISION ENGINE
+# ---------------------------------------------------------
+
+st.markdown("### 🧠 NFL Decision Engine")
+
+try:
+    nfl_predictions = calibration_df.copy()
+
+    decision_profile = build_nfl_confidence_profile(
+        nfl_predictions
+    )
+
+    decision_rows = []
+
+    for _, game in nfl_predictions.iterrows():
+
+        decision = get_nfl_decision(
+            home_team=game["home_team"],
+            away_team=game["away_team"],
+            home_win_probability=game["home_win_probability"],
+            confidence_profile=decision_profile,
+        )
+
+        decision_rows.append(
+            {
+                "start_time": game["start_time"],
+                "home_team": game["home_team"],
+                "away_team": game["away_team"],
+                "predicted_team": decision["predicted_team"],
+                "confidence": decision["confidence"],
+                "decision": decision["decision"],
+                "historical_accuracy": decision["historical_accuracy"],
+                "historical_sample": decision["historical_sample"],
+                "reason": decision["reason"],
+                "actual": game["actual"],
+                "correct": game["correct"],
+            }
+        )
+
+    nfl_decisions = pd.DataFrame(decision_rows)
+
+    st.session_state["nfl_decisions"] = nfl_decisions
+    st.session_state["nfl_confidence_profile"] = decision_profile
+
+    bet_count = (nfl_decisions["decision"] == "BET").sum()
+    lean_count = (nfl_decisions["decision"] == "LEAN").sum()
+    pass_count = (nfl_decisions["decision"] == "PASS").sum()
+
+    c1, c2, c3 = st.columns(3)
+
+    c1.metric("BET", int(bet_count))
+    c2.metric("LEAN", int(lean_count))
+    c3.metric("PASS", int(pass_count))
+
+    bet_games = nfl_decisions[
+        nfl_decisions["decision"] == "BET"
+    ].copy()
+
+    if not bet_games.empty:
+
+        bet_accuracy = bet_games["correct"].mean()
+
+        st.markdown("#### 🔥 Historical BET Performance")
+
+        b1, b2, b3 = st.columns(3)
+
+        b1.metric("Qualified Bets", len(bet_games))
+        b2.metric("Correct", int(bet_games["correct"].sum()))
+        b3.metric("Accuracy", f"{bet_accuracy:.1%}")
+
+        display_bets = bet_games.copy()
+
+        display_bets["confidence"] = (
+            display_bets["confidence"]
+            .map(lambda x: f"{x:.1%}")
+        )
+
+        display_bets["historical_accuracy"] = (
+            display_bets["historical_accuracy"]
+            .map(
+                lambda x: f"{x:.1%}"
+                if pd.notna(x)
+                else "—"
+            )
+        )
+
+        st.dataframe(
+            display_bets,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    else:
+        st.info(
+            "No historical predictions currently "
+            "qualify as BET decisions."
+        )
+
+except Exception as e:
+    st.error(f"NFL Decision Engine error: {e}")
