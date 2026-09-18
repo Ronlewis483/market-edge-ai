@@ -120,3 +120,72 @@ def get_nfl_seasons():
         "season_count": len(df),
         "seasons": df,
     }
+
+def get_nfl_season_games(season_id):
+    """
+    Retrieve NFL games for a specific Sportradar season.
+    """
+
+    endpoint = f"seasons/{season_id}/summaries.json"
+
+    data = _sportradar_get(endpoint)
+
+    summaries = data.get("summaries", [])
+
+    rows = []
+
+    for summary in summaries:
+        sport_event = summary.get("sport_event", {})
+        status = summary.get("sport_event_status", {})
+
+        competitors = sport_event.get("competitors", [])
+
+        home_team = None
+        home_team_id = None
+        away_team = None
+        away_team_id = None
+
+        for competitor in competitors:
+            qualifier = competitor.get("qualifier")
+
+            if qualifier == "home":
+                home_team = competitor.get("name")
+                home_team_id = competitor.get("id")
+
+            elif qualifier == "away":
+                away_team = competitor.get("name")
+                away_team_id = competitor.get("id")
+
+        rows.append(
+            {
+                "game_id": sport_event.get("id"),
+                "start_time": sport_event.get("start_time"),
+                "home_team": home_team,
+                "home_team_id": home_team_id,
+                "away_team": away_team,
+                "away_team_id": away_team_id,
+                "status": status.get("status"),
+                "home_score": status.get("home_score"),
+                "away_score": status.get("away_score"),
+                "winner_id": status.get("winner_id"),
+            }
+        )
+
+    games_df = pd.DataFrame(rows)
+
+    if not games_df.empty and "start_time" in games_df.columns:
+        games_df["start_time"] = pd.to_datetime(
+            games_df["start_time"],
+            errors="coerce",
+        )
+
+        games_df = games_df.sort_values(
+            "start_time"
+        ).reset_index(drop=True)
+
+    return {
+        "success": True,
+        "season_id": season_id,
+        "game_count": len(games_df),
+        "games": games_df,
+    }
