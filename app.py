@@ -2164,3 +2164,84 @@ else:
             st.error(
                 f"NFL best-line error: {e}"
             )
+
+# ------------------------------------------------------------
+# LIVE NFL OPPORTUNITY ENGINE
+# ------------------------------------------------------------
+
+st.markdown("### 🧠 Live NFL Opportunity Engine")
+
+if (
+    "nfl_best_lines" in st.session_state
+    and "nfl_calibration_predictions" in st.session_state
+):
+    if st.button("Analyze Live NFL Opportunities"):
+
+        try:
+            live_opportunities = build_live_nfl_opportunities(
+                model_predictions=st.session_state[
+                    "nfl_calibration_predictions"
+                ],
+                best_lines=st.session_state[
+                    "nfl_best_lines"
+                ],
+            )
+
+            st.session_state[
+                "nfl_live_opportunities"
+            ] = live_opportunities
+
+            if live_opportunities.empty:
+                st.warning(
+                    "No live NFL games matched the available "
+                    "model predictions."
+                )
+            else:
+                st.success(
+                    f"Analyzed {len(live_opportunities)} "
+                    "live NFL opportunities."
+                )
+
+        except Exception as e:
+            st.error(
+                f"Live NFL Opportunity Engine error: {e}"
+            )
+
+else:
+    st.info(
+        "Load NFL model predictions and run the "
+        "Best-Line Shopper first."
+    )
+
+
+if "nfl_live_opportunities" in st.session_state:
+
+    live_display = st.session_state[
+        "nfl_live_opportunities"
+    ].copy()
+
+    if not live_display.empty:
+
+        for column in [
+            "home_win_probability",
+            "model_probability",
+            "market_no_vig_probability",
+            "model_edge",
+        ]:
+            if column in live_display.columns:
+                live_display[column] = (
+                    live_display[column]
+                    .map(lambda x: f"{x:.1%}")
+                )
+
+        if "expected_value" in live_display.columns:
+            live_display["expected_value"] = (
+                live_display["expected_value"]
+                .map(lambda x: f"{x:+.3f}")
+            )
+
+        st.dataframe(
+            live_display,
+            use_container_width=True,
+            hide_index=True,
+        )
