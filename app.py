@@ -25,7 +25,7 @@ from dual_agent.nba_research import (
 from dual_agent.nfl_data import (
     test_sportradar_connection,
     get_nfl_seasons,
-    get_nfl_historical_games,
+    get_nfl_season_games,
     get_multiple_nfl_seasons,
     audit_nfl_games,
 )
