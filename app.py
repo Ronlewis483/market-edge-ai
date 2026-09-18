@@ -18,6 +18,7 @@ from dual_agent.nba_research import (
     build_balldontlie_future_matchup_features,
     predict_balldontlie_matchup,
     calculate_no_vig_model_edge,
+    get_live_nba_moneylines,
 )
 
 import streamlit as st
@@ -1089,5 +1090,31 @@ if "multi_nba_research_result" in st.session_state:
                 use_container_width=True,
                 hide_index=True,
             )
+st.markdown("### 🏀 Live NBA Moneylines")
 
+try:
+    live_moneylines = get_live_nba_moneylines()
+
+    if live_moneylines:
+        moneyline_df = pd.DataFrame(live_moneylines)
+
+        st.success(
+            f"Live NBA odds retrieved - "
+            f"{len(moneyline_df)} sportsbook lines found."
+        )
+
+        st.dataframe(
+            moneyline_df,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    else:
+        st.info(
+            "The Odds API connection worked, "
+            "but no NBA moneylines are currently available."
+        )
+
+except Exception as e:
+    st.error(f"Live NBA odds test failed: {e}")
     st.divider()
