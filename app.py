@@ -801,7 +801,7 @@ nba_seasons_text = st.text_input(
 if st.button("Run Multi-Season NBA Validation"):
 
     seasons = [
-        x.strip()
+        int(x.strip())
         for x in nba_seasons_text.split(",")
         if x.strip()
     ]
@@ -810,13 +810,7 @@ try:
     with st.spinner(
         "Downloading multiple NBA seasons and running walk-forward validation..."
     ):
-        multi_bdl_result = test_multiple_historical_seasons(
-    [
-        int(x.strip())
-        for x in nba_seasons_text.split(",")
-        if x.strip()
-    ]
-)
+        multi_bdl_result = test_multiple_historical_seasons(seasons)
         
 
         historical_games = multi_bdl_result["games"]
