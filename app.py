@@ -32,6 +32,7 @@ from dual_agent.nfl_data import (
 
 from dual_agent.nfl_research import (
     build_nfl_pregame_features,
+    run_nfl_walkforward_model,
 )
 
 import streamlit as st
@@ -1500,6 +1501,137 @@ if "nfl_feature_games" in st.session_state:
 
     st.dataframe(
         nfl_features,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+# ============================================================
+# NFL WALK-FORWARD MODEL VALIDATION
+# ============================================================
+
+st.markdown("## 🧠 NFL Predictive Model Validation")
+
+if "multi_nfl_games" not in st.session_state:
+    st.info(
+        "Load the multi-season NFL dataset first before "
+        "running predictive validation."
+    )
+
+else:
+    nfl_model_games = st.session_state["multi_nfl_games"]
+
+    st.write(
+        f"Historical games available for modeling: "
+        f"{len(nfl_model_games):,}"
+    )
+
+    if st.button("Run NFL Walk-Forward Model"):
+
+        try:
+            with st.spinner(
+                "Building leakage-safe features and "
+                "running NFL walk-forward validation..."
+            ):
+
+                nfl_features = build_nfl_pregame_features(
+                    nfl_model_games
+                )
+
+                nfl_model_result = run_nfl_walkforward_model(
+                    nfl_features
+                )
+
+                st.session_state[
+                    "nfl_walkforward_result"
+                ] = nfl_model_result
+
+                st.session_state[
+                    "nfl_feature_games"
+                ] = nfl_features
+
+            st.success(
+                "NFL walk-forward validation complete."
+            )
+
+        except Exception as e:
+            st.error(
+                f"NFL walk-forward validation error: {e}"
+            )
+
+
+if "nfl_walkforward_result" in st.session_state:
+
+    result = st.session_state[
+        "nfl_walkforward_result"
+    ]
+
+    st.markdown("### 🏈 NFL Model Performance")
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    c1.metric(
+        "Predictions",
+        f"{result['prediction_count']:,}",
+    )
+
+    c2.metric(
+        "Accuracy",
+        f"{result['accuracy']:.1%}",
+    )
+
+    c3.metric(
+        "AUC",
+        f"{result['auc']:.3f}",
+    )
+
+    c4.metric(
+        "Brier Score",
+        f"{result['brier']:.3f}",
+    )
+
+    c1, c2, c3 = st.columns(3)
+
+    c1.metric(
+        "Log Loss",
+        f"{result['log_loss']:.3f}",
+    )
+
+    c2.metric(
+        "Home-Team Baseline",
+        f"{result['baseline_home_accuracy']:.1%}",
+    )
+
+    c3.metric(
+        "Accuracy vs Baseline",
+        f"{result['accuracy_vs_baseline']:+.1%}",
+    )
+
+    st.markdown("### 🔎 Walk-Forward Predictions")
+
+    prediction_table = result[
+        "predictions"
+    ].copy()
+
+    prediction_table[
+        "home_win_probability"
+    ] = prediction_table[
+        "probability"
+    ].map(
+        lambda x: f"{x:.1%}"
+    )
+
+    st.dataframe(
+        prediction_table[
+            [
+                "start_time",
+                "home_team",
+                "away_team",
+                "home_win_probability",
+                "prediction",
+                "actual",
+                "correct",
+            ]
+        ],
         use_container_width=True,
         hide_index=True,
     )
