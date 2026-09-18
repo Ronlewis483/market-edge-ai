@@ -78,3 +78,45 @@ def test_sportradar_connection():
         "competition_count": len(df),
         "competitions": df,
     }
+
+NFL_COMPETITION_ID = "sr:competition:31"
+NCAA_COMPETITION_ID = "sr:competition:850"
+
+
+def get_nfl_seasons():
+    """
+    Return the NFL seasons available through Sportradar.
+    """
+
+    endpoint = f"competitions/{NFL_COMPETITION_ID}/seasons.json"
+
+    data = _sportradar_get(endpoint)
+
+    seasons = data.get("seasons", [])
+
+    rows = []
+
+    for season in seasons:
+        rows.append(
+            {
+                "id": season.get("id"),
+                "name": season.get("name"),
+                "start_date": season.get("start_date"),
+                "end_date": season.get("end_date"),
+                "year": season.get("year"),
+            }
+        )
+
+    df = pd.DataFrame(rows)
+
+    if not df.empty and "start_date" in df.columns:
+        df = df.sort_values(
+            "start_date",
+            ascending=False,
+        ).reset_index(drop=True)
+
+    return {
+        "success": True,
+        "season_count": len(df),
+        "seasons": df,
+    }
