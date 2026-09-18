@@ -1361,9 +1361,28 @@ if "multi_nfl_games" in st.session_state:
         hide_index=True,
     )
 
-    multi_audit = audit_nfl_games(
-        multi_games
-    )
+    multi_audit = {
+    "total_games": len(multi_games),
+    "unique_games": multi_games["game_id"].nunique(),
+    "duplicate_games": multi_games["game_id"].duplicated().sum(),
+    "team_count": len(
+        set(multi_games["home_team"].dropna())
+        | set(multi_games["away_team"].dropna())
+    ),
+    "completed_games": (
+        multi_games["status"].astype(str).str.lower() == "closed"
+    ).sum(),
+    "missing_scores": (
+        multi_games["home_score"].isna()
+        | multi_games["away_score"].isna()
+    ).sum(),
+    "ties": (
+        multi_games["home_score"] == multi_games["away_score"]
+    ).sum(),
+    "home_win_rate": (
+        multi_games["home_score"] > multi_games["away_score"]
+    ).mean(),
+}
 
     st.markdown("### 🔍 Multi-Season NFL Audit")
 
