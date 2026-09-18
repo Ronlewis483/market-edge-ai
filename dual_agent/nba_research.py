@@ -2152,9 +2152,23 @@ if "game_date" in future.columns:
         df["game_date"]
     )
 
+    print(
+    "MATCHUP DATE DEBUG:",
+    prediction_date,
+    "BEFORE FILTER:",
+    len(df),
+)
+
     df = df[
         df["game_date"] < prediction_date
     ].copy()
+
+    print(
+    "AFTER DATE FILTER:",
+    len(df),
+    "LATEST TRAIN DATE:",
+    df["game_date"].max(),
+)
 
     if len(df) == 0:
         raise ValueError(
