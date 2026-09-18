@@ -19,6 +19,7 @@ from dual_agent.nba_research import (
     predict_balldontlie_matchup,
     calculate_no_vig_model_edge,
     get_live_nba_moneylines,
+    normalize_nba_team_name,
 )
 
 import streamlit as st
@@ -1097,7 +1098,40 @@ try:
 
     if live_moneylines:
         moneyline_df = pd.DataFrame(live_moneylines)
+        moneyline_df["home_team_code"] = (
+            moneyline_df["home_team"].apply(
+                normalize_nba_team_name
+            )
+        )
 
+        moneyline_df["away_team_code"] = (
+            moneyline_df["away_team"].apply(
+                normalize_nba_team_name
+            )
+        )
+
+        unmapped_home = moneyline_df[
+            moneyline_df["home_team_code"].isna()
+        ]["home_team"].unique()
+
+        unmapped_away = moneyline_df[
+            moneyline_df["away_team_code"].isna()
+        ]["away_team"].unique()
+
+        unmapped_teams = sorted(
+            set(unmapped_home) | set(unmapped_away)
+        )
+
+        if unmapped_teams:
+            st.error(
+                "Unmapped NBA teams: "
+                + ", ".join(unmapped_teams)
+            )
+        else:
+            st.success(
+                "NBA team mapping successful - "
+                "all live teams recognized."
+            )
         st.success(
             f"Live NBA odds retrieved - "
             f"{len(moneyline_df)} sportsbook lines found."
