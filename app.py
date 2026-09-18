@@ -593,6 +593,11 @@ else:
                 hide_index=True,
             )
 
+            st.write(
+                "DEBUG future columns:",
+                list(future_test_features.columns),
+            )
+
             st.markdown("#### 🎯 NBA Matchup Prediction")
     
             live_prediction = predict_balldontlie_matchup(
