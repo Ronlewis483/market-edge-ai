@@ -2248,6 +2248,7 @@ if "game_date" in future.columns:
         "feature_count": len(feature_columns),
         "training_games": len(train_df),
     }
+   
 # ============================================================
 # SPORTSBOOK ODDS UTILITIES
 # ============================================================
