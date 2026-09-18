@@ -330,3 +330,53 @@ def audit_nfl_games(games_df):
         "start_date": date_min,
         "end_date": date_max,
     }
+
+def get_multiple_nfl_seasons(season_ids):
+    """
+    Download and combine multiple NFL seasons.
+    """
+
+    all_games = []
+    season_summaries = []
+
+    for season_id in season_ids:
+        result = get_nfl_season_games(season_id)
+
+        games = result["games"].copy()
+
+        if not games.empty:
+            games["season_id"] = season_id
+            all_games.append(games)
+
+        season_summaries.append(
+            {
+                "season_id": season_id,
+                "game_count": result["game_count"],
+            }
+        )
+
+    if not all_games:
+        return {
+            "success": True,
+            "season_count": len(season_ids),
+            "game_count": 0,
+            "games": pd.DataFrame(),
+            "season_summary": pd.DataFrame(season_summaries),
+        }
+
+    combined_games = pd.concat(
+        all_games,
+        ignore_index=True,
+    )
+
+    combined_games = combined_games.sort_values(
+        "start_time"
+    ).reset_index(drop=True)
+
+    return {
+        "success": True,
+        "season_count": len(season_ids),
+        "game_count": len(combined_games),
+        "games": combined_games,
+        "season_summary": pd.DataFrame(season_summaries),
+    }
