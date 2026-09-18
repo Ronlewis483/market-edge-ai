@@ -25,6 +25,7 @@ from dual_agent.nba_research import (
 from dual_agent.nfl_data import (
     test_sportradar_connection,
     get_nfl_seasons,
+    get_nfl_season_games,
 )
 
 import streamlit as st
@@ -1210,3 +1211,33 @@ if st.button("Get NFL Seasons"):
 
     except Exception as e:
         st.error(f"NFL season lookup error: {e}")
+
+st.markdown("### 🏈 NFL Historical Games")
+
+if st.button("Load 2024–25 NFL Games"):
+    try:
+        with st.spinner("Downloading 2024–25 NFL games..."):
+            nfl_games_test = get_nfl_season_games(
+                "sr:season:115087"
+            )
+
+        st.success(
+            f"NFL historical game download successful — "
+            f"{nfl_games_test['game_count']} games found."
+        )
+
+        nfl_games_df = nfl_games_test["games"]
+
+        if not nfl_games_df.empty:
+            st.dataframe(
+                nfl_games_df,
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.warning(
+                "Connection succeeded, but no NFL games were returned."
+            )
+
+    except Exception as e:
+        st.error(f"NFL historical games error: {e}")
