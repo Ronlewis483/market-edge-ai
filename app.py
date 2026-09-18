@@ -22,7 +22,10 @@ from dual_agent.nba_research import (
     normalize_nba_team_name,
 )
 
-from dual_agent.nfl_data import test_sportradar_connection
+from dual_agent.nfl_data import (
+    test_sportradar_connection,
+    get_nfl_seasons,
+)
 
 import streamlit as st
 
@@ -1179,3 +1182,31 @@ if st.button("Test Football API"):
 
     except Exception as e:
         st.error(f"Sportradar connection error: {e}")
+
+st.markdown("### 🏈 NFL Historical Seasons")
+
+if st.button("Get NFL Seasons"):
+    try:
+        with st.spinner("Checking available NFL seasons..."):
+            nfl_season_test = get_nfl_seasons()
+
+        st.success(
+            f"NFL season lookup successful — "
+            f"{nfl_season_test['season_count']} seasons found."
+        )
+
+        nfl_seasons_df = nfl_season_test["seasons"]
+
+        if not nfl_seasons_df.empty:
+            st.dataframe(
+                nfl_seasons_df,
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.warning(
+                "Connection succeeded, but no NFL seasons were returned."
+            )
+
+    except Exception as e:
+        st.error(f"NFL season lookup error: {e}")
