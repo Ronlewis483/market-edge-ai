@@ -2494,3 +2494,73 @@ def calculate_no_vig_model_edge(
             market["sportsbook_hold"]
         ),
     }
+def get_live_nba_moneylines():
+    """
+    Retrieve current NBA moneyline odds from The Odds API.
+    """
+
+    import requests
+    import streamlit as st
+
+    api_key = st.secrets["ODDS_API_KEY"]
+
+    url = (
+        "https://api.the-odds-api.com/v4/"
+        "sports/basketball_nba/odds"
+    )
+
+    params = {
+        "apiKey": api_key,
+        "regions": "us",
+        "markets": "h2h",
+        "oddsFormat": "american",
+        "dateFormat": "iso",
+    }
+
+    response = requests.get(
+        url,
+        params=params,
+        timeout=20,
+    )
+
+    response.raise_for_status()
+
+    games = response.json()
+
+    results = []
+
+    for game in games:
+        home_team = game.get("home_team")
+        away_team = game.get("away_team")
+
+        for bookmaker in game.get("bookmakers", []):
+            for market in bookmaker.get("markets", []):
+                if market.get("key") != "h2h":
+                    continue
+
+                home_odds = None
+                away_odds = None
+
+                for outcome in market.get("outcomes", []):
+                    if outcome.get("name") == home_team:
+                        home_odds = outcome.get("price")
+
+                    elif outcome.get("name") == away_team:
+                        away_odds = outcome.get("price")
+
+                if home_odds is not None and away_odds is not None:
+                    results.append(
+                        {
+                            "event_id": game.get("id"),
+                            "commence_time": game.get(
+                                "commence_time"
+                            ),
+                            "home_team": home_team,
+                            "away_team": away_team,
+                            "bookmaker": bookmaker.get("title"),
+                            "home_odds": home_odds,
+                            "away_odds": away_odds,
+                        }
+                    )
+
+    return results
