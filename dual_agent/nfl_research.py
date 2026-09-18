@@ -466,3 +466,225 @@ def run_nfl_walkforward_model(
         ),
         "predictions": predictions_df,
     }
+
+def build_nfl_future_matchup_features(
+    feature_games,
+    home_team,
+    away_team,
+    game_time,
+):
+    """
+    Build leakage-safe features for a future NFL matchup using only
+    historical games that occurred before the future game's start time.
+    """
+
+    if feature_games is None or feature_games.empty:
+        raise ValueError("NFL feature dataset is empty.")
+
+    df = feature_games.copy()
+
+    df["start_time"] = pd.to_datetime(
+        df["start_time"],
+        utc=True,
+        errors="coerce",
+    )
+
+    game_time = pd.to_datetime(
+        game_time,
+        utc=True,
+        errors="coerce",
+    )
+
+    if pd.isna(game_time):
+        raise ValueError("Future NFL game time is invalid.")
+
+    history = df[df["start_time"] < game_time].copy()
+
+    if history.empty:
+        raise ValueError(
+            "No historical NFL games exist before this matchup."
+        )
+
+    def get_team_history(team):
+        team_games = history[
+            (history["home_team"] == team)
+            | (history["away_team"] == team)
+        ].copy()
+
+        return team_games.sort_values("start_time")
+
+    def summarize_team(team):
+        games = get_team_history(team)
+
+        if games.empty:
+            raise ValueError(
+                f"No historical NFL games found for {team}."
+            )
+
+        wins = []
+        point_diffs = []
+
+        for _, game in games.iterrows():
+
+            is_home = game["home_team"] == team
+
+            if is_home:
+                team_score = game["home_score"]
+                opponent_score = game["away_score"]
+            else:
+                team_score = game["away_score"]
+                opponent_score = game["home_score"]
+
+            if pd.isna(team_score) or pd.isna(opponent_score):
+                continue
+
+            wins.append(
+                1 if team_score > opponent_score else 0
+            )
+
+            point_diffs.append(
+                team_score - opponent_score
+            )
+
+        if not wins:
+            raise ValueError(
+                f"No completed historical NFL games found for {team}."
+            )
+
+        recent_wins = wins[-5:]
+        recent_point_diffs = point_diffs[-5:]
+
+        last_game_time = games["start_time"].max()
+
+        rest_days = (
+            game_time - last_game_time
+        ).total_seconds() / 86400.0
+
+        return {
+            "win_pct": sum(wins) / len(wins),
+            "avg_point_diff": sum(point_diffs) / len(point_diffs),
+            "recent_5_win_pct": (
+                sum(recent_wins) / len(recent_wins)
+            ),
+            "recent_5_point_diff": (
+                sum(recent_point_diffs)
+                / len(recent_point_diffs)
+            ),
+            "rest_days": rest_days,
+        }
+
+    home = summarize_team(home_team)
+    away = summarize_team(away_team)
+
+    return pd.DataFrame(
+        [
+            {
+                "home_team": home_team,
+                "away_team": away_team,
+                "start_time": game_time,
+                "win_pct_diff": (
+                    home["win_pct"] - away["win_pct"]
+                ),
+                "avg_point_diff_diff": (
+                    home["avg_point_diff"]
+                    - away["avg_point_diff"]
+                ),
+                "recent_5_win_pct_diff": (
+                    home["recent_5_win_pct"]
+                    - away["recent_5_win_pct"]
+                ),
+                "recent_5_point_diff_diff": (
+                    home["recent_5_point_diff"]
+                    - away["recent_5_point_diff"]
+                ),
+                "rest_diff": (
+                    home["rest_days"]
+                    - away["rest_days"]
+                ),
+            }
+        ]
+    )
+
+
+def predict_nfl_matchup(
+    feature_games,
+    future_features,
+):
+    """
+    Train the NFL model on historical data and predict one future matchup.
+    """
+
+    from sklearn.linear_model import LogisticRegression
+
+    feature_columns = [
+        "win_pct_diff",
+        "avg_point_diff_diff",
+        "recent_5_win_pct_diff",
+        "recent_5_point_diff_diff",
+        "rest_diff",
+    ]
+
+    if feature_games is None or feature_games.empty:
+        raise ValueError("NFL feature dataset is empty.")
+
+    if future_features is None or future_features.empty:
+        raise ValueError("Future NFL matchup features are empty.")
+
+    df = feature_games.copy()
+
+    df = df.dropna(
+        subset=feature_columns + ["home_win"]
+    ).copy()
+
+    if df.empty:
+        raise ValueError(
+            "No valid NFL training rows are available."
+        )
+
+    X_train = df[feature_columns]
+    y_train = df["home_win"].astype(int)
+
+    if y_train.nunique() < 2:
+        raise ValueError(
+            "NFL training data needs both home wins and home losses."
+        )
+
+    model = LogisticRegression(
+        max_iter=1000
+    )
+
+    model.fit(
+        X_train,
+        y_train,
+    )
+
+    X_future = future_features[
+        feature_columns
+    ]
+
+    home_probability = float(
+        model.predict_proba(X_future)[0][1]
+    )
+
+    away_probability = 1.0 - home_probability
+
+    if home_probability >= away_probability:
+        predicted_team = future_features.iloc[0][
+            "home_team"
+        ]
+        confidence = home_probability
+    else:
+        predicted_team = future_features.iloc[0][
+            "away_team"
+        ]
+        confidence = away_probability
+
+    return {
+        "home_team": future_features.iloc[0]["home_team"],
+        "away_team": future_features.iloc[0]["away_team"],
+        "start_time": future_features.iloc[0]["start_time"],
+        "home_win_probability": home_probability,
+        "away_win_probability": away_probability,
+        "predicted_team": predicted_team,
+        "confidence": confidence,
+    }
