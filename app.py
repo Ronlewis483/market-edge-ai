@@ -1871,6 +1871,9 @@ st.markdown("### 🧠 NFL Decision Engine")
 try:
     nfl_predictions = st.session_state["nfl_calibration_predictions"].copy()
 
+    if "home_win_probability" not in nfl_predictions.columns and "probability" in nfl_predictions.columns:
+    nfl_predictions["home_win_probability"] = nfl_predictions["probability"]
+
     decision_profile = build_nfl_confidence_profile(
         nfl_predictions
     )
