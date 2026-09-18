@@ -45,7 +45,10 @@ from dual_agent.nfl_market import (
     classify_nfl_market_edge,
 )
 
-from dual_agent.nfl_odds import get_live_nfl_moneylines
+from dual_agent.nfl_odds import (
+    get_live_nfl_moneylines,
+    get_best_nfl_moneylines,
+)
 
 import streamlit as st
 
@@ -2112,3 +2115,48 @@ if st.button("Load Live NFL Moneylines"):
 
     except Exception as e:
         st.error(f"Live NFL odds error: {e}")
+
+# --------------------------------------------------
+# NFL BEST-LINE SHOPPER
+# --------------------------------------------------
+
+st.markdown("### 🛒 NFL Best-Line Shopper")
+
+if "live_nfl_odds" not in st.session_state:
+    st.info(
+        "Load Live NFL Moneylines first."
+    )
+
+else:
+    if st.button("Find Best NFL Moneylines"):
+        try:
+            odds_rows = (
+                st.session_state["live_nfl_odds"]
+                .to_dict("records")
+            )
+
+            best_lines = get_best_nfl_moneylines(
+                odds_rows
+            )
+
+            best_lines_df = pd.DataFrame(best_lines)
+
+            st.session_state["best_nfl_moneylines"] = (
+                best_lines_df
+            )
+
+            st.success(
+                f"Found best available lines for "
+                f"{len(best_lines_df)} NFL games."
+            )
+
+            st.dataframe(
+                best_lines_df,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        except Exception as e:
+            st.error(
+                f"NFL best-line error: {e}"
+            )
