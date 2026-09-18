@@ -50,6 +50,10 @@ from dual_agent.nfl_odds import (
     get_best_nfl_moneylines,
 )
 
+from dual_agent.nfl_live_engine import (
+    build_live_nfl_opportunities,
+)
+
 import streamlit as st
 
 st.set_page_config(page_title="Market Edge AI V5", page_icon="📊", layout="wide")
