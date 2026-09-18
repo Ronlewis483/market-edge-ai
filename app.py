@@ -1635,3 +1635,224 @@ if "nfl_walkforward_result" in st.session_state:
         use_container_width=True,
         hide_index=True,
     )
+
+# ============================================================
+# NFL CONFIDENCE CALIBRATION
+# ============================================================
+
+if "nfl_walkforward_result" in st.session_state:
+
+    st.markdown("## 🎯 NFL Confidence Calibration")
+
+    calibration_result = st.session_state[
+        "nfl_walkforward_result"
+    ]
+
+    calibration_df = calibration_result[
+        "predictions"
+    ].copy()
+
+    # Confidence = probability assigned to the predicted winner.
+    calibration_df["confidence"] = (
+        calibration_df["probability"].where(
+            calibration_df["prediction"] == 1,
+            1.0 - calibration_df["probability"],
+        )
+    )
+
+    calibration_df["correct"] = (
+        calibration_df["prediction"]
+        == calibration_df["actual"]
+    ).astype(int)
+
+    # Confidence bands.
+    calibration_df["confidence_band"] = pd.cut(
+        calibration_df["confidence"],
+        bins=[
+            0.50,
+            0.55,
+            0.60,
+            0.65,
+            0.70,
+            0.75,
+            0.80,
+            0.85,
+            0.90,
+            0.95,
+            1.01,
+        ],
+        labels=[
+            "50–55%",
+            "55–60%",
+            "60–65%",
+            "65–70%",
+            "70–75%",
+            "75–80%",
+            "80–85%",
+            "85–90%",
+            "90–95%",
+            "95–100%",
+        ],
+        include_lowest=True,
+    )
+
+    calibration_summary = (
+        calibration_df
+        .groupby(
+            "confidence_band",
+            observed=False,
+        )
+        .agg(
+            predictions=("correct", "size"),
+            correct=("correct", "sum"),
+            actual_accuracy=("correct", "mean"),
+            avg_confidence=("confidence", "mean"),
+        )
+        .reset_index()
+    )
+
+    calibration_summary["calibration_gap"] = (
+        calibration_summary["actual_accuracy"]
+        - calibration_summary["avg_confidence"]
+    )
+
+    display_calibration = calibration_summary.copy()
+
+    display_calibration["Average Confidence"] = (
+        display_calibration["avg_confidence"]
+        .map(
+            lambda x: f"{x:.1%}"
+            if pd.notna(x)
+            else "—"
+        )
+    )
+
+    display_calibration["Actual Accuracy"] = (
+        display_calibration["actual_accuracy"]
+        .map(
+            lambda x: f"{x:.1%}"
+            if pd.notna(x)
+            else "—"
+        )
+    )
+
+    display_calibration["Calibration Gap"] = (
+        display_calibration["calibration_gap"]
+        .map(
+            lambda x: f"{x:+.1%}"
+            if pd.notna(x)
+            else "—"
+        )
+    )
+
+    display_calibration = display_calibration[
+        [
+            "confidence_band",
+            "predictions",
+            "correct",
+            "Average Confidence",
+            "Actual Accuracy",
+            "Calibration Gap",
+        ]
+    ]
+
+    display_calibration = display_calibration.rename(
+        columns={
+            "confidence_band": "Confidence Band",
+            "predictions": "Predictions",
+            "correct": "Correct",
+        }
+    )
+
+    st.dataframe(
+        display_calibration,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    # --------------------------------------------------------
+    # HIGH-CONFIDENCE PERFORMANCE
+    # --------------------------------------------------------
+
+    st.markdown("### 🔥 High-Confidence Performance")
+
+    confidence_thresholds = [
+        0.55,
+        0.60,
+        0.65,
+        0.70,
+        0.75,
+        0.80,
+    ]
+
+    threshold_rows = []
+
+    for threshold in confidence_thresholds:
+
+        subset = calibration_df[
+            calibration_df["confidence"] >= threshold
+        ]
+
+        if len(subset) == 0:
+            continue
+
+        threshold_rows.append(
+            {
+                "Minimum Confidence": threshold,
+                "Predictions": len(subset),
+                "Correct": int(
+                    subset["correct"].sum()
+                ),
+                "Accuracy": subset["correct"].mean(),
+                "Average Confidence": subset[
+                    "confidence"
+                ].mean(),
+            }
+        )
+
+    threshold_df = pd.DataFrame(
+        threshold_rows
+    )
+
+    if not threshold_df.empty:
+
+        threshold_display = threshold_df.copy()
+
+        threshold_display[
+            "Minimum Confidence"
+        ] = threshold_display[
+            "Minimum Confidence"
+        ].map(
+            lambda x: f"{x:.0%}+"
+        )
+
+        threshold_display[
+            "Accuracy"
+        ] = threshold_display[
+            "Accuracy"
+        ].map(
+            lambda x: f"{x:.1%}"
+        )
+
+        threshold_display[
+            "Average Confidence"
+        ] = threshold_display[
+            "Average Confidence"
+        ].map(
+            lambda x: f"{x:.1%}"
+        )
+
+        st.dataframe(
+            threshold_display,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    # Save raw calibration data for later decision-engine work.
+    st.session_state[
+        "nfl_calibration_predictions"
+    ] = calibration_df
+
+    st.session_state[
+        "nfl_calibration_summary"
+    ] = calibration_summary
