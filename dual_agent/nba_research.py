@@ -2113,6 +2113,8 @@ def build_balldontlie_future_matchup_features(
         - features["away_rest_days"]
     )
 
+    features["game_date"] = target_date
+
     return pd.DataFrame([features])
 
 # ============================================================
