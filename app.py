@@ -1869,7 +1869,7 @@ if "nfl_walkforward_result" in st.session_state:
 st.markdown("### 🧠 NFL Decision Engine")
 
 try:
-    nfl_predictions = calibration_df.copy()
+    nfl_predictions = st.session_state["nfl_calibration_predictions"].copy()
 
     decision_profile = build_nfl_confidence_profile(
         nfl_predictions
