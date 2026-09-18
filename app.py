@@ -22,6 +22,8 @@ from dual_agent.nba_research import (
     normalize_nba_team_name,
 )
 
+from dual_agent.nfl_data import test_sportradar_connection
+
 import streamlit as st
 
 st.set_page_config(page_title="Market Edge AI V5", page_icon="📊", layout="wide")
@@ -1148,3 +1150,32 @@ try:
 except Exception as e:
     st.error(f"Live NBA odds test failed: {e}")
     st.divider()
+
+st.markdown("---")
+st.markdown("### 🏈 Football API Connection")
+
+if st.button("Test Football API"):
+    try:
+        with st.spinner("Connecting to Sportradar..."):
+            football_test = test_sportradar_connection()
+
+        st.success(
+            f"Sportradar connection successful — "
+            f"{football_test['competition_count']} competitions found."
+        )
+
+        competitions_df = football_test["competitions"]
+
+        if not competitions_df.empty:
+            st.dataframe(
+                competitions_df,
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.warning(
+                "Connection succeeded, but no competitions were returned."
+            )
+
+    except Exception as e:
+        st.error(f"Sportradar connection error: {e}")
