@@ -40,6 +40,11 @@ from dual_agent.nfl_decision import (
     get_nfl_decision,
 )
 
+from dual_agent.nfl_market import (
+    calculate_nfl_market_edge,
+    classify_nfl_market_edge,
+)
+
 import streamlit as st
 
 st.set_page_config(page_title="Market Edge AI V5", page_icon="📊", layout="wide")
@@ -1966,3 +1971,106 @@ try:
 
 except Exception as e:
     st.error(f"NFL Decision Engine error: {e}")
+
+# --------------------------------------------------
+# NFL MARKET EDGE TEST
+# --------------------------------------------------
+
+st.markdown("### 💰 NFL Market Edge Test")
+
+test_home_probability = st.number_input(
+    "Home model probability",
+    min_value=0.01,
+    max_value=0.99,
+    value=0.70,
+    step=0.01,
+)
+
+test_home_odds = st.number_input(
+    "Home moneyline",
+    value=-150,
+    step=5,
+)
+
+test_away_odds = st.number_input(
+    "Away moneyline",
+    value=130,
+    step=5,
+)
+
+if st.button("Test NFL Market Edge"):
+
+    try:
+        edge_result = calculate_nfl_market_edge(
+            home_model_probability=test_home_probability,
+            home_odds=test_home_odds,
+            away_odds=test_away_odds,
+        )
+
+        if edge_result["best_side"] == "HOME":
+            selected_probability = edge_result[
+                "home_model_probability"
+            ]
+            selected_market_probability = edge_result[
+                "home_no_vig_probability"
+            ]
+        else:
+            selected_probability = edge_result[
+                "away_model_probability"
+            ]
+            selected_market_probability = edge_result[
+                "away_no_vig_probability"
+            ]
+
+        classification = classify_nfl_market_edge(
+            model_probability=selected_probability,
+            market_probability=selected_market_probability,
+            american_odds=edge_result["best_odds"],
+        )
+
+        col1, col2, col3, col4 = st.columns(4)
+
+        col1.metric(
+            "Best Side",
+            edge_result["best_side"],
+        )
+
+        col2.metric(
+            "Model Probability",
+            f"{selected_probability:.1%}",
+        )
+
+        col3.metric(
+            "Market No-Vig Probability",
+            f"{selected_market_probability:.1%}",
+        )
+
+        col4.metric(
+            "Model Edge",
+            f"{edge_result['best_edge']:+.1%}",
+        )
+
+        st.metric(
+            "Expected Value / $1",
+            f"{classification['expected_value']:+.3f}",
+        )
+
+        decision = classification["decision"]
+
+        if decision == "BET":
+            st.success(
+                f"BET — {classification['reason']}"
+            )
+        elif decision == "LEAN":
+            st.warning(
+                f"LEAN — {classification['reason']}"
+            )
+        else:
+            st.info(
+                f"PASS — {classification['reason']}"
+            )
+
+    except Exception as e:
+        st.error(
+            f"NFL Market Edge Test error: {e}"
+        )
