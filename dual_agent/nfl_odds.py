@@ -98,4 +98,57 @@ def get_live_nfl_moneylines():
                         }
                     )
 
+    def get_best_nfl_moneylines(odds_rows):
+    """
+    Reduce sportsbook-level NFL odds into one row per game.
+
+    For each team, select the most favorable available American
+    moneyline and remember which sportsbook offered it.
+    """
+
+    if not odds_rows:
+        return []
+
+    games = {}
+
+    for row in odds_rows:
+        game_id = row["game_id"]
+
+        if game_id not in games:
+            games[game_id] = {
+                "game_id": game_id,
+                "commence_time": row["commence_time"],
+                "home_team": row["home_team"],
+                "away_team": row["away_team"],
+                "best_home_moneyline": None,
+                "best_home_sportsbook": None,
+                "best_away_moneyline": None,
+                "best_away_sportsbook": None,
+            }
+
+        game = games[game_id]
+
+        home_line = row["home_moneyline"]
+        away_line = row["away_moneyline"]
+
+        # With American odds, the numerically larger line is
+        # always better for the bettor:
+        # +130 is better than +120
+        # -140 is better than -150
+        if (
+            game["best_home_moneyline"] is None
+            or home_line > game["best_home_moneyline"]
+        ):
+            game["best_home_moneyline"] = home_line
+            game["best_home_sportsbook"] = row["sportsbook"]
+
+        if (
+            game["best_away_moneyline"] is None
+            or away_line > game["best_away_moneyline"]
+        ):
+            game["best_away_moneyline"] = away_line
+            game["best_away_sportsbook"] = row["sportsbook"]
+
+    return list(games.values())
+
     return rows
