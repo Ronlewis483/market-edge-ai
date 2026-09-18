@@ -2564,3 +2564,44 @@ def get_live_nba_moneylines():
                     )
 
     return results
+
+def normalize_nba_team_name(team_name):
+    """
+    Convert The Odds API NBA team names to the abbreviations
+    used by the historical BALLDONTLIE model.
+    """
+
+    team_map = {
+        "Atlanta Hawks": "ATL",
+        "Boston Celtics": "BOS",
+        "Brooklyn Nets": "BKN",
+        "Charlotte Hornets": "CHA",
+        "Chicago Bulls": "CHI",
+        "Cleveland Cavaliers": "CLE",
+        "Dallas Mavericks": "DAL",
+        "Denver Nuggets": "DEN",
+        "Detroit Pistons": "DET",
+        "Golden State Warriors": "GSW",
+        "Houston Rockets": "HOU",
+        "Indiana Pacers": "IND",
+        "Los Angeles Clippers": "LAC",
+        "Los Angeles Lakers": "LAL",
+        "Memphis Grizzlies": "MEM",
+        "Miami Heat": "MIA",
+        "Milwaukee Bucks": "MIL",
+        "Minnesota Timberwolves": "MIN",
+        "New Orleans Pelicans": "NOP",
+        "New York Knicks": "NYK",
+        "Oklahoma City Thunder": "OKC",
+        "Orlando Magic": "ORL",
+        "Philadelphia 76ers": "PHI",
+        "Phoenix Suns": "PHX",
+        "Portland Trail Blazers": "POR",
+        "Sacramento Kings": "SAC",
+        "San Antonio Spurs": "SAS",
+        "Toronto Raptors": "TOR",
+        "Utah Jazz": "UTA",
+        "Washington Wizards": "WAS",
+    }
+
+    return team_map.get(team_name)
