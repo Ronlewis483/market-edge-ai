@@ -45,6 +45,8 @@ from dual_agent.nfl_market import (
     classify_nfl_market_edge,
 )
 
+from dual_agent.nfl_odds import get_live_nfl_moneylines
+
 import streamlit as st
 
 st.set_page_config(page_title="Market Edge AI V5", page_icon="📊", layout="wide")
@@ -2074,3 +2076,39 @@ if st.button("Test NFL Market Edge"):
         st.error(
             f"NFL Market Edge Test error: {e}"
         )
+
+# --------------------------------------------------
+# LIVE NFL MONEYLINES
+# --------------------------------------------------
+
+st.markdown("### 📡 Live NFL Moneylines")
+
+if st.button("Load Live NFL Moneylines"):
+    try:
+        with st.spinner("Loading current NFL moneylines..."):
+            live_nfl_odds = get_live_nfl_moneylines()
+
+        if not live_nfl_odds:
+            st.info(
+                "No current NFL moneyline markets were returned."
+            )
+        else:
+            live_nfl_odds_df = pd.DataFrame(live_nfl_odds)
+
+            st.success(
+                f"Loaded {len(live_nfl_odds_df)} "
+                "NFL sportsbook moneyline markets."
+            )
+
+            st.dataframe(
+                live_nfl_odds_df,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            st.session_state["live_nfl_odds"] = (
+                live_nfl_odds_df
+            )
+
+    except Exception as e:
+        st.error(f"Live NFL odds error: {e}")
