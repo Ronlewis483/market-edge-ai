@@ -189,3 +189,144 @@ def get_nfl_season_games(season_id):
         "game_count": len(games_df),
         "games": games_df,
     }
+
+def audit_nfl_games(games_df):
+    """
+    Audit an NFL historical games DataFrame before model training.
+    """
+
+    if games_df is None or games_df.empty:
+        raise ValueError("NFL games dataset is empty.")
+
+    df = games_df.copy()
+
+    total_games = len(df)
+
+    unique_game_ids = (
+        df["game_id"].nunique()
+        if "game_id" in df.columns
+        else 0
+    )
+
+    duplicate_games = (
+        df["game_id"].duplicated().sum()
+        if "game_id" in df.columns
+        else 0
+    )
+
+    completed_games = (
+        df["status"].isin(["closed", "complete"]).sum()
+        if "status" in df.columns
+        else 0
+    )
+
+    missing_home_scores = (
+        df["home_score"].isna().sum()
+        if "home_score" in df.columns
+        else total_games
+    )
+
+    missing_away_scores = (
+        df["away_score"].isna().sum()
+        if "away_score" in df.columns
+        else total_games
+    )
+
+    missing_teams = 0
+
+    if "home_team" in df.columns:
+        missing_teams += df["home_team"].isna().sum()
+
+    if "away_team" in df.columns:
+        missing_teams += df["away_team"].isna().sum()
+
+    ties = 0
+
+    if (
+        "home_score" in df.columns
+        and "away_score" in df.columns
+    ):
+        scored = df[
+            df["home_score"].notna()
+            & df["away_score"].notna()
+        ]
+
+        ties = (
+            scored["home_score"]
+            == scored["away_score"]
+        ).sum()
+
+    teams = set()
+
+    if "home_team" in df.columns:
+        teams.update(
+            df["home_team"].dropna().unique()
+        )
+
+    if "away_team" in df.columns:
+        teams.update(
+            df["away_team"].dropna().unique()
+        )
+
+    date_min = None
+    date_max = None
+
+    if "start_time" in df.columns:
+        dates = pd.to_datetime(
+            df["start_time"],
+            errors="coerce",
+            utc=True,
+        )
+
+        if dates.notna().any():
+            date_min = dates.min()
+            date_max = dates.max()
+
+    home_wins = 0
+    away_wins = 0
+
+    scored = pd.DataFrame()
+
+    if (
+        "home_score" in df.columns
+        and "away_score" in df.columns
+    ):
+        scored = df[
+            df["home_score"].notna()
+            & df["away_score"].notna()
+        ].copy()
+
+        home_wins = (
+            scored["home_score"]
+            > scored["away_score"]
+        ).sum()
+
+        away_wins = (
+            scored["away_score"]
+            > scored["home_score"]
+        ).sum()
+
+    decided_games = home_wins + away_wins
+
+    home_win_rate = (
+        home_wins / decided_games
+        if decided_games > 0
+        else None
+    )
+
+    return {
+        "total_games": int(total_games),
+        "unique_game_ids": int(unique_game_ids),
+        "duplicate_games": int(duplicate_games),
+        "completed_games": int(completed_games),
+        "missing_home_scores": int(missing_home_scores),
+        "missing_away_scores": int(missing_away_scores),
+        "missing_teams": int(missing_teams),
+        "ties": int(ties),
+        "team_count": int(len(teams)),
+        "home_wins": int(home_wins),
+        "away_wins": int(away_wins),
+        "home_win_rate": home_win_rate,
+        "start_date": date_min,
+        "end_date": date_max,
+    }
