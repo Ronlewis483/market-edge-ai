@@ -291,3 +291,178 @@ def build_nfl_pregame_features(games):
     features = pd.DataFrame(feature_rows)
 
     return features
+
+def run_nfl_walkforward_model(
+    feature_games,
+    min_train_games=100,
+    retrain_every=25,
+):
+    """
+    Run leakage-safe walk-forward NFL validation.
+
+    The model trains only on games that occurred BEFORE
+    the game being predicted.
+    """
+
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.metrics import (
+        accuracy_score,
+        roc_auc_score,
+        brier_score_loss,
+        log_loss,
+    )
+
+    if feature_games is None or feature_games.empty:
+        raise ValueError("NFL feature dataset is empty.")
+
+    df = feature_games.copy()
+
+    # Remove ties because home_win is NaN for tied games.
+    df = df.dropna(subset=["home_win"]).copy()
+
+    df = df.sort_values("start_time").reset_index(drop=True)
+
+    feature_columns = [
+        "win_pct_diff",
+        "avg_point_diff_diff",
+        "recent_5_win_pct_diff",
+        "recent_5_point_diff_diff",
+        "rest_diff",
+    ]
+
+    missing_columns = [
+        col for col in feature_columns
+        if col not in df.columns
+    ]
+
+    if missing_columns:
+        raise ValueError(
+            f"Missing NFL model features: {missing_columns}"
+        )
+
+    if len(df) <= min_train_games:
+        raise ValueError(
+            f"Not enough NFL games for walk-forward validation. "
+            f"Found {len(df)}, need more than {min_train_games}."
+        )
+
+    predictions = []
+
+    model = None
+
+    for i in range(min_train_games, len(df)):
+
+        train_df = df.iloc[:i].copy()
+        test_row = df.iloc[[i]].copy()
+
+        X_train = train_df[feature_columns]
+        y_train = train_df["home_win"].astype(int)
+
+        X_test = test_row[feature_columns]
+
+        # LogisticRegression needs both classes in training data.
+        if y_train.nunique() < 2:
+            continue
+
+        # Retrain periodically instead of fitting on every single game.
+        if (
+            model is None
+            or (i - min_train_games) % retrain_every == 0
+        ):
+            model = LogisticRegression(
+                max_iter=2000
+            )
+
+            model.fit(
+                X_train,
+                y_train,
+            )
+
+        home_probability = float(
+            model.predict_proba(X_test)[0][1]
+        )
+
+        prediction = int(
+            home_probability >= 0.50
+        )
+
+        actual = int(
+            test_row["home_win"].iloc[0]
+        )
+
+        predictions.append(
+            {
+                "game_id": test_row["game_id"].iloc[0],
+                "season_id": test_row["season_id"].iloc[0],
+                "start_time": test_row["start_time"].iloc[0],
+                "home_team": test_row["home_team"].iloc[0],
+                "away_team": test_row["away_team"].iloc[0],
+                "probability": home_probability,
+                "prediction": prediction,
+                "actual": actual,
+                "correct": int(prediction == actual),
+            }
+        )
+
+    predictions_df = pd.DataFrame(predictions)
+
+    if predictions_df.empty:
+        raise ValueError(
+            "NFL walk-forward model produced no predictions."
+        )
+
+    y_true = predictions_df["actual"]
+    y_prob = predictions_df["probability"]
+    y_pred = predictions_df["prediction"]
+
+    accuracy = accuracy_score(
+        y_true,
+        y_pred,
+    )
+
+    brier = brier_score_loss(
+        y_true,
+        y_prob,
+    )
+
+    logloss = log_loss(
+        y_true,
+        y_prob,
+        labels=[0, 1],
+    )
+
+    if y_true.nunique() > 1:
+        auc = roc_auc_score(
+            y_true,
+            y_prob,
+        )
+    else:
+        auc = np.nan
+
+    baseline_home_prediction = np.ones(
+        len(y_true),
+        dtype=int,
+    )
+
+    baseline_accuracy = accuracy_score(
+        y_true,
+        baseline_home_prediction,
+    )
+
+    return {
+        "success": True,
+        "model_name": "NFL Logistic Regression Walk-Forward",
+        "feature_columns": feature_columns,
+        "total_feature_games": len(df),
+        "training_start_games": min_train_games,
+        "prediction_count": len(predictions_df),
+        "accuracy": float(accuracy),
+        "auc": float(auc) if not np.isnan(auc) else np.nan,
+        "brier": float(brier),
+        "log_loss": float(logloss),
+        "baseline_home_accuracy": float(baseline_accuracy),
+        "accuracy_vs_baseline": float(
+            accuracy - baseline_accuracy
+        ),
+        "predictions": predictions_df,
+    }
