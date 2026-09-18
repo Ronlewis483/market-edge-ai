@@ -1,5 +1,4 @@
 import time
-
 import pandas as pd
 import requests
 import streamlit as st
@@ -23,6 +22,7 @@ def _get_api_key():
 def _balldontlie_get(endpoint, params=None):
     """
     Make an authenticated request to BALLDONTLIE.
+    Automatically retry if the API rate-limits us.
     """
     api_key = _get_api_key()
 
@@ -30,20 +30,42 @@ def _balldontlie_get(endpoint, params=None):
         "Authorization": api_key
     }
 
-    response = requests.get(
-        f"{BALLDONTLIE_BASE_URL}/{endpoint}",
-        headers=headers,
-        params=params,
-        timeout=30,
-    )
+    max_retries = 5
 
-    if response.status_code != 200:
+    for attempt in range(max_retries):
+        response = requests.get(
+            f"{BALLDONTLIE_BASE_URL}/{endpoint}",
+            headers=headers,
+            params=params,
+            timeout=30,
+        )
+
+        if response.status_code == 200:
+            return response.json()
+
+        if response.status_code == 429:
+            retry_after = response.headers.get("Retry-After")
+
+            if retry_after:
+                try:
+                    wait_seconds = float(retry_after)
+                except ValueError:
+                    wait_seconds = 10
+            else:
+                wait_seconds = 10 * (attempt + 1)
+
+            time.sleep(wait_seconds)
+            continue
+
         raise RuntimeError(
             f"BALLDONTLIE error {response.status_code}: "
             f"{response.text}"
         )
 
-    return response.json()
+    raise RuntimeError(
+        "BALLDONTLIE rate limit continued after "
+        f"{max_retries} retry attempts."
+    ))
 
 
 def _games_to_dataframe(games):
