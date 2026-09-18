@@ -33,6 +33,8 @@ from dual_agent.nfl_data import (
 from dual_agent.nfl_research import (
     build_nfl_pregame_features,
     run_nfl_walkforward_model,
+    build_nfl_future_matchup_features,
+    predict_nfl_matchup,
 )
 
 from dual_agent.nfl_decision import (
