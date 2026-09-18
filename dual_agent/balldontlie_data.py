@@ -66,7 +66,7 @@ def _balldontlie_get(endpoint, params=None):
     raise RuntimeError(
         "BALLDONTLIE rate limit continued after "
         f"{max_retries} retry attempts."
-    ))
+    )
 
 
 def _games_to_dataframe(games):
