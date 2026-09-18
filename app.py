@@ -207,7 +207,7 @@ else:
                 "This will take several minutes..."
             ):
                 multi_bdl_test = test_multiple_historical_seasons(
-                    [2022, 2023]
+                    [2022, 2023, 2024, 2025]
                 )
 
             st.success(
