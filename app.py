@@ -25,9 +25,13 @@ from dual_agent.nba_research import (
 from dual_agent.nfl_data import (
     test_sportradar_connection,
     get_nfl_seasons,
-    get_nfl_season_games,
-    audit_nfl_games,
+    get_nfl_historical_games,
     get_multiple_nfl_seasons,
+    audit_nfl_games,
+)
+
+from dual_agent.nfl_research import (
+    build_nfl_pregame_features,
 )
 
 import streamlit as st
@@ -1428,4 +1432,74 @@ if "multi_nfl_games" in st.session_state:
     c4.metric(
         "Home Win Rate",
         f"{multi_audit['home_win_rate']:.1%}",
+    )
+
+# ============================================================
+# NFL PREGAME FEATURE ENGINE
+# ============================================================
+
+if "multi_nfl_games" in st.session_state:
+
+    st.markdown("---")
+    st.markdown("### 🧠 NFL Pregame Feature Engine")
+
+    if st.button("Build NFL Pregame Features"):
+
+        try:
+            with st.spinner(
+                "Building leakage-safe NFL pregame features..."
+            ):
+                nfl_feature_games = build_nfl_pregame_features(
+                    st.session_state["multi_nfl_games"]
+                )
+
+                st.session_state[
+                    "nfl_feature_games"
+                ] = nfl_feature_games
+
+            st.success(
+                f"NFL feature build complete — "
+                f"{len(nfl_feature_games)} games processed."
+            )
+
+        except Exception as e:
+            st.error(
+                f"NFL feature engine error: {e}"
+            )
+
+
+if "nfl_feature_games" in st.session_state:
+
+    nfl_features = st.session_state[
+        "nfl_feature_games"
+    ]
+
+    st.markdown("#### 🧠 NFL Predictive Feature Dataset")
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    c1.metric(
+        "Games",
+        len(nfl_features),
+    )
+
+    c2.metric(
+        "Predictive Features",
+        max(len(nfl_features.columns) - 6, 0),
+    )
+
+    c3.metric(
+        "Training Games",
+        nfl_features["home_win"].notna().sum(),
+    )
+
+    c4.metric(
+        "Ties Excluded",
+        nfl_features["home_win"].isna().sum(),
+    )
+
+    st.dataframe(
+        nfl_features,
+        use_container_width=True,
+        hide_index=True,
     )
