@@ -811,8 +811,13 @@ try:
         "Downloading multiple NBA seasons and running walk-forward validation..."
     ):
         multi_bdl_result = test_multiple_historical_seasons(
-            [int(season) for season in seasons]
-        )
+    [
+        int(x.strip())
+        for x in nba_seasons_text.split(",")
+        if x.strip()
+    ]
+)
+        
 
         historical_games = multi_bdl_result["games"]
 
