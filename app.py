@@ -807,8 +807,8 @@ if st.button("Run Multi-Season NBA Validation"):
     ]
 
 try:
-with st.spinner(
-    "Downloading multiple NBA seasons and running walk-forward validation..."
+    with st.spinner(
+        "Downloading multiple NBA seasons and running walk-forward validation..."
 ):
     multi_bdl_result = test_multiple_historical_seasons(
         [int(season) for season in seasons]
