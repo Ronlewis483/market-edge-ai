@@ -35,6 +35,11 @@ from dual_agent.nfl_research import (
     run_nfl_walkforward_model,
 )
 
+from dual_agent.nfl_decision import (
+    build_nfl_confidence_profile,
+    get_nfl_decision,
+)
+
 import streamlit as st
 
 st.set_page_config(page_title="Market Edge AI V5", page_icon="📊", layout="wide")
