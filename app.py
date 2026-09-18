@@ -27,6 +27,7 @@ from dual_agent.nfl_data import (
     get_nfl_seasons,
     get_nfl_season_games,
     audit_nfl_games,
+    get_multiple_nfl_seasons,
 )
 
 import streamlit as st
@@ -1312,3 +1313,100 @@ if st.button("Load 2024–25 NFL Games"):
 
     except Exception as e:
         st.error(f"NFL historical games error: {e}")
+
+st.markdown("---")
+st.markdown("### 🏈 Multi-Season NFL Dataset")
+
+if st.button("Load Multi-Season NFL Dataset"):
+
+    try:
+        with st.spinner("Downloading multiple NFL seasons..."):
+
+            season_ids = [
+                "sr:season:115087",  # 2024-25
+                "sr:season:127985",  # 2025-26
+            ]
+
+            multi_nfl = get_multiple_nfl_seasons(
+                season_ids
+            )
+
+            st.session_state["multi_nfl_games"] = multi_nfl["games"]
+
+        st.success(
+            f"Multi-season NFL download successful — "
+            f"{multi_nfl['game_count']} games found."
+        )
+
+        st.markdown("#### Season Summary")
+        st.dataframe(
+            multi_nfl["season_summary"],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    except Exception as e:
+        st.error(f"Multi-season NFL error: {e}")
+
+
+if "multi_nfl_games" in st.session_state:
+
+    multi_games = st.session_state["multi_nfl_games"]
+
+    st.markdown("#### Combined NFL Games")
+
+    st.dataframe(
+        multi_games,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    multi_audit = audit_nfl_games(
+        multi_games
+    )
+
+    st.markdown("### 🔍 Multi-Season NFL Audit")
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    c1.metric(
+        "Total Games",
+        multi_audit["total_games"],
+    )
+
+    c2.metric(
+        "Unique Games",
+        multi_audit["unique_games"],
+    )
+
+    c3.metric(
+        "Duplicates",
+        multi_audit["duplicate_games"],
+    )
+
+    c4.metric(
+        "Teams",
+        multi_audit["team_count"],
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    c1.metric(
+        "Completed Games",
+        multi_audit["completed_games"],
+    )
+
+    c2.metric(
+        "Missing Scores",
+        multi_audit["missing_scores"],
+    )
+
+    c3.metric(
+        "Ties",
+        multi_audit["ties"],
+    )
+
+    c4.metric(
+        "Home Win Rate",
+        f"{multi_audit['home_win_rate']:.1%}",
+    )
