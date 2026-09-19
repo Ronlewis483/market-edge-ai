@@ -1965,8 +1965,8 @@ if calibration_result is not None:
         )
 
     st.session_state[
-        "nfl_calibration_predictions"
-    ] = nfl_model_predictions
+    "nfl_historical_predictions"
+] = nfl_model_predictions
     
 # ---------------------------------------------------------
 # NFL DECISION ENGINE
@@ -2293,20 +2293,49 @@ if (
                 )
                 st.stop()
 
-            live_opportunities = build_live_nfl_opportunities(
-                model_predictions=st.session_state[
+                # Retrieve historical walk-forward validation results.
+                historical_result = st.session_state[
+                    "nfl_walkforward_result"
+                ]
+                
+                # Retrieve confidence calibration data.
+                calibration_predictions = st.session_state.get(
                     "nfl_calibration_predictions"
-                ],
-                best_lines=st.session_state[
-                    "nfl_best_lines"
-                ],
-                historical_accuracy=st.session_state[
-                    "nfl_walkforward_result"
-                ].get("accuracy"),
-                historical_sample=st.session_state[
-                    "nfl_walkforward_result"
-                ].get("prediction_count"),
-            )
+                )
+                
+                # Historical validation must be available.
+                if (
+                    calibration_predictions is None
+                    or calibration_predictions.empty
+                ):
+                    st.error(
+                        "NFL confidence calibration data is unavailable. "
+                        "Run the walk-forward model and confidence "
+                        "calibration before analyzing live opportunities."
+                    )
+                    st.stop()
+
+
+            
+
+            
+                live_opportunities = build_live_nfl_opportunities(
+                    model_predictions=st.session_state[
+                        "nfl_calibration_predictions"
+                    ],
+                
+                    best_lines=st.session_state[
+                        "nfl_best_lines"
+                    ],
+                
+                    historical_accuracy=historical_result.get(
+                        "accuracy"
+                    ),
+                
+                    historical_sample=historical_result.get(
+                        "prediction_count"
+                    ),
+                )
 
             
 
