@@ -235,7 +235,7 @@ def classify_nfl_market_edge(
                 "the current decision requirements."
             )
     
-        reason = " ".join(reasons)
+            reason = " ".join(reasons)
     
         return {
             "decision": decision,
