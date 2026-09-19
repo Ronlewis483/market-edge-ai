@@ -139,12 +139,14 @@ def expected_value_per_dollar(model_probability, american_odds):
 
 
 
+
 def classify_nfl_market_edge(
     model_probability,
     market_probability,
     american_odds,
     historical_accuracy=None,
     historical_sample=None,
+    historical_reliability=None,
 ):
     """
     Classify an NFL moneyline opportunity using model
@@ -211,7 +213,14 @@ def classify_nfl_market_edge(
     # 4. Validate historical performance
     # -----------------------------------------
 
+    
     history_ok = False
+    reliability_ok = False
+
+    # Historical validation requirements.
+    MIN_HISTORICAL_ACCURACY = 0.70
+    MIN_HISTORICAL_SAMPLE = 30
+    MAX_BRIER_SCORE = 0.25
 
     if (
         historical_accuracy is not None
@@ -226,9 +235,27 @@ def classify_nfl_market_edge(
         )
 
         history_ok = (
-            historical_accuracy >= 0.70
-            and historical_sample >= 25
+            historical_accuracy >= MIN_HISTORICAL_ACCURACY
+            and historical_sample >= MIN_HISTORICAL_SAMPLE
         )
+
+    # Reliability must be established separately using
+    # completed, out-of-sample NFL predictions.
+    if historical_reliability is not None:
+
+        brier_score = historical_reliability.get(
+            "brier_score"
+        )
+
+        reliability_ok = (
+            historical_reliability.get(
+                "reliability_passed"
+            ) is True
+            and brier_score is not None
+            and float(brier_score) < MAX_BRIER_SCORE
+        )
+
+    history_ok = history_ok and reliability_ok
 
 
     # ------------------------------------------
