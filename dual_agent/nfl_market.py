@@ -237,9 +237,9 @@ def classify_nfl_market_edge(
                 "Opportunity did not satisfy "
                 "the current decision requirements."
             )
-    
-            reason = " ".join(reasons)
-    
+        
+        if decision == "PASS":
+            reason = " ".join(reasons)   
 
     return {
         "decision": decision,
