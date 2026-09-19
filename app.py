@@ -1627,6 +1627,72 @@ if "nfl_walkforward_result" in st.session_state:
         f"{result['accuracy_vs_baseline']:+.1%}",
     )
 
+
+    # ------------------------------------------
+    # NFL PROBABILITY-BAND VALIDATION
+    # ------------------------------------------
+
+    st.markdown("### 🎯 NFL Probability-Band Validation")
+
+    probability_bands = result.get("probability_bands")
+
+    if (
+        probability_bands is not None
+        and not probability_bands.empty
+    ):
+
+        display_bands = probability_bands.copy()
+
+        # Format percentages for dashboard display.
+
+        percentage_columns = [
+            "average_confidence",
+            "actual_win_rate",
+            "calibration_gap",
+            "win_rate_lower_95",
+            "win_rate_upper_95",
+        ]
+
+        for column in percentage_columns:
+            display_bands[column] = (
+                display_bands[column] * 100
+            ).round(1)
+
+        display_bands = display_bands.rename(
+            columns={
+                "confidence_band": "Confidence Band",
+                "total_predictions": "Games",
+                "correct_predictions": "Correct",
+                "average_confidence": "Average Confidence (%)",
+                "actual_win_rate": "Actual Win Rate (%)",
+                "calibration_gap": "Calibration Gap (pp)",
+                "win_rate_lower_95": "95% Lower Bound (%)",
+                "win_rate_upper_95": "95% Upper Bound (%)",
+            }
+        )
+
+        st.dataframe(
+            display_bands,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.caption(
+            "Historical out-of-sample prediction accuracy "
+            "by model-confidence range. Confidence intervals "
+            "reflect sampling uncertainty and do not guarantee "
+            "future betting performance."
+        )
+
+    else:
+
+        st.info(
+            "Run the NFL Walk-Forward Model to generate "
+            "probability-band validation results."
+        )
+
+
+    
     st.markdown("### 🔎 Walk-Forward Predictions")
 
     prediction_table = result[
