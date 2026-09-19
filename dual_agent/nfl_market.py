@@ -279,16 +279,22 @@ def classify_nfl_market_edge(
     MIN_LEAN_EDGE = 0.01
 
     # Validate historical performance
-    history_ok = False
-
+    historical_validation_ok = False
+    
     if (
         historical_accuracy is not None
         and historical_sample is not None
     ):
-        history_ok = (
+        historical_validation_ok = (
             historical_accuracy >= MIN_HISTORICAL_ACCURACY
             and historical_sample >= MIN_HISTORICAL_SAMPLE
         )
+
+# Require both historical validation and reliability.
+history_ok = (
+    historical_validation_ok
+    and reliability_ok
+)
 
     # Evaluate BET qualification
     bet_probability_ok = (
@@ -306,11 +312,12 @@ def classify_nfl_market_edge(
         and history_ok
     )
 
-    # Evaluate LEAN qualification
+        # Evaluate LEAN qualification
     lean_qualified = (
         model_probability >= MIN_LEAN_PROBABILITY
         and edge >= MIN_LEAN_EDGE
         and ev > 0
+        and history_ok
     )
 
     # Final classification
