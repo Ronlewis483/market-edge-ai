@@ -72,10 +72,10 @@ def build_live_nfl_opportunities(
             home_model_probability=float(
                 game["home_win_probability"]
             ),
-            home_odds=
+            home_odds=int(
                 game["best_home_moneyline"]
             ),
-            away_odds=
+            away_odds=int(
                 game["best_away_moneyline"]
             ),
         )
