@@ -112,20 +112,19 @@ def build_live_nfl_opportunities(
                 "best_away_sportsbook":
                     game["best_away_sportsbook"],
 
-                "best_side":
-                    market_result["best_side"],
-
+                "best_side": "home",
+                
                 "model_probability":
-                    market_result["model_probability"],
-
+                    classification["model_probability"],
+                
                 "market_no_vig_probability":
-                    market_result["market_no_vig_probability"],
-
+                    classification["market_probability"],
+                
                 "model_edge":
-                    market_result["model_edge"],
-
+                    classification["edge"],
+                
                 "expected_value":
-                    market_result["expected_value"],
+                    classification["expected_value"],
 
                 "decision":
                     classification["decision"],
