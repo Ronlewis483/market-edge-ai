@@ -816,3 +816,108 @@ def predict_nfl_matchup(
         "predicted_team": predicted_team,
         "confidence": confidence,
     }
+
+def evaluate_nfl_prediction_reliability(
+    historical_predictions,
+    min_samples=30,
+):
+    """
+    Evaluate historical NFL prediction accuracy and calibration.
+
+    historical_predictions must contain:
+        probability: predicted probability of a home win
+        actual: actual game result (1 = home win, 0 = away win)
+
+    Use only completed, out-of-sample predictions.
+    """
+
+    import pandas as pd
+    import numpy as np
+
+    required_columns = ["probability", "actual"]
+
+    if historical_predictions is None:
+        raise ValueError(
+            "Historical NFL predictions are unavailable."
+        )
+
+    missing = [
+        col for col in required_columns
+        if col not in historical_predictions.columns
+    ]
+
+    if missing:
+        raise ValueError(
+            f"Missing historical prediction columns: {missing}"
+        )
+
+    df = historical_predictions[
+        required_columns
+    ].copy()
+
+    df["probability"] = pd.to_numeric(
+        df["probability"],
+        errors="coerce",
+    )
+
+    df["actual"] = pd.to_numeric(
+        df["actual"],
+        errors="coerce",
+    )
+
+    df = df.dropna()
+
+    df = df[
+        df["probability"].between(0, 1)
+        & df["actual"].isin([0, 1])
+    ].copy()
+
+    sample_size = len(df)
+
+    if sample_size == 0:
+        return {
+            "historical_accuracy": None,
+            "brier_score": None,
+            "sample_size": 0,
+            "reliability_passed": False,
+            "reason": "No valid historical predictions.",
+        }
+
+    df["predicted"] = (
+        df["probability"] >= 0.50
+    ).astype(int)
+
+    df["correct"] = (
+        df["predicted"] == df["actual"]
+    ).astype(int)
+
+    historical_accuracy = float(
+        df["correct"].mean()
+    )
+
+    brier_score = float(
+        np.mean(
+            (
+                df["probability"]
+                - df["actual"]
+            ) ** 2
+        )
+    )
+
+    reliability_passed = (
+        sample_size >= min_samples
+        and historical_accuracy >= 0.60
+        and brier_score < 0.25
+    )
+
+    return {
+        "historical_accuracy": historical_accuracy,
+        "brier_score": brier_score,
+        "sample_size": sample_size,
+        "reliability_passed": bool(reliability_passed),
+        "reason": (
+            "Historical validation passed."
+            if reliability_passed
+            else "Historical validation requirements not met."
+        ),
+    }
