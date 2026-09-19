@@ -138,6 +138,7 @@ def expected_value_per_dollar(model_probability, american_odds):
     )
 
 
+
 def classify_nfl_market_edge(
     model_probability,
     market_probability,
@@ -146,54 +147,110 @@ def classify_nfl_market_edge(
     historical_sample=None,
 ):
     """
-    Conservative market-aware classification.
+    Classify an NFL moneyline opportunity using model
+    probability, market edge, expected value, and
+    historical validation.
 
-    BET requires:
-        - >= 65% model probability
-        - >= 3% model edge
-        - positive EV
-        - historical band accuracy >= 70% when available
-        - historical sample >= 25 when available
+    BET requirements:
+        Model probability >= 65%
+        Model edge >= 3 percentage points
+        Positive expected value
+        Historical accuracy >= 70%
+        Historical sample >= 25 games
 
-    LEAN requires:
-        - >= 60% model probability
-        - >= 1% model edge
-        - positive EV
+    LEAN requirements:
+        Model probability >= 60%
+        Model edge >= 1 percentage point
+        Positive expected value
 
     Otherwise PASS.
     """
+
+    # -----------------------------------------
+    # 1. Convert and validate inputs
+    # -----------------------------------------
+
     model_probability = float(model_probability)
     market_probability = float(market_probability)
+    american_odds = float(american_odds)
+
+    if not 0.0 <= model_probability <= 1.0:
+        raise ValueError(
+            "Model probability must be between 0 and 1."
+        )
+
+    if not 0.0 <= market_probability <= 1.0:
+        raise ValueError(
+            "Market probability must be between 0 and 1."
+        )
+
+    if not (
+        american_odds <= -100
+        or american_odds >= 100
+    ):
+        raise ValueError(
+            "Invalid American moneyline odds."
+        )
+
+    # -----------------------------------------
+    # 2. Calculate model edge
+    # -----------------------------------------
 
     edge = model_probability - market_probability
+
+    # -----------------------------------------
+    # 3. Calculate expected value
+    # -----------------------------------------
 
     ev = expected_value_per_dollar(
         model_probability,
         american_odds,
     )
 
-    
-history_ok = False
+    # -----------------------------------------
+    # 4. Validate historical performance
+    # -----------------------------------------
 
-if historical_accuracy is not None and historical_sample is not None:
-    history_ok = (
-        float(historical_accuracy) >= 0.70
-        and int(historical_sample) >= 25
-    )
-  
-    
+    history_ok = False
+
+    if (
+        historical_accuracy is not None
+        and historical_sample is not None
+    ):
+        historical_accuracy = float(
+            historical_accuracy
+        )
+
+        historical_sample = int(
+            historical_sample
+        )
+
+        history_ok = (
+            historical_accuracy >= 0.70
+            and historical_sample >= 25
+        )
+
+    # -----------------------------------------
+    # 5. Classify opportunity
+    # -----------------------------------------
+
+    decision = "PASS"
+
     reason = "No classification reason provided."
-    
+
     if (
         model_probability >= 0.65
         and edge >= 0.03
         and ev > 0
         and history_ok
     ):
+
         decision = "BET"
+
         reason = (
-            "Model confidence, market edge, expected value, "
-            "and historical validation passed BET thresholds."
+            "Model confidence, market edge, "
+            "expected value, and historical "
+            "validation passed BET thresholds."
         )
 
     elif (
@@ -201,51 +258,55 @@ if historical_accuracy is not None and historical_sample is not None:
         and edge >= 0.01
         and ev > 0
     ):
+
         decision = "LEAN"
+
         reason = (
-            "Positive market edge exists, but the opportunity "
+            "Positive model edge and expected "
+            "value exist, but the opportunity "
             "did not pass every BET threshold."
         )
 
     else:
+
         decision = "PASS"
-    
+
         reasons = []
-    
+
         if model_probability < 0.60:
             reasons.append(
                 "Model win probability is below "
                 "the 60% minimum for LEAN."
             )
-    
+
         if edge < 0.01:
             reasons.append(
                 "Model edge is below the "
-                "1% minimum for LEAN."
+                "1 percentage point minimum."
             )
-    
+
         if ev <= 0:
             reasons.append(
                 "Expected value is not positive."
             )
-    
-        if not reasons:
-            reasons.append(
-                "Opportunity did not satisfy "
-                "the current decision requirements."
-            )
-        
-        if decision == "PASS":
-            reason = " ".join(reasons)   
+
+        if reasons:
+            reason = " ".join(reasons)
+
+    # -----------------------------------------
+    # 6. Return classification results
+    # -----------------------------------------
 
     return {
         "decision": decision,
+        "reason": reason,
         "model_probability": model_probability,
         "market_probability": market_probability,
         "edge": edge,
         "expected_value": ev,
-        "american_odds": float(american_odds),
+        "ev": ev,
+        "american_odds": american_odds,
         "historical_accuracy": historical_accuracy,
         "historical_sample": historical_sample,
-        "reason": reason,
+        "history_ok": history_ok,
     }
