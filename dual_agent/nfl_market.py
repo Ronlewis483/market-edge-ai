@@ -172,18 +172,15 @@ def classify_nfl_market_edge(
         american_odds,
     )
 
-    history_ok = True
+    
+history_ok = False
 
-    if historical_accuracy is not None:
-        history_ok = history_ok and (
-            float(historical_accuracy) >= 0.70
-        )
-
-    if historical_sample is not None:
-        history_ok = history_ok and (
-            int(historical_sample) >= 25
-        )
-
+if historical_accuracy is not None and historical_sample is not None:
+    history_ok = (
+        float(historical_accuracy) >= 0.70
+        and int(historical_sample) >= 25
+    )
+  
     
     reason = "No classification reason provided."
     
