@@ -2161,8 +2161,9 @@ else:
 
             best_lines_df = pd.DataFrame(best_lines)
 
-            st.session_state["best_nfl_moneylines"] = (
+            st.session_state["nfl_best_lines"] = (
                 best_lines_df
+
             )
 
             st.success(
