@@ -207,44 +207,44 @@ def classify_nfl_market_edge(
             "did not pass every BET threshold."
         )
 
-else:
-    decision = "PASS"
-
-    reasons = []
-
-    if model_probability < 0.60:
-        reasons.append(
-            "Model win probability is below "
-            "the 60% minimum for LEAN."
-        )
-
-    if edge < 0.01:
-        reasons.append(
-            "Model edge is below the "
-            "1% minimum for LEAN."
-        )
-
-    if ev <= 0:
-        reasons.append(
-            "Expected value is not positive."
-        )
-
-    if not reasons:
-        reasons.append(
-            "Opportunity did not satisfy "
-            "the current decision requirements."
-        )
-
-    reason = " ".join(reasons)
-
-    return {
-        "decision": decision,
-        "model_probability": model_probability,
-        "market_probability": market_probability,
-        "edge": edge,
-        "expected_value": ev,
-        "american_odds": float(american_odds),
-        "historical_accuracy": historical_accuracy,
-        "historical_sample": historical_sample,
-        "reason": reason,
-    }
+    else:
+        decision = "PASS"
+    
+        reasons = []
+    
+        if model_probability < 0.60:
+            reasons.append(
+                "Model win probability is below "
+                "the 60% minimum for LEAN."
+            )
+    
+        if edge < 0.01:
+            reasons.append(
+                "Model edge is below the "
+                "1% minimum for LEAN."
+            )
+    
+        if ev <= 0:
+            reasons.append(
+                "Expected value is not positive."
+            )
+    
+        if not reasons:
+            reasons.append(
+                "Opportunity did not satisfy "
+                "the current decision requirements."
+            )
+    
+        reason = " ".join(reasons)
+    
+        return {
+            "decision": decision,
+            "model_probability": model_probability,
+            "market_probability": market_probability,
+            "edge": edge,
+            "expected_value": ev,
+            "american_odds": float(american_odds),
+            "historical_accuracy": historical_accuracy,
+            "historical_sample": historical_sample,
+            "reason": reason,
+        }
