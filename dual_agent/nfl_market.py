@@ -184,6 +184,9 @@ def classify_nfl_market_edge(
             int(historical_sample) >= 25
         )
 
+    
+    reason = "No classification reason provided."
+    
     if (
         model_probability >= 0.65
         and edge >= 0.03
