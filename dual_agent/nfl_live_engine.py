@@ -51,6 +51,14 @@ def build_live_nfl_opportunities(
             "Model predictions are missing required columns: "
             + ", ".join(sorted(missing))
         )
+    
+    # Keep one model prediction per matchup.
+    # If multiple predictions exist for the same game,
+    # keep the most recent/final row.
+    predictions = predictions.drop_duplicates(
+        subset=["home_team", "away_team"],
+        keep="last",
+    ).copy()
 
     merged = lines.merge(
         predictions[
