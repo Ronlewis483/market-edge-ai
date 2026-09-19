@@ -9,6 +9,8 @@ from dual_agent.nfl_market import (
 def build_live_nfl_opportunities(
     model_predictions,
     best_lines,
+    historical_accuracy=None,
+    historical_sample=None,
 ):
     """
     Join NFL model predictions to the best available sportsbook
@@ -88,6 +90,7 @@ def build_live_nfl_opportunities(
             ),
         )
 
+        
         classification = classify_nfl_market_edge(
             model_probability=float(
                 market_result["best_model_probability"]
@@ -98,6 +101,8 @@ def build_live_nfl_opportunities(
             american_odds=float(
                 market_result["best_odds"]
             ),
+            historical_accuracy=historical_accuracy,
+            historical_sample=historical_sample,
         )
         opportunities.append(
             {
