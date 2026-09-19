@@ -296,23 +296,24 @@ def classify_nfl_market_edge(
         and reliability_ok
     )
     
-        # Evaluate BET qualification
-        bet_probability_ok = (
-            model_probability >= MIN_BET_PROBABILITY
-        )
-    
-        bet_edge_ok = edge >= MIN_BET_EDGE
-    
-        bet_ev_ok = ev > MIN_BET_EV
-    
-        bet_qualified = (
-            bet_probability_ok
-            and bet_edge_ok
-            and bet_ev_ok
-            and history_ok
-        )
 
-        # Evaluate LEAN qualification
+    # Evaluate BET qualification
+    bet_probability_ok = (
+        model_probability >= MIN_BET_PROBABILITY
+    )
+
+    bet_edge_ok = edge >= MIN_BET_EDGE
+
+    bet_ev_ok = ev > MIN_BET_EV
+
+    bet_qualified = (
+        bet_probability_ok
+        and bet_edge_ok
+        and bet_ev_ok
+        and history_ok
+    )
+
+    # Evaluate LEAN qualification
     lean_qualified = (
         model_probability >= MIN_LEAN_PROBABILITY
         and edge >= MIN_LEAN_EDGE
