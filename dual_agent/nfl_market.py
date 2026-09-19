@@ -230,42 +230,98 @@ def classify_nfl_market_edge(
             and historical_sample >= 25
         )
 
-    # -----------------------------------------
+
+    # ------------------------------------------
     # 5. Classify opportunity
-    # -----------------------------------------
+    # ------------------------------------------
 
     decision = "PASS"
-
     reason = "No classification reason provided."
 
+    # BET qualification thresholds
+    MIN_BET_PROBABILITY = 0.65
+    MIN_BET_EDGE = 0.03
+    MIN_BET_EV = 0.0
+
+    # Historical validation thresholds
+    MIN_HISTORICAL_ACCURACY = 0.70
+    MIN_HISTORICAL_SAMPLE = 25
+
+    # LEAN qualification thresholds
+    MIN_LEAN_PROBABILITY = 0.60
+    MIN_LEAN_EDGE = 0.01
+
+    # Validate historical performance
+    history_ok = False
+
     if (
-        model_probability >= 0.65
-        and edge >= 0.03
-        and ev > 0
-        and history_ok
+        historical_accuracy is not None
+        and historical_sample is not None
     ):
+        history_ok = (
+            historical_accuracy >= MIN_HISTORICAL_ACCURACY
+            and historical_sample >= MIN_HISTORICAL_SAMPLE
+        )
+
+    # Evaluate BET qualification
+    bet_probability_ok = (
+        model_probability >= MIN_BET_PROBABILITY
+    )
+
+    bet_edge_ok = edge >= MIN_BET_EDGE
+
+    bet_ev_ok = ev > MIN_BET_EV
+
+    bet_qualified = (
+        bet_probability_ok
+        and bet_edge_ok
+        and bet_ev_ok
+        and history_ok
+    )
+
+    # Evaluate LEAN qualification
+    lean_qualified = (
+        model_probability >= MIN_LEAN_PROBABILITY
+        and edge >= MIN_LEAN_EDGE
+        and ev > 0
+    )
+
+    # Final classification
+    if bet_qualified:
 
         decision = "BET"
 
         reason = (
-            "Model confidence, market edge, "
+            "Model probability, market edge, "
             "expected value, and historical "
             "validation passed BET thresholds."
         )
 
-    elif (
-        model_probability >= 0.60
-        and edge >= 0.01
-        and ev > 0
-    ):
+    elif lean_qualified:
 
         decision = "LEAN"
 
-        reason = (
-            "Positive model edge and expected "
-            "value exist, but the opportunity "
-            "did not pass every BET threshold."
-        )
+        reasons = []
+
+        if not bet_probability_ok:
+            reasons.append(
+                "Model probability is below "
+                "the 65% BET threshold."
+            )
+
+        if not bet_edge_ok:
+            reasons.append(
+                "Model edge is below "
+                "the 3 percentage point BET threshold."
+            )
+
+        if not history_ok:
+            reasons.append(
+                "Historical validation did not "
+                "meet BET requirements."
+            )
+
+        reason = " ".join(reasons)
 
     else:
 
@@ -273,16 +329,16 @@ def classify_nfl_market_edge(
 
         reasons = []
 
-        if model_probability < 0.60:
+        if model_probability < MIN_LEAN_PROBABILITY:
             reasons.append(
                 "Model win probability is below "
                 "the 60% minimum for LEAN."
             )
 
-        if edge < 0.01:
+        if edge < MIN_LEAN_EDGE:
             reasons.append(
-                "Model edge is below the "
-                "1 percentage point minimum."
+                "Model edge is below "
+                "the 1 percentage point minimum."
             )
 
         if ev <= 0:
@@ -290,8 +346,11 @@ def classify_nfl_market_edge(
                 "Expected value is not positive."
             )
 
-        if reasons:
-            reason = " ".join(reasons)
+        reason = (
+            " ".join(reasons)
+            if reasons
+            else "Opportunity did not meet classification requirements."
+        )
 
     # -----------------------------------------
     # 6. Return classification results
