@@ -464,8 +464,136 @@ def run_nfl_walkforward_model(
         "accuracy_vs_baseline": float(
             accuracy - baseline_accuracy
         ),
+        
         "predictions": predictions_df,
+        "probability_bands": analyze_nfl_probability_bands(
+            predictions_df
+        ),
     }
+
+def analyze_nfl_probability_bands(predictions_df):
+    """
+    Evaluate historical NFL prediction accuracy
+    across different model-confidence ranges.
+
+    Uses walk-forward predictions rather than
+    training-set predictions.
+    """
+
+    import pandas as pd
+    import numpy as np
+
+    if predictions_df is None or predictions_df.empty:
+        return pd.DataFrame()
+
+    df = predictions_df.copy()
+
+    required_columns = {
+        "probability",
+        "actual",
+        "correct",
+    }
+
+    missing = required_columns - set(df.columns)
+
+    if missing:
+        raise ValueError(
+            f"Missing prediction columns: {sorted(missing)}"
+        )
+
+    # Convert home-team probability into the
+    # probability of the model's selected winner.
+
+    df["model_confidence"] = np.maximum(
+        df["probability"],
+        1.0 - df["probability"],
+    )
+
+    # Assign each prediction to a confidence band.
+
+    bins = [
+        0.50,
+        0.60,
+        0.70,
+        0.80,
+        0.90,
+        1.000001,
+    ]
+
+    labels = [
+        "50-59%",
+        "60-69%",
+        "70-79%",
+        "80-89%",
+        "90-100%",
+    ]
+
+    df["confidence_band"] = pd.cut(
+        df["model_confidence"],
+        bins=bins,
+        labels=labels,
+        right=False,
+        include_lowest=True,
+    )
+
+    # Calculate historical performance.
+
+    results = (
+        df.groupby(
+            "confidence_band",
+            observed=False,
+        )
+        .agg(
+            total_predictions=("correct", "count"),
+            correct_predictions=("correct", "sum"),
+            average_confidence=("model_confidence", "mean"),
+            actual_win_rate=("correct", "mean"),
+        )
+        .reset_index()
+    )
+
+    # Compare predicted confidence with actual results.
+
+    results["calibration_gap"] = (
+        results["actual_win_rate"]
+        - results["average_confidence"]
+    )
+
+    # Calculate uncertainty around the observed win rate.
+    # Wilson 95% confidence interval.
+
+    n = results["total_predictions"].astype(float)
+    p = results["actual_win_rate"]
+    z = 1.96
+
+    denominator = 1 + z**2 / n.replace(0, np.nan)
+
+    center = (
+        p + z**2 / (2 * n.replace(0, np.nan))
+    ) / denominator
+
+    margin = (
+        z
+        * np.sqrt(
+            p * (1 - p) / n.replace(0, np.nan)
+            + z**2 / (4 * n.replace(0, np.nan)**2)
+        )
+        / denominator
+    )
+
+    results["win_rate_lower_95"] = center - margin
+    results["win_rate_upper_95"] = center + margin
+
+    # Remove bands without historical predictions.
+
+    results = results[
+        results["total_predictions"] > 0
+    ].copy()
+
+    return results
+
+
+
 
 def build_nfl_future_matchup_features(
     feature_games,
