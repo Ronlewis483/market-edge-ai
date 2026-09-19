@@ -81,9 +81,16 @@ def build_live_nfl_opportunities(
         )
 
         classification = classify_nfl_market_edge(
-            market_result
+            model_probability=float(
+                game["home_win_probability"]
+            ),
+            market_probability=float(
+                market_result["home_no_vig_probability"]
+            ),
+            american_odds=int(
+                game["best_home_moneyline"]
+            ),
         )
-
         opportunities.append(
             {
                 "commence_time": game["commence_time"],
