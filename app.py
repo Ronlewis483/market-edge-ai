@@ -2207,7 +2207,15 @@ if (
 ):
     if st.button("Analyze Live NFL Opportunities"):
 
+
         try:
+            if not st.session_state.get("nfl_walkforward_result"):
+                st.error(
+                    "Run NFL Walk-Forward Model before analyzing "
+                    "live opportunities. Historical validation is required."
+                )
+                st.stop()
+
             live_opportunities = build_live_nfl_opportunities(
                 model_predictions=st.session_state[
                     "nfl_calibration_predictions"
@@ -2215,7 +2223,15 @@ if (
                 best_lines=st.session_state[
                     "nfl_best_lines"
                 ],
+                historical_accuracy=st.session_state[
+                    "nfl_walkforward_result"
+                ].get("accuracy"),
+                historical_sample=st.session_state[
+                    "nfl_walkforward_result"
+                ].get("prediction_count"),
             )
+
+            
 
             st.session_state[
                 "nfl_live_opportunities"
