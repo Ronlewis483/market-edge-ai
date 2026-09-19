@@ -1869,26 +1869,28 @@ if "nfl_walkforward_result" in st.session_state:
             hide_index=True,
         )
 
-    # Save raw calibration data for later decision-engine work.
-    # Save model predictions for later decision-engine/live-engine work.
-nfl_model_predictions = calibration_df.copy()
+# Save model predictions for later decision-engine/live-engine work.
+calibration_result = st.session_state.get(
+    "nfl_walkforward_result"
+)
 
-if (
-    "home_win_probability" not in nfl_model_predictions.columns
-    and "probability" in nfl_model_predictions.columns
-):
-    nfl_model_predictions["home_win_probability"] = (
-        nfl_model_predictions["probability"]
-    )
+if calibration_result is not None:
+    nfl_model_predictions = calibration_result[
+        "predictions"
+    ].copy()
 
-st.session_state[
-    "nfl_calibration_predictions"
-] = nfl_model_predictions
-   
-st.session_state[
-    "nfl_calibration_summary"
-] = calibration_summary
+    if (
+        "home_win_probability" not in nfl_model_predictions.columns
+        and "probability" in nfl_model_predictions.columns
+    ):
+        nfl_model_predictions["home_win_probability"] = (
+            nfl_model_predictions["probability"]
+        )
 
+    st.session_state[
+        "nfl_calibration_predictions"
+    ] = nfl_model_predictions
+    
 # ---------------------------------------------------------
 # NFL DECISION ENGINE
 # ---------------------------------------------------------
