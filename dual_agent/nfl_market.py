@@ -237,14 +237,15 @@ def classify_nfl_market_edge(
     
             reason = " ".join(reasons)
     
-        return {
-            "decision": decision,
-            "model_probability": model_probability,
-            "market_probability": market_probability,
-            "edge": edge,
-            "expected_value": ev,
-            "american_odds": float(american_odds),
-            "historical_accuracy": historical_accuracy,
-            "historical_sample": historical_sample,
-            "reason": reason,
-        }
+
+    return {
+        "decision": decision,
+        "model_probability": model_probability,
+        "market_probability": market_probability,
+        "edge": edge,
+        "expected_value": ev,
+        "american_odds": float(american_odds),
+        "historical_accuracy": historical_accuracy,
+        "historical_sample": historical_sample,
+        "reason": reason,
+    }
