@@ -1803,6 +1803,17 @@ if "nfl_walkforward_result" in st.session_state:
         - calibration_summary["avg_confidence"]
     )
 
+
+    # ------------------------------------------
+    # Store NFL historical confidence calibration
+    # for use by the live opportunity engine.
+    # ------------------------------------------
+
+    st.session_state["nfl_calibration_summary"] = (
+        calibration_summary.copy()
+    )
+    
+
     display_calibration = calibration_summary.copy()
 
     display_calibration["Average Confidence"] = (
