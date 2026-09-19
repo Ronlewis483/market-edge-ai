@@ -90,13 +90,13 @@ def build_live_nfl_opportunities(
 
         classification = classify_nfl_market_edge(
             model_probability=float(
-                game["home_win_probability"]
+                market_result["best_model_probability"]
             ),
             market_probability=float(
-                market_result["home_no_vig_probability"]
+                market_result["best_market_probability"]
             ),
-            american_odds=int(
-                game["best_home_moneyline"]
+            american_odds=float(
+                market_result["best_odds"]
             ),
         )
         opportunities.append(
@@ -120,16 +120,16 @@ def build_live_nfl_opportunities(
                 "best_away_sportsbook":
                     game["best_away_sportsbook"],
 
-                "best_side": "home",
+                 "best_side": market_result["best_side"].lower(),
                 
                 "model_probability":
-                    classification["model_probability"],
+                    market_result["best_model_probability"],
                 
                 "market_no_vig_probability":
-                    classification["market_probability"],
+                    market_result["best_market_probability"],
                 
                 "model_edge":
-                    classification["edge"],
+                    market_result["best_edge"],
                 
                 "expected_value":
                     classification["expected_value"],
