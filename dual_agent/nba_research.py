@@ -2275,6 +2275,281 @@ def predict_balldontlie_matchup(feature_games, matchup_features):
         "feature_count": len(feature_columns),
         "training_games": len(train_df),
     }
+
+
+# ============================================================
+# LIVE NBA MODEL - HISTORICAL VALIDATION
+# ============================================================
+
+def validate_live_nba_model(
+    historical_games,
+    feature_games,
+    minimum_training_games=500,
+    test_games=100,
+):
+    """
+    Test the live NBA prediction model against completed games.
+
+    Each prediction uses only historical information available
+    before the game being tested.
+
+    Returns historical accuracy, probability calibration,
+    and individual game predictions.
+    """
+
+    if historical_games is None or historical_games.empty:
+        raise ValueError("No historical NBA games supplied.")
+
+    if feature_games is None or feature_games.empty:
+        raise ValueError("No historical NBA features supplied.")
+
+    games = historical_games.copy()
+
+    games["game_date"] = pd.to_datetime(
+        games["game_date"],
+        errors="coerce",
+    )
+
+    games = games.dropna(
+        subset=[
+            "game_date",
+            "home_team",
+            "away_team",
+            "home_points",
+            "away_points",
+        ]
+    )
+
+    games = games.sort_values(
+        ["game_date", "game_id"]
+    ).reset_index(drop=True)
+
+    if test_games < 1:
+        raise ValueError("test_games must be at least 1.")
+
+    results = []
+    skipped_games = []
+
+    # Test the most recent completed games.
+    test_set = games.tail(test_games)
+
+    for _, game in test_set.iterrows():
+
+        game_date = game["game_date"]
+        home_team = game["home_team"]
+        away_team = game["away_team"]
+
+        # Exclude the game being tested and all later games.
+        past_games = games[
+            games["game_date"] < game_date
+        ].copy()
+
+        past_features = feature_games.copy()
+
+        past_features["game_date"] = pd.to_datetime(
+            past_features["game_date"],
+            errors="coerce",
+        )
+
+        past_features = past_features[
+            past_features["game_date"] < game_date
+        ].copy()
+
+        if len(past_features) < minimum_training_games:
+            skipped_games.append({
+                "game_date": game_date,
+                "home_team": home_team,
+                "away_team": away_team,
+                "reason": "Insufficient training history",
+            })
+            continue
+
+        try:
+
+            # Build features using only earlier games.
+            matchup_features = (
+                build_balldontlie_future_matchup_features(
+                    past_games,
+                    home_team,
+                    away_team,
+                    game_date,
+                )
+            )
+
+            # Call the same model used by the live NBA center.
+            prediction = predict_balldontlie_matchup(
+                past_features,
+                matchup_features,
+            )
+
+            if prediction is None:
+                raise ValueError(
+                    "NBA prediction model returned None."
+                )
+
+            home_probability = float(
+                prediction["home_win_probability"]
+            )
+
+            if not np.isfinite(home_probability):
+                raise ValueError(
+                    "Model returned an invalid probability."
+                )
+
+            if not 0 <= home_probability <= 1:
+                raise ValueError(
+                    "Model probability is outside 0-1."
+                )
+
+            predicted_home_win = int(
+                home_probability >= 0.50
+            )
+
+            actual_home_win = int(
+                game["home_points"] > game["away_points"]
+            )
+
+            predicted_probability = max(
+                home_probability,
+                1.0 - home_probability,
+            )
+
+            correct = int(
+                predicted_home_win == actual_home_win
+            )
+
+            results.append({
+                "game_date": game_date,
+                "home_team": home_team,
+                "away_team": away_team,
+                "home_win_probability": home_probability,
+                "predicted_probability": predicted_probability,
+                "predicted_side": (
+                    "HOME" if predicted_home_win else "AWAY"
+                ),
+                "actual_home_win": actual_home_win,
+                "correct": correct,
+                "training_games": prediction["training_games"],
+            })
+
+        except Exception as error:
+
+            skipped_games.append({
+                "game_date": game_date,
+                "home_team": home_team,
+                "away_team": away_team,
+                "reason": str(error),
+            })
+
+    predictions_df = pd.DataFrame(results)
+
+    skipped_df = pd.DataFrame(skipped_games)
+
+    if predictions_df.empty:
+        raise ValueError(
+            "Historical validation produced no predictions. "
+            "Check the historical data and skipped games."
+        )
+
+    # ========================================================
+    # PERFORMANCE METRICS
+    # ========================================================
+
+    actual = predictions_df[
+        "actual_home_win"
+    ].astype(int)
+
+    probabilities = predictions_df[
+        "home_win_probability"
+    ].astype(float)
+
+    accuracy = float(
+        predictions_df["correct"].mean()
+    )
+
+    brier = float(
+        brier_score_loss(
+            actual,
+            probabilities,
+        )
+    )
+
+    logloss = float(
+        log_loss(
+            actual,
+            probabilities,
+            labels=[0, 1],
+        )
+    )
+
+    # ========================================================
+    # CONFIDENCE ANALYSIS
+    # ========================================================
+
+    confidence_bands = [
+        (0.50, 0.60),
+        (0.60, 0.70),
+        (0.70, 0.80),
+        (0.80, 0.90),
+        (0.90, 1.01),
+    ]
+
+    confidence_results = []
+
+    for lower, upper in confidence_bands:
+
+        sample = predictions_df[
+            (
+                predictions_df["predicted_probability"]
+                >= lower
+            )
+            &
+            (
+                predictions_df["predicted_probability"]
+                < upper
+            )
+        ]
+
+        if sample.empty:
+            continue
+
+        confidence_results.append({
+            "confidence_band": (
+                f"{lower:.0%}-{min(upper, 1.0):.0%}"
+            ),
+            "games": len(sample),
+            "average_probability": float(
+                sample["predicted_probability"].mean()
+            ),
+            "actual_accuracy": float(
+                sample["correct"].mean()
+            ),
+        })
+
+    confidence_df = pd.DataFrame(
+        confidence_results
+    )
+
+    # ========================================================
+    # RETURN VALIDATION RESULTS
+    # ========================================================
+
+    return {
+        "games_tested": len(predictions_df),
+        "games_skipped": len(skipped_df),
+        "accuracy": accuracy,
+        "brier_score": brier,
+        "log_loss": logloss,
+        "predictions": predictions_df,
+        "confidence": confidence_df,
+        "skipped_games": skipped_df,
+    }
+
+
+# ============================================================
+# END LIVE NBA MODEL VALIDATION
+# ============================================================
+
    
 # ============================================================
 # SPORTSBOOK ODDS UTILITIES
