@@ -2303,6 +2303,49 @@ def validate_live_nba_model(
     if feature_games is None or feature_games.empty:
         raise ValueError("No historical NBA features supplied.")
 
+
+
+    # ==========================================
+    # EXCLUDE FUTURE AND UNFINISHED NBA GAMES
+    # ==========================================
+
+    historical_games = historical_games.copy()
+
+    historical_games["game_date"] = pd.to_datetime(
+        historical_games["game_date"],
+        errors="coerce",
+        utc=True,
+    )
+
+    today = pd.Timestamp.now(tz="UTC")
+
+    historical_games["home_points"] = pd.to_numeric(
+        historical_games["home_points"],
+        errors="coerce",
+    )
+
+    historical_games["away_points"] = pd.to_numeric(
+        historical_games["away_points"],
+        errors="coerce",
+    )
+
+    historical_games = historical_games[
+        (historical_games["game_date"] < today)
+        & historical_games["home_points"].notna()
+        & historical_games["away_points"].notna()
+        & (
+            historical_games["home_points"]
+            != historical_games["away_points"]
+        )
+    ].copy()
+
+    if historical_games.empty:
+        raise ValueError(
+            "No completed historical NBA games "
+            "with valid final scores are available."
+        )
+    
+
     games = historical_games.copy()
 
     games["game_date"] = pd.to_datetime(
