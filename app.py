@@ -282,15 +282,69 @@ if page=="Command Center":
         "and potential wager payouts."
     )
 
-    nba_home = st.text_input(
+    
+    # ==========================================
+    # NBA TEAM SELECTION
+    # ==========================================
+
+    NBA_TEAMS = [
+        "Atlanta Hawks",
+        "Boston Celtics",
+        "Brooklyn Nets",
+        "Charlotte Hornets",
+        "Chicago Bulls",
+        "Cleveland Cavaliers",
+        "Dallas Mavericks",
+        "Denver Nuggets",
+        "Detroit Pistons",
+        "Golden State Warriors",
+        "Houston Rockets",
+        "Indiana Pacers",
+        "Los Angeles Clippers",
+        "Los Angeles Lakers",
+        "Memphis Grizzlies",
+        "Miami Heat",
+        "Milwaukee Bucks",
+        "Minnesota Timberwolves",
+        "New Orleans Pelicans",
+        "New York Knicks",
+        "Oklahoma City Thunder",
+        "Orlando Magic",
+        "Philadelphia 76ers",
+        "Phoenix Suns",
+        "Portland Trail Blazers",
+        "Sacramento Kings",
+        "San Antonio Spurs",
+        "Toronto Raptors",
+        "Utah Jazz",
+        "Washington Wizards",
+    ]
+
+    nba_home = st.selectbox(
         "Home Team",
-        key="nba_home_team"
+        NBA_TEAMS,
+        index=None,
+        placeholder="Select the home team",
+        key="nba_home_team",
     )
 
-    nba_away = st.text_input(
+    nba_away = st.selectbox(
         "Away Team",
-        key="nba_away_team"
+        NBA_TEAMS,
+        index=None,
+        placeholder="Select the away team",
+        key="nba_away_team",
     )
+
+    if nba_home and nba_away:
+        if nba_home == nba_away:
+            st.error(
+                "The home and away teams must be different."
+            )
+        else:
+            st.info(
+                f"Selected Matchup: {nba_away} at {nba_home}"
+            )
 
     nba_wager = st.number_input(
         "Wager Amount ($)",
