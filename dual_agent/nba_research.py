@@ -2394,6 +2394,19 @@ def validate_live_nba_model(
             errors="coerce",
         )
 
+        past_features["game_date"] = pd.to_datetime(
+            past_features["game_date"],
+            errors="coerce",
+            utc=True,
+        )
+        
+        game_date = pd.to_datetime(
+            game_date,
+            utc=True,
+        )
+
+        
+
         past_features = past_features[
             past_features["game_date"] < game_date
         ].copy()
