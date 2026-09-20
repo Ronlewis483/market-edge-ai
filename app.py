@@ -2278,6 +2278,31 @@ else:
 
 st.markdown("### 🧠 Live NFL Opportunity Engine")
 
+
+st.write("NFL ENGINE DIAGNOSTICS")
+
+st.write(
+    "Best lines loaded:",
+    "nfl_best_lines" in st.session_state
+)
+
+st.write(
+    "Calibration predictions loaded:",
+    "nfl_calibration_predictions" in st.session_state
+)
+
+st.write(
+    "Historical predictions loaded:",
+    "nfl_historical_predictions" in st.session_state
+)
+
+st.write(
+    "Walk-forward results loaded:",
+    "nfl_walkforward_result" in st.session_state
+)
+
+
+
 if (
     "nfl_best_lines" in st.session_state
     and "nfl_calibration_predictions" in st.session_state
