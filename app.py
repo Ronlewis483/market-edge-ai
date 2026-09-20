@@ -427,10 +427,35 @@ elif page == "My Bets":
     # Betting history
     # -----------------------------------
 
-    st.subheader("Your Betting History")
+    
+st.subheader("Your Betting History")
 
-    bets = get_all_bets()
+bets = get_all_bets()
 
+# Calculate the total payout for each bet.
+# Payout includes the returned original stake.
+
+for bet in bets:
+
+    wager_amount = float(bet.get("wager") or 0)
+    profit = float(bet.get("profit_loss") or 0)
+    status = bet.get("status")
+
+    if status == "Won":
+        bet["total_payout"] = round(
+            wager_amount + profit, 2
+        )
+
+    elif status == "Push":
+        bet["total_payout"] = round(
+            wager_amount, 2
+        )
+
+    elif status == "Lost":
+        bet["total_payout"] = 0.0
+
+    else:
+        bet["total_payout"] = None
     if not bets:
 
         st.info(
