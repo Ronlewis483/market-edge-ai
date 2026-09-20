@@ -638,14 +638,26 @@ for bet in bets:
 
 
 
-elif page=="Saved Model":
-    st.subheader("💾 Saved Validated Model")
-    st.success("This configuration is bundled with the app and survives Streamlit restarts.")
-    st.json(M)
-    st.write("Daily Command Center scans load this approved configuration automatically; they do not rerun the 90-symbol walk-forward experiment.")
 
-else:
-    st.subheader("🧪 Research Lab — Optional Revalidation")
+if page == "Saved Model":
+    st.subheader("💾 Saved Validated Model")
+
+    st.success(
+        "This configuration is bundled with the app "
+        "and survives Streamlit restarts."
+    )
+
+    st.json(M)
+
+    st.write(
+        "Daily Command Center scans load this approved "
+        "configuration automatically; they do not rerun "
+        "the 90-symbol walk-forward experiment."
+    )
+
+
+if page == "Research Lab":
+    st.subheader("🧪 Research Lab – Optional Revalidation")
 
     st.markdown("### 🏀 NBA Data Connection Test")
 
@@ -663,11 +675,6 @@ else:
 
     st.divider()
 
-
-    
-
-
-    st.divider()
 
 # ============================================================
 # MULTI-SEASON NBA VALIDATION
