@@ -614,6 +614,7 @@ elif page == "My Bets":
         # Update bet results
         # -----------------------------------
 
+
     # ==========================================
     # LOAD BETTING HISTORY
     # ==========================================
@@ -626,13 +627,12 @@ elif page == "My Bets":
 
     st.subheader("Update a Bet Result")
 
+    pending_bets = [
+        bet for bet in bets
+        if bet["status"] == "Pending"
+    ]
 
-pending_bets = [
-    bet for bet in bets
-    if bet["status"] == "Pending"
-]
-
-if pending_bets:
+    if pending_bets:
 
     bet_options = {
         (
