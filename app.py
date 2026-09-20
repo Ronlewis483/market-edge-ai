@@ -57,7 +57,13 @@ from dual_agent.nfl_live_engine import (
 )
 
 import streamlit as st
-from dual_agent.supabase_db import test_connection
+
+from dual_agent.supabase_db import (
+    test_connection,
+    save_bet,
+    get_all_bets,
+    update_bet_result,
+)
 
 st.set_page_config(page_title="Market Edge AI V5", page_icon="📊", layout="wide")
 from dual_agent.research import DEFAULT_UNIVERSE, latest_scan, run_research
@@ -262,6 +268,346 @@ if page=="Command Center":
         st.warning(sd["status"])
         st.caption(sd["reason"])
         st.code("PICK THIS TEAM / PICK THIS PLAYER PROP\nor\nNO QUALIFYING SPORTS PICK")
+
+
+
+elif page == "My Bets":
+
+    st.title("My Bets")
+    st.write(
+        "Record your wagers, track wins and losses, "
+        "and monitor your betting performance."
+    )
+
+    st.divider()
+
+    # -----------------------------------
+    # Record a new bet
+    # -----------------------------------
+
+    st.subheader("Record a New Bet")
+
+    with st.form("new_bet_form"):
+
+        sport = st.selectbox(
+            "Sport",
+            [
+                "NFL",
+                "NBA",
+                "College Football",
+                "MLB",
+                "Other",
+            ],
+        )
+
+        betting_market = st.selectbox(
+            "Betting Market",
+            [
+                "Game Winner",
+                "Player Points",
+                "Player Rebounds",
+                "Player Assists",
+                "Passing Yards",
+                "Rushing Yards",
+                "Receiving Yards",
+                "Three-Pointers",
+                "Other",
+            ],
+        )
+
+        player_name = st.text_input(
+            "Player Name (optional)"
+        )
+
+        team_name = st.text_input(
+            "Team Name (optional)"
+        )
+
+        bet_description = st.text_input(
+            "Describe Your Bet",
+            placeholder="Example: Player over 25.5 points",
+        )
+
+        bet_type = st.selectbox(
+            "Bet Direction",
+            [
+                "Over",
+                "Under",
+                "Moneyline",
+                "Spread",
+                "Other",
+            ],
+        )
+
+        betting_line = st.number_input(
+            "Betting Line",
+            value=0.0,
+            step=0.5,
+        )
+
+        odds = st.number_input(
+            "American Odds",
+            value=-110,
+            step=1,
+        )
+
+        wager = st.number_input(
+            "Amount Wagered ($)",
+            min_value=0.01,
+            value=10.00,
+            step=1.00,
+        )
+
+        sportsbook = st.text_input(
+            "Sportsbook (optional)"
+        )
+
+        notes = st.text_area(
+            "Notes (optional)"
+        )
+
+        submitted = st.form_submit_button(
+            "Save My Bet"
+        )
+
+    if submitted:
+
+        if not bet_description.strip():
+
+            st.error(
+                "Please enter a description of your bet."
+            )
+
+        elif abs(odds) < 100:
+
+            st.error(
+                "Enter valid American odds, "
+                "such as -110 or +150."
+            )
+
+        else:
+
+            bet_data = {
+                "sport": sport,
+                "betting_market": betting_market,
+                "player_name": player_name,
+                "team_name": team_name,
+                "bet_description": bet_description,
+                "bet_type": bet_type,
+                "betting_line": betting_line,
+                "odds": odds,
+                "wager": wager,
+                "status": "Pending",
+                "profit_loss": 0,
+                "sportsbook": sportsbook,
+                "strategy": betting_market,
+                "notes": notes,
+                "source": "Manual",
+            }
+
+            success, result = save_bet(
+                bet_data
+            )
+
+            if success:
+
+                st.success(
+                    "Your bet was saved successfully!"
+                )
+
+            else:
+
+                st.error(
+                    "Unable to save your bet."
+                )
+
+    st.divider()
+
+    # -----------------------------------
+    # Betting history
+    # -----------------------------------
+
+    st.subheader("Your Betting History")
+
+    bets = get_all_bets()
+
+    if not bets:
+
+        st.info(
+            "You haven't recorded any bets yet."
+        )
+
+    else:
+
+        st.dataframe(
+            bets,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.divider()
+
+        # -----------------------------------
+        # Betting performance
+        # -----------------------------------
+
+        st.subheader("Your Performance")
+
+        settled_bets = [
+            bet for bet in bets
+            if bet["status"] in ("Won", "Lost")
+        ]
+
+        wins = sum(
+            1 for bet in settled_bets
+            if bet["status"] == "Won"
+        )
+
+        losses = sum(
+            1 for bet in settled_bets
+            if bet["status"] == "Lost"
+        )
+
+        total_profit = sum(
+            float(bet.get("profit_loss") or 0)
+            for bet in bets
+        )
+
+        total_settled = wins + losses
+
+        win_rate = (
+            wins / total_settled * 100
+            if total_settled > 0
+            else 0
+        )
+
+        col1, col2, col3, col4 = st.columns(4)
+
+        col1.metric(
+            "Total Bets",
+            len(bets)
+        )
+
+        col2.metric(
+            "Wins",
+            wins
+        )
+
+        col3.metric(
+            "Losses",
+            losses
+        )
+
+        col4.metric(
+            "Win Rate",
+            f"{win_rate:.1f}%"
+        )
+
+        st.metric(
+            "Total Profit / Loss",
+            f"${total_profit:,.2f}"
+        )
+
+        st.divider()
+
+        # -----------------------------------
+        # Update bet results
+        # -----------------------------------
+
+        st.subheader("Update a Bet Result")
+
+        pending_bets = [
+            bet for bet in bets
+            if bet["status"] == "Pending"
+        ]
+
+        if pending_bets:
+
+            bet_options = {
+                (
+                    f"#{bet['id']} - "
+                    f"{bet['bet_description']}"
+                ): bet
+                for bet in pending_bets
+            }
+
+            selected_bet = st.selectbox(
+                "Select a Pending Bet",
+                list(bet_options.keys()),
+            )
+
+            selected_result = st.selectbox(
+                "What was the result?",
+                [
+                    "Won",
+                    "Lost",
+                    "Push",
+                ],
+            )
+
+            if st.button("Save Bet Result"):
+
+                bet = bet_options[selected_bet]
+
+                wager_amount = float(
+                    bet["wager"]
+                )
+
+                american_odds = int(
+                    bet["odds"]
+                )
+
+                if selected_result == "Won":
+
+                    if american_odds > 0:
+
+                        profit_loss = (
+                            wager_amount
+                            * american_odds / 100
+                        )
+
+                    else:
+
+                        profit_loss = (
+                            wager_amount
+                            * 100 / abs(american_odds)
+                        )
+
+                elif selected_result == "Lost":
+
+                    profit_loss = -wager_amount
+
+                else:
+
+                    profit_loss = 0
+
+                success, result = update_bet_result(
+                    bet["id"],
+                    selected_result,
+                    round(profit_loss, 2),
+                )
+
+                if success:
+
+                    st.success(
+                        "Your betting result was updated!"
+                    )
+
+                    st.rerun()
+
+                else:
+
+                    st.error(
+                        "Unable to update your bet."
+                    )
+
+        else:
+
+            st.info(
+                "You have no pending bets to update."
+            )
+
+
 
 elif page=="Saved Model":
     st.subheader("💾 Saved Validated Model")
