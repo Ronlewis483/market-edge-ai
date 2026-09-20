@@ -2353,25 +2353,21 @@ if (
             
 
             
-                live_opportunities = build_live_nfl_opportunities(
-                    model_predictions=st.session_state[
-                        "nfl_calibration_predictions"
-                    ],
                 
-                    best_lines=st.session_state[
-                        "nfl_best_lines"
-                    ],
-                
-                    historical_accuracy=historical_result.get(
-                        "accuracy"
-                    ),
-                
-                    historical_sample=historical_result.get(
-                        "prediction_count"
-                    ),
-                )
-
-            
+            live_opportunities = build_live_nfl_opportunities(
+                model_predictions=st.session_state[
+                    "nfl_calibration_predictions"
+                ],
+                best_lines=st.session_state[
+                    "nfl_best_lines"
+                ],
+                historical_accuracy=historical_result.get(
+                    "accuracy"
+                ),
+                historical_sample=historical_result.get(
+                    "prediction_count"
+                ),
+            )
 
             st.session_state[
                 "nfl_live_opportunities"
