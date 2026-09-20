@@ -270,6 +270,109 @@ if page=="Command Center":
         st.code("PICK THIS TEAM / PICK THIS PLAYER PROP\nor\nNO QUALIFYING SPORTS PICK")
 
 
+    # ==========================================
+    # NBA PREDICTION CENTER
+    # ==========================================
+
+    st.divider()
+    st.subheader("🏀 NBA Prediction Center")
+
+    st.caption(
+        "NBA game predictions, sportsbook comparison, "
+        "and potential wager payouts."
+    )
+
+    nba_home = st.text_input(
+        "Home Team",
+        key="nba_home_team"
+    )
+
+    nba_away = st.text_input(
+        "Away Team",
+        key="nba_away_team"
+    )
+
+    nba_wager = st.number_input(
+        "Wager Amount ($)",
+        min_value=1.0,
+        value=100.0,
+        step=10.0,
+        key="nba_wager"
+    )
+
+    nba_odds = st.number_input(
+        "American Odds",
+        value=-110,
+        step=5,
+        key="nba_odds"
+    )
+
+    if st.button(
+        "Generate NBA Prediction",
+        key="generate_nba_prediction"
+    ):
+
+        st.info(
+            "NBA prediction inputs are ready. "
+            "Historical game features and upcoming matchup "
+            "features must be connected before predictions "
+            "can be generated."
+        )
+
+        st.write(
+            f"Matchup: {nba_away} at {nba_home}"
+        )
+
+        st.write(
+            f"Wager: ${nba_wager:,.2f}"
+        )
+
+        if nba_odds > 0:
+
+            nba_profit = (
+                nba_wager * nba_odds / 100
+            )
+
+        elif nba_odds < 0:
+
+            nba_profit = (
+                nba_wager * 100 / abs(nba_odds)
+            )
+
+        else:
+
+            nba_profit = 0.0
+
+        nba_total_payout = (
+            nba_wager + nba_profit
+        )
+
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            st.metric(
+                "Wager",
+                f"${nba_wager:,.2f}"
+            )
+
+        with col2:
+            st.metric(
+                "Potential Profit",
+                f"${nba_profit:,.2f}"
+            )
+
+        with col3:
+            st.metric(
+                "Total Payout",
+                f"${nba_total_payout:,.2f}"
+            )
+
+        st.caption(
+            "Payout assumes the selected wager wins. "
+            "The original stake is included in total payout."
+        )
+
+
 
 elif page == "My Bets":
 
