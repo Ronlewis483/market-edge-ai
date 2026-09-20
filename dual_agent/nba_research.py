@@ -2229,52 +2229,52 @@ def predict_balldontlie_matchup(feature_games, matchup_features):
 
         
     
-        X_train = train_df[feature_columns]
-        y_train = train_df["home_win"].astype(int)
-    
-        X_future = future[feature_columns]
-    
-        model = Pipeline(
-            [
-                ("scaler", StandardScaler()),
-                (
-                    "model",
-                    LogisticRegression(
-                        max_iter=2000,
-                        random_state=42,
-                    ),
+    X_train = train_df[feature_columns]
+    y_train = train_df["home_win"].astype(int)
+
+    X_future = future[feature_columns]
+
+    model = Pipeline(
+        [
+            ("scaler", StandardScaler()),
+            (
+                "model",
+                LogisticRegression(
+                    max_iter=2000,
+                    random_state=42,
                 ),
-            ]
-        )
-    
-        model.fit(X_train, y_train)
-    
-        home_probability = float(
-            model.predict_proba(X_future)[0][1]
-        )
-    
-        away_probability = 1.0 - home_probability
-    
-        predicted_side = (
-            "HOME"
-            if home_probability >= 0.50
-            else "AWAY"
-        )
-    
-        confidence = max(
-            home_probability,
-            away_probability,
-        )
-    
-        return {
-            "home_win_probability": home_probability,
-            "away_win_probability": away_probability,
-            "predicted_side": predicted_side,
-            "confidence": confidence,
-            "feature_columns": feature_columns,
-            "feature_count": len(feature_columns),
-            "training_games": len(train_df),
-        }
+            ),
+        ]
+    )
+
+    model.fit(X_train, y_train)
+
+    home_probability = float(
+        model.predict_proba(X_future)[0][1]
+    )
+
+    away_probability = 1.0 - home_probability
+
+    predicted_side = (
+        "HOME"
+        if home_probability >= 0.50
+        else "AWAY"
+    )
+
+    confidence = max(
+        home_probability,
+        away_probability,
+    )
+
+    return {
+        "home_win_probability": home_probability,
+        "away_win_probability": away_probability,
+        "predicted_side": predicted_side,
+        "confidence": confidence,
+        "feature_columns": feature_columns,
+        "feature_count": len(feature_columns),
+        "training_games": len(train_df),
+    }
    
 # ============================================================
 # SPORTSBOOK ODDS UTILITIES
