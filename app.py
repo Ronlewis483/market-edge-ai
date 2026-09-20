@@ -71,14 +71,13 @@ with st.expander("Database Connection Status"):
     if st.button("Test Supabase Connection"):
         success, message = test_connection()
 
+        
         if success:
             st.success(message)
         else:
             st.error("Database connection failed.")
-            st.caption(
-                "Check your Supabase credentials, "
-                "database permissions, and bets table."
-            )
+            st.error(f"Error details: {message}")
+            
 st.caption("Persistent validated model • lightweight daily inference • research/paper mode")
 
 with st.sidebar:
