@@ -1073,19 +1073,18 @@ if page=="Command Center":
 
                             })
 
-                except Exception as game_error:
 
-                    st.warning(
-                        f"Could not analyze "
-                        f"{away_team} at {home_team}: "
-                        f"{game_error}"
-                    )
-                    
-            st.exception(game_error)
-
-                progress.progress(
-                    game_number / total_games
+            except Exception as game_error:
+                st.warning(
+                    f"Could not analyze "
+                    f"{away_team} at {home_team}: "
+                    f"{game_error}"
                 )
+                st.exception(game_error)
+
+            progress.progress(
+                game_number / total_games
+            )
 
             # ======================================
             # DISPLAY AUTOMATIC PREDICTIONS
