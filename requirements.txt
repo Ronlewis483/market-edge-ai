@@ -6,3 +6,4 @@ requests>=2.32
 joblib>=1.4
 alpaca-py>=0.42
 nba_api==1.11.4
+supabase
