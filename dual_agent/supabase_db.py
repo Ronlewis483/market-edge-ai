@@ -30,3 +30,60 @@ def test_connection():
 
     except Exception as e:
         return False, str(e)
+
+
+def save_bet(bet_data):
+    """Save a new bet to Supabase."""
+    try:
+        client = get_supabase_client()
+
+        response = (
+            client.table("bets")
+            .insert(bet_data)
+            .execute()
+        )
+
+        return True, response.data
+
+    except Exception as e:
+        return False, str(e)
+
+
+def get_all_bets():
+    """Retrieve saved bets, newest first."""
+    try:
+        client = get_supabase_client()
+
+        response = (
+            client.table("bets")
+            .select("*")
+            .order("created_at", desc=True)
+            .execute()
+        )
+
+        return response.data
+
+    except Exception as e:
+        st.error(f"Unable to load betting history: {e}")
+        return []
+
+
+def update_bet_result(bet_id, status, profit_loss):
+    """Record the final result of a bet."""
+    try:
+        client = get_supabase_client()
+
+        response = (
+            client.table("bets")
+            .update({
+                "status": status,
+                "profit_loss": profit_loss,
+            })
+            .eq("id", bet_id)
+            .execute()
+        )
+
+        return True, response.data
+
+    except Exception as e:
+        return False, str(e)
