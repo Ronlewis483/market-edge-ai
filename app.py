@@ -361,18 +361,34 @@ if page=="Command Center":
         key="nba_odds"
     )
 
+    
     if st.button(
         "Generate NBA Prediction",
         key="generate_nba_prediction"
     ):
 
-        st.info(
-            "NBA prediction inputs are ready. "
-            "Historical game features and upcoming matchup "
-            "features must be connected before predictions "
-            "can be generated."
-        )
+        if not nba_home.strip() or not nba_away.strip():
 
+            st.warning(
+                "Please enter both NBA teams before "
+                "generating a prediction."
+            )
+
+        elif nba_home.strip().lower() == nba_away.strip().lower():
+
+            st.warning(
+                "Home and away teams must be different."
+            )
+
+        else:
+
+            st.info(
+                "Matchup selected: "
+                f"{nba_away} at {nba_home}. "
+                "Connecting historical NBA data and "
+                "upcoming matchup features is required "
+                "before the prediction model can run."
+            )
         st.write(
             f"Matchup: {nba_away} at {nba_home}"
         )
