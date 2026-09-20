@@ -67,11 +67,138 @@ st.title("📊 Market Edge AI — V5")
 st.caption("Persistent validated model • lightweight daily inference • research/paper mode")
 
 with st.sidebar:
-    page=st.radio("Navigation",["Command Center","Saved Model","Research Lab"])
+    page = st.radio(
+        "Navigation",
+        [
+            "Command Center",
+            "Sports Betting Center",
+            "My Bets",
+            "Strategy Tracker",
+            "Saved Model",
+            "Research Lab",
+        ],
+    )
     st.success("Persistence enabled")
     st.caption("Validated configuration loads automatically. Daily use does not require walk-forward retraining.")
 
 default=clean_symbols(DEFAULT_UNIVERSE)
+
+
+if page == "Sports Betting Center":
+
+    st.title("🏈 Sports Betting Center")
+
+    st.write(
+        "Find opportunities, review predictions, "
+        "and track your betting performance."
+    )
+
+    st.divider()
+
+    # Dashboard summary
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    with col1:
+        st.metric(
+            "Today's Opportunities",
+            "—"
+        )
+
+    with col2:
+        st.metric(
+            "My Win Rate",
+            "—"
+        )
+
+    with col3:
+        st.metric(
+            "Total Profit / Loss",
+            "—"
+        )
+
+    with col4:
+        st.metric(
+            "Active Bets",
+            "—"
+        )
+
+    st.divider()
+
+    # Sports selection
+
+    st.subheader("Choose Your Sport")
+
+    sport = st.selectbox(
+        "Which sport would you like to analyze?",
+        [
+            "NFL Football",
+            "NBA Basketball",
+            "College Football",
+            "MLB Baseball",
+            "Other Sports",
+        ],
+    )
+
+    st.divider()
+
+    # Betting market selection
+
+    st.subheader("Choose Your Betting Market")
+
+    market = st.selectbox(
+        "What type of bet are you interested in?",
+        [
+            "Game Winner",
+            "Player Points",
+            "Player Rebounds",
+            "Player Assists",
+            "Player Passing Yards",
+            "Player Rushing Yards",
+            "Player Receiving Yards",
+            "Game Total Points",
+            "Point Spread",
+            "Other",
+        ],
+    )
+
+    st.divider()
+
+    # Prediction area
+
+    st.subheader("Today's Betting Opportunities")
+
+    st.info(
+        f"Selected sport: {sport}\n\n"
+        f"Selected betting market: {market}"
+    )
+
+    st.write(
+        "Your available predictions and betting "
+        "opportunities will appear here."
+    )
+
+    st.caption(
+        "Predictions are estimates, not guaranteed outcomes. "
+        "Historical performance and current odds should be "
+        "reviewed before placing a wager."
+    )
+
+    st.divider()
+
+    # Strategy section
+
+    st.subheader("Strategy Performance")
+
+    st.write(
+        "Track how different betting strategies "
+        "perform over time."
+    )
+
+    st.info(
+        "Strategy performance will appear here "
+        "after your betting history is connected."
+    )
 
 if page=="Command Center":
     st.success(f"VALIDATED MODEL LOADED — {M['target']} • {M['features']} • AUC {M['auc']:.3f}")
