@@ -511,98 +511,98 @@ elif page == "My Bets":
         # Update bet results
         # -----------------------------------
 
-        st.subheader("Update a Bet Result")
+st.subheader("Update a Bet Result")
 
-        pending_bets = [
-            bet for bet in bets
-            if bet["status"] == "Pending"
-        ]
+pending_bets = [
+    bet for bet in bets
+    if bet["status"] == "Pending"
+]
 
-        if pending_bets:
+if pending_bets:
 
-            bet_options = {
-                (
-                    f"#{bet['id']} - "
-                    f"{bet['bet_description']}"
-                ): bet
-                for bet in pending_bets
-            }
+    bet_options = {
+        (
+            f"#{bet['id']} - "
+            f"{bet['bet_description']}"
+        ): bet
+        for bet in pending_bets
+    }
 
-            selected_bet = st.selectbox(
-                "Select a Pending Bet",
-                list(bet_options.keys()),
-            )
+    selected_bet = st.selectbox(
+        "Select a Pending Bet",
+        list(bet_options.keys()),
+    )
 
-            selected_result = st.selectbox(
-                "What was the result?",
-                [
-                    "Won",
-                    "Lost",
-                    "Push",
-                ],
-            )
+    selected_result = st.selectbox(
+        "What was the result?",
+        [
+            "Won",
+            "Lost",
+            "Push",
+        ],
+    )
 
-            if st.button("Save Bet Result"):
+    if st.button("Save Bet Result"):
 
-                bet = bet_options[selected_bet]
+        bet = bet_options[selected_bet]
 
-                wager_amount = float(
-                    bet["wager"]
+        wager_amount = float(
+            bet["wager"]
+        )
+
+        american_odds = int(
+            bet["odds"]
+        )
+
+        if selected_result == "Won":
+
+            if american_odds > 0:
+
+                profit_loss = (
+                    wager_amount
+                    * american_odds / 100
                 )
 
-                american_odds = int(
-                    bet["odds"]
+            else:
+
+                profit_loss = (
+                    wager_amount
+                    * 100 / abs(american_odds)
                 )
 
-                if selected_result == "Won":
+        elif selected_result == "Lost":
 
-                    if american_odds > 0:
-
-                        profit_loss = (
-                            wager_amount
-                            * american_odds / 100
-                        )
-
-                    else:
-
-                        profit_loss = (
-                            wager_amount
-                            * 100 / abs(american_odds)
-                        )
-
-                elif selected_result == "Lost":
-
-                    profit_loss = -wager_amount
-
-                else:
-
-                    profit_loss = 0
-
-                success, result = update_bet_result(
-                    bet["id"],
-                    selected_result,
-                    round(profit_loss, 2),
-                )
-
-                if success:
-
-                    st.success(
-                        "Your betting result was updated!"
-                    )
-
-                    st.rerun()
-
-                else:
-
-                    st.error(
-                        "Unable to update your bet."
-                    )
+            profit_loss = -wager_amount
 
         else:
 
-            st.info(
-                "You have no pending bets to update."
+            profit_loss = 0
+
+        success, result = update_bet_result(
+            bet["id"],
+            selected_result,
+            round(profit_loss, 2),
+        )
+
+        if success:
+
+            st.success(
+                "Your betting result was updated!"
             )
+
+            st.rerun()
+
+        else:
+
+            st.error(
+                "Unable to update your bet."
+            )
+
+else:
+
+    st.info(
+        "You have no pending bets to update."
+    )
 
 
 
