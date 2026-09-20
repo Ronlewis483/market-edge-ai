@@ -769,10 +769,11 @@ if page=="Command Center":
         "completed historical games."
     )
 
+    
     nba_test_count = st.selectbox(
         "Number of historical games to test",
-        options=[25, 50, 100],
-        index=0,
+        options=[25, 50, 100, 250, 500, 1000],
+        index=4,
         key="nba_live_validation_count",
     )
 
