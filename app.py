@@ -57,6 +57,7 @@ from dual_agent.nfl_live_engine import (
 )
 
 import streamlit as st
+from dual_agent.supabase_db import test_connection
 
 st.set_page_config(page_title="Market Edge AI V5", page_icon="📊", layout="wide")
 from dual_agent.research import DEFAULT_UNIVERSE, latest_scan, run_research
@@ -64,6 +65,20 @@ from dual_agent.signal_engine import clean_symbols, stock_decision, sports_decis
 from dual_agent.validated_model import VALIDATED_STOCK_MODEL as M
 
 st.title("📊 Market Edge AI — V5")
+
+# Supabase database connection test
+with st.expander("Database Connection Status"):
+    if st.button("Test Supabase Connection"):
+        success, message = test_connection()
+
+        if success:
+            st.success(message)
+        else:
+            st.error("Database connection failed.")
+            st.caption(
+                "Check your Supabase credentials, "
+                "database permissions, and bets table."
+            )
 st.caption("Persistent validated model • lightweight daily inference • research/paper mode")
 
 with st.sidebar:
