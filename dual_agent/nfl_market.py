@@ -209,102 +209,150 @@ def classify_nfl_market_edge(
         american_odds,
     )
 
-    # -----------------------------------------
-    # 4. Validate historical performance
-    # -----------------------------------------
-
     
-    history_ok = False
-    reliability_ok = False
+    # ----------------------------------------
+    # 4. Validate historical performance
+    # ----------------------------------------
 
-    # Historical validation requirements.
     MIN_HISTORICAL_ACCURACY = 0.70
     MIN_HISTORICAL_SAMPLE = 30
     MAX_BRIER_SCORE = 0.25
 
-    if (
-        historical_accuracy is not None
-        and historical_sample is not None
-    ):
+    history_ok = False
+    reliability_ok = False
+    historical_validation_ok = False
+
+    validation_reasons = []
+
+    # Validate historical accuracy and sample size.
+
+    if historical_accuracy is None:
+        validation_reasons.append(
+            "Historical accuracy is unavailable."
+        )
+
+    else:
         historical_accuracy = float(
             historical_accuracy
         )
 
+        if historical_accuracy < MIN_HISTORICAL_ACCURACY:
+            validation_reasons.append(
+                f"Historical accuracy "
+                f"({historical_accuracy:.1%}) is below "
+                f"the {MIN_HISTORICAL_ACCURACY:.0%} minimum."
+            )
+
+    if historical_sample is None:
+        validation_reasons.append(
+            "Historical sample size is unavailable."
+        )
+
+    else:
         historical_sample = int(
             historical_sample
         )
 
-        history_ok = (
-            historical_accuracy >= MIN_HISTORICAL_ACCURACY
-            and historical_sample >= MIN_HISTORICAL_SAMPLE
+        if historical_sample < MIN_HISTORICAL_SAMPLE:
+            validation_reasons.append(
+                f"Historical sample size "
+                f"({historical_sample}) is below "
+                f"the {MIN_HISTORICAL_SAMPLE}-game minimum."
+            )
+
+    historical_validation_ok = (
+        historical_accuracy is not None
+        and historical_sample is not None
+        and historical_accuracy >= MIN_HISTORICAL_ACCURACY
+        and historical_sample >= MIN_HISTORICAL_SAMPLE
+    )
+
+    # Validate out-of-sample reliability.
+
+    if historical_reliability is None:
+
+        validation_reasons.append(
+            "Historical reliability data is unavailable."
         )
 
-    # Reliability must be established separately using
-    # completed, out-of-sample NFL predictions.
-    if historical_reliability is not None:
+    elif not isinstance(historical_reliability, dict):
+
+        validation_reasons.append(
+            "Historical reliability data has an invalid format."
+        )
+
+    else:
 
         brier_score = historical_reliability.get(
             "brier_score"
         )
 
+        reliability_passed = historical_reliability.get(
+            "reliability_passed"
+        )
+
+        if brier_score is None:
+
+            validation_reasons.append(
+                "Historical Brier score is unavailable."
+            )
+
+        else:
+
+            brier_score = float(
+                brier_score
+            )
+
+            if brier_score >= MAX_BRIER_SCORE:
+
+                validation_reasons.append(
+                    f"Brier score ({brier_score:.4f}) "
+                    f"does not meet the required "
+                    f"threshold of {MAX_BRIER_SCORE:.2f}."
+                )
+
+        if reliability_passed is not True:
+
+            validation_reasons.append(
+                "Historical reliability validation "
+                "has not passed."
+            )
+
         reliability_ok = (
-            historical_reliability.get(
-                "reliability_passed"
-            ) is True
+            reliability_passed is True
             and brier_score is not None
-            and float(brier_score) < MAX_BRIER_SCORE
+            and brier_score < MAX_BRIER_SCORE
         )
 
-    history_ok = history_ok and reliability_ok
-
-
-    # ------------------------------------------
-    # 5. Classify opportunity
-    # ------------------------------------------
-
-    decision = "PASS"
-    reason = "No classification reason provided."
-
-    # BET qualification thresholds
-    MIN_BET_PROBABILITY = 0.65
-    MIN_BET_EDGE = 0.03
-    MIN_BET_EV = 0.0
-
-    # Historical validation thresholds
-    MIN_HISTORICAL_ACCURACY = 0.70
-    MIN_HISTORICAL_SAMPLE = 25
-
-    # LEAN qualification thresholds
-    MIN_LEAN_PROBABILITY = 0.60
-    MIN_LEAN_EDGE = 0.01
-
-    # Validate historical performance
-    historical_validation_ok = False
-    
-    if (
-        historical_accuracy is not None
-        and historical_sample is not None
-    ):
-        historical_validation_ok = (
-            historical_accuracy >= MIN_HISTORICAL_ACCURACY
-            and historical_sample >= MIN_HISTORICAL_SAMPLE
-        )
-
-    # Require both historical validation and reliability.
     history_ok = (
         historical_validation_ok
         and reliability_ok
     )
-    
 
-    # Evaluate BET qualification
+    # ----------------------------------------
+    # 5. Classify opportunity
+    # ----------------------------------------
+
+    MIN_BET_PROBABILITY = 0.65
+    MIN_BET_EDGE = 0.03
+    MIN_BET_EV = 0.0
+
+    MIN_LEAN_PROBABILITY = 0.60
+    MIN_LEAN_EDGE = 0.01
+
+    # Evaluate BET qualification.
+
     bet_probability_ok = (
         model_probability >= MIN_BET_PROBABILITY
     )
 
-    bet_edge_ok = edge >= MIN_BET_EDGE
+    bet_edge_ok = (
+        edge >= MIN_BET_EDGE
+    )
 
-    bet_ev_ok = ev > MIN_BET_EV
+    bet_ev_ok = (
+        ev > MIN_BET_EV
+    )
 
     bet_qualified = (
         bet_probability_ok
@@ -313,7 +361,8 @@ def classify_nfl_market_edge(
         and history_ok
     )
 
-    # Evaluate LEAN qualification
+    # Evaluate LEAN qualification.
+
     lean_qualified = (
         model_probability >= MIN_LEAN_PROBABILITY
         and edge >= MIN_LEAN_EDGE
@@ -321,64 +370,77 @@ def classify_nfl_market_edge(
         and history_ok
     )
 
-    # Final classification
+    # Generate classification and explanation.
+
+    decision = "PASS"
+    reasons = []
+
     if bet_qualified:
 
         decision = "BET"
 
         reason = (
-            "Model probability, market edge, "
-            "expected value, and historical "
-            "validation passed BET thresholds."
+            f"Model probability {model_probability:.1%}, "
+            f"model edge {edge:.1%}, and "
+            f"expected value {ev:+.3f}. "
+            "Historical accuracy and reliability "
+            "validation passed."
         )
 
     elif lean_qualified:
 
         decision = "LEAN"
 
-        reasons = []
-
         if not bet_probability_ok:
+
             reasons.append(
-                "Model probability is below "
+                f"Model probability "
+                f"({model_probability:.1%}) is below "
                 "the 65% BET threshold."
             )
 
         if not bet_edge_ok:
+
             reasons.append(
-                "Model edge is below "
+                f"Model edge ({edge:.1%}) is below "
                 "the 3 percentage point BET threshold."
             )
 
-        if not history_ok:
-            reasons.append(
-                "Historical validation did not "
-                "meet BET requirements."
-            )
-
-        reason = " ".join(reasons)
+        reason = (
+            "LEAN classification: "
+            + " ".join(reasons)
+        )
 
     else:
 
         decision = "PASS"
 
-        reasons = []
-
         if model_probability < MIN_LEAN_PROBABILITY:
+
             reasons.append(
-                "Model win probability is below "
-                "the 60% minimum for LEAN."
+                f"Model probability "
+                f"({model_probability:.1%}) is below "
+                "the 60% LEAN threshold."
             )
 
         if edge < MIN_LEAN_EDGE:
+
             reasons.append(
-                "Model edge is below "
-                "the 1 percentage point minimum."
+                f"Model edge ({edge:.1%}) is below "
+                "the 1 percentage point LEAN threshold."
             )
 
         if ev <= 0:
+
             reasons.append(
-                "Expected value is not positive."
+                f"Expected value ({ev:+.3f}) "
+                "is not positive."
+            )
+
+        if not history_ok:
+
+            reasons.extend(
+                validation_reasons
             )
 
         reason = (
@@ -403,4 +465,7 @@ def classify_nfl_market_edge(
         "historical_accuracy": historical_accuracy,
         "historical_sample": historical_sample,
         "history_ok": history_ok,
+        "historical_validation_ok": historical_validation_ok,
+        "reliability_ok": reliability_ok,
+        "validation_reasons": validation_reasons,
     }
