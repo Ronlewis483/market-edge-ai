@@ -1080,6 +1080,8 @@ if page=="Command Center":
                         f"{away_team} at {home_team}: "
                         f"{game_error}"
                     )
+                    
+            st.exception(game_error)
 
                 progress.progress(
                     game_number / total_games
