@@ -456,6 +456,10 @@ for bet in bets:
 
     else:
         bet["total_payout"] = None
+
+
+
+    
     if not bets:
 
         st.info(
