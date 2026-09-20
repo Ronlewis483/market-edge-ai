@@ -11,6 +11,7 @@ def build_live_nfl_opportunities(
     best_lines,
     historical_accuracy=None,
     historical_sample=None,
+    historical_reliability=None,
 ):
     """
     Join NFL model predictions to the best available sportsbook
@@ -103,7 +104,9 @@ def build_live_nfl_opportunities(
             ),
             historical_accuracy=historical_accuracy,
             historical_sample=historical_sample,
-        )
+            historical_reliability=historical_reliability,
+            )
+        
         opportunities.append(
             {
                 "commence_time": game["commence_time"],
