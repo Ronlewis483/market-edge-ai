@@ -2201,6 +2201,33 @@ def predict_balldontlie_matchup(feature_games, matchup_features):
         train_df = df.dropna(
             subset=feature_columns + ["home_win"]
         ).copy()
+
+
+    # Validate historical training data
+    MIN_TRAINING_GAMES = 500
+
+    if len(train_df) < MIN_TRAINING_GAMES:
+        raise ValueError(
+            f"Insufficient NBA training data: "
+            f"{len(train_df)} games available. "
+            f"At least {MIN_TRAINING_GAMES} required."
+        )
+
+    if train_df["home_win"].nunique() < 2:
+        raise ValueError(
+            "NBA training data must contain "
+            "both home wins and home losses."
+        )
+
+    if not np.isfinite(
+        train_df[feature_columns].to_numpy(dtype=float)
+    ).all():
+        raise ValueError(
+            "NBA training features contain "
+            "invalid or infinite values."
+        )
+
+        
     
         X_train = train_df[feature_columns]
         y_train = train_df["home_win"].astype(int)
