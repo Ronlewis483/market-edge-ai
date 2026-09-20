@@ -1974,9 +1974,10 @@ if calibration_result is not None:
 
 st.markdown("### 🧠 NFL Decision Engine")
 
+
 try:
     nfl_predictions = st.session_state.get(
-        "nfl_calibration_predictions",
+        "nfl_historical_predictions",
         pd.DataFrame()
     ).copy()
 
@@ -1984,7 +1985,6 @@ try:
         raise ValueError(
             "Run the NFL historical model first to load NFL model predictions."
         )
-
     if "home_win_probability" not in nfl_predictions.columns and "probability" in nfl_predictions.columns:
         nfl_predictions["home_win_probability"] = nfl_predictions["probability"]
     
