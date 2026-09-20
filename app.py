@@ -634,27 +634,27 @@ elif page == "My Bets":
 
     if pending_bets:
 
-    bet_options = {
-        (
-            f"#{bet['id']} - "
-            f"{bet['bet_description']}"
-        ): bet
-        for bet in pending_bets
-    }
+        bet_options = {
+            (
+                f"#{bet['id']} - "
+                f"{bet['bet_description']}"
+            ): bet
+            for bet in pending_bets
+        }
 
-    selected_bet = st.selectbox(
-        "Select a Pending Bet",
-        list(bet_options.keys()),
-    )
+        selected_bet = st.selectbox(
+            "Select a Pending Bet",
+            list(bet_options.keys()),
+        )
 
-    selected_result = st.selectbox(
-        "What was the result?",
-        [
-            "Won",
-            "Lost",
-            "Push",
-        ],
-    )
+        selected_result = st.selectbox(
+            "What was the result?",
+            [
+                "Won",
+                "Lost",
+                "Push",
+            ],
+        )
 
     if st.button("Save Bet Result"):
 
