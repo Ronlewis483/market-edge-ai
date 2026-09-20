@@ -3078,10 +3078,28 @@ if calibration_result is not None:
 # Store historical calibration data separately
 # from predictions for upcoming NFL games.
 
-st.session_state[
-    "nfl_calibration_predictions"
-] = nfl_model_predictions.copy()
 
+# ==========================================
+# STORE NFL HISTORICAL PREDICTIONS
+# ==========================================
+
+nfl_model_predictions = st.session_state.get(
+    "nfl_model_predictions",
+    pd.DataFrame()
+)
+
+if (
+    isinstance(nfl_model_predictions, pd.DataFrame)
+    and not nfl_model_predictions.empty
+):
+
+    st.session_state[
+        "nfl_historical_predictions"
+    ] = nfl_model_predictions.copy()
+
+    st.session_state[
+        "nfl_calibration_predictions"
+    ] = nfl_model_predictions.copy()
 
     
 # ---------------------------------------------------------
