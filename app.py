@@ -428,117 +428,85 @@ elif page == "My Bets":
     # -----------------------------------
 
     
-st.subheader("Your Betting History")
 
-bets = get_all_bets()
+    # ---------------------------------
+    # Betting History and Full Payout
+    # ---------------------------------
 
-# Calculate the total payout for each bet.
-# Payout includes the returned original stake.
+    st.subheader("Your Betting History")
 
-for bet in bets:
+    bets = get_all_bets()
 
-    wager_amount = float(bet.get("wager") or 0)
-    profit = float(bet.get("profit_loss") or 0)
-    status = bet.get("status")
-
-    if status == "Won":
-        bet["total_payout"] = round(
-            wager_amount + profit, 2
-        )
-
-    elif status == "Push":
-        bet["total_payout"] = round(
-            wager_amount, 2
-        )
-
-    elif status == "Lost":
-        bet["total_payout"] = 0.0
-
-    else:
-        bet["total_payout"] = None
-
-
-
-    
     if not bets:
-
-        st.info(
-            "You haven't recorded any bets yet."
-        )
+        st.info("You haven't recorded any bets yet.")
 
     else:
+        history = []
+
+        for bet in bets:
+
+            wager = float(bet.get("wager") or 0)
+            profit = float(bet.get("profit_loss") or 0)
+            status = bet.get("status", "Pending")
+
+            # Calculate total payout.
+            # A winning payout includes the original wager.
+
+            if status == "Won":
+                total_payout = round(
+                    wager + profit, 2
+                )
+
+            elif status == "Push":
+                total_payout = round(wager, 2)
+
+            elif status == "Lost":
+                total_payout = 0.0
+
+            else:
+                total_payout = None
+
+            # Build a readable betting history.
+
+            history.append({
+                "Bet ID": bet.get("id"),
+                "Sport": bet.get("sport"),
+                "Bet": bet.get("bet_description"),
+                "Market": bet.get("betting_market"),
+                "Odds": bet.get("odds"),
+                "Wager": round(wager, 2),
+                "Status": status,
+                "Profit / Loss": (
+                    round(profit, 2)
+                    if status != "Pending"
+                    else None
+                ),
+                "Total Payout": total_payout,
+            })
+
+        # Display complete betting history.
 
         st.dataframe(
-            bets,
+            history,
             use_container_width=True,
             hide_index=True,
+            column_config={
+                "Wager": st.column_config.NumberColumn(
+                    "Wager",
+                    format="$%.2f",
+                ),
+                "Profit / Loss": st.column_config.NumberColumn(
+                    "Profit / Loss",
+                    format="$%.2f",
+                ),
+                "Total Payout": st.column_config.NumberColumn(
+                    "Total Payout",
+                    format="$%.2f",
+                ),
+            },
         )
 
-        st.divider()
-
-        # -----------------------------------
-        # Betting performance
-        # -----------------------------------
-
-        st.subheader("Your Performance")
-
-        settled_bets = [
-            bet for bet in bets
-            if bet["status"] in ("Won", "Lost")
-        ]
-
-        wins = sum(
-            1 for bet in settled_bets
-            if bet["status"] == "Won"
-        )
-
-        losses = sum(
-            1 for bet in settled_bets
-            if bet["status"] == "Lost"
-        )
-
-        total_profit = sum(
-            float(bet.get("profit_loss") or 0)
-            for bet in bets
-        )
-
-        total_settled = wins + losses
-
-        win_rate = (
-            wins / total_settled * 100
-            if total_settled > 0
-            else 0
-        )
-
-        col1, col2, col3, col4 = st.columns(4)
-
-        col1.metric(
-            "Total Bets",
-            len(bets)
-        )
-
-        col2.metric(
-            "Wins",
-            wins
-        )
-
-        col3.metric(
-            "Losses",
-            losses
-        )
-
-        col4.metric(
-            "Win Rate",
-            f"{win_rate:.1f}%"
-        )
-
-        st.metric(
-            "Total Profit / Loss",
-            f"${total_profit:,.2f}"
-        )
-
-        st.divider()
-
+    st.divider()
         # -----------------------------------
         # Update bet results
         # -----------------------------------
@@ -674,6 +642,7 @@ if page == "Research Lab":
                 st.warning(f"⚠️ {provider}: {info['message']}")
 
     st.divider()
+    # Betting performance
 
 
 # ============================================================
