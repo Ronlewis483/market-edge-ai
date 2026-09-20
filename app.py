@@ -614,7 +614,18 @@ elif page == "My Bets":
         # Update bet results
         # -----------------------------------
 
-st.subheader("Update a Bet Result")
+    # ==========================================
+    # LOAD BETTING HISTORY
+    # ==========================================
+
+    bets = get_all_bets()
+
+    # ==========================================
+    # UPDATE A BET RESULT
+    # ==========================================
+
+    st.subheader("Update a Bet Result")
+
 
 pending_bets = [
     bet for bet in bets
