@@ -1613,13 +1613,21 @@ if "multi_nba_research_result" in st.session_state:
                 use_container_width=True,
                 hide_index=True,
             )
-st.markdown("### 🏀 Live NBA Moneylines")
+
+st.markdown("### 🏀 NBA Betting Center")
+
+st.caption(
+    "Live NBA moneylines, sportsbook odds, "
+    "and potential betting payouts."
+)
 
 try:
     live_moneylines = get_live_nba_moneylines()
 
     if live_moneylines:
+
         moneyline_df = pd.DataFrame(live_moneylines)
+
         moneyline_df["home_team_code"] = (
             moneyline_df["home_team"].apply(
                 normalize_nba_team_name
@@ -1645,34 +1653,143 @@ try:
         )
 
         if unmapped_teams:
-            st.error(
+            st.warning(
                 "Unmapped NBA teams: "
                 + ", ".join(unmapped_teams)
             )
         else:
             st.success(
-                "NBA team mapping successful - "
+                "NBA team mapping successful — "
                 "all live teams recognized."
             )
+
         st.success(
-            f"Live NBA odds retrieved - "
+            f"Live NBA odds retrieved — "
             f"{len(moneyline_df)} sportsbook lines found."
         )
 
+        st.subheader("Today's NBA Games")
+
         st.dataframe(
             moneyline_df,
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
+        st.divider()
+
+        st.subheader("NBA Betting Payout Calculator")
+
+        st.caption(
+            "Select a sportsbook line to calculate "
+            "your potential return."
+        )
+
+        selected_index = st.selectbox(
+            "Select NBA Game",
+            options=list(moneyline_df.index),
+            format_func=lambda i: (
+                f"{moneyline_df.loc[i, 'away_team']} "
+                f"vs {moneyline_df.loc[i, 'home_team']}"
+            ),
+        )
+
+        selected_game = moneyline_df.loc[selected_index]
+
+        st.write(
+            f"**Matchup:** "
+            f"{selected_game['away_team']} "
+            f"vs {selected_game['home_team']}"
+        )
+
+        st.write("Available sportsbook information:")
+
+        st.json(selected_game.to_dict())
+
+        st.divider()
+
+        st.subheader("Calculate Potential Payout")
+
+        wager_amount = st.number_input(
+            "Wager Amount ($)",
+            min_value=1.0,
+            value=10.0,
+            step=5.0,
+            key="nba_wager_amount",
+        )
+
+        american_odds = st.number_input(
+            "American Odds",
+            value=100,
+            step=10,
+            key="nba_american_odds",
+            help=(
+                "Enter the odds shown by your sportsbook. "
+                "For example, +120 or -150."
+            ),
+        )
+
+        if american_odds == 0:
+            st.error("American odds cannot be zero.")
+
+        else:
+
+            if american_odds > 0:
+
+                potential_profit = (
+                    wager_amount
+                    * american_odds / 100
+                )
+
+            else:
+
+                potential_profit = (
+                    wager_amount
+                    * 100 / abs(american_odds)
+                )
+
+            total_payout = (
+                wager_amount + potential_profit
+            )
+
+            col1, col2, col3 = st.columns(3)
+
+            with col1:
+                st.metric(
+                    "Your Wager",
+                    f"${wager_amount:,.2f}",
+                )
+
+            with col2:
+                st.metric(
+                    "Potential Profit",
+                    f"${potential_profit:,.2f}",
+                )
+
+            with col3:
+                st.metric(
+                    "Total Payout",
+                    f"${total_payout:,.2f}",
+                )
+
+            st.info(
+                "Total payout includes your original "
+                "wager plus potential profit. "
+                "This is a calculation, not a prediction."
+            )
+
     else:
+
         st.info(
             "The Odds API connection worked, "
             "but no NBA moneylines are currently available."
         )
 
 except Exception as e:
-    st.error(f"Live NBA odds test failed: {e}")
+
+    st.error(
+        f"Live NBA odds test failed: {e}"
+    )
     st.divider()
 
 st.markdown("---")
