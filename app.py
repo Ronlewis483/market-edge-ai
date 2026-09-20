@@ -2320,6 +2320,18 @@ if (
 
 
         try:
+            
+            historical_result = st.session_state.get(
+                "nfl_walkforward_result"
+            )
+
+            if historical_result is None:
+                st.error(
+                    "NFL historical validation results are missing. "
+                    "Run the NFL Walk-Forward Model first."
+                )
+                st.stop()
+                
             if not st.session_state.get("nfl_walkforward_result"):
                 st.error(
                     "Run NFL Walk-Forward Model before analyzing "
