@@ -756,6 +756,177 @@ if page=="Command Center":
                     f"Error details: {e}"
                 )
 
+    
+    # ==========================================
+    # NBA LIVE MODEL HISTORICAL VALIDATION
+    # ==========================================
+
+    st.divider()
+    st.subheader("🏀 NBA Live Model Validation")
+
+    st.caption(
+        "Test the NBA prediction model against "
+        "completed historical games."
+    )
+
+    nba_test_count = st.selectbox(
+        "Number of historical games to test",
+        options=[25, 50, 100],
+        index=0,
+        key="nba_live_validation_count",
+    )
+
+    if st.button(
+        "Run NBA Live Model Validation",
+        key="run_nba_live_validation",
+    ):
+
+        try:
+            from dual_agent import nba_research
+
+            if not hasattr(
+                nba_research,
+                "validate_live_nba_model",
+            ):
+                st.error(
+                    "The live-model validation function "
+                    "is missing from nba_research.py. "
+                    "Confirm it is committed to main."
+                )
+
+            else:
+                with st.spinner(
+                    "Loading NBA history and "
+                    "running historical validation..."
+                ):
+
+                    current_year = pd.Timestamp.now().year
+
+                    seasons = tuple(
+                        range(
+                            current_year - 4,
+                            current_year + 1,
+                        )
+                    )
+
+                    historical_games = (
+                        load_nba_prediction_history(
+                            seasons
+                        )
+                    )
+
+                    prepared_games = (
+                        prepare_balldontlie_games_for_research(
+                            historical_games
+                        )
+                    )
+
+                    feature_games = (
+                        build_balldontlie_pregame_features(
+                            prepared_games
+                        )
+                    )
+
+                    results = (
+                        nba_research.validate_live_nba_model(
+                            historical_games=prepared_games,
+                            feature_games=feature_games,
+                            minimum_training_games=500,
+                            test_games=nba_test_count,
+                        )
+                    )
+
+                    st.session_state[
+                        "nba_live_validation_results"
+                    ] = results
+
+                st.success(
+                    "NBA historical validation completed!"
+                )
+
+        except Exception as validation_error:
+
+            st.error(
+                "NBA historical validation failed."
+            )
+
+            st.exception(validation_error)
+
+    # ==========================================
+    # DISPLAY HISTORICAL VALIDATION RESULTS
+    # ==========================================
+
+    if (
+        "nba_live_validation_results"
+        in st.session_state
+    ):
+
+        results = st.session_state[
+            "nba_live_validation_results"
+        ]
+
+        st.subheader("Historical Model Performance")
+
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            st.metric(
+                "Games Tested",
+                results["games_tested"],
+            )
+
+        with col2:
+            st.metric(
+                "Prediction Accuracy",
+                f'{results["accuracy"]:.1%}',
+            )
+
+        with col3:
+            st.metric(
+                "Brier Score",
+                f'{results["brier_score"]:.4f}',
+            )
+
+        st.metric(
+            "Log Loss",
+            f'{results["log_loss"]:.4f}',
+        )
+
+        st.metric(
+            "Games Skipped",
+            results["games_skipped"],
+        )
+
+        st.subheader("Accuracy by Confidence Range")
+
+        st.dataframe(
+            results["confidence"],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        with st.expander(
+            "View Individual Historical Predictions"
+        ):
+            st.dataframe(
+                results["predictions"],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        with st.expander(
+            "View Skipped Games"
+        ):
+            st.dataframe(
+                results["skipped_games"],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    # ==========================================
+    # END NBA LIVE MODEL VALIDATION
+    # ==========================================
+
 
     # ==========================================
     # AUTOMATIC NBA PREDICTION CENTER
