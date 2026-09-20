@@ -1967,6 +1967,15 @@ if calibration_result is not None:
     st.session_state[
     "nfl_historical_predictions"
 ] = nfl_model_predictions
+
+# Store historical calibration data separately
+# from predictions for upcoming NFL games.
+
+st.session_state[
+    "nfl_calibration_predictions"
+] = nfl_model_predictions.copy()
+
+
     
 # ---------------------------------------------------------
 # NFL DECISION ENGINE
