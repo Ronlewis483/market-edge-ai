@@ -72,6 +72,113 @@ from dual_agent.research import DEFAULT_UNIVERSE, latest_scan, run_research
 from dual_agent.signal_engine import clean_symbols, stock_decision, sports_decision, GATES
 from dual_agent.validated_model import VALIDATED_STOCK_MODEL as M
 
+
+# ==========================================
+# MARKET EDGE AI — DASHBOARD V2 THEME
+# ==========================================
+
+st.markdown(
+    """
+    <style>
+
+    /* Main application background */
+    .stApp {
+        background: #0B1220;
+        color: #F8FAFC;
+    }
+
+    /* Main content spacing */
+    .block-container {
+        padding-top: 2rem;
+        padding-bottom: 3rem;
+        max-width: 1500px;
+    }
+
+    /* Sidebar */
+    section[data-testid="stSidebar"] {
+        background: #111C30;
+        border-right: 1px solid #243247;
+    }
+
+    /* Headings */
+    h1, h2, h3 {
+        color: #F8FAFC !important;
+        letter-spacing: -0.5px;
+    }
+
+    h1 {
+        font-weight: 800 !important;
+    }
+
+    /* Dashboard metric cards */
+    div[data-testid="stMetric"] {
+        background: #172338;
+        border: 1px solid #263850;
+        border-radius: 16px;
+        padding: 20px;
+    }
+
+    div[data-testid="stMetricLabel"] {
+        color: #94A3B8;
+    }
+
+    div[data-testid="stMetricValue"] {
+        color: #F8FAFC;
+        font-weight: 700;
+    }
+
+    /* Buttons */
+    .stButton > button {
+        background: #172338;
+        color: #F8FAFC;
+        border: 1px solid #334155;
+        border-radius: 10px;
+        font-weight: 600;
+        min-height: 42px;
+    }
+
+    .stButton > button:hover {
+        border-color: #38BDF8;
+        color: #38BDF8;
+    }
+
+    .stButton > button[kind="primary"] {
+        background: #0284C7;
+        color: white;
+        border: none;
+    }
+
+    /* Input fields */
+    div[data-baseweb="select"] > div,
+    div[data-baseweb="input"] > div {
+        background: #172338;
+        border-radius: 10px;
+    }
+
+    /* Expandable sections */
+    div[data-testid="stExpander"] {
+        background: #111C30;
+        border: 1px solid #263850;
+        border-radius: 12px;
+    }
+
+    /* Data tables */
+    div[data-testid="stDataFrame"] {
+        border: 1px solid #263850;
+        border-radius: 12px;
+        overflow: hidden;
+    }
+
+    /* Horizontal dividers */
+    hr {
+        border-color: #263850;
+    }
+
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 st.title("📊 Market Edge AI — V5")
 
 # Supabase database connection test
