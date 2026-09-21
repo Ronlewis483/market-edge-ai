@@ -281,17 +281,13 @@ with st.sidebar:
             "🧪 Research Lab",
         ],
         label_visibility="collapsed",
+        
     )
 
     st.divider()
 
     st.caption("MARKET EDGE AI V5")
     st.success("System Online")
-    
-    )
-    
-    st.success("Persistence enabled")
-    st.caption("Validated configuration loads automatically. Daily use does not require walk-forward retraining.")
 
 default=clean_symbols(DEFAULT_UNIVERSE)
 
