@@ -318,7 +318,36 @@ if page == "🏀 Sports Center":
         key="sports_center_tabs",
     )
 
+    
+# SPORTS CENTER NAVIGATION
+
+if sports_tab == "🎟️ My Bets":
+    st.session_state["sports_destination"] = "my_bets"
+
+elif sports_tab == "📊 Model Performance":
+    st.session_state["sports_destination"] = "performance"
+
+else:
+    st.session_state["sports_destination"] = "today"
+
+    
+
     st.divider()
+
+    
+    # Control which dashboard section is displayed
+
+    show_today = (
+        st.session_state["sports_destination"] == "today"
+    )
+
+    show_bets = (
+        st.session_state["sports_destination"] == "my_bets"
+    )
+
+    show_performance = (
+        st.session_state["sports_destination"] == "performance"
+    )
 
     st.divider()
 
