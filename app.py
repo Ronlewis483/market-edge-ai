@@ -287,7 +287,9 @@ with st.sidebar:
 
     st.caption("MARKET EDGE AI V5")
     st.success("System Online")
+    
     )
+    
     st.success("Persistence enabled")
     st.caption("Validated configuration loads automatically. Daily use does not require walk-forward retraining.")
 
