@@ -321,21 +321,31 @@ if page == "🏀 Sports Center":
     
 # SPORTS CENTER NAVIGATION
 
-if sports_tab == "🎟️ My Bets":
-    st.session_state["sports_destination"] = "my_bets"
 
-elif sports_tab == "📊 Model Performance":
-    st.session_state["sports_destination"] = "performance"
+if page == "🏀 Sports Center":
 
-else:
-    st.session_state["sports_destination"] = "today"
+    st.title("🏈 Sports Betting Center")
 
-    
+    sports_tab = st.radio(
+        "Sports Center Navigation",
+        [
+            "🎯 Today's Picks",
+            "🎟️ My Bets",
+            "📊 Model Performance",
+        ],
+        horizontal=True,
+        label_visibility="collapsed",
+        key="sports_center_tabs",
+    )
 
-    st.divider()
+    if sports_tab == "🎟️ My Bets":
+        st.session_state["sports_destination"] = "my_bets"
 
-    
-    # Control which dashboard section is displayed
+    elif sports_tab == "📊 Model Performance":
+        st.session_state["sports_destination"] = "performance"
+
+    else:
+        st.session_state["sports_destination"] = "today"
 
     show_today = (
         st.session_state["sports_destination"] == "today"
