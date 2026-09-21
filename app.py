@@ -258,17 +258,35 @@ with st.expander("Database Connection Status"):
             
 st.caption("Persistent validated model • lightweight daily inference • research/paper mode")
 
+
+# ==========================================
+# MARKET EDGE AI — NAVIGATION V2
+# ==========================================
+
 with st.sidebar:
+
+    st.markdown("## ⚡ MARKET EDGE AI")
+    st.caption("Sports Intelligence & Trading")
+
+    st.divider()
+
     page = st.radio(
-        "Navigation",
+        "NAVIGATION",
         [
-            "Command Center",
-            "Sports Betting Center",
-            "My Bets",
-            "Strategy Tracker",
-            "Saved Model",
-            "Research Lab",
+            "🏠 Home",
+            "🏀 Sports Center",
+            "📈 Trading Center",
+            "🎟️ My Bets",
+            "📊 Performance",
+            "🧪 Research Lab",
         ],
+        label_visibility="collapsed",
+    )
+
+    st.divider()
+
+    st.caption("MARKET EDGE AI V5")
+    st.success("System Online")
     )
     st.success("Persistence enabled")
     st.caption("Validated configuration loads automatically. Daily use does not require walk-forward retraining.")
@@ -276,7 +294,7 @@ with st.sidebar:
 default=clean_symbols(DEFAULT_UNIVERSE)
 
 
-if page == "Sports Betting Center":
+if page == "🏀 Sports Center":
 
     st.title("🏈 Sports Betting Center")
 
@@ -392,7 +410,7 @@ if page == "Sports Betting Center":
         "after your betting history is connected."
     )
 
-if page=="Command Center":
+if page=="🏠 Home":
     st.success(f"VALIDATED MODEL LOADED — {M['target']} • {M['features']} • AUC {M['auc']:.3f}")
     c1,c2=st.columns(2)
     with c1:
@@ -1573,7 +1591,7 @@ if page=="Command Center":
 
 
 
-elif page == "My Bets":
+elif page == "🎟️ My Bets":
 
     st.title("My Bets")
     st.write(
@@ -1920,7 +1938,7 @@ else:
 
 
 
-if page == "Saved Model":
+if page == "📈 Trading Center":
     st.subheader("💾 Saved Validated Model")
 
     st.success(
@@ -1937,7 +1955,7 @@ if page == "Saved Model":
     )
 
 
-if page == "Research Lab":
+if page == "🧪 Research Lab":
     st.subheader("🧪 Research Lab – Optional Revalidation")
 
     st.markdown("### 🏀 NBA Data Connection Test")
