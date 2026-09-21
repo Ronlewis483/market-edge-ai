@@ -301,6 +301,25 @@ if page == "🏀 Sports Center":
         "and track your betting performance."
     )
 
+    
+    # ==========================================
+    # SPORTS CENTER — DASHBOARD NAVIGATION
+    # ==========================================
+
+    sports_tab = st.radio(
+        "Sports Center Navigation",
+        [
+            "🎯 Today's Picks",
+            "🎟️ My Bets",
+            "📊 Model Performance",
+        ],
+        horizontal=True,
+        label_visibility="collapsed",
+        key="sports_center_tabs",
+    )
+
+    st.divider()
+
     st.divider()
 
     # Dashboard summary
