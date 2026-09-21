@@ -1760,11 +1760,13 @@ def run_balldontlie_walkforward_model(feature_games):
         X_train_scaled = scaler.fit_transform(X_train)
         X_test_scaled = scaler.transform(X_test)
 
+        
         model = LogisticRegression(
             max_iter=2000,
+            C=0.1,
             random_state=42,
         )
-
+        
         model.fit(
             X_train_scaled,
             y_train,
