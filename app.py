@@ -270,18 +270,31 @@ with st.sidebar:
 
     st.divider()
 
+    
+    navigation_options = [
+        "🏠 Home",
+        "🏀 Sports Center",
+        "📈 Trading Center",
+        "🎟️ My Bets",
+        "📊 Performance",
+        "🧪 Research Lab",
+    ]
+
+    if "main_navigation" not in st.session_state:
+        st.session_state["main_navigation"] = "🏠 Home"
+
+    destination = st.session_state.pop(
+        "sports_destination", None
+    )
+
+    if destination in navigation_options:
+        st.session_state["main_navigation"] = destination
+
     page = st.radio(
         "NAVIGATION",
-        [
-            "🏠 Home",
-            "🏀 Sports Center",
-            "📈 Trading Center",
-            "🎟️ My Bets",
-            "📊 Performance",
-            "🧪 Research Lab",
-        ],
+        navigation_options,
+        key="main_navigation",
         label_visibility="collapsed",
-        
     )
 
     st.divider()
@@ -317,6 +330,14 @@ if page == "🏀 Sports Center":
         label_visibility="collapsed",
         key="sports_center_tabs",
     )
+
+    if sports_tab == "🎟️ My Bets":
+        st.session_state["sports_destination"] = "🎟️ My Bets"
+        st.rerun()
+
+elif sports_tab == "📊 Model Performance":
+    st.session_state["sports_destination"] = "📊 Performance"
+    st.rerun()
 
     
     if sports_tab == "🎟️ My Bets":
