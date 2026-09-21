@@ -2239,8 +2239,10 @@ def predict_balldontlie_matchup(feature_games, matchup_features):
             ("scaler", StandardScaler()),
             (
                 "model",
+                
                 LogisticRegression(
                     max_iter=2000,
+                    C=0.1,
                     random_state=42,
                 ),
             ),
