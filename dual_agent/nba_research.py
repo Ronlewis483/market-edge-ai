@@ -2967,3 +2967,79 @@ def normalize_nba_team_name(team_name):
     }
 
     return team_map.get(team_name)
+
+
+def analyze_nba_pick_confidence(predictions):
+    """
+    Analyze historical NBA prediction accuracy
+    at different confidence levels.
+
+    Research only: does not establish future
+    accuracy or betting profitability.
+    """
+    import pandas as pd
+
+    if predictions is None or len(predictions) == 0:
+        raise ValueError("No NBA predictions available.")
+
+    df = pd.DataFrame(predictions).copy()
+
+    required = [
+        "predicted_probability",
+        "correct",
+    ]
+
+    missing = [
+        col for col in required
+        if col not in df.columns
+    ]
+
+    if missing:
+        raise ValueError(
+            "Missing prediction columns: "
+            + ", ".join(missing)
+        )
+
+    df["predicted_probability"] = pd.to_numeric(
+        df["predicted_probability"],
+        errors="coerce",
+    )
+
+    df["correct"] = pd.to_numeric(
+        df["correct"],
+        errors="coerce",
+    )
+
+    df = df.dropna(subset=required)
+
+    df = df[
+        df["predicted_probability"].between(
+            0.50, 1.00
+        )
+        & df["correct"].isin([0, 1])
+    ].copy()
+
+    if df.empty:
+        raise ValueError(
+            "No valid historical predictions found."
+        )
+
+    results = []
+
+    for threshold in [0.50, 0.60, 0.65, 0.70, 0.75, 0.80]:
+
+        selected = df[
+            df["predicted_probability"] >= threshold
+        ]
+
+        if selected.empty:
+            continue
+
+        results.append({
+            "Minimum probability": f"{threshold:.0%}",
+            "Picks tested": int(len(selected)),
+            "Correct picks": int(selected["correct"].sum()),
+            "Accuracy": float(selected["correct"].mean()),
+        })
+
+    return pd.DataFrame(results)
