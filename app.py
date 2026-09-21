@@ -174,6 +174,69 @@ st.markdown(
         border-color: #263850;
     }
 
+    
+/* ==========================================
+   NAVIGATION & TOOLBAR VISIBILITY FIX
+   ========================================== */
+
+/* Sidebar navigation labels */
+section[data-testid="stSidebar"] label,
+section[data-testid="stSidebar"] p,
+section[data-testid="stSidebar"] span {
+    color: #E2E8F0 !important;
+}
+
+/* Sidebar radio navigation */
+section[data-testid="stSidebar"]
+div[role="radiogroup"] label {
+    color: #F8FAFC !important;
+}
+
+/* Streamlit top toolbar */
+header[data-testid="stHeader"] {
+    background: #111C30 !important;
+    color: #F8FAFC !important;
+}
+
+/* Toolbar buttons and icons */
+header[data-testid="stHeader"] button {
+    color: #F8FAFC !important;
+}
+
+header[data-testid="stHeader"] button svg {
+    color: #F8FAFC !important;
+    fill: none;
+    stroke: currentColor;
+}
+
+/* Toolbar icon visibility */
+[data-testid="stToolbar"] button,
+[data-testid="stToolbar"] svg {
+    color: #F8FAFC !important;
+}
+
+/* Main text and input labels */
+.stApp label,
+.stApp .stMarkdown p {
+    color: #E2E8F0;
+}
+
+/* Selected sidebar navigation item */
+section[data-testid="stSidebar"]
+div[role="radiogroup"]
+label:has(input:checked) {
+    background: #1E3A5F;
+    border-radius: 8px;
+    padding: 8px;
+}
+
+/* Selected navigation text */
+section[data-testid="stSidebar"]
+label:has(input:checked) p {
+    color: #38BDF8 !important;
+    font-weight: 700;
+}
+
     </style>
     """,
     unsafe_allow_html=True,
