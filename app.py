@@ -911,34 +911,34 @@ if page=="Command Center":
         ):
 
         
-        # ==========================================
-        # NBA PICK CONFIDENCE ANALYSIS
-        # ==========================================
-
-        st.subheader("🏀 NBA Pick Confidence Analysis")
-
-        try:
-            from dual_agent.nba_research import (
-                analyze_nba_pick_confidence,
-            )
-
-            historical_predictions = results["predictions"]
-
-            confidence_results = analyze_nba_pick_confidence(
-                historical_predictions
-            )
-
-            st.dataframe(
-                confidence_results,
-                use_container_width=True,
-                hide_index=True,
-            )
-
-        except Exception as confidence_error:
-            st.warning(
-                "NBA confidence analysis could not run."
-            )
-            st.exception(confidence_error)
+            # ==========================================
+            # NBA PICK CONFIDENCE ANALYSIS
+            # ==========================================
+    
+            st.subheader("🏀 NBA Pick Confidence Analysis")
+    
+            try:
+                from dual_agent.nba_research import (
+                    analyze_nba_pick_confidence,
+                )
+    
+                historical_predictions = results["predictions"]
+    
+                confidence_results = analyze_nba_pick_confidence(
+                    historical_predictions
+                )
+    
+                st.dataframe(
+                    confidence_results,
+                    use_container_width=True,
+                    hide_index=True,
+                )
+    
+            except Exception as confidence_error:
+                st.warning(
+                    "NBA confidence analysis could not run."
+                )
+                st.exception(confidence_error)
 
             
             st.dataframe(
