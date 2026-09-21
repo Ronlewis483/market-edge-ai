@@ -335,9 +335,9 @@ if page == "🏀 Sports Center":
         st.session_state["sports_destination"] = "🎟️ My Bets"
         st.rerun()
 
-elif sports_tab == "📊 Model Performance":
-    st.session_state["sports_destination"] = "📊 Performance"
-    st.rerun()
+    elif sports_tab == "📊 Model Performance":
+        st.session_state["sports_destination"] = "📊 Performance"
+        st.rerun()
 
     
     if sports_tab == "🎟️ My Bets":
