@@ -331,17 +331,11 @@ if page == "🏀 Sports Center":
         key="sports_center_tabs",
     )
 
-    if sports_tab == "🎟️ My Bets":
-        st.session_state["sports_destination"] = "🎟️ My Bets"
-        st.rerun()
-
-    elif sports_tab == "📊 Model Performance":
-        st.session_state["sports_destination"] = "📊 Performance"
-        st.rerun()
-
     
+    # Sports Center navigation
+
     if sports_tab == "🎟️ My Bets":
-            st.session_state["sports_destination"] = "my_bets"
+        st.session_state["sports_destination"] = "my_bets"
 
     elif sports_tab == "📊 Model Performance":
         st.session_state["sports_destination"] = "performance"
@@ -390,6 +384,13 @@ if page == "🏀 Sports Center":
             "Active Bets",
             "—"
         )
+
+
+    if show_today:
+        st.divider()
+        st.subheader("Today's Picks")
+
+    
 
     st.divider()
 
