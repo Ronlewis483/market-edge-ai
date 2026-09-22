@@ -2157,19 +2157,131 @@ def render_research_lab():
             "stock_training_results"
         )
 
+        
         if results:
 
-            st.subheader(
-                "Historical Validation Results"
+            st.subheader("📊 Stock Model Performance")
+
+            st.caption(
+                "Historical out-of-sample validation. "
+                "Results do not guarantee future performance."
             )
 
             for horizon, metrics in results.items():
 
-                st.markdown(
-                    f"### {horizon}-Day Prediction Model"
+                st.divider()
+
+                st.subheader(
+                    f"📈 {horizon}-Day Prediction Model"
                 )
 
-                st.json(metrics)
+                passed = metrics.get(
+                    "passes_benchmarks", False
+                )
+
+                if passed:
+                    st.success(
+                        "Validation benchmarks passed."
+                    )
+                else:
+                    st.error(
+                        "Validation benchmarks not passed. "
+                        "Model requires further evaluation."
+                    )
+
+                auc = metrics.get("auc")
+                test_rows = metrics.get("test_rows", 0)
+
+                model_brier = metrics.get("model_brier")
+                baseline_brier = metrics.get(
+                    "baseline_brier"
+                )
+
+                model_log_loss = metrics.get(
+                    "model_log_loss"
+                )
+
+                baseline_log_loss = metrics.get(
+                    "baseline_log_loss"
+                )
+
+                col1, col2 = st.columns(2)
+
+                with col1:
+                    st.metric(
+                        "AUC Score",
+                        f"{auc:.3f}"
+                        if auc is not None else "N/A"
+                    )
+
+                    st.metric(
+                        "Model Brier Score",
+                        f"{model_brier:.4f}"
+                        if model_brier is not None
+                        else "N/A",
+                        delta=(
+                            f"{baseline_brier - model_brier:+.4f}"
+                            if model_brier is not None
+                            and baseline_brier is not None
+                            else None
+                        ),
+                        delta_color="normal",
+                    )
+
+                with col2:
+                    st.metric(
+                        "Test Observations",
+                        f"{test_rows:,}"
+                    )
+
+                    st.metric(
+                        "Model Log Loss",
+                        f"{model_log_loss:.4f}"
+                        if model_log_loss is not None
+                        else "N/A",
+                        delta=(
+                            f"{baseline_log_loss - model_log_loss:+.4f}"
+                            if model_log_loss is not None
+                            and baseline_log_loss is not None
+                            else None
+                        ),
+                        delta_color="normal",
+                    )
+
+                st.markdown(
+                    "#### Historical Data Summary"
+                )
+
+                col3, col4, col5 = st.columns(3)
+
+                with col3:
+                    st.metric(
+                        "Training Observations",
+                        f"{metrics.get('train_rows', 0):,}"
+                    )
+
+                with col4:
+                    st.metric(
+                        "Calibration Observations",
+                        f"{metrics.get('calibration_rows', 0):,}"
+                    )
+
+                with col5:
+                    base_rate = metrics.get(
+                        "base_rate"
+                    )
+
+                    st.metric(
+                        "Positive Outcome Rate",
+                        f"{base_rate:.2%}"
+                        if base_rate is not None
+                        else "N/A"
+                    )
+
+                with st.expander(
+                    "View Detailed Validation Data"
+                ):
+                    st.json(metrics)
 
         st.divider()
 
