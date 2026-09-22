@@ -16,11 +16,15 @@ F=["ret_1","ret_2","ret_5","ret_10","ret_20","ret_60","vol_5","vol_20","vol_rati
 "spy_ret_1","spy_ret_5","spy_ret_20","spy_vol_20","qqq_ret_5","qqq_ret_20","rel_spy_5","rel_spy_20"]
 
 def path(h): return MODEL_DIR/f"stock_model_h{h}.joblib"
+
 def client():
-    
-    k, s = secret("ALPACA_API_KEY"), secret("ALPACA_SECRET_KEY")
-    if not k or not s: raise RuntimeError("Missing Alpaca credentials.")
-    return StockHistoricalDataClient(k,s)
+    k = secret("ALPACA_API_KEY")
+    s = secret("ALPACA_SECRET_KEY")
+
+    if not k or not s:
+        raise RuntimeError("Missing Alpaca credentials.")
+
+    return StockHistoricalDataClient(k, s)
 def bars(symbols,years=7):
     syms=sorted(set(symbols+["SPY","QQQ"])); end=datetime.now(timezone.utc); start=end-timedelta(days=int(years*365.25))
     q=StockBarsRequest(symbol_or_symbols=syms,timeframe=TimeFrame.Day,start=start,end=end,feed=DataFeed.IEX)
