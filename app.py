@@ -131,6 +131,11 @@ with st.sidebar.expander("Alpaca Connection Test"):
         except Exception as error:
             st.error(f"Connection test failed: {error}")
 from dual_agent.research import DEFAULT_UNIVERSE, latest_scan, run_research
+
+from dual_agent.stock import (
+    train_all as train_stock_models,
+    metrics_all as stock_model_metrics,
+)
 from dual_agent.signal_engine import clean_symbols, stock_decision, sports_decision, GATES
 from dual_agent.validated_model import VALIDATED_STOCK_MODEL as M
 from trading_center_ui import render_trading_center
@@ -2082,8 +2087,116 @@ if page == "📈 Trading Center":
     )
 
 
+
 def render_research_lab():
     if page == "🧪 Research Lab":
+        st.subheader("🧪 Research Lab - Optional Revalidation")
+
+        # ==========================================
+        # STOCK MODEL TRAINING CENTER
+        # ==========================================
+
+        st.divider()
+        st.subheader("📈 Stock Model Training Center")
+
+        st.caption(
+            "Train and evaluate historical stock predictions "
+            "using Alpaca market data. No trades are placed."
+        )
+
+        stock_symbols = st.text_input(
+            "Stocks to train",
+            value="AAPL,MSFT,NVDA,AMZN,META",
+            key="stock_training_symbols",
+        )
+
+        symbols = [
+            symbol.strip().upper()
+            for symbol in stock_symbols.split(",")
+            if symbol.strip()
+        ]
+
+        st.write(
+            "Prediction horizons: 1, 5, and 20 trading days."
+        )
+
+        if st.button(
+            "Train Stock Prediction Models",
+            key="train_stock_models_button",
+            type="primary",
+        ):
+
+            if not symbols:
+                st.warning(
+                    "Enter at least one stock symbol."
+                )
+
+            else:
+                try:
+                    with st.spinner(
+                        "Downloading historical data and "
+                        "training stock prediction models..."
+                    ):
+
+                        results = train_stock_models(symbols)
+
+                    st.session_state[
+                        "stock_training_results"
+                    ] = results
+
+                    st.success(
+                        "Stock model training completed."
+                    )
+
+                except Exception as e:
+                    st.error(
+                        f"Stock model training failed: {e}"
+                    )
+
+        results = st.session_state.get(
+            "stock_training_results"
+        )
+
+        if results:
+
+            st.subheader(
+                "Historical Validation Results"
+            )
+
+            for horizon, metrics in results.items():
+
+                st.markdown(
+                    f"### {horizon}-Day Prediction Model"
+                )
+
+                st.json(metrics)
+
+        st.divider()
+
+        if st.button(
+            "View Saved Stock Model Results",
+            key="view_stock_model_results",
+        ):
+
+            try:
+                saved_metrics = stock_model_metrics()
+
+                if saved_metrics:
+                    st.json(saved_metrics)
+
+                else:
+                    st.info(
+                        "No saved stock model results found."
+                    )
+
+            except Exception as e:
+                st.error(
+                    f"Unable to load model results: {e}"
+                )
+
+        # ==========================================
+        # EXISTING NBA RESEARCH CONTINUES BELOW
+        # ==========================================
         st.subheader("🧪 Research Lab – Optional Revalidation")
 
         st.markdown("### 🏀 NBA Data Connection Test")
