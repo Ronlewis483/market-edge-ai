@@ -96,19 +96,182 @@ def split_dates(d, h=1):
         )
 
     return train, calibration, test
-def train(symbols,h):
-    d=dataset(bars(symbols),h); d=d[d.symbol.isin(symbols)].dropna(subset=F+["target"]).sort_values("timestamp")
+
+def train(symbols, h):
+
+    # Download historical market data.
+    d = dataset(bars(symbols), h)
+
+    d = (
+        d[d.symbol.isin(symbols)]
+        .dropna(subset=F + ["target"])
+        .sort_values("timestamp")
+    )
+
+    # Separate historical training, calibration,
+    # and testing periods.
     tr, cal, te = split_dates(d, h)
-    m=HistGradientBoostingClassifier(learning_rate=.035,max_iter=350,max_leaf_nodes=15,min_samples_leaf=35,l2_regularization=2,random_state=42)
-    m.fit(tr[F],tr.target.astype(int))
-    pc=m.predict_proba(cal[F])[:,1]; iso=IsotonicRegression(out_of_bounds="clip",y_min=.02,y_max=.98).fit(pc,cal.target.astype(int))
-    raw=m.predict_proba(te[F])[:,1]; p=iso.predict(raw); y=te.target.astype(int); base=float(tr.target.mean()); bp=np.full(len(y),base)
-    met={"horizon":h,"train_rows":len(tr),"calibration_rows":len(cal),"test_rows":len(te),"base_rate":base,
-         "baseline_brier":float(brier_score_loss(y,bp)),"model_brier":float(brier_score_loss(y,p)),
-         "baseline_log_loss":float(log_loss(y,bp)),"model_log_loss":float(log_loss(y,p)),
-         "auc":float(roc_auc_score(y,p)) if y.nunique()>1 else None}
-    met["passes_benchmarks"]=met["model_brier"]<met["baseline_brier"] and met["model_log_loss"]<met["baseline_log_loss"]
-    joblib.dump({"model":m,"cal":iso,"base":base,"metrics":met},path(h)); return met
+
+    # Train the existing prediction model.
+    m = HistGradientBoostingClassifier(
+        learning_rate=0.035,
+        max_iter=350,
+        max_leaf_nodes=15,
+        min_samples_leaf=35,
+        l2_regularization=2,
+        random_state=42,
+    )
+
+    m.fit(tr[F], tr.target.astype(int))
+
+    # Calibrate probability estimates.
+    pc = m.predict_proba(cal[F])[:, 1]
+
+    iso = IsotonicRegression(
+        out_of_bounds="clip",
+        y_min=0.02,
+        y_max=0.98,
+    )
+
+    iso.fit(pc, cal.target.astype(int))
+
+    # Evaluate on unseen historical test data.
+    raw = m.predict_proba(te[F])[:, 1]
+
+    p = iso.predict(raw)
+
+    y = te.target.astype(int)
+
+    base = float(tr.target.mean())
+
+    bp = np.full(len(y), base)
+
+    # Convert predicted probabilities into
+    # directional predictions.
+    predicted_direction = (p >= 0.50).astype(int)
+
+    actual_direction = y.to_numpy()
+
+    # Directional accuracy.
+    directional_accuracy = float(
+        np.mean(
+            predicted_direction == actual_direction
+        )
+    )
+
+    # Precision of bullish predictions.
+    bullish_predictions = predicted_direction == 1
+
+    if bullish_predictions.sum() > 0:
+
+        bullish_precision = float(
+            np.mean(
+                actual_direction[bullish_predictions] == 1
+            )
+        )
+
+    else:
+        bullish_precision = None
+
+    # Precision of bearish predictions.
+    bearish_predictions = predicted_direction == 0
+
+    if bearish_predictions.sum() > 0:
+
+        bearish_precision = float(
+            np.mean(
+                actual_direction[bearish_predictions] == 0
+            )
+        )
+
+    else:
+        bearish_precision = None
+
+    # Historical majority-class baseline.
+    test_positive_rate = float(y.mean())
+
+    majority_baseline_accuracy = max(
+        test_positive_rate,
+        1.0 - test_positive_rate,
+    )
+
+    # Probability validation.
+    baseline_brier = float(
+        brier_score_loss(y, bp)
+    )
+
+    model_brier = float(
+        brier_score_loss(y, p)
+    )
+
+    baseline_log_loss = float(
+        log_loss(y, bp, labels=[0, 1])
+    )
+
+    model_log_loss = float(
+        log_loss(y, p, labels=[0, 1])
+    )
+
+    auc = (
+        float(roc_auc_score(y, p))
+        if y.nunique() > 1
+        else None
+    )
+
+    # Save validation results.
+    met = {
+        "horizon": h,
+
+        "train_rows": len(tr),
+        "calibration_rows": len(cal),
+        "test_rows": len(te),
+
+        "base_rate": base,
+
+        "baseline_brier": baseline_brier,
+        "model_brier": model_brier,
+
+        "baseline_log_loss": baseline_log_loss,
+        "model_log_loss": model_log_loss,
+
+        "auc": auc,
+
+        "directional_accuracy": directional_accuracy,
+
+        "bullish_precision": bullish_precision,
+
+        "bearish_precision": bearish_precision,
+
+        "majority_baseline_accuracy":
+            majority_baseline_accuracy,
+
+        "test_positive_rate": test_positive_rate,
+    }
+
+    # Require improvement over probability baselines
+    # and the historical majority-class benchmark.
+    met["passes_benchmarks"] = bool(
+        model_brier < baseline_brier
+        and model_log_loss < baseline_log_loss
+        and auc is not None
+        and auc > 0.50
+        and directional_accuracy
+        > majority_baseline_accuracy
+    )
+
+    # Preserve compatibility with the existing
+    # Research Lab and stock scanner.
+    joblib.dump(
+        {
+            "model": m,
+            "cal": iso,
+            "base": base,
+            "metrics": met,
+        },
+        path(h),
+    )
+
+    return met
 def train_all(symbols): return {str(h):train(symbols,h) for h in HORIZONS}
 def scan(symbols):
     rawdata=bars(symbols,1); rows=[]
