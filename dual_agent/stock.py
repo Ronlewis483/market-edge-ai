@@ -52,12 +52,53 @@ def dataset(d,h):
     x=x.merge(spy,on="timestamp",how="left").merge(q,on="timestamp",how="left")
     x["rel_spy_5"]=x.ret_5-x.spy_ret_5; x["rel_spy_20"]=x.ret_20-x.spy_ret_20
     return x
-def split_dates(d):
-    dates=np.array(sorted(d.timestamp.dt.normalize().unique())); a=dates[int(len(dates)*.70)]; b=dates[int(len(dates)*.85)]
-    return d[d.timestamp.dt.normalize()<a],d[(d.timestamp.dt.normalize()>=a)&(d.timestamp.dt.normalize()<b)],d[d.timestamp.dt.normalize()>=b]
+
+def split_dates(d, h=1):
+    dates = np.array(
+        sorted(d.timestamp.dt.normalize().unique())
+    )
+
+    if len(dates) < 100:
+        raise ValueError(
+            "Insufficient historical dates for validation."
+        )
+
+    a_idx = int(len(dates) * 0.70)
+    b_idx = int(len(dates) * 0.85)
+
+    a = dates[a_idx]
+    b = dates[b_idx]
+
+    # Exclude observations whose future outcomes
+    # overlap the following evaluation period.
+    train_end = dates[max(0, a_idx - h)]
+    cal_end = dates[max(a_idx, b_idx - h)]
+
+    normalized = d.timestamp.dt.normalize()
+
+    train = d[normalized < train_end].copy()
+
+    calibration = d[
+        (normalized >= a) &
+        (normalized < cal_end)
+    ].copy()
+
+    test = d[normalized >= b].copy()
+
+    if (
+        train.empty or
+        calibration.empty or
+        test.empty
+    ):
+        raise ValueError(
+            "Insufficient data after applying "
+            "the prediction-horizon separation."
+        )
+
+    return train, calibration, test
 def train(symbols,h):
     d=dataset(bars(symbols),h); d=d[d.symbol.isin(symbols)].dropna(subset=F+["target"]).sort_values("timestamp")
-    tr,cal,te=split_dates(d)
+    tr, cal, te = split_dates(d, h)
     m=HistGradientBoostingClassifier(learning_rate=.035,max_iter=350,max_leaf_nodes=15,min_samples_leaf=35,l2_regularization=2,random_state=42)
     m.fit(tr[F],tr.target.astype(int))
     pc=m.predict_proba(cal[F])[:,1]; iso=IsotonicRegression(out_of_bounds="clip",y_min=.02,y_max=.98).fit(pc,cal.target.astype(int))
