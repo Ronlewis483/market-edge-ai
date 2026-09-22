@@ -71,6 +71,7 @@ st.set_page_config(page_title="Market Edge AI V5", page_icon="📊", layout="wid
 from dual_agent.research import DEFAULT_UNIVERSE, latest_scan, run_research
 from dual_agent.signal_engine import clean_symbols, stock_decision, sports_decision, GATES
 from dual_agent.validated_model import VALIDATED_STOCK_MODEL as M
+from trading_center_ui import render_trading_center
 
 
 # ==========================================
@@ -2010,19 +2011,12 @@ if page == "📊 Performance":
 
 
 if page == "📈 Trading Center":
-    st.subheader("💾 Saved Validated Model")
-
-    st.success(
-        "This configuration is bundled with the app "
-        "and survives Streamlit restarts."
-    )
-
-    st.json(M)
-
-    st.write(
-        "Daily Command Center scans load this approved "
-        "configuration automatically; they do not rerun "
-        "the 90-symbol walk-forward experiment."
+    render_trading_center(
+        latest_scan=latest_scan,
+        stock_decision=stock_decision,
+        universe=default,
+        clean_symbols=clean_symbols,
+        model=M,
     )
 
 
