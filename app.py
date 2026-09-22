@@ -68,6 +68,68 @@ from dual_agent.supabase_db import (
 )
 
 st.set_page_config(page_title="Market Edge AI V5", page_icon="📊", layout="wide")
+
+# ==========================================
+# MARKET EDGE AI V5 - ALPACA CONNECTION TEST
+# ==========================================
+
+import requests
+
+with st.sidebar.expander("Alpaca Connection Test"):
+
+    if st.button("Test Alpaca API", key="test_alpaca_connection"):
+
+        try:
+            api_key = st.secrets["ALPACA_API_KEY"]
+            secret_key = st.secrets["ALPACA_SECRET_KEY"]
+
+            headers = {
+                "APCA-API-KEY-ID": api_key,
+                "APCA-API-SECRET-KEY": secret_key,
+            }
+
+            response = requests.get(
+                "https://data.alpaca.markets/v2/stocks/AAPL/bars",
+                headers=headers,
+                params={
+                    "timeframe": "1Day",
+                    "limit": 1,
+                    "feed": "iex",
+                },
+                timeout=15,
+            )
+
+            if response.status_code == 200:
+
+                data = response.json()
+                bars = data.get("bars", [])
+
+                st.success("Alpaca API connected successfully!")
+
+                if bars:
+                    st.write("Latest available AAPL bar:")
+                    st.json(bars[0])
+                else:
+                    st.warning(
+                        "Connection successful, but no price bars were returned."
+                    )
+
+            else:
+                st.error(
+                    f"Alpaca API returned HTTP {response.status_code}."
+                )
+                st.write(response.text[:500])
+
+        except KeyError as error:
+            st.error(
+                f"Missing Alpaca credential in Streamlit Secrets: {error}"
+            )
+
+        except requests.RequestException as error:
+            st.error(f"Alpaca connection error: {error}")
+
+        except Exception as error:
+            st.error(f"Connection test failed: {error}")
 from dual_agent.research import DEFAULT_UNIVERSE, latest_scan, run_research
 from dual_agent.signal_engine import clean_symbols, stock_decision, sports_decision, GATES
 from dual_agent.validated_model import VALIDATED_STOCK_MODEL as M
