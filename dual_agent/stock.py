@@ -342,7 +342,9 @@ def train(symbols, h):
         "majority_baseline_accuracy":
             majority_baseline_accuracy,
 
-        "test_positive_rate": test_positive_rate,
+                "test_positive_rate": test_positive_rate,
+
+        "prediction_diagnostics": prediction_diagnostics,
     }
 
     # Require improvement over probability baselines
