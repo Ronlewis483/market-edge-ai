@@ -2248,87 +2248,87 @@ def render_research_lab():
                         delta_color="normal",
                     )
 
-            # -----------------------------------------
-            # Prediction Diagnostics
-            # -----------------------------------------
-    
-            st.markdown("### Prediction Diagnostics")
-    
-            diagnostics = metrics.get(
-                "prediction_diagnostics"
+    # -----------------------------------------
+    # Prediction Diagnostics
+    # -----------------------------------------
+
+    st.markdown("### Prediction Diagnostics")
+
+    diagnostics = metrics.get(
+        "prediction_diagnostics"
+    )
+
+    if diagnostics is not None:
+
+        st.json(diagnostics)
+
+    else:
+
+        st.warning(
+            "Prediction diagnostics are not available. "
+            "Retrain the stock models to generate them."
+        )
+
+
+            
+
+            st.markdown(
+                "#### Historical Data Summary"
             )
-    
-            if diagnostics is not None:
-    
-                st.json(diagnostics)
-    
-            else:
-    
-                st.warning(
-                    "Prediction diagnostics are not available. "
-                    "Retrain the stock models to generate them."
+
+            col3, col4, col5 = st.columns(3)
+
+            with col3:
+                st.metric(
+                    "Training Observations",
+                    f"{metrics.get('train_rows', 0):,}"
                 )
-      
-    
-                    
-    
-                    st.markdown(
-                        "#### Historical Data Summary"
-                    )
-    
-                    col3, col4, col5 = st.columns(3)
-    
-                    with col3:
-                        st.metric(
-                            "Training Observations",
-                            f"{metrics.get('train_rows', 0):,}"
-                        )
-    
-                    with col4:
-                        st.metric(
-                            "Calibration Observations",
-                            f"{metrics.get('calibration_rows', 0):,}"
-                        )
-    
-                    with col5:
-                        base_rate = metrics.get(
-                            "base_rate"
-                        )
-    
-                        st.metric(
-                            "Positive Outcome Rate",
-                            f"{base_rate:.2%}"
-                            if base_rate is not None
-                            else "N/A"
-                        )
-    
-                    with st.expander(
-                        "View Detailed Validation Data"
-                    ):
-                        st.json(metrics)
-    
-            st.divider()
-    
-            if st.button(
-                "View Saved Stock Model Results",
-                key="view_stock_model_results",
+
+            with col4:
+                st.metric(
+                    "Calibration Observations",
+                    f"{metrics.get('calibration_rows', 0):,}"
+                )
+
+            with col5:
+                base_rate = metrics.get(
+                    "base_rate"
+                )
+
+                st.metric(
+                    "Positive Outcome Rate",
+                    f"{base_rate:.2%}"
+                    if base_rate is not None
+                    else "N/A"
+                )
+
+            with st.expander(
+                "View Detailed Validation Data"
             ):
-    
-                try:
-                    saved_metrics = stock_model_metrics()
-    
-                    if saved_metrics:
-                        st.json(saved_metrics)
-    
-                    else:
-                        st.info(
-                            "No saved stock model results found."
-                        )
-    
-                except Exception as e:
-                    st.error(
-                        f"Unable to load model results: {e}"
-                    )
+                st.json(metrics)
+
+    st.divider()
+
+    if st.button(
+        "View Saved Stock Model Results",
+        key="view_stock_model_results",
+    ):
+
+        try:
+            saved_metrics = stock_model_metrics()
+
+            if saved_metrics:
+                st.json(saved_metrics)
+
+            else:
+                st.info(
+                    "No saved stock model results found."
+                )
+
+        except Exception as e:
+            st.error(
+                f"Unable to load model results: {e}"
+            )
 
         # ==========================================
         # EXISTING NBA RESEARCH CONTINUES BELOW
