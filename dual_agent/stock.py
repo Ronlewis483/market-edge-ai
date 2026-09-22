@@ -17,7 +17,8 @@ F=["ret_1","ret_2","ret_5","ret_10","ret_20","ret_60","vol_5","vol_20","vol_rati
 
 def path(h): return MODEL_DIR/f"stock_model_h{h}.joblib"
 def client():
-    k,s=secret("ALPACA_API_KEY"),secret("ALPACA_API_SECRET")
+    
+    k, s = secret("ALPACA_API_KEY"), secret("ALPACA_SECRET_KEY")
     if not k or not s: raise RuntimeError("Missing Alpaca credentials.")
     return StockHistoricalDataClient(k,s)
 def bars(symbols,years=7):
