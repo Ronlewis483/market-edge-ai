@@ -218,6 +218,103 @@ def train(symbols, h):
         else None
     )
 
+
+    # ==========================================
+    # MARKET EDGE AI - PREDICTION DIAGNOSTICS
+    # ==========================================
+
+    # Analyze raw and calibrated probabilities.
+    raw_probability_stats = {
+        "min": float(np.min(raw)),
+        "max": float(np.max(raw)),
+        "mean": float(np.mean(raw)),
+        "std": float(np.std(raw)),
+    }
+
+    calibrated_probability_stats = {
+        "min": float(np.min(p)),
+        "max": float(np.max(p)),
+        "mean": float(np.mean(p)),
+        "std": float(np.std(p)),
+    }
+
+    # Count bullish and bearish predictions.
+    bullish_count = int(np.sum(predicted_direction == 1))
+    bearish_count = int(np.sum(predicted_direction == 0))
+
+    # Evaluate alternative probability thresholds.
+    threshold_results = {}
+
+    for threshold in [0.45, 0.50, 0.55, 0.60, 0.65]:
+
+        threshold_predictions = (
+            p >= threshold
+        ).astype(int)
+
+        threshold_accuracy = float(
+            np.mean(
+                threshold_predictions == actual_direction
+            )
+        )
+
+        threshold_results[str(threshold)] = {
+            "accuracy": threshold_accuracy,
+            "bullish_predictions": int(
+                np.sum(threshold_predictions == 1)
+            ),
+            "bearish_predictions": int(
+                np.sum(threshold_predictions == 0)
+            ),
+        }
+
+    # Analyze predictions farther from 50%.
+    confidence_results = {}
+
+    for confidence in [0.55, 0.60, 0.65, 0.70]:
+
+        confident_bullish = p >= confidence
+        confident_bearish = p <= (1.0 - confidence)
+
+        selected = confident_bullish | confident_bearish
+
+        selected_count = int(np.sum(selected))
+
+        if selected_count > 0:
+
+            selected_predictions = (
+                p[selected] >= 0.50
+            ).astype(int)
+
+            selected_actual = actual_direction[selected]
+
+            selected_accuracy = float(
+                np.mean(
+                    selected_predictions == selected_actual
+                )
+            )
+
+        else:
+            selected_accuracy = None
+
+        confidence_results[str(confidence)] = {
+            "observations": selected_count,
+            "coverage": float(
+                selected_count / len(p)
+            ),
+            "directional_accuracy": selected_accuracy,
+        }
+
+    # Preserve diagnostic results.
+    prediction_diagnostics = {
+        "raw_probability_stats": raw_probability_stats,
+        "calibrated_probability_stats":
+            calibrated_probability_stats,
+        "bullish_predictions": bullish_count,
+        "bearish_predictions": bearish_count,
+        "threshold_results": threshold_results,
+        "confidence_results": confidence_results,
+    }
+    
     # Save validation results.
     met = {
         "horizon": h,
