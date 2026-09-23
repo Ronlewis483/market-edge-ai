@@ -3403,170 +3403,89 @@ def render_research_lab():
 
             selected_game = moneyline_df.loc[selected_index]
 
-            # =====================================
+
+            # ========================================
             # MARKET EDGE AI - NBA MATCHUP CARD
-            # =====================================
+            # ========================================
 
-            from zoneinfo import ZoneInfo
-            from html import escape
+            st.markdown("### NBA Moneyline")
 
-            # Retrieve selected game information
-            home_team = str(selected_game["home_team"])
-            away_team = str(selected_game["away_team"])
-            sportsbook = str(
-                selected_game.get("bookmaker", "Sportsbook")
+            away_col, home_col = st.columns(
+                2,
+                gap="medium"
             )
 
-            home_odds = selected_game.get("home_odds")
-            away_odds = selected_game.get("away_odds")
+            # ========================================
+            # AWAY TEAM
+            # ========================================
 
-            # Format American betting odds
-            def format_moneyline(odds):
-                if pd.isna(odds):
-                    return "N/A"
+            with away_col:
+                with st.container(border=True):
 
-                odds = int(odds)
+                    st.caption("AWAY TEAM")
 
-                return f"{odds:+d}"
+                    st.subheader(away_team)
 
-            home_odds_display = format_moneyline(home_odds)
-            away_odds_display = format_moneyline(away_odds)
+                    st.metric(
+                        label="Moneyline Odds",
+                        value=away_odds_display,
+                    )
 
-            # Convert UTC game time to Houston time
-            game_time = pd.to_datetime(
-                selected_game["commence_time"],
-                utc=True,
-                errors="coerce",
+            # ========================================
+            # HOME TEAM
+            # ========================================
+
+            with home_col:
+                with st.container(border=True):
+
+                    st.caption("HOME TEAM")
+
+                    st.subheader(home_team)
+
+                    st.metric(
+                        label="Moneyline Odds",
+                        value=home_odds_display,
+                    )
+
+            # ========================================
+            # TECHNICAL GAME DATA
+            # ========================================
+
+            with st.expander("View Technical Game Data"):
+                st.json(selected_game.to_dict())
+
+            st.divider()
+
+            # ========================================
+            # NBA PAYOUT CALCULATOR
+            # ========================================
+
+            st.subheader("Calculate Potential Payout")
+
+            wager_amount = st.number_input(
+                "Wager Amount ($)",
+                min_value=1.0,
+                value=10.0,
+                step=5.0,
+                key="nba_wager_amount",
             )
 
-            if pd.notna(game_time):
-                local_time = game_time.tz_convert(
-                    ZoneInfo("America/Chicago")
-                )
-
-                game_date_display = local_time.strftime(
-                    "%A, %B %d, %Y"
-                )
-
-                game_time_display = local_time.strftime(
-                    "%I:%M %p %Z"
-                )
-
-            else:
-                game_date_display = "Date unavailable"
-                game_time_display = "Time unavailable"
-
-            # Escape external text before rendering HTML
-            home_team_display = escape(home_team)
-            away_team_display = escape(away_team)
-            sportsbook_display = escape(sportsbook)
-
-            # ==========================================
-            # MATCHUP HEADER
-            # ==========================================
-
-            st.markdown("### NBA Game Odds")
-
-            st.caption(
-                f"{game_date_display} | "
-                f"{game_time_display}"
+            american_odds = st.number_input(
+                "American Odds",
+                value=100,
+                step=10,
+                key="nba_american_odds",
+                help=(
+                    "Enter the odds shown by your sportsbook. "
+                    "For example, +120 or -150."
+                ),
             )
 
-            st.markdown(
-                f"**Sportsbook:** {sportsbook}"
-            )
-
-
-        # ========================================
-        # MARKET EDGE AI - NBA MATCHUP CARD
-        # ========================================
-
-        st.markdown("### NBA Moneyline")
-
-        st.caption(
-            f"{game_date_display} | {game_time_display}"
-        )
-
-        st.write(f"**Sportsbook:** {sportsbook}")
-
-        st.markdown("")
-
-        # Create two side-by-side team cards
-        away_col, home_col = st.columns(2, gap="medium")
-
-        # ========================================
-        # AWAY TEAM
-        # ========================================
-
-        with away_col:
-
-            with st.container(border=True):
-
-                st.caption("AWAY TEAM")
-
-                st.subheader(away_team)
-
-                st.metric(
-                    label="Moneyline Odds",
-                    value=away_odds_display
-                )
-
-        # ========================================
-        # HOME TEAM
-        # ========================================
-
-        with home_col:
-
-            with st.container(border=True):
-
-                st.caption("HOME TEAM")
-
-                st.subheader(home_team)
-
-                st.metric(
-                    label="Moneyline Odds",
-                    value=home_odds_display
-                )
-
-        st.markdown("")
-
-            
-
-    # ========================================
-    # TECHNICAL GAME DATA
-    # ========================================
-
-    with st.expander("View Technical Game Data"):
-        st.json(selected_game.to_dict())
-
-    st.divider()
-
-    # ========================================
-    # NBA PAYOUT CALCULATOR
-    # ========================================
-
-    st.subheader("Calculate Potential Payout")
-
-    wager_amount = st.number_input(
-        "Wager Amount ($)",
-        min_value=1.0,
-        value=10.0,
-        step=5.0,
-        key="nba_wager_amount",
-    )
-
-    american_odds = st.number_input(
-        "American Odds",
-        value=100,
-        step=10,
-        key="nba_american_odds",
-        help=(
-            "Enter the odds shown by your sportsbook. "
-            "For example, +120 or -150."
-        ),
-    )
             if american_odds == 0:
-                st.error("American odds cannot be zero.")
+
+                st.error(
+                    "American odds cannot be zero."
+                )
 
             else:
 
@@ -3626,6 +3545,7 @@ def render_research_lab():
         st.error(
             f"Live NBA odds test failed: {e}"
         )
+
         st.divider()
 
     st.markdown("---")
