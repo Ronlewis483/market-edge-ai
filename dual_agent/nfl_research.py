@@ -735,124 +735,36 @@ def build_nfl_future_matchup_features(
 
 
 
-def predict_nfl_matchup(
-    feature_games,
-    future_features,
-):
-    """
-    Train on completed historical NFL games
-    and predict an upcoming matchup.
-    """
+df = feature_games.copy()
 
-    import pandas as pd
-    from sklearn.linear_model import LogisticRegression
+# Convert historical game dates to UTC
+df["start_time"] = pd.to_datetime(
+    df["start_time"],
+    utc=True,
+    errors="coerce",
+)
 
-    feature_columns = [
-        "win_pct_diff",
-        "avg_point_diff_diff",
-        "recent_5_win_pct_diff",
-        "recent_5_point_diff_diff",
-        "rest_diff",
-    ]
+# Get the upcoming matchup's kickoff time
+game_time = pd.to_datetime(
+    future_features.iloc[0]["start_time"],
+    utc=True,
+    errors="coerce",
+)
 
-    if feature_games is None or feature_games.empty:
-        raise ValueError(
-            "NFL historical feature dataset is empty."
-        )
-
-    if future_features is None or future_features.empty:
-        raise ValueError(
-            "Future NFL matchup features are empty."
-        )
-
-    future = future_features.iloc[[0]].copy()
-
-    game_time = pd.to_datetime(
-        future["start_time"].iloc[0],
-        utc=True,
-        errors="coerce",
+if pd.isna(game_time):
+    raise ValueError(
+        "Upcoming NFL game time is invalid."
     )
 
-    if pd.isna(game_time):
-        raise ValueError(
-            "Upcoming NFL game time is invalid."
-        )
+# Only use historical games before kickoff
+df = df[
+    df["start_time"] < game_time
+].copy()
 
-    df = feature_games.copy()
-
-    df["start_time"] = pd.to_datetime(
-        df["start_time"],
-        utc=True,
-        errors="coerce",
-    )
-
-    # Train only on completed historical games
-    # that occurred before the upcoming matchup.
-
-    df = df[
-        df["start_time"] < game_time
-    ].copy()
-
-    df = df.dropna(
-        subset=feature_columns + ["home_win"]
-    ).copy()
-
-    if len(df) < 100:
-        raise ValueError(
-            "Insufficient completed NFL games "
-            "for model training."
-        )
-
-    X_train = df[feature_columns]
-
-    y_train = df["home_win"].astype(int)
-
-    if y_train.nunique() < 2:
-        raise ValueError(
-            "NFL training data must contain "
-            "both home wins and home losses."
-        )
-
-    model = LogisticRegression(
-        max_iter=2000
-    )
-
-    model.fit(
-        X_train,
-        y_train,
-    )
-
-    X_future = future[feature_columns]
-
-    home_probability = float(
-        model.predict_proba(X_future)[0][1]
-    )
-
-    away_probability = 1.0 - home_probability
-
-    home_team = future["home_team"].iloc[0]
-    away_team = future["away_team"].iloc[0]
-
-    if home_probability >= away_probability:
-
-        predicted_team = home_team
-        confidence = home_probability
-
-    else:
-
-        predicted_team = away_team
-        confidence = away_probability
-
-    return {
-        "home_team": home_team,
-        "away_team": away_team,
-        "start_time": game_time,
-        "home_win_probability": home_probability,
-        "away_win_probability": away_probability,
-        "predicted_team": predicted_team,
-        "confidence": confidence,
-        "training_games": len(df),
-    }
+# Remove incomplete training rows
+df = df.dropna(
+    subset=feature_columns + ["home_win"]
+).copy()
 
 def evaluate_nfl_prediction_reliability(
     historical_predictions,
