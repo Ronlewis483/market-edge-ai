@@ -3530,10 +3530,15 @@ def render_research_lab():
 
         st.markdown("")
 
-            # Optional: Keep raw API data for debugging
-            with st.expander("View Technical Game Data"):
-                st.json(selected_game.to_dict())
-            st.divider()
+            
+        # ========================================
+        # TECHNICAL GAME DATA
+        # ========================================
+
+        with st.expander("View Technical Game Data"):
+            st.json(selected_game.to_dict())
+
+        st.divider()
 
             st.subheader("Calculate Potential Payout")
 
