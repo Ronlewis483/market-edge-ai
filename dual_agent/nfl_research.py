@@ -312,34 +312,20 @@ def run_nfl_walkforward_model(
         log_loss,
     )
 
-    def predict_nfl_matchup(
-        feature_games,
-        future_features,
-    ):
-        if feature_games is None or feature_games.empty:
-            raise ValueError("NFL feature dataset is empty.")
-    
-        df = feature_games.copy()
-        df = feature_games.copy()
-    
-        # Remove ties because home_win is NaN for tied games.
-        df = df.dropna(subset=["home_win"]).copy()
-    
-        df = df.sort_values("start_time").reset_index(drop=True)
-    
-        feature_columns = [
-            "win_pct_diff",
-            "avg_point_diff_diff",
-            "recent_5_win_pct_diff",
-            "recent_5_point_diff_diff",
-            "rest_diff",
-        ]
-    
-        missing_columns = [
-            col for col in feature_columns
-            if col not in df.columns
-        ]
+    if feature_games is None or feature_games.empty:
+        raise ValueError("NFL feature dataset is empty.")
+    if retrain_every < 1 or min_train_games < 1:
+        raise ValueError("Training and retraining intervals must be positive.")
 
+    df = feature_games.copy()
+    df = df.dropna(subset=["home_win"]).copy()
+    df["start_time"] = pd.to_datetime(df["start_time"], utc=True, errors="coerce")
+    df = df.dropna(subset=["start_time"]).sort_values("start_time").reset_index(drop=True)
+    feature_columns = [
+        "win_pct_diff", "avg_point_diff_diff", "recent_5_win_pct_diff",
+        "recent_5_point_diff_diff", "rest_diff",
+    ]
+    missing_columns = [col for col in feature_columns if col not in df.columns]
     if missing_columns:
         raise ValueError(
             f"Missing NFL model features: {missing_columns}"
@@ -357,8 +343,10 @@ def run_nfl_walkforward_model(
 
     for i in range(min_train_games, len(df)):
 
-        train_df = df.iloc[:i].copy()
         test_row = df.iloc[[i]].copy()
+        train_df = df[df["start_time"] < test_row["start_time"].iloc[0]].copy()
+        if len(train_df) < min_train_games:
+            continue
 
         X_train = train_df[feature_columns]
         y_train = train_df["home_win"].astype(int)
@@ -373,6 +361,7 @@ def run_nfl_walkforward_model(
         if (
             model is None
             or (i - min_train_games) % retrain_every == 0
+            or model_training_end >= test_row["start_time"].iloc[0]
         ):
             model = LogisticRegression(
                 max_iter=2000
@@ -382,6 +371,7 @@ def run_nfl_walkforward_model(
                 X_train,
                 y_train,
             )
+            model_training_end = train_df["start_time"].max()
 
         home_probability = float(
             model.predict_proba(X_test)[0][1]
@@ -475,6 +465,51 @@ def run_nfl_walkforward_model(
             predictions_df
         ),
     }
+
+def predict_nfl_matchup(feature_games, future_features):
+    """Predict one future matchup from completed games before its kickoff."""
+    from sklearn.linear_model import LogisticRegression
+
+    if feature_games is None or feature_games.empty:
+        raise ValueError("NFL feature dataset is empty.")
+    if future_features is None or future_features.empty:
+        raise ValueError("Future NFL matchup features are empty.")
+    features = [
+        "win_pct_diff", "avg_point_diff_diff", "recent_5_win_pct_diff",
+        "recent_5_point_diff_diff", "rest_diff",
+    ]
+    missing = [c for c in features if c not in feature_games.columns or c not in future_features.columns]
+    if missing:
+        raise ValueError(f"Missing NFL model features: {missing}")
+    future = future_features.iloc[[0]].copy()
+    game_time = pd.to_datetime(future.iloc[0]["start_time"], utc=True, errors="coerce")
+    if pd.isna(game_time):
+        raise ValueError("Upcoming NFL game time is invalid.")
+    df = feature_games.copy()
+    df["start_time"] = pd.to_datetime(df["start_time"], utc=True, errors="coerce")
+    df = df[(df["start_time"] < game_time) & df["home_win"].notna()].copy()
+    df = df.dropna(subset=features).sort_values("start_time")
+    if df.empty or df["home_win"].nunique() < 2:
+        raise ValueError("Not enough completed historical NFL games from both outcome classes before kickoff.")
+    if future[features].isna().any().any():
+        raise ValueError("Future NFL matchup contains missing model features.")
+    model = LogisticRegression(max_iter=2000)
+    model.fit(df[features], df["home_win"].astype(int))
+    home_probability = float(model.predict_proba(future[features])[0, 1])
+    away_probability = 1.0 - home_probability
+    home_team = future.iloc[0]["home_team"]
+    away_team = future.iloc[0]["away_team"]
+    return {
+        "home_team": home_team,
+        "away_team": away_team,
+        "start_time": game_time,
+        "home_win_probability": home_probability,
+        "away_win_probability": away_probability,
+        "predicted_team": home_team if home_probability >= 0.5 else away_team,
+        "confidence": max(home_probability, away_probability),
+        "training_games": len(df),
+    }
+
 
 def analyze_nfl_probability_bands(predictions_df):
     """
