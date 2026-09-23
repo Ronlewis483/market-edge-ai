@@ -4751,12 +4751,159 @@ def render_research_lab():
                     "NFL sportsbook moneyline markets."
                 )
 
-                st.dataframe(
-                    live_nfl_odds_df,
-                    use_container_width=True,
-                    hide_index=True,
+                
+            # NFL SPORTSBOOK ODDS DASHBOARD
+
+            from zoneinfo import ZoneInfo
+
+            def display_nfl_moneyline(odds):
+                if pd.isna(odds):
+                    return "N/A"
+                return f"{int(odds):+d}"
+
+            st.markdown("### 🏈 NFL Sportsbook Odds Center")
+
+            st.caption(
+                "Compare moneyline odds across sportsbooks "
+                "and find the best available price for each team."
+            )
+
+            nfl_games = live_nfl_odds_df.groupby(
+                "game_id", sort=False
+            )
+
+            st.info(
+                f"Displaying {len(nfl_games)} NFL games "
+                f"across {len(live_nfl_odds_df)} sportsbook markets."
+            )
+
+            for game_id, game_lines in nfl_games:
+
+                game = game_lines.iloc[0]
+
+                home_team = str(game["home_team"])
+                away_team = str(game["away_team"])
+
+                game_time = pd.to_datetime(
+                    game["commence_time"],
+                    utc=True,
+                    errors="coerce",
                 )
 
+                if pd.notna(game_time):
+                    game_time_display = (
+                        game_time.tz_convert(
+                            ZoneInfo("America/Chicago")
+                        ).strftime("%a, %b %d · %I:%M %p CT")
+                    )
+                else:
+                    game_time_display = "Time unavailable"
+
+                home_lines = game_lines.dropna(
+                    subset=["home_moneyline"]
+                )
+
+                away_lines = game_lines.dropna(
+                    subset=["away_moneyline"]
+                )
+
+                best_home = (
+                    home_lines.loc[
+                        home_lines["home_moneyline"].idxmax()
+                    ]
+                    if not home_lines.empty
+                    else None
+                )
+
+                best_away = (
+                    away_lines.loc[
+                        away_lines["away_moneyline"].idxmax()
+                    ]
+                    if not away_lines.empty
+                    else None
+                )
+
+                with st.container(border=True):
+
+                    st.caption(game_time_display)
+
+                    st.subheader(
+                        f"{away_team} @ {home_team}"
+                    )
+
+                    away_col, home_col = st.columns(2)
+
+                    with away_col:
+                        st.caption("AWAY TEAM")
+                        st.markdown(f"**{away_team}**")
+
+                        if best_away is not None:
+                            st.metric(
+                                "Best Moneyline",
+                                display_nfl_moneyline(
+                                    best_away["away_moneyline"]
+                                ),
+                            )
+
+                            st.caption(
+                                f"Sportsbook: {best_away['sportsbook']}"
+                            )
+                        else:
+                            st.info("Odds unavailable")
+
+                    with home_col:
+                        st.caption("HOME TEAM")
+                        st.markdown(f"**{home_team}**")
+
+                        if best_home is not None:
+                            st.metric(
+                                "Best Moneyline",
+                                display_nfl_moneyline(
+                                    best_home["home_moneyline"]
+                                ),
+                            )
+
+                            st.caption(
+                                f"Sportsbook: {best_home['sportsbook']}"
+                            )
+                        else:
+                            st.info("Odds unavailable")
+
+                    with st.expander(
+                        "View All Sportsbook Odds"
+                    ):
+
+                        comparison = game_lines[
+                            [
+                                "sportsbook",
+                                "away_moneyline",
+                                "home_moneyline",
+                            ]
+                        ].copy()
+
+                        comparison["away_moneyline"] = (
+                            comparison["away_moneyline"].apply(
+                                display_nfl_moneyline
+                            )
+                        )
+
+                        comparison["home_moneyline"] = (
+                            comparison["home_moneyline"].apply(
+                                display_nfl_moneyline
+                            )
+                        )
+
+                        comparison.columns = [
+                            "Sportsbook",
+                            away_team,
+                            home_team,
+                        ]
+
+                        st.dataframe(
+                            comparison,
+                            use_container_width=True,
+                            hide_index=True,
+                        )
                 st.session_state["live_nfl_odds"] = (
                     live_nfl_odds_df
                 )
