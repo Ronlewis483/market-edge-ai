@@ -3486,89 +3486,119 @@ def render_research_lab():
             # ========================================
 
             
-# ==========================================
-# GAME INFORMATION PANEL
-# ==========================================
 
-with st.expander("Game Information", expanded=True):
+            # ==========================================
+            # MARKET EDGE AI - GAME INFORMATION PANEL
+            # ==========================================
 
-    game_info = selected_game
+            with st.expander(
+                "Game Information",
+                expanded=True,
+            ):
 
-    # Retrieve game information
-    event_id = str(game_info.get("event_id", "N/A"))
+                game_info = selected_game
 
-    game_date = pd.to_datetime(
-        game_info.get("commence_time"),
-        utc=True,
-        errors="coerce"
-    )
+                # Retrieve game information
+                event_id = str(
+                    game_info.get("event_id", "N/A")
+                )
 
-    if pd.notna(game_date):
-        game_date = game_date.tz_convert(
-            "America/Chicago"
-        )
+                game_date = pd.to_datetime(
+                    game_info.get("commence_time"),
+                    utc=True,
+                    errors="coerce",
+                )
 
-        date_display = game_date.strftime(
-            "%B %d, %Y"
-        )
+                if pd.notna(game_date):
 
-        time_display = game_date.strftime(
-            "%I:%M %p %Z"
-        )
+                    game_date = game_date.tz_convert(
+                        "America/Chicago"
+                    )
 
-    else:
-        date_display = "Not available"
-        time_display = "Not available"
+                    date_display = game_date.strftime(
+                        "%B %d, %Y"
+                    )
 
-    sportsbook_name = str(
-        game_info.get("bookmaker", "N/A")
-    )
+                    time_display = game_date.strftime(
+                        "%I:%M %p %Z"
+                    )
 
-    home_code = str(
-        game_info.get("home_team_code", "N/A")
-    )
+                else:
 
-    away_code = str(
-        game_info.get("away_team_code", "N/A")
-    )
+                    date_display = "Not available"
+                    time_display = "Not available"
 
-    # Display game information
-    st.markdown("### Game Details")
+                sportsbook_name = str(
+                    game_info.get("bookmaker", "N/A")
+                )
 
-    col1, col2 = st.columns(2)
+                home_code = str(
+                    game_info.get("home_team_code", "N/A")
+                )
 
-    with col1:
-        st.caption("GAME DATE")
-        st.markdown(f"**{date_display}**")
+                away_code = str(
+                    game_info.get("away_team_code", "N/A")
+                )
 
-        st.caption("AWAY TEAM")
-        st.markdown(f"**{away_team} ({away_code})**")
+                # ======================================
+                # GAME DETAILS
+                # ======================================
 
-    with col2:
-        st.caption("GAME TIME")
-        st.markdown(f"**{time_display}**")
+                st.markdown("### Game Details")
 
-        st.caption("HOME TEAM")
-        st.markdown(f"**{home_team} ({home_code})**")
+                col1, col2 = st.columns(2)
 
-    st.divider()
+                with col1:
 
-    st.markdown("### Sportsbook Information")
+                    st.caption("GAME DATE")
+                    st.markdown(f"**{date_display}**")
 
-    col3, col4 = st.columns(2)
+                    st.caption("AWAY TEAM")
+                    st.markdown(
+                        f"**{away_team} ({away_code})**"
+                    )
 
-    with col3:
-        st.caption("SPORTSBOOK")
-        st.markdown(f"**{sportsbook_name}**")
+                with col2:
 
-    with col4:
-        st.caption("MARKET")
-        st.markdown("**NBA Moneyline**")
+                    st.caption("GAME TIME")
+                    st.markdown(f"**{time_display}**")
 
-    st.divider()
+                    st.caption("HOME TEAM")
+                    st.markdown(
+                        f"**{home_team} ({home_code})**"
+                    )
 
-    st.caption("EVENT ID")
-    st.code(event_id, language=None)
+                st.divider()
+
+                # ======================================
+                # SPORTSBOOK INFORMATION
+                # ======================================
+
+                st.markdown(
+                    "### Sportsbook Information"
+                )
+
+                col3, col4 = st.columns(2)
+
+                with col3:
+
+                    st.caption("SPORTSBOOK")
+                    st.markdown(
+                        f"**{sportsbook_name}**"
+                    )
+
+                with col4:
+
+                    st.caption("MARKET")
+                    st.markdown("**NBA Moneyline**")
+
+                st.divider()
+
+                st.caption("EVENT ID")
+                st.code(
+                    event_id,
+                    language=None,
+                )
     
             st.divider()
 
