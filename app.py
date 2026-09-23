@@ -3485,9 +3485,91 @@ def render_research_lab():
             # TECHNICAL GAME DATA
             # ========================================
 
-            with st.expander("View Technical Game Data"):
-                st.json(selected_game.to_dict())
+            
+# ==========================================
+# GAME INFORMATION PANEL
+# ==========================================
 
+with st.expander("Game Information", expanded=True):
+
+    game_info = selected_game
+
+    # Retrieve game information
+    event_id = str(game_info.get("event_id", "N/A"))
+
+    game_date = pd.to_datetime(
+        game_info.get("commence_time"),
+        utc=True,
+        errors="coerce"
+    )
+
+    if pd.notna(game_date):
+        game_date = game_date.tz_convert(
+            "America/Chicago"
+        )
+
+        date_display = game_date.strftime(
+            "%B %d, %Y"
+        )
+
+        time_display = game_date.strftime(
+            "%I:%M %p %Z"
+        )
+
+    else:
+        date_display = "Not available"
+        time_display = "Not available"
+
+    sportsbook_name = str(
+        game_info.get("bookmaker", "N/A")
+    )
+
+    home_code = str(
+        game_info.get("home_team_code", "N/A")
+    )
+
+    away_code = str(
+        game_info.get("away_team_code", "N/A")
+    )
+
+    # Display game information
+    st.markdown("### Game Details")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.caption("GAME DATE")
+        st.markdown(f"**{date_display}**")
+
+        st.caption("AWAY TEAM")
+        st.markdown(f"**{away_team} ({away_code})**")
+
+    with col2:
+        st.caption("GAME TIME")
+        st.markdown(f"**{time_display}**")
+
+        st.caption("HOME TEAM")
+        st.markdown(f"**{home_team} ({home_code})**")
+
+    st.divider()
+
+    st.markdown("### Sportsbook Information")
+
+    col3, col4 = st.columns(2)
+
+    with col3:
+        st.caption("SPORTSBOOK")
+        st.markdown(f"**{sportsbook_name}**")
+
+    with col4:
+        st.caption("MARKET")
+        st.markdown("**NBA Moneyline**")
+
+    st.divider()
+
+    st.caption("EVENT ID")
+    st.code(event_id, language=None)
+    
             st.divider()
 
             # ========================================
