@@ -4957,163 +4957,402 @@ def render_research_lab():
                     f"NFL best-line error: {e}"
                 )
 
-    # ------------------------------------------------------------
+    
+    # ============================================================
     # LIVE NFL OPPORTUNITY ENGINE
-    # ------------------------------------------------------------
+    # ============================================================
 
     st.markdown("### 🧠 Live NFL Opportunity Engine")
 
-
-    st.write("NFL ENGINE DIAGNOSTICS")
-
-    st.write(
-        "Best lines loaded:",
-        "nfl_best_lines" in st.session_state
+    best_lines = st.session_state.get("nfl_best_lines")
+    feature_games = st.session_state.get("nfl_feature_games")
+    historical_result = st.session_state.get(
+        "nfl_walkforward_result"
     )
 
-    st.write(
-        "Calibration predictions loaded:",
-        "nfl_calibration_predictions" in st.session_state
-    )
+    # ------------------------------------------------------------
+    # ENGINE STATUS
+    # ------------------------------------------------------------
 
-    st.write(
-        "Historical predictions loaded:",
-        "nfl_historical_predictions" in st.session_state
-    )
+    st.caption("NFL Engine Status")
 
-    st.write(
-        "Walk-forward results loaded:",
-        "nfl_walkforward_result" in st.session_state
-    )
+    col1, col2, col3 = st.columns(3)
 
+    with col1:
+        st.metric(
+            "Sportsbook Lines",
+            "Ready" if (
+                isinstance(best_lines, pd.DataFrame)
+                and not best_lines.empty
+            ) else "Not Loaded"
+        )
 
+    with col2:
+        st.metric(
+            "Historical Features",
+            "Ready" if (
+                isinstance(feature_games, pd.DataFrame)
+                and not feature_games.empty
+            ) else "Not Loaded"
+        )
 
-    if (
-        "nfl_best_lines" in st.session_state
-        and "nfl_calibration_predictions" in st.session_state
+    with col3:
+        st.metric(
+            "Walk-Forward Validation",
+            "Ready" if historical_result else "Not Loaded"
+        )
+
+    # ------------------------------------------------------------
+    # GENERATE UPCOMING NFL PREDICTIONS
+    # ------------------------------------------------------------
+
+    if st.button(
+        "Generate Live NFL Predictions",
+        key="generate_live_nfl_predictions"
     ):
-        if st.button("Analyze Live NFL Opportunities"):
 
+        try:
 
-            try:
-            
-                historical_result = st.session_state.get(
-                    "nfl_walkforward_result"
+            if (
+                best_lines is None
+                or best_lines.empty
+            ):
+                st.error(
+                    "Load NFL moneylines and run the "
+                    "Best-Line Shopper first."
                 )
 
-                if historical_result is None:
-                    st.error(
-                        "NFL historical validation results are missing. "
-                        "Run the NFL Walk-Forward Model first."
-                    )
-                    st.stop()
-                
-                if not st.session_state.get("nfl_walkforward_result"):
-                    st.error(
-                        "Run NFL Walk-Forward Model before analyzing "
-                        "live opportunities. Historical validation is required."
-                    )
-                    st.stop()
+            elif (
+                feature_games is None
+                or feature_games.empty
+            ):
+                st.error(
+                    "Build NFL pregame features first."
+                )
 
-                    # Retrieve historical walk-forward validation results.
-                    historical_result = st.session_state[
-                        "nfl_walkforward_result"
-                    ]
-                
-                    # Retrieve confidence calibration data.
-                    calibration_predictions = st.session_state.get(
-                        "nfl_calibration_predictions"
-                    )
-                
-                    # Historical validation must be available.
-                    if (
-                        calibration_predictions is None
-                        or calibration_predictions.empty
-                    ):
-                        st.error(
-                            "NFL confidence calibration data is unavailable. "
-                            "Run the walk-forward model and confidence "
-                            "calibration before analyzing live opportunities."
+            elif not historical_result:
+                st.error(
+                    "Run NFL Walk-Forward Model first."
+                )
+
+            else:
+
+                prediction_rows = []
+                prediction_errors = []
+
+                current_time = pd.Timestamp.now(tz="UTC")
+
+                with st.spinner(
+                    "Generating predictions for upcoming NFL games..."
+                ):
+
+                    for _, game in best_lines.iterrows():
+
+                        home_team = game["home_team"]
+                        away_team = game["away_team"]
+
+                        game_time = pd.to_datetime(
+                            game["commence_time"],
+                            utc=True,
+                            errors="coerce"
                         )
-                        st.stop()
 
+                        if pd.isna(game_time):
+                            continue
 
-            
+                        # Only predict games that have not started.
+                        if game_time <= current_time:
+                            continue
 
-            
-                
-                live_opportunities = build_live_nfl_opportunities(
-                    model_predictions=st.session_state[
-                        "nfl_calibration_predictions"
-                    ],
-                    best_lines=st.session_state[
-                        "nfl_best_lines"
-                    ],
-                    historical_accuracy=historical_result.get(
-                        "accuracy"
-                    ),
-                    historical_sample=historical_result.get(
-                        "prediction_count"
-                    ),
+                        try:
+
+                            # Build matchup features using
+                            # historical games before kickoff.
+
+                            future_features = (
+                                build_nfl_future_matchup_features(
+                                    feature_games,
+                                    home_team,
+                                    away_team,
+                                    game_time
+                                )
+                            )
+
+                            # Generate an actual model prediction.
+
+                            prediction = predict_nfl_matchup(
+                                feature_games,
+                                future_features
+                            )
+
+                            prediction_rows.append(
+                                {
+                                    "game_id": game.get("game_id"),
+                                    "commence_time": game_time,
+                                    "home_team": home_team,
+                                    "away_team": away_team,
+                                    "home_win_probability": prediction[
+                                        "home_win_probability"
+                                    ],
+                                    "away_win_probability": prediction[
+                                        "away_win_probability"
+                                    ],
+                                    "predicted_team": prediction[
+                                        "predicted_team"
+                                    ],
+                                    "confidence": prediction[
+                                        "confidence"
+                                    ],
+                                    "training_games": prediction[
+                                        "training_games"
+                                    ]
+                                }
+                            )
+
+                        except Exception as game_error:
+
+                            prediction_errors.append(
+                                f"{away_team} at {home_team}: "
+                                f"{game_error}"
+                            )
+
+                # ------------------------------------------------
+                # SAVE LIVE PREDICTIONS
+                # ------------------------------------------------
+
+                live_predictions = pd.DataFrame(
+                    prediction_rows
                 )
 
                 st.session_state[
-                    "nfl_live_opportunities"
-                ] = live_opportunities
+                    "nfl_live_predictions"
+                ] = live_predictions
+
+                # Clear previously generated opportunities
+                # so stale predictions cannot be displayed.
+
+                st.session_state.pop(
+                    "nfl_live_opportunities",
+                    None
+                )
+
+                if live_predictions.empty:
+
+                    st.warning(
+                        "No upcoming NFL predictions could "
+                        "be generated from the available data."
+                    )
+
+                else:
+
+                    st.success(
+                        f"Generated predictions for "
+                        f"{len(live_predictions)} upcoming NFL games."
+                    )
+
+                if prediction_errors:
+
+                    with st.expander(
+                        "Games that could not be predicted"
+                    ):
+
+                        for error in prediction_errors:
+                            st.write(error)
+
+        except Exception as e:
+
+            st.error(
+                f"NFL prediction error: {e}"
+            )
+
+    # ------------------------------------------------------------
+    # DISPLAY LIVE PREDICTIONS
+    # ------------------------------------------------------------
+
+    live_predictions = st.session_state.get(
+        "nfl_live_predictions"
+    )
+
+    if (
+        isinstance(live_predictions, pd.DataFrame)
+        and not live_predictions.empty
+    ):
+
+        st.markdown("### 🏈 Upcoming NFL Predictions")
+
+        display_predictions = live_predictions.copy()
+
+        display_predictions["commence_time"] = (
+            pd.to_datetime(
+                display_predictions["commence_time"],
+                utc=True
+            )
+            .dt.tz_convert("America/Chicago")
+            .dt.strftime("%b %d, %I:%M %p CT")
+        )
+
+        for column in [
+            "home_win_probability",
+            "away_win_probability",
+            "confidence"
+        ]:
+
+            display_predictions[column] = (
+                display_predictions[column]
+                .map(lambda x: f"{x:.1%}")
+            )
+
+        st.dataframe(
+            display_predictions[
+                [
+                    "commence_time",
+                    "away_team",
+                    "home_team",
+                    "predicted_team",
+                    "confidence",
+                    "home_win_probability",
+                    "away_win_probability",
+                    "training_games"
+                ]
+            ],
+            use_container_width=True,
+            hide_index=True
+        )
+
+        st.caption(
+            "Model probabilities are estimates, "
+            "not guaranteed outcomes."
+        )
+
+    # ------------------------------------------------------------
+    # LIVE NFL MARKET OPPORTUNITY ANALYSIS
+    # ------------------------------------------------------------
+
+    st.markdown("### 💰 NFL Market Opportunities")
+
+    if (
+        isinstance(live_predictions, pd.DataFrame)
+        and not live_predictions.empty
+        and isinstance(best_lines, pd.DataFrame)
+        and not best_lines.empty
+        and historical_result
+    ):
+
+        if st.button(
+            "Analyze Live NFL Opportunities",
+            key="analyze_live_nfl_opportunities"
+        ):
+
+            try:
+
+                with st.spinner(
+                    "Comparing NFL predictions against sportsbook odds..."
+                ):
+
+                    # Use live predictions, not historical
+                    # calibration predictions.
+
+                    live_opportunities = (
+                        build_live_nfl_opportunities(
+                            model_predictions=live_predictions,
+                            best_lines=best_lines,
+                            historical_accuracy=historical_result.get(
+                                "accuracy"
+                            ),
+                            historical_sample=historical_result.get(
+                                "prediction_count"
+                            )
+                        )
+                    )
+
+                    st.session_state[
+                        "nfl_live_opportunities"
+                    ] = live_opportunities
 
                 if live_opportunities.empty:
+
                     st.warning(
-                        "No live NFL games matched the available "
-                        "model predictions."
+                        "No upcoming NFL games matched "
+                        "the available sportsbook markets."
                     )
+
                 else:
+
                     st.success(
                         f"Analyzed {len(live_opportunities)} "
-                        "live NFL opportunities."
+                        "NFL market opportunities."
                     )
 
             except Exception as e:
+
                 st.error(
-                    f"Live NFL Opportunity Engine error: {e}"
+                    f"NFL opportunity analysis error: {e}"
                 )
 
     else:
+
         st.info(
-            "Load NFL model predictions and run the "
-            "Best-Line Shopper first."
+            "Generate live NFL predictions and load "
+            "the Best-Line Shopper before analyzing opportunities."
         )
 
+    # ------------------------------------------------------------
+    # DISPLAY NFL OPPORTUNITIES
+    # ------------------------------------------------------------
 
-    if "nfl_live_opportunities" in st.session_state:
+    live_opportunities = st.session_state.get(
+        "nfl_live_opportunities"
+    )
 
-        live_display = st.session_state[
-            "nfl_live_opportunities"
-        ].copy()
+    if (
+        isinstance(live_opportunities, pd.DataFrame)
+        and not live_opportunities.empty
+    ):
 
-        if not live_display.empty:
+        st.markdown("### 📊 NFL Opportunity Results")
 
-            for column in [
-                "home_win_probability",
-                "model_probability",
-                "market_no_vig_probability",
-                "model_edge",
-            ]:
-                if column in live_display.columns:
-                    live_display[column] = (
-                        live_display[column]
-                        .map(lambda x: f"{x:.1%}")
+        live_display = live_opportunities.copy()
+
+        for column in [
+            "home_win_probability",
+            "model_probability",
+            "market_no_vig_probability",
+            "model_edge"
+        ]:
+
+            if column in live_display.columns:
+
+                live_display[column] = (
+                    live_display[column]
+                    .map(
+                        lambda x: f"{x:.1%}"
+                        if pd.notna(x)
+                        else "—"
                     )
-
-            if "expected_value" in live_display.columns:
-                live_display["expected_value"] = (
-                    live_display["expected_value"]
-                    .map(lambda x: f"{x:+.3f}")
                 )
 
-            st.dataframe(
-                live_display,
-                use_container_width=True,
-                hide_index=True,
+        if "expected_value" in live_display.columns:
+
+            live_display["expected_value"] = (
+                live_display["expected_value"]
+                .map(
+                    lambda x: f"{x:+.3f}"
+                    if pd.notna(x)
+                    else "—"
+                )
             )
+
+        st.dataframe(
+            live_display,
+            use_container_width=True,
+            hide_index=True
+        )
+
+        st.caption(
+            "Expected value depends on model probability "
+            "accuracy and the sportsbook odds available "
+            "when the analysis was generated."
+        )
+
 if page == "🧪 Research Lab":
     render_research_lab()
