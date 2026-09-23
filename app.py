@@ -3403,16 +3403,195 @@ def render_research_lab():
 
             selected_game = moneyline_df.loc[selected_index]
 
-            st.write(
-                f"**Matchup:** "
-                f"{selected_game['away_team']} "
-                f"vs {selected_game['home_team']}"
+            s
+            # ==========================================
+            # MARKET EDGE AI - NBA MATCHUP CARD
+            # ==========================================
+
+            from zoneinfo import ZoneInfo
+            from html import escape
+
+            # Retrieve selected game information
+            home_team = str(selected_game["home_team"])
+            away_team = str(selected_game["away_team"])
+
+            sportsbook = str(
+                selected_game.get("bookmaker", "Sportsbook")
             )
 
-            st.write("Available sportsbook information:")
+            home_odds = selected_game.get("home_odds")
+            away_odds = selected_game.get("away_odds")
 
-            st.json(selected_game.to_dict())
+            # Format American betting odds
+            def format_moneyline(odds):
+                if pd.isna(odds):
+                    return "N/A"
 
+                odds = int(odds)
+
+                return f"{odds:+d}"
+
+            home_odds_display = format_moneyline(home_odds)
+            away_odds_display = format_moneyline(away_odds)
+
+            # Convert UTC game time to Houston time
+            game_time = pd.to_datetime(
+                selected_game["commence_time"],
+                utc=True,
+                errors="coerce",
+            )
+
+            if pd.notna(game_time):
+                local_time = game_time.tz_convert(
+                    ZoneInfo("America/Chicago")
+                )
+
+                game_date_display = local_time.strftime(
+                    "%A, %B %d, %Y"
+                )
+
+                game_time_display = local_time.strftime(
+                    "%I:%M %p %Z"
+                )
+
+            else:
+                game_date_display = "Date unavailable"
+                game_time_display = "Time unavailable"
+
+            # Escape external text before rendering HTML
+            home_team_display = escape(home_team)
+            away_team_display = escape(away_team)
+            sportsbook_display = escape(sportsbook)
+
+            # ==========================================
+            # MATCHUP HEADER
+            # ==========================================
+
+            st.markdown("### NBA Game Odds")
+
+            st.caption(
+                f"{game_date_display} | "
+                f"{game_time_display}"
+            )
+
+            st.markdown(
+                f"**Sportsbook:** {sportsbook}"
+            )
+
+            # ==========================================
+            # STYLED MATCHUP CARD
+            # ==========================================
+
+            st.markdown(
+                f"""
+                <div style="
+                    background: #172338;
+                    border: 1px solid #263850;
+                    border-radius: 16px;
+                    padding: 24px;
+                    margin-top: 12px;
+                    margin-bottom: 20px;
+                ">
+
+                    <div style="
+                        color: #94A3B8;
+                        font-size: 13px;
+                        font-weight: 600;
+                        margin-bottom: 20px;
+                    ">
+                        NBA MONEYLINE
+                    </div>
+
+                    <div style="
+                        display: flex;
+                        justify-content: space-between;
+                        align-items: center;
+                        gap: 12px;
+                        margin-bottom: 18px;
+                    ">
+
+                        <div>
+                            <div style="
+                                color: #94A3B8;
+                                font-size: 12px;
+                            ">
+                                AWAY TEAM
+                            </div>
+
+                            <div style="
+                                color: #F8FAFC;
+                                font-size: 20px;
+                                font-weight: 700;
+                            ">
+                                {away_team_display}
+                            </div>
+                        </div>
+
+                        <div style="
+                            background: #263850;
+                            color: #38BDF8;
+                            padding: 12px 18px;
+                            border-radius: 10px;
+                            font-size: 22px;
+                            font-weight: 700;
+                            white-space: nowrap;
+                        ">
+                            {away_odds_display}
+                        </div>
+
+                    </div>
+
+                    <div style="
+                        border-top: 1px solid #334155;
+                        margin-bottom: 18px;
+                    "></div>
+
+                    <div style="
+                        display: flex;
+                        justify-content: space-between;
+                        align-items: center;
+                        gap: 12px;
+                    ">
+
+                        <div>
+                            <div style="
+                                color: #94A3B8;
+                                font-size: 12px;
+                            ">
+                                HOME TEAM
+                            </div>
+
+                            <div style="
+                                color: #F8FAFC;
+                                font-size: 20px;
+                                font-weight: 700;
+                            ">
+                                {home_team_display}
+                            </div>
+                        </div>
+
+                        <div style="
+                            background: #263850;
+                            color: #38BDF8;
+                            padding: 12px 18px;
+                            border-radius: 10px;
+                            font-size: 22px;
+                            font-weight: 700;
+                            white-space: nowrap;
+                        ">
+                            {home_odds_display}
+                        </div>
+
+                    </div>
+
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            # Optional: Keep raw API data for debugging
+            with st.expander("View Technical Game Data"):
+                st.json(selected_game.to_dict())
             st.divider()
 
             st.subheader("Calculate Potential Payout")
