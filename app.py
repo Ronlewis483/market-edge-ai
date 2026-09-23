@@ -3401,19 +3401,18 @@ def render_research_lab():
                 ),
             )
 
-            selected_game = moneyline_df.loc[selected_index]
+                   selected_game = moneyline_df.loc[selected_index]
 
-            s
-            # ==========================================
-            # MARKET EDGE AI - NBA MATCHUP CARD
-            # ==========================================
+        # =====================================
+        # MARKET EDGE AI - NBA MATCHUP CARD
+        # =====================================
 
-            from zoneinfo import ZoneInfo
-            from html import escape
+        from zoneinfo import ZoneInfo
+        from html import escape
 
-            # Retrieve selected game information
-            home_team = str(selected_game["home_team"])
-            away_team = str(selected_game["away_team"])
+        # Retrieve selected game information
+        home_team = str(selected_game["home_team"])
+        away_team = str(selected_game["away_team"])
 
             sportsbook = str(
                 selected_game.get("bookmaker", "Sportsbook")
