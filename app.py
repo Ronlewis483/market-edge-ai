@@ -3401,7 +3401,7 @@ def render_research_lab():
                 ),
             )
 
-                   selected_game = moneyline_df.loc[selected_index]
+           selected_game = moneyline_df.loc[selected_index]
 
         # =====================================
         # MARKET EDGE AI - NBA MATCHUP CARD
