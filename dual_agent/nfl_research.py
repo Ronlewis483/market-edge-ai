@@ -313,32 +313,32 @@ def run_nfl_walkforward_model(
     )
 
     def predict_nfl_matchup(
-    feature_games,
-    future_features,
-):
-    if feature_games is None or feature_games.empty:
-        raise ValueError("NFL feature dataset is empty.")
-
-    df = feature_games.copy()
-    df = feature_games.copy()
-
-    # Remove ties because home_win is NaN for tied games.
-    df = df.dropna(subset=["home_win"]).copy()
-
-    df = df.sort_values("start_time").reset_index(drop=True)
-
-    feature_columns = [
-        "win_pct_diff",
-        "avg_point_diff_diff",
-        "recent_5_win_pct_diff",
-        "recent_5_point_diff_diff",
-        "rest_diff",
-    ]
-
-    missing_columns = [
-        col for col in feature_columns
-        if col not in df.columns
-    ]
+        feature_games,
+        future_features,
+    ):
+        if feature_games is None or feature_games.empty:
+            raise ValueError("NFL feature dataset is empty.")
+    
+        df = feature_games.copy()
+        df = feature_games.copy()
+    
+        # Remove ties because home_win is NaN for tied games.
+        df = df.dropna(subset=["home_win"]).copy()
+    
+        df = df.sort_values("start_time").reset_index(drop=True)
+    
+        feature_columns = [
+            "win_pct_diff",
+            "avg_point_diff_diff",
+            "recent_5_win_pct_diff",
+            "recent_5_point_diff_diff",
+            "rest_diff",
+        ]
+    
+        missing_columns = [
+            col for col in feature_columns
+            if col not in df.columns
+        ]
 
     if missing_columns:
         raise ValueError(
