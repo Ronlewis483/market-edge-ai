@@ -3476,116 +3476,59 @@ def render_research_lab():
                 f"**Sportsbook:** {sportsbook}"
             )
 
-            # ==========================================
-            # STYLED MATCHUP CARD
-            # ==========================================
 
-            st.markdown(
-                f"""
-                <div style="
-                    background: #172338;
-                    border: 1px solid #263850;
-                    border-radius: 16px;
-                    padding: 24px;
-                    margin-top: 12px;
-                    margin-bottom: 20px;
-                ">
+        # ========================================
+        # MARKET EDGE AI - NBA MATCHUP CARD
+        # ========================================
 
-                    <div style="
-                        color: #94A3B8;
-                        font-size: 13px;
-                        font-weight: 600;
-                        margin-bottom: 20px;
-                    ">
-                        NBA MONEYLINE
-                    </div>
+        st.markdown("### NBA Moneyline")
 
-                    <div style="
-                        display: flex;
-                        justify-content: space-between;
-                        align-items: center;
-                        gap: 12px;
-                        margin-bottom: 18px;
-                    ">
+        st.caption(
+            f"{game_date_display} | {game_time_display}"
+        )
 
-                        <div>
-                            <div style="
-                                color: #94A3B8;
-                                font-size: 12px;
-                            ">
-                                AWAY TEAM
-                            </div>
+        st.write(f"**Sportsbook:** {sportsbook}")
 
-                            <div style="
-                                color: #F8FAFC;
-                                font-size: 20px;
-                                font-weight: 700;
-                            ">
-                                {away_team_display}
-                            </div>
-                        </div>
+        st.markdown("")
 
-                        <div style="
-                            background: #263850;
-                            color: #38BDF8;
-                            padding: 12px 18px;
-                            border-radius: 10px;
-                            font-size: 22px;
-                            font-weight: 700;
-                            white-space: nowrap;
-                        ">
-                            {away_odds_display}
-                        </div>
+        # Create two side-by-side team cards
+        away_col, home_col = st.columns(2, gap="medium")
 
-                    </div>
+        # ========================================
+        # AWAY TEAM
+        # ========================================
 
-                    <div style="
-                        border-top: 1px solid #334155;
-                        margin-bottom: 18px;
-                    "></div>
+        with away_col:
 
-                    <div style="
-                        display: flex;
-                        justify-content: space-between;
-                        align-items: center;
-                        gap: 12px;
-                    ">
+            with st.container(border=True):
 
-                        <div>
-                            <div style="
-                                color: #94A3B8;
-                                font-size: 12px;
-                            ">
-                                HOME TEAM
-                            </div>
+                st.caption("AWAY TEAM")
 
-                            <div style="
-                                color: #F8FAFC;
-                                font-size: 20px;
-                                font-weight: 700;
-                            ">
-                                {home_team_display}
-                            </div>
-                        </div>
+                st.subheader(away_team)
 
-                        <div style="
-                            background: #263850;
-                            color: #38BDF8;
-                            padding: 12px 18px;
-                            border-radius: 10px;
-                            font-size: 22px;
-                            font-weight: 700;
-                            white-space: nowrap;
-                        ">
-                            {home_odds_display}
-                        </div>
+                st.metric(
+                    label="Moneyline Odds",
+                    value=away_odds_display
+                )
 
-                    </div>
+        # ========================================
+        # HOME TEAM
+        # ========================================
 
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
+        with home_col:
+
+            with st.container(border=True):
+
+                st.caption("HOME TEAM")
+
+                st.subheader(home_team)
+
+                st.metric(
+                    label="Moneyline Odds",
+                    value=home_odds_display
+                )
+
+        st.markdown("")
 
             # Optional: Keep raw API data for debugging
             with st.expander("View Technical Game Data"):
