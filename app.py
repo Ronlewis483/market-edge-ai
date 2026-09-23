@@ -3531,36 +3531,40 @@ def render_research_lab():
         st.markdown("")
 
             
-        # ========================================
-        # TECHNICAL GAME DATA
-        # ========================================
 
-        with st.expander("View Technical Game Data"):
-            st.json(selected_game.to_dict())
+    # ========================================
+    # TECHNICAL GAME DATA
+    # ========================================
 
-        st.divider()
+    with st.expander("View Technical Game Data"):
+        st.json(selected_game.to_dict())
 
-            st.subheader("Calculate Potential Payout")
+    st.divider()
 
-            wager_amount = st.number_input(
-                "Wager Amount ($)",
-                min_value=1.0,
-                value=10.0,
-                step=5.0,
-                key="nba_wager_amount",
-            )
+    # ========================================
+    # NBA PAYOUT CALCULATOR
+    # ========================================
 
-            american_odds = st.number_input(
-                "American Odds",
-                value=100,
-                step=10,
-                key="nba_american_odds",
-                help=(
-                    "Enter the odds shown by your sportsbook. "
-                    "For example, +120 or -150."
-                ),
-            )
+    st.subheader("Calculate Potential Payout")
 
+    wager_amount = st.number_input(
+        "Wager Amount ($)",
+        min_value=1.0,
+        value=10.0,
+        step=5.0,
+        key="nba_wager_amount",
+    )
+
+    american_odds = st.number_input(
+        "American Odds",
+        value=100,
+        step=10,
+        key="nba_american_odds",
+        help=(
+            "Enter the odds shown by your sportsbook. "
+            "For example, +120 or -150."
+        ),
+    )
             if american_odds == 0:
                 st.error("American odds cannot be zero.")
 
