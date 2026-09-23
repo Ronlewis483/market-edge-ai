@@ -312,14 +312,14 @@ def run_nfl_walkforward_model(
         log_loss,
     )
 
-    if feature_games is None or feature_games.empty:
-        raise ValueError("NFL feature dataset is empty.")
-
     def predict_nfl_matchup(
     feature_games,
     future_features,
 ):
+    if feature_games is None or feature_games.empty:
+        raise ValueError("NFL feature dataset is empty.")
 
+    df = feature_games.copy()
     df = feature_games.copy()
 
     # Remove ties because home_win is NaN for tied games.
