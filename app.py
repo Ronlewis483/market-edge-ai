@@ -3404,6 +3404,40 @@ def render_research_lab():
             selected_game = moneyline_df.loc[selected_index]
 
 
+            
+            # ========================================
+            # RETRIEVE SELECTED NBA GAME INFORMATION
+            # ========================================
+
+            selected_game = moneyline_df.loc[selected_index]
+
+            # Retrieve team names
+            home_team = str(selected_game["home_team"])
+            away_team = str(selected_game["away_team"])
+
+            # Retrieve sportsbook information
+            sportsbook = str(
+                selected_game.get("bookmaker", "Sportsbook")
+            )
+
+            # Retrieve American betting odds
+            home_odds = selected_game.get("home_odds")
+            away_odds = selected_game.get("away_odds")
+
+            # Format American betting odds
+            def format_moneyline(odds):
+
+                if pd.isna(odds):
+                    return "N/A"
+
+                odds = int(odds)
+
+                return f"{odds:+d}"
+
+            home_odds_display = format_moneyline(home_odds)
+            away_odds_display = format_moneyline(away_odds)
+
+
             # ========================================
             # MARKET EDGE AI - NBA MATCHUP CARD
             # ========================================
