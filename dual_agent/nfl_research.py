@@ -635,6 +635,7 @@ def analyze_nfl_probability_bands(predictions_df):
 
 
 
+
 def build_nfl_future_matchup_features(
     feature_games,
     home_team,
@@ -642,14 +643,43 @@ def build_nfl_future_matchup_features(
     game_time,
 ):
     """
-    Build leakage-safe features for a future NFL matchup using only
-    historical games that occurred before the future game's start time.
+    Build future NFL matchup features from historical
+    pregame statistics and completed game outcomes.
+
+    Uses only games played before the upcoming kickoff.
     """
 
     if feature_games is None or feature_games.empty:
         raise ValueError("NFL feature dataset is empty.")
 
     df = feature_games.copy()
+
+    required = [
+        "start_time",
+        "home_team",
+        "away_team",
+        "home_win",
+        "home_win_pct",
+        "away_win_pct",
+        "home_avg_point_diff",
+        "away_avg_point_diff",
+        "home_recent_5_win_pct",
+        "away_recent_5_win_pct",
+        "home_recent_5_point_diff",
+        "away_recent_5_point_diff",
+        "home_days_rest",
+        "away_days_rest",
+    ]
+
+    missing = [
+        col for col in required
+        if col not in df.columns
+    ]
+
+    if missing:
+        raise ValueError(
+            f"Missing historical NFL features: {missing}"
+        )
 
     df["start_time"] = pd.to_datetime(
         df["start_time"],
@@ -666,28 +696,32 @@ def build_nfl_future_matchup_features(
     if pd.isna(game_time):
         raise ValueError("Future NFL game time is invalid.")
 
-    history = df[df["start_time"] < game_time].copy()
+    # Only use completed historical games before kickoff.
+    history = df[
+        (df["start_time"] < game_time)
+        & df["home_win"].notna()
+    ].copy()
+
+    history = history.sort_values("start_time")
 
     if history.empty:
         raise ValueError(
-            "No historical NFL games exist before this matchup."
+            "No completed historical NFL games found."
         )
 
-    def get_team_history(team):
-        team_games = history[
+    def summarize_team(team):
+
+        games = history[
             (history["home_team"] == team)
             | (history["away_team"] == team)
         ].copy()
-
-        return team_games.sort_values("start_time")
-
-    def summarize_team(team):
-        games = get_team_history(team)
 
         if games.empty:
             raise ValueError(
                 f"No historical NFL games found for {team}."
             )
+
+        games = games.sort_values("start_time")
 
         wins = []
         point_diffs = []
@@ -697,30 +731,77 @@ def build_nfl_future_matchup_features(
             is_home = game["home_team"] == team
 
             if is_home:
-                team_score = game["home_score"]
-                opponent_score = game["away_score"]
+                result = float(game["home_win"])
+                pregame_win_pct = game["home_win_pct"]
+                pregame_point_diff = game[
+                    "home_avg_point_diff"
+                ]
+                recent_win_pct = game[
+                    "home_recent_5_win_pct"
+                ]
+                recent_point_diff = game[
+                    "home_recent_5_point_diff"
+                ]
+
             else:
-                team_score = game["away_score"]
-                opponent_score = game["home_score"]
+                result = 1.0 - float(game["home_win"])
+                pregame_win_pct = game["away_win_pct"]
+                pregame_point_diff = game[
+                    "away_avg_point_diff"
+                ]
+                recent_win_pct = game[
+                    "away_recent_5_win_pct"
+                ]
+                recent_point_diff = game[
+                    "away_recent_5_point_diff"
+                ]
 
-            if pd.isna(team_score) or pd.isna(opponent_score):
-                continue
+            wins.append(result)
 
-            wins.append(
-                1 if team_score > opponent_score else 0
-            )
-
-            point_diffs.append(
-                team_score - opponent_score
-            )
+            point_diffs.append({
+                "pregame_average": pregame_point_diff,
+                "pregame_recent": recent_point_diff,
+                "pregame_win_pct": pregame_win_pct,
+                "pregame_recent_win_pct": recent_win_pct,
+            })
 
         if not wins:
             raise ValueError(
-                f"No completed historical NFL games found for {team}."
+                f"No completed NFL results for {team}."
             )
 
-        recent_wins = wins[-5:]
-        recent_point_diffs = point_diffs[-5:]
+        last_game = games.iloc[-1]
+
+        is_home = last_game["home_team"] == team
+
+        # The latest historical row contains statistics
+        # calculated before that team's last completed game.
+        # We cannot recover its final point differential
+        # from these features alone.
+
+        if is_home:
+            avg_point_diff = last_game[
+                "home_avg_point_diff"
+            ]
+            recent_point_diff = last_game[
+                "home_recent_5_point_diff"
+            ]
+        else:
+            avg_point_diff = last_game[
+                "away_avg_point_diff"
+            ]
+            recent_point_diff = last_game[
+                "away_recent_5_point_diff"
+            ]
+
+        # Reconstruct the current win percentage using
+        # the completed game outcomes.
+
+        win_pct = sum(wins) / len(wins)
+
+        recent_5_win_pct = (
+            sum(wins[-5:]) / len(wins[-5:])
+        )
 
         last_game_time = games["start_time"].max()
 
@@ -729,49 +810,51 @@ def build_nfl_future_matchup_features(
         ).total_seconds() / 86400.0
 
         return {
-            "win_pct": sum(wins) / len(wins),
-            "avg_point_diff": sum(point_diffs) / len(point_diffs),
-            "recent_5_win_pct": (
-                sum(recent_wins) / len(recent_wins)
-            ),
-            "recent_5_point_diff": (
-                sum(recent_point_diffs)
-                / len(recent_point_diffs)
-            ),
-            "rest_days": rest_days,
+            "win_pct": float(win_pct),
+            "avg_point_diff": float(avg_point_diff),
+            "recent_5_win_pct": float(recent_5_win_pct),
+            "recent_5_point_diff": float(recent_point_diff),
+            "rest_days": float(rest_days),
         }
 
     home = summarize_team(home_team)
     away = summarize_team(away_team)
 
-    return pd.DataFrame(
-        [
-            {
-                "home_team": home_team,
-                "away_team": away_team,
-                "start_time": game_time,
-                "win_pct_diff": (
-                    home["win_pct"] - away["win_pct"]
-                ),
-                "avg_point_diff_diff": (
-                    home["avg_point_diff"]
-                    - away["avg_point_diff"]
-                ),
-                "recent_5_win_pct_diff": (
-                    home["recent_5_win_pct"]
-                    - away["recent_5_win_pct"]
-                ),
-                "recent_5_point_diff_diff": (
-                    home["recent_5_point_diff"]
-                    - away["recent_5_point_diff"]
-                ),
-                "rest_diff": (
-                    home["rest_days"]
-                    - away["rest_days"]
-                ),
-            }
-        ]
-    )
+    future_features = pd.DataFrame([
+        {
+            "home_team": home_team,
+            "away_team": away_team,
+            "start_time": game_time,
+
+            "win_pct_diff": (
+                home["win_pct"]
+                - away["win_pct"]
+            ),
+
+            "avg_point_diff_diff": (
+                home["avg_point_diff"]
+                - away["avg_point_diff"]
+            ),
+
+            "recent_5_win_pct_diff": (
+                home["recent_5_win_pct"]
+                - away["recent_5_win_pct"]
+            ),
+
+            "recent_5_point_diff_diff": (
+                home["recent_5_point_diff"]
+                - away["recent_5_point_diff"]
+            ),
+
+            "rest_diff": (
+                home["rest_days"]
+                - away["rest_days"]
+            ),
+        }
+    ])
+
+    return future_features
+
 
 
 def evaluate_nfl_prediction_reliability(
