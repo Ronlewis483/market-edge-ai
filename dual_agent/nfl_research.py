@@ -739,38 +739,6 @@ def build_nfl_future_matchup_features(
     )
 
 
-
-df = feature_games.copy()
-
-# Convert historical game dates to UTC
-df["start_time"] = pd.to_datetime(
-    df["start_time"],
-    utc=True,
-    errors="coerce",
-)
-
-# Get the upcoming matchup's kickoff time
-game_time = pd.to_datetime(
-    future_features.iloc[0]["start_time"],
-    utc=True,
-    errors="coerce",
-)
-
-if pd.isna(game_time):
-    raise ValueError(
-        "Upcoming NFL game time is invalid."
-    )
-
-# Only use historical games before kickoff
-df = df[
-    df["start_time"] < game_time
-].copy()
-
-# Remove incomplete training rows
-df = df.dropna(
-    subset=feature_columns + ["home_win"]
-).copy()
-
 def evaluate_nfl_prediction_reliability(
     historical_predictions,
     min_samples=30,
