@@ -388,6 +388,15 @@ if page == "🏀 Sports Center":
     # SPORTS CENTER — DASHBOARD NAVIGATION
     # ==========================================
 
+
+    with st.expander(
+        "🏈 NFL Player Props Research",
+        expanded=False,
+    ):
+        render_nfl_player_props()
+
+    
+    
     sports_tab = st.radio(
         "Sports Center Navigation",
         [
