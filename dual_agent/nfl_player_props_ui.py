@@ -382,5 +382,351 @@ def render_nfl_player_props():
     # ==========================================================
     # END PLAYER INTELLIGENCE
     # ==========================================================
+
+
+    # ==========================================================
+    # HISTORICAL PLAYER PERFORMANCE
+    # ==========================================================
+
+    st.divider()
+
+    st.markdown("## 📊 Historical Player Performance")
+
+    st.caption(
+        "Review completed NFL game statistics, recent player "
+        "performance, and historical results against sportsbook lines."
+    )
+
+    history_file = st.session_state.get("props_history_upload")
+
+    if history_file is None:
+
+        st.info(
+            "Upload historical player game logs in the "
+            "research section below to activate player "
+            "performance analysis."
+        )
+
+    else:
+
+        try:
+
+            history_file.seek(0)
+
+            player_history = validate_history(
+                pd.read_csv(history_file)
+            )
+
+            if player_history.empty:
+
+                st.warning(
+                    "No valid historical player statistics "
+                    "were found in the uploaded file."
+                )
+
+            elif "selected_player" not in locals() or "selected_market" not in locals():
+
+                st.info(
+                    "Select a player and prop market above "
+                    "to view historical performance."
+                )
+
+            else:
+
+                market_lookup = {
+                    value: name
+                    for name, value in MARKETS.items()
+                }
+
+                historical_market = market_lookup.get(
+                    selected_market,
+                    selected_market
+                )
+
+                player_key = (
+                    str(selected_player)
+                    .lower()
+                    .replace(" ", "")
+                    .replace(".", "")
+                    .replace("-", "")
+                    .replace("'", "")
+                )
+
+                player_games = player_history.loc[
+                    (
+                        player_history["player_key"]
+                        == player_key
+                    )
+                    &
+                    (
+                        player_history["market"]
+                        == historical_market
+                    )
+                ].copy()
+
+                player_games = player_games.sort_values(
+                    "game_time"
+                )
+
+                if player_games.empty:
+
+                    st.info(
+                        f"No historical {historical_market} "
+                        f"statistics are available for "
+                        f"{selected_player}."
+                    )
+
+                else:
+
+                    st.markdown(
+                        f"### 👤 {selected_player}"
+                    )
+
+                    st.caption(
+                        f"Historical performance: "
+                        f"{historical_market}"
+                    )
+
+                    # ------------------------------------------
+                    # RECENT GAME SELECTION
+                    # ------------------------------------------
+
+                    recent_count = st.selectbox(
+                        "Historical sample",
+                        [5, 10, 12, 15, 20],
+                        index=1,
+                        key="props_history_sample"
+                    )
+
+                    player_games = player_games.tail(
+                        recent_count
+                    )
+
+                    total_games = len(player_games)
+
+                    average_value = (
+                        player_games["value"].mean()
+                    )
+
+                    highest_value = (
+                        player_games["value"].max()
+                    )
+
+                    lowest_value = (
+                        player_games["value"].min()
+                    )
+
+                    # ------------------------------------------
+                    # PERFORMANCE SUMMARY
+                    # ------------------------------------------
+
+                    c1, c2, c3, c4 = st.columns(4)
+
+                    c1.metric(
+                        "Games Analyzed",
+                        total_games
+                    )
+
+                    c2.metric(
+                        "Historical Average",
+                        f"{average_value:.1f}"
+                    )
+
+                    c3.metric(
+                        "Highest",
+                        f"{highest_value:.1f}"
+                    )
+
+                    c4.metric(
+                        "Lowest",
+                        f"{lowest_value:.1f}"
+                    )
+
+                    st.divider()
+
+                    # ------------------------------------------
+                    # SPORTSBOOK LINE COMPARISON
+                    # ------------------------------------------
+
+                    available_lines = pd.to_numeric(
+                        market_data["line"],
+                        errors="coerce"
+                    ).dropna()
+
+                    if not available_lines.empty:
+
+                        selected_line = st.selectbox(
+                            "Compare against sportsbook line",
+                            sorted(
+                                available_lines.unique().tolist()
+                            ),
+                            key="props_history_line"
+                        )
+
+                        over_count = int(
+                            (
+                                player_games["value"]
+                                > selected_line
+                            ).sum()
+                        )
+
+                        under_count = int(
+                            (
+                                player_games["value"]
+                                < selected_line
+                            ).sum()
+                        )
+
+                        push_count = int(
+                            (
+                                player_games["value"]
+                                == selected_line
+                            ).sum()
+                        )
+
+                        eligible_games = (
+                            over_count + under_count
+                        )
+
+                        over_rate = (
+                            over_count / eligible_games
+                            if eligible_games
+                            else 0
+                        )
+
+                        under_rate = (
+                            under_count / eligible_games
+                            if eligible_games
+                            else 0
+                        )
+
+                        st.markdown(
+                            f"### 🎯 Historical Results vs {selected_line}"
+                        )
+
+                        c1, c2, c3 = st.columns(3)
+
+                        c1.metric(
+                            "Games Over",
+                            f"{over_count}/{eligible_games}",
+                            f"{over_rate:.1%}"
+                            if eligible_games
+                            else "N/A"
+                        )
+
+                        c2.metric(
+                            "Games Under",
+                            f"{under_count}/{eligible_games}",
+                            f"{under_rate:.1%}"
+                            if eligible_games
+                            else "N/A"
+                        )
+
+                        c3.metric(
+                            "Pushes",
+                            push_count
+                        )
+
+                        st.caption(
+                            "Historical frequencies exclude pushes. "
+                            "These results describe completed games "
+                            "and are not calibrated predictions "
+                            "of future performance."
+                        )
+
+                        # --------------------------------------
+                        # GAME-BY-GAME PERFORMANCE CHART
+                        # --------------------------------------
+
+                        st.markdown(
+                            "### 📈 Recent Game Performance"
+                        )
+
+                        chart_data = (
+                            player_games[
+                                ["game_time", "value"]
+                            ]
+                            .copy()
+                            .set_index("game_time")
+                        )
+
+                        chart_data["Sportsbook Line"] = (
+                            selected_line
+                        )
+
+                        chart_data = chart_data.rename(
+                            columns={
+                                "value": "Player Performance"
+                            }
+                        )
+
+                        st.line_chart(
+                            chart_data
+                        )
+
+                        # --------------------------------------
+                        # RECENT GAME LOG
+                        # --------------------------------------
+
+                        st.markdown(
+                            "### 🏈 Recent Game Log"
+                        )
+
+                        game_log = player_games[
+                            ["game_time", "value"]
+                        ].copy()
+
+                        game_log["Result"] = (
+                            game_log["value"].apply(
+                                lambda value:
+                                "OVER"
+                                if value > selected_line
+                                else (
+                                    "UNDER"
+                                    if value < selected_line
+                                    else "PUSH"
+                                )
+                            )
+                        )
+
+                        game_log = game_log.rename(
+                            columns={
+                                "game_time": "Game Date",
+                                "value": historical_market
+                            }
+                        )
+
+                        st.dataframe(
+                            game_log.sort_values(
+                                "Game Date",
+                                ascending=False
+                            ),
+                            hide_index=True,
+                            use_container_width=True
+                        )
+
+                    else:
+
+                        st.warning(
+                            "No valid sportsbook line is "
+                            "available for historical comparison."
+                        )
+
+        except (
+            ValueError,
+            KeyError,
+            pd.errors.ParserError
+        ) as history_error:
+
+            st.error(
+                "Historical performance could not be "
+                f"loaded: {history_error}"
+            )
+
+    # ==========================================================
+    # END HISTORICAL PLAYER PERFORMANCE
+    # ==========================================================
+    
+
     st.divider()
     
