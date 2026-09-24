@@ -5,6 +5,9 @@ import streamlit as st
 from dual_agent.nfl_player_props import (MARKETS, analyze, event_props, events,
                                           normalize_props, validate_history, walkforward)
 
+from dual_agent.nfl_player_history import load_player_history
+from dual_agent.nfl_player_props import canonical_name
+
 @st.cache_data(ttl=600, show_spinner=False)
 def cached_events(key):
     return events(key)
