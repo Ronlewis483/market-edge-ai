@@ -106,6 +106,20 @@ def render_nfl_player_props():
         None
     )
 
+  
+    # Identify the sportsbook column.
+    book_col = next(
+        (
+            col for col in [
+                "bookmaker",
+                "sportsbook",
+                "bookmaker_key"
+            ]
+            if col in display_lines.columns
+        ),
+        None
+    )
+
     if not all([
         player_col,
         market_col,
