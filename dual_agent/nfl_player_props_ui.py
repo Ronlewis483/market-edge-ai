@@ -513,11 +513,6 @@ def render_nfl_player_props():
                 f"{', '.join(map(str, loaded_seasons))}"
             )
 
-            # Existing historical analysis continues below.
-            player_history = validate_history(
-                pd.read_csv(history_file)
-            )
-
             if player_history.empty:
 
                 st.warning(
