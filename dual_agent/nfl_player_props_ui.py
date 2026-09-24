@@ -16,6 +16,15 @@ def cached_events(key):
 def cached_props(key, event_id, market_keys):
     return event_props(key,event_id,list(market_keys))
 
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def cached_player_history(seasons):
+    return validate_history(
+        load_player_history(seasons)
+    )
+
+
+
 def render_nfl_player_props():
     st.header('🏈 NFL Player Props Research')
     st.caption('Independent module. Historical frequencies are not calibrated predictions or betting recommendations.')
