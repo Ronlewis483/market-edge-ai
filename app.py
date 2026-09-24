@@ -5409,9 +5409,14 @@ if audit is not None:
         "nfl_live_predictions"
     )
 
+    
     if (
         isinstance(live_predictions, pd.DataFrame)
         and not live_predictions.empty
+        and isinstance(best_lines, pd.DataFrame)
+        and not best_lines.empty
+        and isinstance(historical_result, dict)
+        and historical_result.get("success") is True
     ):
 
         st.markdown("### 🏈 Upcoming NFL Predictions")
