@@ -4239,6 +4239,242 @@ def render_research_lab():
             hide_index=True,
         )
 
+    
+# =================================================
+# NFL ACCURACY AUDIT DASHBOARD
+# =================================================
+
+st.markdown("---")
+
+st.header("NFL Prediction Accuracy Audit")
+
+st.caption(
+    "Historical out-of-sample model evaluation"
+)
+
+if st.button(
+    "Run NFL Accuracy Audit",
+    key="run_nfl_accuracy_audit",
+):
+
+    walkforward = st.session_state.get(
+        "nfl_walkforward_results"
+    )
+
+    if walkforward is None:
+
+        st.warning(
+            "Run the NFL walk-forward model first."
+        )
+
+    else:
+
+        try:
+
+            if isinstance(walkforward, dict):
+
+                predictions = walkforward.get(
+                    "predictions"
+                )
+
+            else:
+
+                predictions = walkforward
+
+            if predictions is None:
+
+                raise ValueError(
+                    "Walk-forward predictions are missing."
+                )
+
+            audit_df = pd.DataFrame(
+                predictions
+            ).copy()
+
+            # Normalize probability column.
+
+            if (
+                "probability" not in audit_df.columns
+                and "home_win_probability"
+                in audit_df.columns
+            ):
+
+                audit_df["probability"] = (
+                    audit_df["home_win_probability"]
+                )
+
+            # Normalize actual outcome column.
+
+            if (
+                "actual" not in audit_df.columns
+                and "home_win" in audit_df.columns
+            ):
+
+                audit_df["actual"] = (
+                    audit_df["home_win"]
+                )
+
+            # Never audit unfinished games.
+
+            audit_df = audit_df.dropna(
+                subset=["probability", "actual"]
+            )
+
+            audit = run_nfl_accuracy_audit(
+                audit_df,
+                min_samples=30,
+            )
+
+            st.session_state[
+                "nfl_accuracy_audit"
+            ] = audit
+
+        except Exception as e:
+
+            st.error(
+                f"NFL accuracy audit failed: {e}"
+            )
+
+
+# =================================================
+# DISPLAY AUDIT RESULTS
+# =================================================
+
+audit = st.session_state.get(
+    "nfl_accuracy_audit"
+)
+
+if audit is not None:
+
+    overall = audit["overall"]
+
+    st.subheader(
+        "Overall Historical Performance"
+    )
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    col1.metric(
+        "Predictions",
+        overall["total_predictions"],
+    )
+
+    col2.metric(
+        "Correct",
+        overall["correct_predictions"],
+    )
+
+    col3.metric(
+        "Accuracy",
+        f'{overall["accuracy"]:.1%}',
+    )
+
+    col4.metric(
+        "Brier Score",
+        f'{overall["brier_score"]:.4f}',
+    )
+
+    if not audit["sufficient_sample"]:
+
+        st.warning(
+            "Limited historical sample. "
+            "Interpret results cautiously."
+        )
+
+    st.markdown("---")
+
+    st.subheader(
+        "Accuracy by Confidence Threshold"
+    )
+
+    threshold_df = audit[
+        "confidence_thresholds"
+    ].copy()
+
+    st.dataframe(
+        threshold_df,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.markdown("---")
+
+    st.subheader(
+        "Probability Calibration"
+    )
+
+    calibration_df = audit[
+        "calibration"
+    ].copy()
+
+    st.dataframe(
+        calibration_df,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.markdown("---")
+
+    st.subheader(
+        "Historical Performance Over Time"
+    )
+
+    performance_df = audit[
+        "performance_over_time"
+    ]
+
+    if not performance_df.empty:
+
+        st.line_chart(
+            performance_df.set_index(
+                "month"
+            )["accuracy"]
+        )
+
+        st.dataframe(
+            performance_df,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    else:
+
+        st.info(
+            "Historical prediction dates are "
+            "not available."
+        )
+
+    st.markdown("---")
+
+    st.subheader(
+        "Baseline Comparison"
+    )
+
+    baseline = audit[
+        "baseline_comparison"
+    ]
+
+    if baseline is not None:
+
+        col1, col2 = st.columns(2)
+
+        col1.metric(
+            "Model Accuracy",
+            f'{baseline["model_accuracy"]:.1%}',
+        )
+
+        col2.metric(
+            "Baseline Accuracy",
+            f'{baseline["baseline_accuracy"]:.1%}',
+        )
+
+    else:
+
+        st.info(
+            "No pregame baseline probabilities "
+            "were supplied."
+        )
+
     # ============================================================
     # NFL CONFIDENCE CALIBRATION
     # ============================================================
