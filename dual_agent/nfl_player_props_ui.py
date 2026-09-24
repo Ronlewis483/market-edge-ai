@@ -513,11 +513,41 @@ def render_nfl_player_props():
                 f"{', '.join(map(str, loaded_seasons))}"
             )
 
-            if player_history.empty:
+            st.write("Historical data diagnostic")
+            
+            st.write(
+                "Historical data type:",
+                type(player_history).__name__
+            )
+            
+            if isinstance(player_history, pd.DataFrame):
+                st.write(
+                    "Historical records:",
+                    len(player_history)
+                )
+            
+                st.write(
+                    "Available columns:",
+                    list(player_history.columns)
+                )
+            
+                st.write(
+                    "Sample historical records:"
+                )
+            
+                st.dataframe(
+                    player_history.head(5),
+                    use_container_width=True
+                )
+          
+
+            if not isinstance(player_history, pd.DataFrame) or player_history.empty:
 
                 st.warning(
-                    "No valid historical player statistics "
-                    "were found in the uploaded file."
+                    "No historical player statistics are currently available. "
+                    "Select your NFL seasons and click "
+                    "'Load Historical Player Statistics' "
+                    "to download the data automatically."
                 )
 
             elif "selected_player" not in locals() or "selected_market" not in locals():
