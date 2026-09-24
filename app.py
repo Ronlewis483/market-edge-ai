@@ -5270,10 +5270,6 @@ if audit is not None:
                     "Build NFL pregame features first."
                 )
 
-            elif not historical_result:
-                st.error(
-                    "Run NFL Walk-Forward Model first."
-                )
 
             else:
 
