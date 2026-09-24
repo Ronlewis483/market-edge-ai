@@ -383,29 +383,4 @@ def render_nfl_player_props():
     # END PLAYER INTELLIGENCE
     # ==========================================================
     st.divider()
-    st.subheader('Optional historical player-statistics CSV')
-    st.caption('CSV columns: player, market, game_time (ISO timestamp), value. One player/game/market per row. '
-               'Use completed games only. This module does not invent historical statistics.')
-    upload=st.file_uploader('Upload player game logs',type=['csv'],key='props_history_upload')
-    if upload is None:
-        st.info('Historical data provider is unconfirmed. Live odds work independently; research estimates require an uploaded history CSV.')
-        return
-    try:
-        history=validate_history(pd.read_csv(upload))
-        if history.empty: st.warning('No valid historical rows.'); return
-        with st.expander('Walk-forward historical baseline evaluation'):
-            if st.button('Run player-statistics audit',key='props_audit_run'):
-                wf=walkforward(history)
-                if wf.empty: st.warning('Insufficient historical games for validation.')
-                else:
-                    st.metric('Out-of-sample observations',len(wf))
-                    st.dataframe(wf.groupby('market').agg(observations=('absolute_error','size'),
-                        mean_absolute_error=('absolute_error','mean')).reset_index(),hide_index=True)
-                    st.download_button('Download validation rows',wf.to_csv(index=False),'player_props_walkforward.csv',key='props_audit_download')
-        st.subheader('Historical frequency comparison — NOT a calibrated model')
-        result=analyze(lines,history)
-        if result.empty: st.warning('No matching players/markets with at least six prior games.'); return
-        st.dataframe(result,hide_index=True,use_container_width=True)
-        st.download_button('Download research rows',result.to_csv(index=False),'player_props_research.csv',key='props_research_download')
-    except (ValueError,KeyError,pd.errors.ParserError) as exc:
-        st.error(f'Historical CSV could not be processed: {exc}')
+    
