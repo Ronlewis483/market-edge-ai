@@ -4261,6 +4261,10 @@ if st.button(
     "nfl_walkforward_result"
 )
 
+walkforward = st.session_state.get(
+    "nfl_walkforward_result"
+)
+
 if walkforward is None:
     st.warning(
         "Run the NFL walk-forward model first."
