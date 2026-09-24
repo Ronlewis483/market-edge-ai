@@ -5530,13 +5530,26 @@ if audit is not None:
                     f"NFL opportunity analysis error: {e}"
                 )
 
+    
     else:
 
-        st.info(
-            "Generate live NFL predictions and load "
-            "the Best-Line Shopper before analyzing opportunities."
-        )
+        if (
+            isinstance(live_predictions, pd.DataFrame)
+            and not live_predictions.empty
+            and isinstance(best_lines, pd.DataFrame)
+            and not best_lines.empty
+        ):
+            st.info(
+                "Live NFL predictions are available. "
+                "Run the NFL Walk-Forward Model to enable "
+                "validated market opportunity analysis."
+            )
 
+        else:
+            st.info(
+                "Generate live NFL predictions and load "
+                "the Best-Line Shopper before analyzing opportunities."
+            )
     # ------------------------------------------------------------
     # DISPLAY NFL OPPORTUNITIES
     # ------------------------------------------------------------
