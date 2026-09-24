@@ -69,17 +69,14 @@ def render_nfl_player_props():
         None
     )
 
+    
     market_col = next(
         (
-            col for col in ["market_label", "market"]
-            if col in display_lines.columns
-        ),
-        None
-    )
-
-    book_col = next(
-        (
-            col for col in ["bookmaker", "bookmaker_title"]
+            col for col in [
+                "market_label",
+                "market",
+                "market_key"
+            ]
             if col in display_lines.columns
         ),
         None
