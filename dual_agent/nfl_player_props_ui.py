@@ -397,7 +397,27 @@ def render_nfl_player_props():
         "performance, and historical results against sportsbook lines."
     )
 
-    history_file = st.session_state.get("props_history_upload")
+    
+    # ==================================================
+    # HISTORICAL PLAYER DATA UPLOADER
+    # ==================================================
+
+    st.markdown("### 📂 Historical Player Data")
+
+    st.caption(
+        "Upload completed NFL player game statistics "
+        "to activate historical performance analysis."
+    )
+
+    history_file = st.file_uploader(
+        "Upload Historical Player Game Logs",
+        type=["csv"],
+        key="props_history_upload",
+        help=(
+            "CSV columns required: player, market, "
+            "game_time, value."
+        )
+    )
 
     if history_file is None:
 
