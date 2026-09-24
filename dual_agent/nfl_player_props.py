@@ -6,6 +6,9 @@ import numpy as np
 import pandas as pd
 import requests
 
+from dual_agent.nfl_player_history import load_player_history
+from dual_agent.nfl_player_props import canonical_name
+
 SPORT = 'americanfootball_nfl'
 BASE = 'https://api.the-odds-api.com/v4'
 MARKETS = {
