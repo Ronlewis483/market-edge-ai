@@ -409,30 +409,111 @@ def render_nfl_player_props():
         "to activate historical performance analysis."
     )
 
-    history_file = st.file_uploader(
-        "Upload Historical Player Game Logs",
-        type=["csv"],
-        key="props_history_upload",
-        help=(
-            "CSV columns required: player, market, "
-            "game_time, value."
-        )
+    
+    # ==========================================================
+    # AUTOMATIC NFL HISTORICAL PLAYER DATA
+    # ==========================================================
+
+    st.markdown("### 📚 Automatic Historical NFL Data")
+
+    st.caption(
+        "Load completed NFL player game statistics automatically. "
+        "No CSV upload required."
     )
 
-    if history_file is None:
+    available_seasons = list(
+        range(2026, 2021, -1)
+    )
+
+    selected_seasons = st.multiselect(
+        "Select NFL seasons",
+        options=available_seasons,
+        default=[2025, 2026],
+        max_selections=4,
+        key="nfl_props_history_seasons"
+    )
+
+    if st.button(
+        "Load Historical Player Statistics",
+        key="nfl_props_load_history"
+    ):
+
+        if not selected_seasons:
+
+            st.warning(
+                "Select at least one NFL season."
+            )
+
+        else:
+
+            try:
+
+                with st.spinner(
+                    "Downloading historical NFL player statistics..."
+                ):
+
+                    player_history = cached_player_history(
+                        tuple(selected_seasons)
+                    )
+
+                    st.session_state[
+                        "nfl_props_historical_data"
+                    ] = player_history
+
+                    st.session_state[
+                        "nfl_props_loaded_seasons"
+                    ] = tuple(selected_seasons)
+
+                st.success(
+                    f"Loaded {len(player_history):,} "
+                    "historical player-statistic records."
+                )
+
+            except Exception as history_error:
+
+                st.error(
+                    "Unable to load historical NFL statistics: "
+                    f"{type(history_error).__name__}: "
+                    f"{history_error}"
+                )
+
+    player_history = st.session_state.get(
+        "nfl_props_historical_data"
+    )
+
+    loaded_seasons = st.session_state.get(
+        "nfl_props_loaded_seasons"
+    )
+
+    if (
+        not isinstance(player_history, pd.DataFrame)
+        or player_history.empty
+    ):
 
         st.info(
-            "Upload historical player game logs in the "
-            "research section below to activate player "
-            "performance analysis."
+            "Select your NFL seasons and click "
+            "'Load Historical Player Statistics' "
+            "to activate automatic player performance analysis."
+        )
+
+    elif loaded_seasons != tuple(selected_seasons):
+
+        st.info(
+            "Your season selection has changed. "
+            "Click 'Load Historical Player Statistics' "
+            "to refresh the historical dataset."
         )
 
     else:
 
         try:
 
-            history_file.seek(0)
+            st.caption(
+                f"Historical data loaded: "
+                f"{', '.join(map(str, loaded_seasons))}"
+            )
 
+            # Existing historical analysis continues below.
             player_history = validate_history(
                 pd.read_csv(history_file)
             )
