@@ -544,13 +544,9 @@ def render_nfl_player_props():
                     selected_market
                 )
 
-                player_key = (
-                    str(selected_player)
-                    .lower()
-                    .replace(" ", "")
-                    .replace(".", "")
-                    .replace("-", "")
-                    .replace("'", "")
+                
+                player_key = canonical_name(
+                    selected_player
                 )
 
                 player_games = player_history.loc[
