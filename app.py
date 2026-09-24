@@ -63,6 +63,9 @@ from dual_agent.nfl_accuracy_audit import (
     run_nfl_accuracy_audit,
 )
 
+
+from dual_agent.nfl_player_props_ui import render_nfl_player_props
+
 import streamlit as st
 
 from dual_agent.supabase_db import (
