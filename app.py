@@ -58,6 +58,11 @@ from dual_agent.nfl_live_engine import (
     build_live_nfl_opportunities,
 )
 
+
+from dual_agent.nfl_accuracy_audit import (
+    run_nfl_accuracy_audit,
+)
+
 import streamlit as st
 
 from dual_agent.supabase_db import (
