@@ -6040,4 +6040,143 @@ if page == "🧪 Research Lab":
                     "MLB historical data test failed."
                 )
 
+                
+# ==========================================
+# MLB MODEL TRAINING AND VALIDATION
+# ==========================================
+
+st.divider()
+
+st.subheader("⚾ MLB Prediction Model Training")
+
+st.caption(
+    "Train and evaluate the MLB game-winner model "
+    "using historical regular-season games."
+)
+
+if st.button(
+    "Train MLB Prediction Model",
+    key="train_mlb_prediction_model_button",
+    type="primary",
+):
+
+    try:
+        from dual_agent.mlb_research import (
+            fetch_mlb_games,
+            build_mlb_pregame_features,
+            train_mlb_prediction_model,
+        )
+
+        with st.spinner(
+            "Downloading MLB history and training model..."
+        ):
+
+            games = fetch_mlb_games(
+                "2025-03-01",
+                "2025-09-28",
+            )
+
+            if games.empty:
+                raise ValueError(
+                    "No historical MLB games were retrieved."
+                )
+
+            features = build_mlb_pregame_features(
+                games
+            )
+
+            if features.empty:
+                raise ValueError(
+                    "MLB feature generation returned no data."
+                )
+
+            results = train_mlb_prediction_model(
+                features
+            )
+
+            st.session_state[
+                "mlb_training_metrics"
+            ] = results["metrics"]
+
+        st.success(
+            "MLB model training and validation completed."
+        )
+
+    except Exception as e:
+
+        st.error(
+            f"MLB model training failed: {e}"
+        )
+
+# ==========================================
+# DISPLAY MLB VALIDATION RESULTS
+# ==========================================
+
+mlb_metrics = st.session_state.get(
+    "mlb_training_metrics"
+)
+
+if mlb_metrics:
+
+    st.subheader("MLB Model Validation Results")
+
+    if mlb_metrics["passes_benchmarks"]:
+
+        st.success(
+            "Historical validation benchmarks passed."
+        )
+
+    else:
+
+        st.warning(
+            "Historical validation benchmarks not passed. "
+            "Further model evaluation is required."
+        )
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+
+        st.metric(
+            "Model Accuracy",
+            f"{mlb_metrics['model_accuracy']:.2%}",
+        )
+
+        st.metric(
+            "Baseline Accuracy",
+            f"{mlb_metrics['baseline_accuracy']:.2%}",
+        )
+
+    with col2:
+
+        st.metric(
+            "Model Brier Score",
+            f"{mlb_metrics['model_brier']:.4f}",
+        )
+
+        st.metric(
+            "Baseline Brier Score",
+            f"{mlb_metrics['baseline_brier']:.4f}",
+        )
+
+    with col3:
+
+        st.metric(
+            "Model Log Loss",
+            f"{mlb_metrics['model_log_loss']:.4f}",
+        )
+
+        st.metric(
+            "AUC Score",
+            (
+                f"{mlb_metrics['auc']:.3f}"
+                if mlb_metrics["auc"] is not None
+                else "N/A"
+            ),
+        )
+
+    st.subheader("Historical Training Summary")
+
+    st.json(mlb_metrics)
+
                 st.exception(error)
