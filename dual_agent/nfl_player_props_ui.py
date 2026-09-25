@@ -952,4 +952,532 @@ def render_nfl_player_props():
     
 
     st.divider()
+
+
+    # ==========================================================
+    # NFL PLAYER PROP PREDICTION ENGINE — VERSION 1
+    # ==========================================================
+
+    st.divider()
+
+    st.markdown("## 🧠 NFL Player Prop Prediction")
+
+    st.caption(
+        "Forward-looking statistical forecasts based on "
+        "completed NFL player games and the selected sportsbook line."
+    )
+
+    # ----------------------------------------------------------
+    # VERIFY REQUIRED DATA
+    # ----------------------------------------------------------
+
+    forecast_history = st.session_state.get(
+        "nfl_props_historical_data"
+    )
+
+    forecast_ready = (
+        isinstance(forecast_history, pd.DataFrame)
+        and not forecast_history.empty
+        and st.session_state.get(
+            "nfl_props_loaded_seasons"
+        ) == tuple(selected_seasons)
+        and "selected_player" in locals()
+        and "selected_market" in locals()
+        and "market_data" in locals()
+    )
+
+    if not forecast_ready:
+
+        st.info(
+            "Load historical NFL player statistics and select "
+            "a player and prop market to generate a forecast."
+        )
+
+    else:
+
+        # ------------------------------------------------------
+        # IDENTIFY PLAYER AND MARKET
+        # ------------------------------------------------------
+
+        import re
+        import numpy as np
+
+        market_lookup = {
+            value: name
+            for name, value in MARKETS.items()
+        }
+
+        forecast_market = market_lookup.get(
+            selected_market,
+            selected_market
+        )
+
+        def forecast_player_key(name):
+
+            parts = re.findall(
+                r"[A-Za-z]+",
+                str(name)
+            )
+
+            if len(parts) >= 2:
+
+                return canonical_name(
+                    parts[0][0] + parts[-1]
+                )
+
+            return canonical_name(name)
+
+        full_player_key = canonical_name(
+            selected_player
+        )
+
+        short_player_key = forecast_player_key(
+            selected_player
+        )
+
+        # ------------------------------------------------------
+        # MATCH HISTORICAL PLAYER RECORDS
+        # ------------------------------------------------------
+
+        forecast_history = forecast_history.copy()
+
+        exact_matches = forecast_history.loc[
+            forecast_history["player_key"]
+            == full_player_key
+        ]
+
+        if not exact_matches.empty:
+
+            matched_history = exact_matches
+
+        else:
+
+            matched_history = forecast_history.loc[
+                forecast_history["player_key"]
+                == short_player_key
+            ]
+
+        # Check whether the abbreviated identifier could
+        # represent multiple historical player names.
+
+        matched_names = (
+            matched_history["player"]
+            .dropna()
+            .astype(str)
+            .unique()
+            .tolist()
+        )
+
+        if len(matched_names) > 1:
+
+            st.warning(
+                "Multiple historical player names share this "
+                "identifier. A reliable player identity match "
+                "is required before generating a forecast."
+            )
+
+        elif matched_history.empty:
+
+            st.warning(
+                f"No historical statistics were found for "
+                f"{selected_player}."
+            )
+
+        else:
+
+            # --------------------------------------------------
+            # SELECT THE CORRECT STATISTICAL MARKET
+            # --------------------------------------------------
+
+            forecast_games = matched_history.loc[
+                matched_history["market"]
+                == forecast_market
+            ].copy()
+
+            # Use only completed games before the
+            # selected upcoming game's kickoff.
+
+            event_times = pd.to_datetime(
+                market_data["game_time"],
+                utc=True,
+                errors="coerce"
+            ).dropna()
+
+            if event_times.empty:
+
+                st.warning(
+                    "The selected game has no valid kickoff "
+                    "time. A future forecast cannot be generated."
+                )
+
+            else:
+
+                upcoming_kickoff = event_times.min()
+
+                forecast_games["game_time"] = pd.to_datetime(
+                    forecast_games["game_time"],
+                    utc=True,
+                    errors="coerce"
+                )
+
+                forecast_games["value"] = pd.to_numeric(
+                    forecast_games["value"],
+                    errors="coerce"
+                )
+
+                forecast_games = forecast_games.dropna(
+                    subset=["game_time", "value"]
+                )
+
+                forecast_games = forecast_games.loc[
+                    forecast_games["game_time"]
+                    < upcoming_kickoff
+                ]
+
+                forecast_games = (
+                    forecast_games
+                    .sort_values("game_time")
+                    .drop_duplicates(
+                        subset=["game_time"],
+                        keep="last"
+                    )
+                )
+
+                # ----------------------------------------------
+                # SELECT HISTORICAL SAMPLE
+                # ----------------------------------------------
+
+                st.markdown(
+                    f"### 👤 {selected_player}"
+                )
+
+                st.caption(
+                    f"Upcoming matchup · {forecast_market}"
+                )
+
+                sample_window = st.selectbox(
+                    "Historical games to analyze",
+                    options=[5, 10, 15, 20],
+                    index=1,
+                    key="props_forecast_window"
+                )
+
+                recent_games = forecast_games.tail(
+                    sample_window
+                )
+
+                sample_size = len(recent_games)
+
+                if sample_size < 8:
+
+                    st.warning(
+                        f"Only {sample_size} completed games "
+                        "are available for this player and market. "
+                        "At least 8 are required for this "
+                        "preliminary forecast."
+                    )
+
+                else:
+
+                    # ------------------------------------------
+                    # CALCULATE STATISTICAL PROJECTION
+                    # ------------------------------------------
+
+                    values = recent_games[
+                        "value"
+                    ].to_numpy(dtype=float)
+
+                    # Weight recent games more heavily.
+
+                    weights = np.linspace(
+                        1.0,
+                        2.0,
+                        sample_size
+                    )
+
+                    projected_value = float(
+                        np.average(
+                            values,
+                            weights=weights
+                        )
+                    )
+
+                    historical_average = float(
+                        np.mean(values)
+                    )
+
+                    historical_std = float(
+                        np.std(values, ddof=1)
+                    )
+
+                    # ------------------------------------------
+                    # SELECT SPORTSBOOK PROP
+                    # ------------------------------------------
+
+                    forecast_lines = market_data.copy()
+
+                    forecast_lines["line"] = pd.to_numeric(
+                        forecast_lines["line"],
+                        errors="coerce"
+                    )
+
+                    forecast_lines = forecast_lines.dropna(
+                        subset=["line"]
+                    )
+
+                    if forecast_lines.empty:
+
+                        st.warning(
+                            "No valid sportsbook line is "
+                            "available for this market."
+                        )
+
+                    else:
+
+                        available_prop_lines = sorted(
+                            forecast_lines["line"]
+                            .unique()
+                            .tolist()
+                        )
+
+                        forecast_line = st.selectbox(
+                            "Select sportsbook prop line",
+                            available_prop_lines,
+                            key="props_forecast_line"
+                        )
+
+                        selected_line_rows = forecast_lines.loc[
+                            forecast_lines["line"]
+                            == forecast_line
+                        ].copy()
+
+                        available_sides = sorted(
+                            selected_line_rows["side"]
+                            .dropna()
+                            .astype(str)
+                            .unique()
+                            .tolist()
+                        )
+
+                        selected_side = st.selectbox(
+                            "Select prop outcome",
+                            available_sides,
+                            key="props_forecast_side"
+                        )
+
+                        outcome_rows = selected_line_rows.loc[
+                            selected_line_rows["side"]
+                            == selected_side
+                        ]
+
+                        # --------------------------------------
+                        # ESTIMATE OUTCOME FREQUENCY
+                        # --------------------------------------
+
+                        if selected_side in ("Over", "Yes"):
+
+                            if forecast_market == "Anytime touchdown":
+
+                                hits = int(
+                                    (values >= 1).sum()
+                                )
+
+                                pushes = 0
+
+                            else:
+
+                                hits = int(
+                                    (values > forecast_line).sum()
+                                )
+
+                                pushes = int(
+                                    (values == forecast_line).sum()
+                                )
+
+                        else:
+
+                            if forecast_market == "Anytime touchdown":
+
+                                hits = int(
+                                    (values < 1).sum()
+                                )
+
+                                pushes = 0
+
+                            else:
+
+                                hits = int(
+                                    (values < forecast_line).sum()
+                                )
+
+                                pushes = int(
+                                    (values == forecast_line).sum()
+                                )
+
+                        eligible_games = sample_size - pushes
+
+                        if eligible_games <= 0:
+
+                            st.warning(
+                                "All sampled games resulted in "
+                                "pushes. An outcome estimate "
+                                "cannot be calculated."
+                            )
+
+                        else:
+
+                            # Laplace-smoothed historical
+                            # frequency. Preliminary estimate,
+                            # not a calibrated probability.
+
+                            estimated_chance = (
+                                (hits + 1)
+                                / (eligible_games + 2)
+                            )
+
+                            projection_difference = (
+                                projected_value - forecast_line
+                            )
+
+                            # ----------------------------------
+                            # PLAYER FORECAST DASHBOARD
+                            # ----------------------------------
+
+                            st.markdown(
+                                "### 🎯 Upcoming Game Forecast"
+                            )
+
+                            c1, c2 = st.columns(2)
+
+                            c1.metric(
+                                "Projected Player Performance",
+                                f"{projected_value:.1f}"
+                            )
+
+                            c2.metric(
+                                "Sportsbook Line",
+                                f"{forecast_line:g}"
+                            )
+
+                            c3, c4 = st.columns(2)
+
+                            c3.metric(
+                                "Historical Average",
+                                f"{historical_average:.1f}"
+                            )
+
+                            c4.metric(
+                                "Projection vs. Line",
+                                f"{projection_difference:+.1f}"
+                            )
+
+                            st.divider()
+
+                            # ----------------------------------
+                            # CHANCES PLAYER WILL MAKE THE PROP
+                            # ----------------------------------
+
+                            st.markdown(
+                                "### 🏈 Chances Player Will Make the Prop"
+                            )
+
+                            st.caption(
+                                f"{selected_player} · "
+                                f"{selected_side} "
+                                f"{forecast_line:g} · "
+                                f"{forecast_market}"
+                            )
+
+                            st.metric(
+                                "Preliminary Estimated Chance",
+                                f"{estimated_chance:.1%}"
+                            )
+
+                            st.progress(
+                                float(estimated_chance)
+                            )
+
+                            st.caption(
+                                "This estimate uses a smoothed "
+                                "historical hit frequency. It is "
+                                "not yet a calibrated prediction "
+                                "of the upcoming game's outcome."
+                            )
+
+                            # ----------------------------------
+                            # HISTORICAL SUPPORTING DATA
+                            # ----------------------------------
+
+                            st.markdown(
+                                "### 📊 Supporting Player Statistics"
+                            )
+
+                            s1, s2, s3 = st.columns(3)
+
+                            s1.metric(
+                                "Games Analyzed",
+                                sample_size
+                            )
+
+                            s2.metric(
+                                "Historical Hits",
+                                f"{hits}/{eligible_games}"
+                            )
+
+                            s3.metric(
+                                "Game-to-Game Variation",
+                                f"{historical_std:.1f}"
+                            )
+
+                            st.caption(
+                                f"Based on the player's last "
+                                f"{sample_size} available completed "
+                                "games before the selected matchup."
+                            )
+
+                            # ----------------------------------
+                            # SPORTSBOOK PRICE COMPARISON
+                            # ----------------------------------
+
+                            if not outcome_rows.empty:
+
+                                st.markdown(
+                                    "### 💰 Available Sportsbook Prices"
+                                )
+
+                                price_rows = outcome_rows[
+                                    ["bookmaker", "american_odds"]
+                                ].copy()
+
+                                price_rows = price_rows.rename(
+                                    columns={
+                                        "bookmaker": "Sportsbook",
+                                        "american_odds": "American Odds"
+                                    }
+                                )
+
+                                st.dataframe(
+                                    price_rows,
+                                    hide_index=True,
+                                    use_container_width=True
+                                )
+
+                            # ----------------------------------
+                            # MODEL STATUS
+                            # ----------------------------------
+
+                            st.info(
+                                "Research forecast only. The "
+                                "current model does not yet include "
+                                "opponent defensive adjustments, "
+                                "verified player availability, "
+                                "or calibrated future-outcome "
+                                "probabilities. Do not interpret "
+                                "the displayed percentage as a "
+                                "validated betting edge."
+                            )
+
+    # ==========================================================
+    # END NFL PLAYER PROP PREDICTION ENGINE
+    # ==========================================================
     
