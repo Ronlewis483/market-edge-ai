@@ -5855,3 +5855,189 @@ if audit is not None:
 
 if page == "🧪 Research Lab":
     render_research_lab()
+
+
+
+# ==========================================
+# MARKET EDGE AI V5
+# MLB RESEARCH LAB - HISTORICAL DATA TEST
+# ==========================================
+
+if page == "🧪 Research Lab":
+
+    st.divider()
+
+    st.subheader("⚾ MLB Research Lab")
+
+    st.caption(
+        "Historical MLB data retrieval and "
+        "pregame feature validation."
+    )
+
+    with st.expander(
+        "MLB Historical Data Test",
+        expanded=False,
+    ):
+
+        st.info(
+            "This test retrieves completed MLB games "
+            "and calculates historical team statistics. "
+            "It does not generate betting predictions."
+        )
+
+        if st.button(
+            "Run MLB Historical Data Test",
+            key="run_mlb_historical_test",
+        ):
+
+            try:
+
+                from dual_agent.mlb_research import (
+                    fetch_mlb_games,
+                    build_mlb_pregame_features,
+                    summarize_mlb_dataset,
+                )
+
+                with st.spinner(
+                    "Retrieving historical MLB games..."
+                ):
+
+                    games = fetch_mlb_games(
+                        "2025-04-01",
+                        "2025-04-15",
+                    )
+
+                if games.empty:
+
+                    st.error(
+                        "No historical MLB games were returned."
+                    )
+
+                else:
+
+                    st.success(
+                        "MLB historical data retrieved!"
+                    )
+
+                    with st.spinner(
+                        "Building pregame team statistics..."
+                    ):
+
+                        features = (
+                            build_mlb_pregame_features(
+                                games
+                            )
+                        )
+
+                    summary = summarize_mlb_dataset(
+                        features
+                    )
+
+                    # ------------------------------
+                    # HISTORICAL DATA METRICS
+                    # ------------------------------
+
+                    col1, col2, col3 = st.columns(3)
+
+                    with col1:
+
+                        st.metric(
+                            "Historical Games",
+                            len(games),
+                        )
+
+                    with col2:
+
+                        st.metric(
+                            "Pregame Feature Rows",
+                            len(features),
+                        )
+
+                    with col3:
+
+                        st.metric(
+                            "Labeled Games",
+                            summary.get(
+                                "labeled_games",
+                                0,
+                            ),
+                        )
+
+                    # ------------------------------
+                    # DATASET SUMMARY
+                    # ------------------------------
+
+                    st.markdown(
+                        "### MLB Dataset Summary"
+                    )
+
+                    st.json(summary)
+
+                    # ------------------------------
+                    # SAMPLE PREGAME FEATURES
+                    # ------------------------------
+
+                    st.markdown(
+                        "### Sample Pregame Matchups"
+                    )
+
+                    display_columns = [
+                        "home_team",
+                        "away_team",
+                        "home_win",
+                        "home_win_pct",
+                        "away_win_pct",
+                        "win_pct_diff",
+                    ]
+
+                    st.dataframe(
+                        features[
+                            display_columns
+                        ].head(15),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+                    # ------------------------------
+                    # DATA INTEGRITY CHECK
+                    # ------------------------------
+
+                    st.markdown(
+                        "### Data Integrity Check"
+                    )
+
+                    if (
+                        len(games) == len(features)
+                        and summary.get(
+                            "labeled_games",
+                            0,
+                        ) > 0
+                    ):
+
+                        st.success(
+                            "Historical game retrieval "
+                            "and feature generation passed "
+                            "the basic integrity checks."
+                        )
+
+                    else:
+
+                        st.warning(
+                            "The historical dataset requires "
+                            "additional investigation."
+                        )
+
+                    st.caption(
+                        "This preliminary test does not "
+                        "verify historical result-availability "
+                        "timestamps or establish that the "
+                        "features are leakage-free."
+                    )
+
+            except Exception as error:
+
+                st.error(
+                    "MLB historical data test failed."
+                )
+
+                st.exception(error)
