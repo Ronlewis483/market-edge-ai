@@ -597,57 +597,57 @@ def render_nfl_player_props():
                 ]
 
                 
-# ==========================================
-# HISTORICAL PLAYER NAME MATCHING DIAGNOSTIC
-# ==========================================
-
-import re
-
-def abbreviated_player_key(name):
-    name = str(name).strip()
-
-    parts = re.findall(
-        r"[A-Za-z]+",
-        name
-    )
-
-    if len(parts) < 2:
-        return canonical_name(name)
-
-    return (
-        parts[0][0] + parts[-1]
-    ).lower()
-
-
-abbreviated_key = abbreviated_player_key(
-    selected_player
-)
-
-st.write(
-    "Expected historical player key:",
-    abbreviated_key
-)
-
-abbreviated_matches = player_history.loc[
-    player_history["player_key"] == abbreviated_key
-]
-
-st.write(
-    "Abbreviated-name historical matches:",
-    len(abbreviated_matches)
-)
-
-if not abbreviated_matches.empty:
-
-    st.write(
-        "Historical records found for:",
-        selected_player
-    )
-
-    st.dataframe(
-        abbreviated_matches.head(10),
-        use_container_width=True
-    )
+            # ==========================================
+            # HISTORICAL PLAYER NAME MATCHING DIAGNOSTIC
+            # ==========================================
+            
+            import re
+            
+            def abbreviated_player_key(name):
+                name = str(name).strip()
+            
+                parts = re.findall(
+                    r"[A-Za-z]+",
+                    name
+                )
+            
+                if len(parts) < 2:
+                    return canonical_name(name)
+            
+                return (
+                    parts[0][0] + parts[-1]
+                ).lower()
+            
+            
+            abbreviated_key = abbreviated_player_key(
+                selected_player
+            )
+            
+            st.write(
+                "Expected historical player key:",
+                abbreviated_key
+            )
+            
+            abbreviated_matches = player_history.loc[
+                player_history["player_key"] == abbreviated_key
+            ]
+            
+            st.write(
+                "Abbreviated-name historical matches:",
+                len(abbreviated_matches)
+            )
+            
+            if not abbreviated_matches.empty:
+            
+                st.write(
+                    "Historical records found for:",
+                    selected_player
+                )
+            
+                st.dataframe(
+                    abbreviated_matches.head(10),
+                    use_container_width=True
+                )
                 
                 st.write(
                     "Matching historical records:",
