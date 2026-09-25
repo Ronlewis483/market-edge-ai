@@ -6179,4 +6179,9 @@ if mlb_metrics:
 
     st.json(mlb_metrics)
 
-st.exception(error)
+
+        except Exception as e:
+            st.error(
+                f"MLB model training failed: {e}"
+            )
+            st.exception(e)st.exception(error)
