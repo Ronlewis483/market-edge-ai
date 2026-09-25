@@ -1339,6 +1339,66 @@ def render_nfl_player_props():
                                 projected_value - forecast_line
                             )
 
+                            
+                    # ==========================================
+                    # PUBLISH NFL PLAYER PROP FORECAST
+                    # ==========================================
+                    
+                    from datetime import datetime, timezone
+                    
+                    # Save the forecast for the main Sports Center.
+                    # Keep this separate from the existing NFL
+                    # prediction and historical-data session keys.
+                    
+                    forecast_record = {
+                        "event_id": choices[chosen],
+                        "game": chosen,
+                        "player": selected_player,
+                        "market": forecast_market,
+                        "side": selected_side,
+                        "line": float(forecast_line),
+                        "projected_value": float(projected_value),
+                        "historical_average": float(historical_average),
+                        "estimated_chance": float(estimated_chance),
+                        "projection_difference": float(
+                            projection_difference
+                        ),
+                        "sample_size": int(sample_size),
+                        "historical_hits": int(hits),
+                        "eligible_games": int(eligible_games),
+                        "generated_at": datetime.now(
+                            timezone.utc
+                        ).isoformat(),
+                    }
+                    
+                    # Each player, market, side and line
+                    # represents a distinct forecast.
+                    
+                    forecast_id = (
+                        str(forecast_record["event_id"]),
+                        str(forecast_record["player"]),
+                        str(forecast_record["market"]),
+                        str(forecast_record["side"]),
+                        float(forecast_record["line"]),
+                    )
+                    
+                    # Retrieve previously generated forecasts.
+                    
+                    saved_forecasts = st.session_state.get(
+                        "nfl_dashboard_forecasts",
+                        {}
+                    )
+                    
+                    # Update the forecast for this specific prop.
+                    
+                    saved_forecasts[forecast_id] = forecast_record
+                    
+                    # Publish the updated collection.
+                    
+                    st.session_state[
+                        "nfl_dashboard_forecasts"
+                    ] = saved_forecasts
+
                             # ----------------------------------
                             # PLAYER FORECAST DASHBOARD
                             # ----------------------------------
