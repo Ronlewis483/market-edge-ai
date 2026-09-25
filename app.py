@@ -6175,12 +6175,10 @@ if mlb_metrics:
             ),
         )
 
-    st.subheader("Historical Training Summary")
+    
+        st.subheader("Historical Training Summary")
 
-    st.json(mlb_metrics)
-
-
-
+        st.json(mlb_metrics)
 
     except Exception as e:
         st.error(
