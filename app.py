@@ -6182,8 +6182,8 @@ if mlb_metrics:
 
 
 
-        except Exception as e:
-            st.error(
-                f"MLB model training failed: {e}"
-            )
-            st.exception(e)
+except Exception as e:
+    st.error(
+        f"MLB model training failed: {e}"
+    )
+    st.exception(e)
