@@ -574,6 +574,39 @@ def render_nfl_player_props():
                     selected_player
                 )
 
+              
+                st.write("Player matching diagnostic")
+                
+                st.write(
+                    "Selected sportsbook player:",
+                    selected_player
+                )
+                
+                st.write(
+                    "Canonical player key:",
+                    player_key
+                )
+                
+                st.write(
+                    "Historical market:",
+                    historical_market
+                )
+                
+                matching_players = player_history.loc[
+                    player_history["player_key"] == player_key
+                ]
+                
+                st.write(
+                    "Matching historical records:",
+                    len(matching_players)
+                )
+                
+                if not matching_players.empty:
+                    st.dataframe(
+                        matching_players.head(10),
+                        use_container_width=True
+                    )
+
                 player_games = player_history.loc[
                     (
                         player_history["player_key"]
