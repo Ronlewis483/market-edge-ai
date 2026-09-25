@@ -1,4 +1,4 @@
-import pandas as pd
+import pandas as pdst.selectbox
 from dual_agent.nba_data import test_nba_connections
 from dual_agent.nba_history import test_nba_history
 
@@ -460,12 +460,23 @@ if page == "🏀 Sports Center":
 
         sport = st.selectbox(
             "Which sport would you like to analyze?",
-            [
-                "NFL Football",
-                "NBA Basketball",
-                "College Football",
-                "MLB Baseball",
-                "Other Sports",
+            [ 
+                "Game Winner",
+                "Player Points",
+                "Player Rebounds",
+                "Player Assists",
+                "Player Passing Yards",
+                "Player Rushing Yards",
+                "Player Receiving Yards",
+                "Player Receptions",
+                "Player Passing Touchdowns",
+                "Player Anytime Touchdown",
+                "Player Rushing + Receiving Yards",
+                "Player Passing Completions",
+                "Player Interceptions Thrown",
+                "Game Total Points",
+                "Point Spread",
+                "Other",
             ],
         )
 
