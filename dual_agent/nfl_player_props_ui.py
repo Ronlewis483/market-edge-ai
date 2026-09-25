@@ -570,9 +570,24 @@ def render_nfl_player_props():
                 )
 
                 
-                player_key = canonical_name(
+                
+                # Match sportsbook names to historical abbreviations.
+
+                import re
+
+                name_parts = re.findall(
+                    r"[A-Za-z]+",
                     selected_player
                 )
+
+                if len(name_parts) >= 2:
+                    player_key = (
+                        name_parts[0][0] + name_parts[-1]
+                    ).lower()
+                else:
+                    player_key = canonical_name(
+                        selected_player
+                    )
 
               
                 st.write("Player matching diagnostic")
