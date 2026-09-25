@@ -6179,4 +6179,4 @@ if mlb_metrics:
 
     st.json(mlb_metrics)
 
-                st.exception(error)
+st.exception(error)
