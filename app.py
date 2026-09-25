@@ -6176,12 +6176,12 @@ if mlb_metrics:
         )
 
     
-        st.subheader("Historical Training Summary")
-
-        st.json(mlb_metrics)
-
+    st.subheader("Historical Training Summary")
+    
+    st.json(mlb_metrics)
+    
     except Exception as e:
-        st.error(
-            f"MLB model training failed: {e}"
-        )
-        st.exception(e)
+    st.error(
+        f"MLB model training failed: {e}"
+    )
+    st.exception(e)
