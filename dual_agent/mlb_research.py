@@ -459,3 +459,268 @@ def summarize_mlb_dataset(
             len(features.columns)
         ),
     }
+
+
+# ==========================================
+# MLB GAME-WINNER PREDICTION MODEL
+# ==========================================
+
+MLB_MODEL_FEATURES = [
+    "games_played_diff",
+    "win_pct_diff",
+    "avg_runs_for_diff",
+    "avg_runs_against_diff",
+    "avg_run_diff_diff",
+    "recent_5_win_pct_diff",
+    "recent_10_win_pct_diff",
+    "recent_5_run_diff_diff",
+]
+
+
+def train_mlb_prediction_model(features):
+    """
+    Train and evaluate an MLB game-winner model.
+
+    Uses chronological training and testing.
+
+    IMPORTANT:
+    This function is for research only.
+    Historical feature availability must be
+    verified before production use.
+    """
+
+    if features is None or features.empty:
+        raise ValueError(
+            "No MLB training features available."
+        )
+
+    df = features.copy()
+
+    df = df.dropna(
+        subset=["home_win"]
+    )
+
+    df = df.sort_values(
+        ["start_time", "game_id"]
+    ).reset_index(drop=True)
+
+    if len(df) < 500:
+        raise ValueError(
+            "At least 500 historical MLB games "
+            "are required for this initial test."
+        )
+
+    # --------------------------------------
+    # CHRONOLOGICAL TRAIN / TEST SPLIT
+    # --------------------------------------
+
+    split_index = int(
+        len(df) * 0.80
+    )
+
+    # Keep games sharing the boundary
+    # timestamp on the same side.
+    boundary_time = df.iloc[
+        split_index
+    ]["start_time"]
+
+    train = df[
+        df["start_time"] < boundary_time
+    ].copy()
+
+    test = df[
+        df["start_time"] >= boundary_time
+    ].copy()
+
+    if train.empty or test.empty:
+        raise ValueError(
+            "Invalid chronological train/test split."
+        )
+
+    X_train = train[
+        MLB_MODEL_FEATURES
+    ].fillna(0)
+
+    y_train = train[
+        "home_win"
+    ].astype(int)
+
+    X_test = test[
+        MLB_MODEL_FEATURES
+    ].fillna(0)
+
+    y_test = test[
+        "home_win"
+    ].astype(int)
+
+    if y_train.nunique() < 2:
+        raise ValueError(
+            "Training data must contain both "
+            "home wins and home losses."
+        )
+
+    # --------------------------------------
+    # TRAIN THE MODEL
+    # --------------------------------------
+
+    model = make_pipeline(
+        StandardScaler(),
+        LogisticRegression(
+            max_iter=2000,
+            random_state=42,
+        ),
+    )
+
+    model.fit(
+        X_train,
+        y_train,
+    )
+
+    # --------------------------------------
+    # GENERATE HISTORICAL PREDICTIONS
+    # --------------------------------------
+
+    probabilities = (
+        model.predict_proba(X_test)[:, 1]
+    )
+
+    predictions = (
+        probabilities >= 0.50
+    ).astype(int)
+
+    # --------------------------------------
+    # HISTORICAL BASELINE
+    # --------------------------------------
+
+    baseline_probability = float(
+        y_train.mean()
+    )
+
+    baseline_predictions = np.full(
+        len(y_test),
+        int(baseline_probability >= 0.50),
+    )
+
+    baseline_probabilities = np.full(
+        len(y_test),
+        baseline_probability,
+    )
+
+    # --------------------------------------
+    # MODEL EVALUATION
+    # --------------------------------------
+
+    model_accuracy = accuracy_score(
+        y_test,
+        predictions,
+    )
+
+    baseline_accuracy = accuracy_score(
+        y_test,
+        baseline_predictions,
+    )
+
+    model_brier = brier_score_loss(
+        y_test,
+        probabilities,
+    )
+
+    baseline_brier = brier_score_loss(
+        y_test,
+        baseline_probabilities,
+    )
+
+    model_log_loss = log_loss(
+        y_test,
+        probabilities,
+        labels=[0, 1],
+    )
+
+    baseline_log_loss = log_loss(
+        y_test,
+        baseline_probabilities,
+        labels=[0, 1],
+    )
+
+    auc = None
+
+    if y_test.nunique() == 2:
+        auc = float(
+            roc_auc_score(
+                y_test,
+                probabilities,
+            )
+        )
+
+    # --------------------------------------
+    # VALIDATION REPORT
+    # --------------------------------------
+
+    metrics = {
+        "training_games": int(
+            len(train)
+        ),
+
+        "test_games": int(
+            len(test)
+        ),
+
+        "training_start": str(
+            train["start_time"].min()
+        ),
+
+        "training_end": str(
+            train["start_time"].max()
+        ),
+
+        "test_start": str(
+            test["start_time"].min()
+        ),
+
+        "test_end": str(
+            test["start_time"].max()
+        ),
+
+        "model_accuracy": float(
+            model_accuracy
+        ),
+
+        "baseline_accuracy": float(
+            baseline_accuracy
+        ),
+
+        "model_brier": float(
+            model_brier
+        ),
+
+        "baseline_brier": float(
+            baseline_brier
+        ),
+
+        "model_log_loss": float(
+            model_log_loss
+        ),
+
+        "baseline_log_loss": float(
+            baseline_log_loss
+        ),
+
+        "auc": auc,
+
+        "test_home_win_rate": float(
+            y_test.mean()
+        ),
+
+        "passes_benchmarks": bool(
+            model_brier < baseline_brier
+            and model_log_loss < baseline_log_loss
+            and model_accuracy > baseline_accuracy
+            and auc is not None
+            and auc > 0.50
+        ),
+    }
+
+    return {
+        "model": model,
+        "metrics": metrics,
+    }
