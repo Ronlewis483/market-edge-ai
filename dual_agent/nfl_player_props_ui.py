@@ -1399,145 +1399,145 @@ def render_nfl_player_props():
                         "nfl_dashboard_forecasts"
                     ] = saved_forecasts
 
-                            # ----------------------------------
-                            # PLAYER FORECAST DASHBOARD
-                            # ----------------------------------
+                    # ----------------------------------
+                    # PLAYER FORECAST DASHBOARD
+                    # ----------------------------------
 
-                            st.markdown(
-                                "### 🎯 Upcoming Game Forecast"
-                            )
+                    st.markdown(
+                        "### 🎯 Upcoming Game Forecast"
+                    )
 
-                            c1, c2 = st.columns(2)
+                    c1, c2 = st.columns(2)
 
-                            c1.metric(
-                                "Projected Player Performance",
-                                f"{projected_value:.1f}"
-                            )
+                    c1.metric(
+                        "Projected Player Performance",
+                        f"{projected_value:.1f}"
+                    )
 
-                            c2.metric(
-                                "Sportsbook Line",
-                                f"{forecast_line:g}"
-                            )
+                    c2.metric(
+                        "Sportsbook Line",
+                        f"{forecast_line:g}"
+                    )
 
-                            c3, c4 = st.columns(2)
+                    c3, c4 = st.columns(2)
 
-                            c3.metric(
-                                "Historical Average",
-                                f"{historical_average:.1f}"
-                            )
+                    c3.metric(
+                        "Historical Average",
+                        f"{historical_average:.1f}"
+                    )
 
-                            c4.metric(
-                                "Projection vs. Line",
-                                f"{projection_difference:+.1f}"
-                            )
+                    c4.metric(
+                        "Projection vs. Line",
+                        f"{projection_difference:+.1f}"
+                    )
 
-                            st.divider()
+                    st.divider()
 
-                            # ----------------------------------
-                            # CHANCES PLAYER WILL MAKE THE PROP
-                            # ----------------------------------
+                    # ----------------------------------
+                    # CHANCES PLAYER WILL MAKE THE PROP
+                    # ----------------------------------
 
-                            st.markdown(
-                                "### 🏈 Chances Player Will Make the Prop"
-                            )
+                    st.markdown(
+                        "### 🏈 Chances Player Will Make the Prop"
+                    )
 
-                            st.caption(
-                                f"{selected_player} · "
-                                f"{selected_side} "
-                                f"{forecast_line:g} · "
-                                f"{forecast_market}"
-                            )
+                    st.caption(
+                        f"{selected_player} · "
+                        f"{selected_side} "
+                        f"{forecast_line:g} · "
+                        f"{forecast_market}"
+                    )
 
-                            st.metric(
-                                "Preliminary Estimated Chance",
-                                f"{estimated_chance:.1%}"
-                            )
+                    st.metric(
+                        "Preliminary Estimated Chance",
+                        f"{estimated_chance:.1%}"
+                    )
 
-                            st.progress(
-                                float(estimated_chance)
-                            )
+                    st.progress(
+                        float(estimated_chance)
+                    )
 
-                            st.caption(
-                                "This estimate uses a smoothed "
-                                "historical hit frequency. It is "
-                                "not yet a calibrated prediction "
-                                "of the upcoming game's outcome."
-                            )
+                    st.caption(
+                        "This estimate uses a smoothed "
+                        "historical hit frequency. It is "
+                        "not yet a calibrated prediction "
+                        "of the upcoming game's outcome."
+                    )
 
-                            # ----------------------------------
-                            # HISTORICAL SUPPORTING DATA
-                            # ----------------------------------
+                    # ----------------------------------
+                    # HISTORICAL SUPPORTING DATA
+                    # ----------------------------------
 
-                            st.markdown(
-                                "### 📊 Supporting Player Statistics"
-                            )
+                    st.markdown(
+                        "### 📊 Supporting Player Statistics"
+                    )
 
-                            s1, s2, s3 = st.columns(3)
+                    s1, s2, s3 = st.columns(3)
 
-                            s1.metric(
-                                "Games Analyzed",
-                                sample_size
-                            )
+                    s1.metric(
+                        "Games Analyzed",
+                        sample_size
+                    )
 
-                            s2.metric(
-                                "Historical Hits",
-                                f"{hits}/{eligible_games}"
-                            )
+                    s2.metric(
+                        "Historical Hits",
+                        f"{hits}/{eligible_games}"
+                    )
 
-                            s3.metric(
-                                "Game-to-Game Variation",
-                                f"{historical_std:.1f}"
-                            )
+                    s3.metric(
+                        "Game-to-Game Variation",
+                        f"{historical_std:.1f}"
+                    )
 
-                            st.caption(
-                                f"Based on the player's last "
-                                f"{sample_size} available completed "
-                                "games before the selected matchup."
-                            )
+                    st.caption(
+                        f"Based on the player's last "
+                        f"{sample_size} available completed "
+                        "games before the selected matchup."
+                    )
 
-                            # ----------------------------------
-                            # SPORTSBOOK PRICE COMPARISON
-                            # ----------------------------------
+                    # ----------------------------------
+                    # SPORTSBOOK PRICE COMPARISON
+                    # ----------------------------------
 
-                            if not outcome_rows.empty:
+                    if not outcome_rows.empty:
 
-                                st.markdown(
-                                    "### 💰 Available Sportsbook Prices"
-                                )
+                        st.markdown(
+                            "### 💰 Available Sportsbook Prices"
+                        )
 
-                                price_rows = outcome_rows[
-                                    ["bookmaker", "american_odds"]
-                                ].copy()
+                        price_rows = outcome_rows[
+                            ["bookmaker", "american_odds"]
+                        ].copy()
 
-                                price_rows = price_rows.rename(
-                                    columns={
-                                        "bookmaker": "Sportsbook",
-                                        "american_odds": "American Odds"
-                                    }
-                                )
+                        price_rows = price_rows.rename(
+                            columns={
+                                "bookmaker": "Sportsbook",
+                                "american_odds": "American Odds"
+                            }
+                        )
 
-                                st.dataframe(
-                                    price_rows,
-                                    hide_index=True,
-                                    use_container_width=True
-                                )
+                        st.dataframe(
+                            price_rows,
+                            hide_index=True,
+                            use_container_width=True
+                        )
 
-                            # ----------------------------------
-                            # MODEL STATUS
-                            # ----------------------------------
+                    # ----------------------------------
+                    # MODEL STATUS
+                    # ----------------------------------
 
-                            st.info(
-                                "Research forecast only. The "
-                                "current model does not yet include "
-                                "opponent defensive adjustments, "
-                                "verified player availability, "
-                                "or calibrated future-outcome "
-                                "probabilities. Do not interpret "
-                                "the displayed percentage as a "
-                                "validated betting edge."
-                            )
+                    st.info(
+                        "Research forecast only. The "
+                        "current model does not yet include "
+                        "opponent defensive adjustments, "
+                        "verified player availability, "
+                        "or calibrated future-outcome "
+                        "probabilities. Do not interpret "
+                        "the displayed percentage as a "
+                        "validated betting edge."
+                    )
 
-    # ==========================================================
-    # END NFL PLAYER PROP PREDICTION ENGINE
-    # ==========================================================
-    
+# ==========================================================
+# END NFL PLAYER PROP PREDICTION ENGINE
+# ==========================================================
+
