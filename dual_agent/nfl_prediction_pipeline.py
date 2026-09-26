@@ -19,6 +19,8 @@ from dual_agent.nfl_live_engine import (
 
 def run_nfl_prediction_pipeline(
     predictions,
+    historical_accuracy=None,
+    historical_sample=None,
 ):
     """
     Run the NFL live market workflow.
@@ -103,9 +105,11 @@ def run_nfl_prediction_pipeline(
     # ==========================================
 
     opportunities = build_live_nfl_opportunities(
-        predictions,
-        best_lines,
-    )
+    model_predictions=predictions,
+    best_lines=best_lines,
+    historical_accuracy=historical_accuracy,
+    historical_sample=historical_sample,
+)
 
     if opportunities is None:
         raise ValueError(
