@@ -67,6 +67,10 @@ from dual_agent.nfl_prediction_pipeline import (
     run_nfl_prediction_pipeline,
 )
 
+from dual_agent.nba_prediction_pipeline import (
+    run_nba_prediction_pipeline,
+)
+
 
 from dual_agent.nfl_player_props_ui import render_nfl_player_props
 
