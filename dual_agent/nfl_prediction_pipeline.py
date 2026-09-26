@@ -239,8 +239,9 @@ def run_nfl_prediction_pipeline(
     # ==========================================
 
     return {
-        "live_odds": live_odds,
-        "best_lines": best_lines,
-        "predictions": predictions,
-        "opportunities": opportunities,
-    }
+    "live_odds": live_odds,
+    "best_lines": best_lines,
+    "predictions": predictions,
+    "opportunities": opportunities,
+    "prediction_errors": prediction_errors,
+}
