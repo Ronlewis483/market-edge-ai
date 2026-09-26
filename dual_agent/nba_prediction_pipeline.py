@@ -1,5 +1,7 @@
 import pandas as pd
 import streamlit as st
+import time
+
 from dual_agent.balldontlie_data import (
     get_multiple_historical_seasons,
 )
@@ -211,7 +213,9 @@ def _build_cached_nba_historical_features(
     return prepared_games, feature_games
 
 
-def run_nba_prediction_pipeline():
+def run_nba_prediction_pipeline(
+    progress_callback=None,
+):
     """
     Generate predictions for all upcoming NBA games.
 
@@ -229,6 +233,17 @@ def run_nba_prediction_pipeline():
         prediction_errors:
             Games that could not be modeled.
     """
+
+        pipeline_start = time.perf_counter()
+
+def report(stage):
+    elapsed = time.perf_counter() - pipeline_start
+
+    if progress_callback:
+        progress_callback(
+            stage,
+            elapsed,
+        )
 
     # ========================================================
     # 1. LOAD LIVE NBA MONEYLINES
