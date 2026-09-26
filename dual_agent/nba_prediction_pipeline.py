@@ -235,13 +235,13 @@ def run_nba_prediction_pipeline(
     """
 
     pipeline_start = time.perf_counter()
-
+    
     def report(stage):
         elapsed = (
             time.perf_counter()
             - pipeline_start
         )
-
+    
         if progress_callback:
             progress_callback(
                 stage,
