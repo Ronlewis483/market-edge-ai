@@ -975,6 +975,475 @@ with st.expander(
     render_nfl_player_props()
 
 
+# ============================================
+# NBA ONE-CLICK PREDICTION CENTER
+# ============================================
+
+st.divider()
+
+st.subheader("🏀 NBA Prediction Center")
+
+st.caption(
+    "Generate upcoming NBA game predictions and "
+    "analyze model-vs-market opportunities."
+)
+
+if st.button(
+    "⚡ Generate NBA Predictions",
+    key="generate_nba_predictions_one_click",
+    type="primary",
+    use_container_width=True,
+):
+
+    try:
+
+        with st.spinner(
+            "Generating NBA predictions and analyzing markets..."
+        ):
+
+            nba_pipeline_result = (
+                run_nba_prediction_pipeline()
+            )
+
+            st.session_state[
+                "nba_prediction_pipeline_result"
+            ] = nba_pipeline_result
+
+        st.success(
+            "NBA predictions generated successfully."
+        )
+
+    except Exception as error:
+
+        st.error(
+            f"NBA prediction pipeline failed: {error}"
+        )
+
+        st.exception(error)
+
+
+# ============================================
+# NBA PREDICTION RESULTS
+# ============================================
+
+nba_pipeline_result = st.session_state.get(
+    "nba_prediction_pipeline_result",
+    None,
+)
+
+if nba_pipeline_result is not None:
+
+    nba_predictions = nba_pipeline_result.get(
+        "predictions"
+    )
+
+    nba_opportunities = nba_pipeline_result.get(
+        "opportunities"
+    )
+
+    if (
+        nba_predictions is not None
+        and not nba_predictions.empty
+    ):
+
+        nba_prediction_count = len(
+            nba_predictions
+        )
+
+        with st.expander(
+            f"🏀 Upcoming NBA Game Predictions "
+            f"({nba_prediction_count})",
+            expanded=False,
+        ):
+
+            st.caption(
+                "Model-generated win probabilities "
+                "for upcoming NBA games."
+            )
+
+            # ====================================
+            # SUMMARY
+            # ====================================
+
+            nba_high_count = int(
+                (
+                    nba_predictions["confidence"]
+                    >= 0.70
+                ).sum()
+            )
+
+            nba_moderate_count = int(
+                (
+                    (
+                        nba_predictions["confidence"]
+                        >= 0.58
+                    )
+                    & (
+                        nba_predictions["confidence"]
+                        < 0.70
+                    )
+                ).sum()
+            )
+
+            nba_close_count = int(
+                (
+                    nba_predictions["confidence"]
+                    < 0.58
+                ).sum()
+            )
+
+            (
+                nba_summary_1,
+                nba_summary_2,
+                nba_summary_3,
+                nba_summary_4,
+            ) = st.columns(4)
+
+            nba_summary_1.metric(
+                "Games",
+                nba_prediction_count,
+            )
+
+            nba_summary_2.metric(
+                "High Confidence",
+                nba_high_count,
+            )
+
+            nba_summary_3.metric(
+                "Moderate",
+                nba_moderate_count,
+            )
+
+            nba_summary_4.metric(
+                "Close Matchups",
+                nba_close_count,
+            )
+
+            st.markdown("")
+
+            # ====================================
+            # MOST FAVORABLE → LEAST FAVORABLE
+            # ====================================
+
+            sorted_nba_predictions = (
+                nba_predictions
+                .sort_values(
+                    by="confidence",
+                    ascending=False,
+                )
+                .reset_index(drop=True)
+            )
+
+            nba_confidence_groups = [
+                (
+                    "🔥 HIGH CONFIDENCE PICKS",
+                    "The model's strongest NBA "
+                    "win-probability predictions.",
+                    sorted_nba_predictions[
+                        sorted_nba_predictions[
+                            "confidence"
+                        ] >= 0.70
+                    ],
+                ),
+                (
+                    "⚡ MODERATE CONFIDENCE",
+                    "The model has a meaningful "
+                    "preference, but with less separation.",
+                    sorted_nba_predictions[
+                        (
+                            sorted_nba_predictions[
+                                "confidence"
+                            ] >= 0.58
+                        )
+                        & (
+                            sorted_nba_predictions[
+                                "confidence"
+                            ] < 0.70
+                        )
+                    ],
+                ),
+                (
+                    "⚖️ CLOSE MATCHUPS",
+                    "NBA games where the model sees "
+                    "relatively little separation.",
+                    sorted_nba_predictions[
+                        sorted_nba_predictions[
+                            "confidence"
+                        ] < 0.58
+                    ],
+                ),
+            ]
+
+            for (
+                group_title,
+                group_description,
+                group_predictions,
+            ) in nba_confidence_groups:
+
+                if group_predictions.empty:
+                    continue
+
+                st.markdown("---")
+
+                st.markdown(
+                    f"### {group_title}"
+                )
+
+                st.caption(
+                    group_description
+                )
+
+                group_records = (
+                    group_predictions.to_dict(
+                        "records"
+                    )
+                )
+
+                for index in range(
+                    0,
+                    len(group_records),
+                    2,
+                ):
+
+                    card_columns = st.columns(2)
+
+                    games_in_row = (
+                        group_records[
+                            index:index + 2
+                        ]
+                    )
+
+                    for column, game in zip(
+                        card_columns,
+                        games_in_row,
+                    ):
+
+                        with column:
+
+                            home_team = game[
+                                "home_team"
+                            ]
+
+                            away_team = game[
+                                "away_team"
+                            ]
+
+                            predicted_team = game[
+                                "predicted_team"
+                            ]
+
+                            confidence = float(
+                                game["confidence"]
+                            )
+
+                            home_probability = float(
+                                game[
+                                    "home_win_probability"
+                                ]
+                            )
+
+                            away_probability = float(
+                                game[
+                                    "away_win_probability"
+                                ]
+                            )
+
+                            # ========================
+                            # GAME TIME
+                            # ========================
+
+                            game_time = pd.to_datetime(
+                                game["commence_time"],
+                                utc=True,
+                                errors="coerce",
+                            )
+
+                            if pd.notna(game_time):
+
+                                central_time = (
+                                    game_time.tz_convert(
+                                        "America/Chicago"
+                                    )
+                                )
+
+                                game_time_text = (
+                                    central_time.strftime(
+                                        "%a • %I:%M %p CT"
+                                    )
+                                    .replace(
+                                        " 0",
+                                        " ",
+                                    )
+                                    .upper()
+                                )
+
+                            else:
+
+                                game_time_text = (
+                                    "TIME TBD"
+                                )
+
+                            # ========================
+                            # CONFIDENCE
+                            # ========================
+
+                            if confidence >= 0.70:
+
+                                confidence_label = (
+                                    "HIGH CONFIDENCE"
+                                )
+
+                                confidence_icon = "🔥"
+
+                            elif confidence >= 0.58:
+
+                                confidence_label = (
+                                    "MODERATE"
+                                )
+
+                                confidence_icon = "⚡"
+
+                            else:
+
+                                confidence_label = (
+                                    "CLOSE MATCHUP"
+                                )
+
+                                confidence_icon = "⚖️"
+
+                            # ========================
+                            # NBA CARD
+                            # ========================
+
+                            with st.container(
+                                border=True
+                            ):
+
+                                st.caption(
+                                    game_time_text
+                                )
+
+                                st.markdown(
+                                    f"#### {away_team} "
+                                    f"@ {home_team}"
+                                )
+
+                                st.markdown(
+                                    "##### 🏆 MODEL PICK"
+                                )
+
+                                st.markdown(
+                                    f"## {predicted_team}"
+                                )
+
+                                st.progress(
+                                    max(
+                                        0.0,
+                                        min(
+                                            1.0,
+                                            confidence,
+                                        ),
+                                    )
+                                )
+
+                                (
+                                    probability_col1,
+                                    probability_col2,
+                                ) = st.columns(2)
+
+                                probability_col1.metric(
+                                    away_team,
+                                    f"{away_probability:.1%}",
+                                )
+
+                                probability_col2.metric(
+                                    home_team,
+                                    f"{home_probability:.1%}",
+                                )
+
+                                st.markdown(
+                                    f"**{confidence_icon} "
+                                    f"{confidence_label}** "
+                                    f"• {confidence:.1%}"
+                                )
+
+                                with st.expander(
+                                    "View model details"
+                                ):
+
+                                    training_games = (
+                                        game.get(
+                                            "training_games"
+                                        )
+                                    )
+
+                                    st.write(
+                                        "**Predicted winner:** "
+                                        f"{predicted_team}"
+                                    )
+
+                                    st.write(
+                                        "**Model confidence:** "
+                                        f"{confidence:.1%}"
+                                    )
+
+                                    st.write(
+                                        "**Home win probability:** "
+                                        f"{home_probability:.1%}"
+                                    )
+
+                                    st.write(
+                                        "**Away win probability:** "
+                                        f"{away_probability:.1%}"
+                                    )
+
+                                    if (
+                                        training_games
+                                        is not None
+                                    ):
+
+                                        st.write(
+                                            "**Historical training "
+                                            "games:** "
+                                            f"{training_games}"
+                                        )
+
+            st.markdown("---")
+
+            st.caption(
+                "Predictions are ordered from highest "
+                "to lowest model confidence within each "
+                "section. Confidence represents estimated "
+                "win probability and does not by itself "
+                "indicate betting value."
+            )
+
+            # ====================================
+            # NBA MARKET OPPORTUNITIES
+            # ====================================
+
+            if (
+                nba_opportunities is not None
+                and not nba_opportunities.empty
+            ):
+
+                with st.expander(
+                    "💰 NBA Market Opportunities",
+                    expanded=False,
+                ):
+
+                    st.caption(
+                        "Model-vs-market analysis sorted "
+                        "by expected ROI and model edge."
+                    )
+
+                    st.dataframe(
+                        nba_opportunities,
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+
 # ==========================================
 # SPORTS CENTER — DASHBOARD NAVIGATION
 # ==========================================
