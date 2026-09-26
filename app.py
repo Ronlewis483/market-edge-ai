@@ -480,11 +480,12 @@ if st.button(
 
         st.exception(error)
 
-    nfl_pipeline_result = st.session_state.get(
-    "nfl_prediction_pipeline_result"
-)
-
-if nfl_pipeline_result:
+        nfl_pipeline_result = st.session_state.get(
+        "nfl_prediction_pipeline_result",
+        None,
+    )
+    
+    if nfl_pipeline_result is not None:
 
     predictions = nfl_pipeline_result.get(
         "predictions"
