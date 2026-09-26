@@ -93,8 +93,8 @@ def _load_nba_historical_features(
         historical_games,
         season_summary,
         requests_used,
-    ) = get_multiple_historical_seasons(
-        list(seasons)
+        ) = get_multiple_historical_seasons(
+        seasons
     )
 
     if (
