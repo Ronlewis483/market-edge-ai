@@ -234,7 +234,7 @@ def run_nba_prediction_pipeline(
             Games that could not be modeled.
     """
 
-            pipeline_start = time.perf_counter()
+    pipeline_start = time.perf_counter()
 
     def report(stage):
         elapsed = (
@@ -352,7 +352,7 @@ def run_nba_prediction_pipeline(
         .date()
     )
 
-    report(
+        report(
         "Loading historical NBA data/features..."
     )
 
@@ -369,6 +369,8 @@ def run_nba_prediction_pipeline(
     report(
         "Historical NBA data/features ready"
     )
+
+    
     # ========================================================
     # TRAIN LIVE MODEL ONCE FOR ENTIRE UPCOMING SLATE
     # ========================================================
