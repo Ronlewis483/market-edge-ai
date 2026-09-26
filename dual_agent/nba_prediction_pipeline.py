@@ -154,6 +154,62 @@ def _load_nba_historical_features(
         requests_used,
     )
 
+@st.cache_data(
+    ttl=86400,
+    show_spinner=False,
+)
+def _build_cached_nba_historical_features(
+    historical_games,
+    cutoff_date,
+):
+    """
+    Prepare historical NBA games and build leakage-safe
+    pregame features once, then reuse them for 24 hours.
+    """
+
+    if historical_games is None or len(historical_games) == 0:
+        raise ValueError(
+            "No historical NBA games were supplied."
+        )
+
+    historical_games = historical_games.copy()
+
+    historical_dates = pd.to_datetime(
+        historical_games["game_date"],
+        utc=True,
+        errors="coerce",
+    )
+
+    historical_games = historical_games[
+        historical_dates.dt.date < cutoff_date
+    ].copy()
+
+    if historical_games.empty:
+        raise ValueError(
+            "No historical NBA games are available "
+            "before the upcoming matchups."
+        )
+
+    prepared_games = (
+        prepare_balldontlie_games_for_research(
+            historical_games
+        )
+    )
+
+    feature_games = (
+        build_balldontlie_pregame_features(
+            prepared_games
+        )
+    )
+
+    if feature_games is None or len(feature_games) == 0:
+        raise ValueError(
+            "NBA historical feature generation "
+            "returned no usable games."
+        )
+
+    return prepared_games, feature_games
+
 
 def run_nba_prediction_pipeline():
     """
