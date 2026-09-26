@@ -407,149 +407,142 @@ if st.button(
     try:
 
         feature_games = st.session_state.get(
-    "nfl_feature_games"
-)
-
-# ============================================
-# AUTO-PREPARE NFL HISTORICAL FEATURES
-# ============================================
-
-if (
-    feature_games is None
-    or (
-        hasattr(feature_games, "empty")
-        and feature_games.empty
-    )
-):
-
-    with st.spinner(
-        "Preparing NFL historical data automatically..."
-    ):
-
-        season_ids = [
-            "sr:season:115087",  # 2024-25
-            "sr:season:127985",  # 2025-26
-        ]
-
-        multi_nfl = get_multiple_nfl_seasons(
-            season_ids
+            "nfl_feature_games"
         )
 
-        historical_games = multi_nfl["games"]
+        # ============================================
+        # AUTO-PREPARE NFL HISTORICAL FEATURES
+        # ============================================
 
         if (
-            historical_games is None
-            or historical_games.empty
+            feature_games is None
+            or (
+                hasattr(feature_games, "empty")
+                and feature_games.empty
+            )
         ):
-            raise ValueError(
-                "NFL historical download returned no games."
-            )
-
-        st.session_state[
-            "multi_nfl_games"
-        ] = historical_games
-
-        feature_games = build_nfl_pregame_features(
-            historical_games
-        )
-
-        if feature_games.empty:
-            raise ValueError(
-                "NFL historical feature generation "
-                "returned no data."
-            )
-
-        st.session_state[
-            "nfl_feature_games"
-        ] = feature_games
-
-        # Run historical validation automatically.
-        nfl_validation = run_nfl_walkforward_model(
-            feature_games
-        )
-
-        st.session_state[
-            "nfl_walkforward_result"
-        ] = nfl_validation
-
-        historical_predictions = (
-            nfl_validation.get("predictions")
-        )
-
-        if historical_predictions is not None:
-            st.session_state[
-                "nfl_historical_predictions"
-            ] = historical_predictions
-
-        st.session_state[
-            "nfl_historical_accuracy"
-        ] = nfl_validation.get(
-            "accuracy"
-        )
-
-        st.session_state[
-            "nfl_historical_sample"
-        ] = nfl_validation.get(
-            "prediction_count"
-        )
-
-
-# ============================================
-# RUN LIVE NFL PREDICTION PIPELINE
-# ============================================
-
-with st.spinner(
-    "Generating NFL predictions and analyzing markets..."
-):
 
             with st.spinner(
-                "Running NFL prediction pipeline..."
+                "Preparing NFL historical data automatically..."
             ):
-                nfl_pipeline_result = (
-                    run_nfl_prediction_pipeline(
-                        feature_games=feature_games,
-                        historical_accuracy=st.session_state.get(
-                            "nfl_historical_accuracy"
-                        ),
-                        historical_sample=st.session_state.get(
-                            "nfl_historical_sample"
-                        ),
+
+                season_ids = [
+                    "sr:season:115087",
+                    "sr:season:127985",
+                ]
+
+                multi_nfl = get_multiple_nfl_seasons(
+                    season_ids
+                )
+
+                historical_games = multi_nfl["games"]
+
+                if (
+                    historical_games is None
+                    or historical_games.empty
+                ):
+                    raise ValueError(
+                        "NFL historical download returned no games."
                     )
+
+                st.session_state[
+                    "multi_nfl_games"
+                ] = historical_games
+
+                feature_games = build_nfl_pregame_features(
+                    historical_games
+                )
+
+                if feature_games.empty:
+                    raise ValueError(
+                        "NFL historical feature generation "
+                        "returned no data."
+                    )
+
+                st.session_state[
+                    "nfl_feature_games"
+                ] = feature_games
+
+                nfl_validation = run_nfl_walkforward_model(
+                    feature_games
                 )
 
                 st.session_state[
-                    "nfl_prediction_pipeline_result"
-                ] = nfl_pipeline_result
+                    "nfl_walkforward_result"
+                ] = nfl_validation
 
-                # Preserve compatibility with the existing
-                # NFL sections elsewhere in app.py.
-                st.session_state[
-                    "live_nfl_moneylines"
-                ] = nfl_pipeline_result[
-                    "live_odds"
-                ]
+                historical_predictions = (
+                    nfl_validation.get("predictions")
+                )
 
-                st.session_state[
-                    "best_nfl_moneylines"
-                ] = nfl_pipeline_result[
-                    "best_lines"
-                ]
+                if historical_predictions is not None:
+                    st.session_state[
+                        "nfl_historical_predictions"
+                    ] = historical_predictions
 
                 st.session_state[
-                    "live_nfl_predictions"
-                ] = nfl_pipeline_result[
-                    "predictions"
-                ]
+                    "nfl_historical_accuracy"
+                ] = nfl_validation.get(
+                    "accuracy"
+                )
 
                 st.session_state[
-                    "live_nfl_opportunities"
-                ] = nfl_pipeline_result[
-                    "opportunities"
-                ]
+                    "nfl_historical_sample"
+                ] = nfl_validation.get(
+                    "prediction_count"
+                )
 
-            st.success(
-                "NFL predictions generated successfully."
+        # ============================================
+        # RUN LIVE NFL PREDICTION PIPELINE
+        # ============================================
+
+        with st.spinner(
+            "Generating NFL predictions and analyzing markets..."
+        ):
+
+            nfl_pipeline_result = (
+                run_nfl_prediction_pipeline(
+                    feature_games=feature_games,
+                    historical_accuracy=st.session_state.get(
+                        "nfl_historical_accuracy"
+                    ),
+                    historical_sample=st.session_state.get(
+                        "nfl_historical_sample"
+                    ),
+                )
             )
+
+            st.session_state[
+                "nfl_prediction_pipeline_result"
+            ] = nfl_pipeline_result
+
+            st.session_state[
+                "live_nfl_moneylines"
+            ] = nfl_pipeline_result[
+                "live_odds"
+            ]
+
+            st.session_state[
+                "best_nfl_moneylines"
+            ] = nfl_pipeline_result[
+                "best_lines"
+            ]
+
+            st.session_state[
+                "live_nfl_predictions"
+            ] = nfl_pipeline_result[
+                "predictions"
+            ]
+
+            st.session_state[
+                "live_nfl_opportunities"
+            ] = nfl_pipeline_result[
+                "opportunities"
+            ]
+
+        st.success(
+            "NFL predictions generated successfully."
+        )
 
     except Exception as error:
 
