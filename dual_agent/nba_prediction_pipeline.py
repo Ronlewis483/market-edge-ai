@@ -234,16 +234,19 @@ def run_nba_prediction_pipeline(
             Games that could not be modeled.
     """
 
-        pipeline_start = time.perf_counter()
+            pipeline_start = time.perf_counter()
 
-def report(stage):
-    elapsed = time.perf_counter() - pipeline_start
-
-    if progress_callback:
-        progress_callback(
-            stage,
-            elapsed,
+    def report(stage):
+        elapsed = (
+            time.perf_counter()
+            - pipeline_start
         )
+
+        if progress_callback:
+            progress_callback(
+                stage,
+                elapsed,
+            )
 
     # ========================================================
     # 1. LOAD LIVE NBA MONEYLINES
