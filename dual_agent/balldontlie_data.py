@@ -260,6 +260,12 @@ def test_full_historical_season(season=2023):
         "sample": games.head(5),
         "games": games,
     }
+
+    @st.cache_data(
+        ttl=86400,
+        show_spinner=False,
+    )
+    
 def get_multiple_historical_seasons(
     seasons,
     per_page=100,
