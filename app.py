@@ -577,114 +577,114 @@ if nfl_pipeline_result is not None:
 ):
 
     st.markdown("### 🏈 Upcoming NFL Predictions")
-
+    
     st.caption(
         "Model-generated win probabilities for upcoming games."
     )
-
+    
     # ------------------------------------------
     # PREDICTION SUMMARY
     # ------------------------------------------
-
+    
     strong_count = int(
         (predictions["confidence"] >= 0.70).sum()
     )
-
+    
     moderate_count = int(
         (
             (predictions["confidence"] >= 0.58)
             & (predictions["confidence"] < 0.70)
         ).sum()
     )
-
+    
     close_count = int(
         (predictions["confidence"] < 0.58).sum()
     )
-
+    
     s1, s2, s3, s4 = st.columns(4)
-
+    
     s1.metric(
         "Games",
         len(predictions),
     )
-
+    
     s2.metric(
         "High Confidence",
         strong_count,
     )
-
+    
     s3.metric(
         "Moderate",
         moderate_count,
     )
-
+    
     s4.metric(
         "Close Matchups",
         close_count,
     )
-
+    
     st.markdown("")
-
+    
     # ------------------------------------------
     # GAME CARDS — TWO PER ROW
     # ------------------------------------------
-
+    
     prediction_records = predictions.to_dict(
         "records"
     )
-
+    
     for index in range(
         0,
         len(prediction_records),
         2,
     ):
-
+    
         card_columns = st.columns(2)
-
+    
         games_in_row = prediction_records[
             index:index + 2
         ]
-
+    
         for column, game in zip(
             card_columns,
             games_in_row,
         ):
-
+    
             with column:
-
+    
                 home_team = game["home_team"]
                 away_team = game["away_team"]
-
+    
                 predicted_team = game[
                     "predicted_team"
                 ]
-
+    
                 confidence = float(
                     game["confidence"]
                 )
-
+    
                 home_probability = float(
                     game["home_win_probability"]
                 )
-
+    
                 away_probability = float(
                     game["away_win_probability"]
                 )
-
+    
                 game_time = pd.to_datetime(
                     game["commence_time"],
                     utc=True,
                     errors="coerce",
                 )
-
+    
                 if pd.notna(game_time):
-
+    
                     central_time = (
                         game_time.tz_convert(
                             "America/Chicago"
                         )
                     )
-
+    
                     game_time_text = (
                         central_time.strftime(
                             "%a • %I:%M %p CT"
@@ -692,34 +692,34 @@ if nfl_pipeline_result is not None:
                         .replace(" 0", " ")
                         .upper()
                     )
-
+    
                 else:
                     game_time_text = (
                         "TIME TBD"
                     )
-
+    
                 if confidence >= 0.70:
                     confidence_label = (
                         "HIGH CONFIDENCE"
                     )
                     confidence_icon = "🔥"
-
+    
                 elif confidence >= 0.58:
                     confidence_label = (
                         "MODERATE"
                     )
                     confidence_icon = "⚡"
-
+    
                 else:
                     confidence_label = (
                         "CLOSE MATCHUP"
                     )
                     confidence_icon = "⚖️"
-
+    
                 with st.container(
                     border=True
                 ):
-
+    
                     st.caption(
                         game_time_text
                     )
