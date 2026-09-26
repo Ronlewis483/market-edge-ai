@@ -264,31 +264,7 @@ def run_nba_prediction_pipeline():
     )
 
     # ========================================================
-    # 3. LOAD HISTORICAL NBA DATA
-    # ========================================================
-
-    (
-        historical_games,
-        season_summary,
-        requests_used,
-    ) = get_multiple_historical_seasons(
-        list(seasons)
-    )
-
-    if (
-        historical_games is None
-        or len(historical_games) == 0
-    ):
-        raise ValueError(
-            "No historical NBA games were returned."
-        )
-
-    historical_games = (
-        historical_games.copy()
-    )
-
-    # ========================================================
-    # 4. STRICT ANTI-LEAKAGE CUTOFF
+    # 3. LOAD CACHED HISTORICAL NBA MODEL DATA
     # ========================================================
 
     first_game_date = (
@@ -297,47 +273,16 @@ def run_nba_prediction_pipeline():
         .date()
     )
 
-    historical_dates = pd.to_datetime(
-        historical_games["game_date"],
-        utc=True,
-        errors="coerce",
+    (
+        prepared_games,
+        feature_games,
+        season_summary,
+        requests_used,
+    ) = _load_nba_historical_features(
+        seasons=seasons,
+        cutoff_date=first_game_date,
     )
 
-    historical_games = historical_games[
-        historical_dates.dt.date
-        < first_game_date
-    ].copy()
-
-    if historical_games.empty:
-        raise ValueError(
-            "No historical NBA games are available "
-            "before the upcoming matchups."
-        )
-
-    # ========================================================
-    # 5. PREPARE MODEL TRAINING DATA
-    # ========================================================
-
-    prepared_games = (
-        prepare_balldontlie_games_for_research(
-            historical_games
-        )
-    )
-
-    feature_games = (
-        build_balldontlie_pregame_features(
-            prepared_games
-        )
-    )
-
-    if (
-        feature_games is None
-        or len(feature_games) == 0
-    ):
-        raise ValueError(
-            "NBA historical feature generation "
-            "returned no usable games."
-        )
 
     # ========================================================
     # 6. GENERATE ONE PREDICTION PER GAME
