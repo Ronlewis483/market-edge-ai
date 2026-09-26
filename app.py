@@ -391,6 +391,12 @@ if page == "🏠 Home":
         "and track your betting performance."
     )
 
+# ============================================
+# HOME — PREDICTION CONTROL CENTER
+# ============================================
+
+if page == "🏠 Home":
+
     # ============================================
 # NFL ONE-CLICK PREDICTION CENTER
 # ============================================
