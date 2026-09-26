@@ -284,6 +284,15 @@ def run_nba_prediction_pipeline():
         cutoff_date=first_game_date,
     )
 
+    # ========================================================
+    # TRAIN LIVE MODEL ONCE FOR ENTIRE UPCOMING SLATE
+    # ========================================================
+
+    trained_model = train_balldontlie_live_model(
+        feature_games=feature_games,
+        prediction_date=first_game_date,
+    )
+
 
     # ========================================================
     # 6. GENERATE ONE PREDICTION PER GAME
