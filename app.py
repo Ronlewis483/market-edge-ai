@@ -387,6 +387,99 @@ if page == "🏀 Sports Center":
         "and track your betting performance."
     )
 
+    # ============================================
+# NFL ONE-CLICK PREDICTION CENTER
+# ============================================
+
+st.subheader("🏈 NFL Prediction Center")
+
+st.caption(
+    "Generate upcoming NFL game predictions, shop available "
+    "moneylines, and analyze model-vs-market opportunities."
+)
+
+if st.button(
+    "⚡ Generate NFL Predictions",
+    key="generate_nfl_predictions_one_click",
+    type="primary",
+    use_container_width=True,
+):
+    try:
+
+        feature_games = st.session_state.get(
+            "nfl_feature_games"
+        )
+
+        if feature_games is None:
+            st.warning(
+                "NFL historical features have not been prepared yet. "
+                "The next automation step will remove this requirement."
+            )
+
+        elif hasattr(feature_games, "empty") and feature_games.empty:
+            st.warning(
+                "NFL historical feature data is empty."
+            )
+
+        else:
+
+            with st.spinner(
+                "Running NFL prediction pipeline..."
+            ):
+                nfl_pipeline_result = (
+                    run_nfl_prediction_pipeline(
+                        feature_games=feature_games,
+                        historical_accuracy=st.session_state.get(
+                            "nfl_historical_accuracy"
+                        ),
+                        historical_sample=st.session_state.get(
+                            "nfl_historical_sample"
+                        ),
+                    )
+                )
+
+                st.session_state[
+                    "nfl_prediction_pipeline_result"
+                ] = nfl_pipeline_result
+
+                # Preserve compatibility with the existing
+                # NFL sections elsewhere in app.py.
+                st.session_state[
+                    "live_nfl_moneylines"
+                ] = nfl_pipeline_result[
+                    "live_odds"
+                ]
+
+                st.session_state[
+                    "best_nfl_moneylines"
+                ] = nfl_pipeline_result[
+                    "best_lines"
+                ]
+
+                st.session_state[
+                    "live_nfl_predictions"
+                ] = nfl_pipeline_result[
+                    "predictions"
+                ]
+
+                st.session_state[
+                    "live_nfl_opportunities"
+                ] = nfl_pipeline_result[
+                    "opportunities"
+                ]
+
+            st.success(
+                "NFL predictions generated successfully."
+            )
+
+    except Exception as error:
+
+        st.error(
+            f"NFL prediction pipeline failed: {error}"
+        )
+
+        st.exception(error)
+
     
     # ==========================================
     # SPORTS CENTER — DASHBOARD NAVIGATION
