@@ -16,9 +16,16 @@ from dual_agent.nfl_live_engine import (
     build_live_nfl_opportunities,
 )
 
+import pandas as pd
+
+from dual_agent.nfl_research import (
+    build_nfl_future_matchup_features,
+    predict_nfl_matchup,
+)
+
 
 def run_nfl_prediction_pipeline(
-    predictions,
+    feature_games,
     historical_accuracy=None,
     historical_sample=None,
 ):
@@ -63,6 +70,119 @@ def run_nfl_prediction_pipeline(
     if live_odds is None:
         raise ValueError(
             "NFL live odds retrieval returned no data."
+        )
+
+        # ==========================================
+    # 3. GENERATE UPCOMING NFL PREDICTIONS
+    # ==========================================
+
+    if feature_games is None:
+        raise ValueError(
+            "NFL historical feature data was not supplied."
+        )
+
+    if hasattr(feature_games, "empty") and feature_games.empty:
+        raise ValueError(
+            "NFL historical feature data is empty."
+        )
+
+    prediction_rows = []
+    prediction_errors = []
+
+    current_time = pd.Timestamp.now(tz="UTC")
+
+    # Normalize best lines to a DataFrame for prediction loop.
+    if isinstance(best_lines, pd.DataFrame):
+        best_lines_df = best_lines.copy()
+    else:
+        best_lines_df = pd.DataFrame(best_lines)
+
+    for _, game in best_lines_df.iterrows():
+
+        home_team = game["home_team"]
+        away_team = game["away_team"]
+
+        game_time = pd.to_datetime(
+            game["commence_time"],
+            utc=True,
+            errors="coerce",
+        )
+
+        if pd.isna(game_time):
+            continue
+
+        # Never generate a prediction after kickoff.
+        if game_time <= current_time:
+            continue
+
+        try:
+            future_features = (
+                build_nfl_future_matchup_features(
+                    feature_games,
+                    home_team,
+                    away_team,
+                    game_time,
+                )
+            )
+
+            prediction = predict_nfl_matchup(
+                feature_games,
+                future_features,
+            )
+
+            home_probability = prediction[
+                "home_win_probability"
+            ]
+
+            away_probability = (
+                prediction.get(
+                    "away_win_probability",
+                    1.0 - home_probability,
+                )
+            )
+
+            if home_probability >= away_probability:
+                predicted_team = home_team
+                confidence = home_probability
+            else:
+                predicted_team = away_team
+                confidence = away_probability
+
+            prediction_rows.append(
+                {
+                    "game_id": game.get("game_id"),
+                    "commence_time": game_time,
+                    "home_team": home_team,
+                    "away_team": away_team,
+                    "predicted_team": predicted_team,
+                    "confidence": confidence,
+                    "home_win_probability": home_probability,
+                    "away_win_probability": away_probability,
+                    "training_games": prediction.get(
+                        "training_games"
+                    ),
+                }
+            )
+
+        except Exception as error:
+            prediction_errors.append(
+                f"{away_team} at {home_team}: {error}"
+            )
+
+    predictions = pd.DataFrame(prediction_rows)
+
+    if predictions.empty:
+        error_preview = "; ".join(
+            prediction_errors[:3]
+        )
+
+        raise ValueError(
+            "No upcoming NFL predictions could be generated."
+            + (
+                f" Errors: {error_preview}"
+                if error_preview
+                else ""
+            )
         )
 
     if hasattr(live_odds, "empty"):
