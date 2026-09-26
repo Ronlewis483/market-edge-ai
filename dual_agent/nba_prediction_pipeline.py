@@ -249,6 +249,9 @@ def report(stage):
     # 1. LOAD LIVE NBA MONEYLINES
     # ========================================================
 
+    report("Loading live NBA odds...")
+    report("Live NBA odds loaded")
+
     live_games = get_live_nba_moneylines()
 
     if not live_games:
@@ -345,6 +348,14 @@ def report(stage):
         .date()
     )
 
+    report(
+        "Loading historical NBA data/features..."
+    )
+
+        report(
+        "Historical NBA data/features ready"
+    )
+
     (
         prepared_games,
         feature_games,
@@ -359,6 +370,9 @@ def report(stage):
     # TRAIN LIVE MODEL ONCE FOR ENTIRE UPCOMING SLATE
     # ========================================================
 
+    report("Training NBA model...")
+    report("NBA model trained")
+
     trained_model = train_balldontlie_live_model(
         feature_games=feature_games,
         prediction_date=first_game_date,
@@ -368,6 +382,11 @@ def report(stage):
     # ========================================================
     # 6. GENERATE ONE PREDICTION PER GAME
     # ========================================================
+
+    report(
+        f"Generating predictions for "
+        f"{len(unique_games)} games..."
+    )
 
     prediction_rows = []
     prediction_errors = []
@@ -511,6 +530,8 @@ def report(stage):
         )
         .reset_index(drop=True)
     )
+
+    report("NBA matchup predictions complete")
 
     # ========================================================
     # 7. BUILD SPORTSBOOK OPPORTUNITIES
@@ -662,6 +683,8 @@ def report(stage):
     # ========================================================
     # 8. RETURN COMPLETE PIPELINE
     # ========================================================
+
+    report("NBA prediction pipeline complete")
 
     return {
         "live_odds":
