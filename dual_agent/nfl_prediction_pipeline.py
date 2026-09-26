@@ -220,9 +220,7 @@ def run_nfl_prediction_pipeline(
             "No usable NFL best lines were found."
         )
 
-    # ==========================================
-    # 3. BUILD LIVE NFL OPPORTUNITIES
-    # ==========================================
+    # 4. BUILD LIVE NFL OPPORTUNITIES
 
     opportunities = build_live_nfl_opportunities(
     model_predictions=predictions,
@@ -237,7 +235,7 @@ def run_nfl_prediction_pipeline(
         )
 
     # ==========================================
-    # 4. RETURN COMPLETE PIPELINE
+    # 5. RETURN COMPLETE PIPELINE  
     # ==========================================
 
     return {
