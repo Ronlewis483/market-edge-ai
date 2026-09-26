@@ -338,9 +338,9 @@ def run_nba_prediction_pipeline():
                 )
             )
 
-            prediction = (
-                predict_balldontlie_matchup(
-                    feature_games,
+                        prediction = (
+                predict_balldontlie_with_trained_model(
+                    trained_model,
                     matchup_features,
                 )
             )
