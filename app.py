@@ -657,8 +657,18 @@ if nfl_pipeline_result is not None:
             # GAME CARDS
             # ------------------------------------
 
+           # ------------------------------------
+            # SORT PICKS BY MODEL CONFIDENCE
+            # HIGHEST CONFIDENCE FIRST
+            # ------------------------------------
+            
+            sorted_predictions = predictions.sort_values(
+                by="confidence",
+                ascending=False,
+            ).reset_index(drop=True)
+            
             prediction_records = (
-                predictions.to_dict(
+                sorted_predictions.to_dict(
                     "records"
                 )
             )
