@@ -571,259 +571,290 @@ if nfl_pipeline_result is not None:
         "opportunities"
     )
 
+    # ========================================
+    # UPCOMING NFL PREDICTIONS
+    # ========================================
+
     if (
-    predictions is not None
-    and not predictions.empty
-):
-
-    st.markdown("### 🏈 Upcoming NFL Predictions")
-    
-    st.caption(
-        "Model-generated win probabilities for upcoming games."
-    )
-    
-    # ------------------------------------------
-    # PREDICTION SUMMARY
-    # ------------------------------------------
-    
-    strong_count = int(
-        (predictions["confidence"] >= 0.70).sum()
-    )
-    
-    moderate_count = int(
-        (
-            (predictions["confidence"] >= 0.58)
-            & (predictions["confidence"] < 0.70)
-        ).sum()
-    )
-    
-    close_count = int(
-        (predictions["confidence"] < 0.58).sum()
-    )
-    
-    s1, s2, s3, s4 = st.columns(4)
-    
-    s1.metric(
-        "Games",
-        len(predictions),
-    )
-    
-    s2.metric(
-        "High Confidence",
-        strong_count,
-    )
-    
-    s3.metric(
-        "Moderate",
-        moderate_count,
-    )
-    
-    s4.metric(
-        "Close Matchups",
-        close_count,
-    )
-    
-    st.markdown("")
-    
-    # ------------------------------------------
-    # GAME CARDS — TWO PER ROW
-    # ------------------------------------------
-    
-    prediction_records = predictions.to_dict(
-        "records"
-    )
-    
-    for index in range(
-        0,
-        len(prediction_records),
-        2,
+        predictions is not None
+        and not predictions.empty
     ):
-    
-        card_columns = st.columns(2)
-    
-        games_in_row = prediction_records[
-            index:index + 2
-        ]
-    
-        for column, game in zip(
-            card_columns,
-            games_in_row,
+
+        st.markdown("### 🏈 Upcoming NFL Predictions")
+
+        st.caption(
+            "Model-generated win probabilities for upcoming games."
+        )
+
+        # ------------------------------------
+        # PREDICTION SUMMARY
+        # ------------------------------------
+
+        high_confidence_count = int(
+            (predictions["confidence"] >= 0.70).sum()
+        )
+
+        moderate_count = int(
+            (
+                (predictions["confidence"] >= 0.58)
+                & (predictions["confidence"] < 0.70)
+            ).sum()
+        )
+
+        close_count = int(
+            (predictions["confidence"] < 0.58).sum()
+        )
+
+        summary_col1, summary_col2, summary_col3, summary_col4 = (
+            st.columns(4)
+        )
+
+        summary_col1.metric(
+            "Games",
+            len(predictions),
+        )
+
+        summary_col2.metric(
+            "High Confidence",
+            high_confidence_count,
+        )
+
+        summary_col3.metric(
+            "Moderate",
+            moderate_count,
+        )
+
+        summary_col4.metric(
+            "Close Matchups",
+            close_count,
+        )
+
+        st.markdown("")
+
+        # ------------------------------------
+        # GAME CARDS
+        # TWO CARDS PER ROW
+        # ------------------------------------
+
+        prediction_records = predictions.to_dict(
+            "records"
+        )
+
+        for index in range(
+            0,
+            len(prediction_records),
+            2,
         ):
-    
-            with column:
-    
-                home_team = game["home_team"]
-                away_team = game["away_team"]
-    
-                predicted_team = game[
-                    "predicted_team"
-                ]
-    
-                confidence = float(
-                    game["confidence"]
-                )
-    
-                home_probability = float(
-                    game["home_win_probability"]
-                )
-    
-                away_probability = float(
-                    game["away_win_probability"]
-                )
-    
-                game_time = pd.to_datetime(
-                    game["commence_time"],
-                    utc=True,
-                    errors="coerce",
-                )
-    
-                if pd.notna(game_time):
-    
-                    central_time = (
-                        game_time.tz_convert(
-                            "America/Chicago"
+
+            card_columns = st.columns(2)
+
+            games_in_row = prediction_records[
+                index:index + 2
+            ]
+
+            for column, game in zip(
+                card_columns,
+                games_in_row,
+            ):
+
+                with column:
+
+                    home_team = game["home_team"]
+                    away_team = game["away_team"]
+
+                    predicted_team = game[
+                        "predicted_team"
+                    ]
+
+                    confidence = float(
+                        game["confidence"]
+                    )
+
+                    home_probability = float(
+                        game["home_win_probability"]
+                    )
+
+                    away_probability = float(
+                        game["away_win_probability"]
+                    )
+
+                    # --------------------------
+                    # FORMAT GAME TIME
+                    # --------------------------
+
+                    game_time = pd.to_datetime(
+                        game["commence_time"],
+                        utc=True,
+                        errors="coerce",
+                    )
+
+                    if pd.notna(game_time):
+
+                        central_time = (
+                            game_time.tz_convert(
+                                "America/Chicago"
+                            )
                         )
-                    )
-    
-                    game_time_text = (
-                        central_time.strftime(
-                            "%a • %I:%M %p CT"
+
+                        game_time_text = (
+                            central_time.strftime(
+                                "%a • %I:%M %p CT"
+                            )
+                            .replace(" 0", " ")
+                            .upper()
                         )
-                        .replace(" 0", " ")
-                        .upper()
-                    )
-    
-                else:
-                    game_time_text = (
-                        "TIME TBD"
-                    )
-    
-                if confidence >= 0.70:
-                    confidence_label = (
-                        "HIGH CONFIDENCE"
-                    )
-                    confidence_icon = "🔥"
-    
-                elif confidence >= 0.58:
-                    confidence_label = (
-                        "MODERATE"
-                    )
-                    confidence_icon = "⚡"
-    
-                else:
-                    confidence_label = (
-                        "CLOSE MATCHUP"
-                    )
-                    confidence_icon = "⚖️"
-    
-                with st.container(
-                    border=True
-                ):
-    
-                    st.caption(
-                        game_time_text
-                    )
 
-                    st.markdown(
-                        f"#### {away_team}  @  "
-                        f"{home_team}"
-                    )
+                    else:
 
-                    st.markdown(
-                        "##### 🏆 MODEL PICK"
-                    )
+                        game_time_text = "TIME TBD"
 
-                    st.markdown(
-                        f"## {predicted_team}"
-                    )
+                    # --------------------------
+                    # CONFIDENCE CLASSIFICATION
+                    # --------------------------
 
-                    st.progress(
-                        max(
-                            0.0,
-                            min(
-                                1.0,
-                                confidence,
-                            ),
+                    if confidence >= 0.70:
+
+                        confidence_label = (
+                            "HIGH CONFIDENCE"
                         )
-                    )
 
-                    p1, p2 = st.columns(2)
+                        confidence_icon = "🔥"
 
-                    p1.metric(
-                        away_team,
-                        f"{away_probability:.1%}",
-                    )
+                    elif confidence >= 0.58:
 
-                    p2.metric(
-                        home_team,
-                        f"{home_probability:.1%}",
-                    )
+                        confidence_label = (
+                            "MODERATE"
+                        )
 
-                    st.markdown(
-                        f"**{confidence_icon} "
-                        f"{confidence_label}** "
-                        f"• {confidence:.1%}"
-                    )
+                        confidence_icon = "⚡"
 
-                    with st.expander(
-                        "View model details"
+                    else:
+
+                        confidence_label = (
+                            "CLOSE MATCHUP"
+                        )
+
+                        confidence_icon = "⚖️"
+
+                    # --------------------------
+                    # RENDER GAME CARD
+                    # --------------------------
+
+                    with st.container(
+                        border=True
                     ):
 
-                        training_games = (
-                            game.get(
-                                "training_games"
+                        st.caption(
+                            game_time_text
+                        )
+
+                        st.markdown(
+                            f"#### {away_team} @ {home_team}"
+                        )
+
+                        st.markdown(
+                            "##### 🏆 MODEL PICK"
+                        )
+
+                        st.markdown(
+                            f"## {predicted_team}"
+                        )
+
+                        st.progress(
+                            max(
+                                0.0,
+                                min(
+                                    1.0,
+                                    confidence,
+                                ),
                             )
                         )
 
-                        st.write(
-                            "**Predicted winner:** "
-                            f"{predicted_team}"
+                        probability_col1, probability_col2 = (
+                            st.columns(2)
                         )
 
-                        st.write(
-                            "**Model confidence:** "
-                            f"{confidence:.1%}"
+                        probability_col1.metric(
+                            away_team,
+                            f"{away_probability:.1%}",
                         )
 
-                        st.write(
-                            "**Home win probability:** "
-                            f"{home_probability:.1%}"
+                        probability_col2.metric(
+                            home_team,
+                            f"{home_probability:.1%}",
                         )
 
-                        st.write(
-                            "**Away win probability:** "
-                            f"{away_probability:.1%}"
+                        st.markdown(
+                            f"**{confidence_icon} "
+                            f"{confidence_label}** "
+                            f"• {confidence:.1%}"
                         )
 
-                        if training_games is not None:
+                        with st.expander(
+                            "View model details"
+                        ):
+
+                            training_games = (
+                                game.get(
+                                    "training_games"
+                                )
+                            )
+
                             st.write(
-                                "**Historical training "
-                                "games:** "
-                                f"{training_games}"
+                                "**Predicted winner:** "
+                                f"{predicted_team}"
                             )
 
-    st.caption(
-        "Confidence describes the model's estimated "
-        "win probability. It does not by itself indicate "
-        "betting value; sportsbook price and market edge "
-        "must also be considered."
-    )
+                            st.write(
+                                "**Model confidence:** "
+                                f"{confidence:.1%}"
+                            )
 
-    if opportunities is not None:
+                            st.write(
+                                "**Home win probability:** "
+                                f"{home_probability:.1%}"
+                            )
 
-        st.markdown("#### Market Opportunities")
+                            st.write(
+                                "**Away win probability:** "
+                                f"{away_probability:.1%}"
+                            )
+
+                            if training_games is not None:
+
+                                st.write(
+                                    "**Historical training games:** "
+                                    f"{training_games}"
+                                )
+
+        st.caption(
+            "Confidence represents the model's estimated "
+            "win probability. It does not by itself indicate "
+            "betting value; sportsbook price and market edge "
+            "must also be considered."
+        )
+
+    # ========================================
+    # MARKET OPPORTUNITIES
+    # ========================================
+
+    if (
+        opportunities is not None
+        and not opportunities.empty
+    ):
+
+        st.markdown("### 💰 NFL Market Opportunities")
+
+        st.caption(
+            "Model-vs-market analysis using available "
+            "sportsbook moneylines."
+        )
 
         st.dataframe(
             opportunities,
             use_container_width=True,
             hide_index=True,
         )
-        st.dataframe(
-            opportunities,
-            use_container_width=True,
-            hide_index=True,
-        )
-
     
     # ==========================================
     # SPORTS CENTER — DASHBOARD NAVIGATION
