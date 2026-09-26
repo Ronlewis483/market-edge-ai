@@ -45,22 +45,6 @@ def run_nfl_prediction_pipeline(
         model predictions, and final market opportunities.
     """
 
-    if predictions is None:
-        raise ValueError(
-            "NFL model predictions were not supplied."
-        )
-
-    if hasattr(predictions, "empty"):
-        if predictions.empty:
-            raise ValueError(
-                "NFL model predictions are empty."
-            )
-
-    elif not predictions:
-        raise ValueError(
-            "NFL model predictions are empty."
-        )
-
     # ==========================================
     # 1. LOAD LIVE NFL MONEYLINES
     # ==========================================
