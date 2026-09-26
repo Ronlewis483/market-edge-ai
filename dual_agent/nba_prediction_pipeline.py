@@ -355,10 +355,6 @@ def run_nba_prediction_pipeline(
         "Loading historical NBA data/features..."
     )
 
-        report(
-        "Historical NBA data/features ready"
-    )
-
     (
         prepared_games,
         feature_games,
@@ -369,6 +365,9 @@ def run_nba_prediction_pipeline(
         cutoff_date=first_game_date,
     )
 
+    report(
+        "Historical NBA data/features ready"
+    )
     # ========================================================
     # TRAIN LIVE MODEL ONCE FOR ENTIRE UPCOMING SLATE
     # ========================================================
