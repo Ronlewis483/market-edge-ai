@@ -480,6 +480,40 @@ if st.button(
 
         st.exception(error)
 
+    nfl_pipeline_result = st.session_state.get(
+    "nfl_prediction_pipeline_result"
+)
+
+if nfl_pipeline_result:
+
+    predictions = nfl_pipeline_result.get(
+        "predictions"
+    )
+
+    opportunities = nfl_pipeline_result.get(
+        "opportunities"
+    )
+
+    if predictions is not None:
+
+        st.markdown("#### Upcoming Predictions")
+
+        st.dataframe(
+            predictions,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    if opportunities is not None:
+
+        st.markdown("#### Market Opportunities")
+
+        st.dataframe(
+            opportunities,
+            use_container_width=True,
+            hide_index=True,
+        )
+
     
     # ==========================================
     # SPORTS CENTER — DASHBOARD NAVIGATION
