@@ -1001,32 +1001,31 @@ if st.button(
     use_container_width=True,
 ):
 
-    try:
+        try:
+        status_box = st.empty()
 
-        with st.spinner(
-            "Generating NBA predictions and analyzing markets..."
+        def update_nba_status(
+            stage,
+            elapsed,
         ):
-
-            nba_pipeline_result = (
-                run_nba_prediction_pipeline()
+            status_box.info(
+                f"🏀 {stage} — "
+                f"{elapsed:.1f} seconds"
             )
 
-            st.session_state[
-                "nba_prediction_pipeline_result"
-            ] = nba_pipeline_result
-
-        st.success(
-            "NBA predictions generated successfully."
+        nba_pipeline_result = (
+            run_nba_prediction_pipeline(
+                progress_callback=update_nba_status,
+            )
         )
 
-    except Exception as error:
+        st.session_state[
+            "nba_prediction_pipeline_result"
+        ] = nba_pipeline_result
 
-        st.error(
-            f"NBA prediction pipeline failed: {error}"
+        status_box.success(
+            "✅ NBA predictions generated successfully."
         )
-
-        st.exception(error)
-
 
 # ============================================
 # NBA PREDICTION RESULTS
