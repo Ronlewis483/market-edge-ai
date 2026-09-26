@@ -382,7 +382,7 @@ with st.sidebar:
 default=clean_symbols(DEFAULT_UNIVERSE)
 
 
-if page == "🏀 Sports Center":
+if page == "🏠 Home":
 
     st.title("🏈 Sports Betting Center")
 
