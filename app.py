@@ -63,6 +63,10 @@ from dual_agent.nfl_accuracy_audit import (
     run_nfl_accuracy_audit,
 )
 
+from dual_agent.nfl_prediction_pipeline import (
+    run_nfl_prediction_pipeline,
+)
+
 
 from dual_agent.nfl_player_props_ui import render_nfl_player_props
 
