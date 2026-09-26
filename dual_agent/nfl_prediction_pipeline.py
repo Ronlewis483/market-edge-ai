@@ -99,8 +99,8 @@ def run_nfl_prediction_pipeline(
     # ==========================================
 
     best_lines = get_best_nfl_moneylines(
-        live_odds
-    )
+    live_odds.to_dict("records")
+)
 
     if best_lines is None:
         raise ValueError(
