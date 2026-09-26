@@ -8,7 +8,8 @@ from dual_agent.nba_research import (
     prepare_balldontlie_games_for_research,
     build_balldontlie_pregame_features,
     build_balldontlie_future_matchup_features,
-    predict_balldontlie_matchup,
+    train_balldontlie_live_model,
+    predict_balldontlie_with_trained_model,
     get_live_nba_moneylines,
     normalize_nba_team_name,
 )
