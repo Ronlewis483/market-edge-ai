@@ -1001,7 +1001,7 @@ if st.button(
     use_container_width=True,
 ):
 
-        try:
+    try:
         status_box = st.empty()
 
         def update_nba_status(
@@ -1026,6 +1026,13 @@ if st.button(
         status_box.success(
             "✅ NBA predictions generated successfully."
         )
+
+    except Exception as error:
+        st.error(
+            f"NBA prediction pipeline failed: {error}"
+        )
+
+        st.exception(error)
 
 # ============================================
 # NBA PREDICTION RESULTS
