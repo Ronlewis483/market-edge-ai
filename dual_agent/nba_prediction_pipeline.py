@@ -394,7 +394,7 @@ def run_nba_prediction_pipeline():
                 )
             )
 
-                        prediction = (
+            prediction = (
                 predict_balldontlie_with_trained_model(
                     trained_model,
                     matchup_features,
