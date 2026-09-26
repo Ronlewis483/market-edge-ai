@@ -480,12 +480,16 @@ if st.button(
 
         st.exception(error)
 
-        nfl_pipeline_result = st.session_state.get(
-        "nfl_prediction_pipeline_result",
-        None,
-    )
-    
-    if nfl_pipeline_result is not None:
+# ============================================
+# DISPLAY NFL PIPELINE RESULTS
+# ============================================
+
+nfl_pipeline_result = st.session_state.get(
+    "nfl_prediction_pipeline_result",
+    None,
+)
+
+if nfl_pipeline_result is not None:
 
     predictions = nfl_pipeline_result.get(
         "predictions"
@@ -509,6 +513,11 @@ if st.button(
 
         st.markdown("#### Market Opportunities")
 
+        st.dataframe(
+            opportunities,
+            use_container_width=True,
+            hide_index=True,
+        )
         st.dataframe(
             opportunities,
             use_container_width=True,
