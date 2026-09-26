@@ -2123,6 +2123,225 @@ def build_balldontlie_future_matchup_features(
 # BALLDONTLIE LIVE NBA PREDICTION MODEL
 # ============================================================
 
+def train_balldontlie_live_model(
+    feature_games,
+    prediction_date=None,
+):
+    """
+    Train the BALLDONTLIE NBA live model once.
+
+    The returned model can then be reused for every
+    upcoming matchup instead of retraining separately
+    for every game.
+    """
+
+    if feature_games is None or len(feature_games) == 0:
+        raise ValueError(
+            "No historical feature games supplied."
+        )
+
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.pipeline import Pipeline
+
+    df = feature_games.copy()
+
+    if prediction_date is not None:
+        prediction_date = pd.to_datetime(
+            prediction_date
+        )
+
+        df["game_date"] = pd.to_datetime(
+            df["game_date"]
+        )
+
+        df = df[
+            df["game_date"] < prediction_date
+        ].copy()
+
+    if len(df) == 0:
+        raise ValueError(
+            "No historical games exist before "
+            "the prediction date."
+        )
+
+    protected_columns = {
+        "game_id",
+        "game_date",
+        "season",
+        "home_team",
+        "away_team",
+        "home_points",
+        "away_points",
+        "point_margin",
+        "total_points",
+        "home_win",
+    }
+
+    feature_columns = [
+        column
+        for column in df.columns
+        if column not in protected_columns
+        and pd.api.types.is_numeric_dtype(
+            df[column]
+        )
+    ]
+
+    if not feature_columns:
+        raise ValueError(
+            "No model feature columns were found."
+        )
+
+    train_df = df.dropna(
+        subset=feature_columns + ["home_win"]
+    ).copy()
+
+    MIN_TRAINING_GAMES = 500
+
+    if len(train_df) < MIN_TRAINING_GAMES:
+        raise ValueError(
+            f"Insufficient NBA training data: "
+            f"{len(train_df)} games available. "
+            f"At least {MIN_TRAINING_GAMES} required."
+        )
+
+    if train_df["home_win"].nunique() < 2:
+        raise ValueError(
+            "NBA training data must contain "
+            "both home wins and home losses."
+        )
+
+    if not np.isfinite(
+        train_df[
+            feature_columns
+        ].to_numpy(dtype=float)
+    ).all():
+        raise ValueError(
+            "NBA training features contain "
+            "invalid or infinite values."
+        )
+
+    X_train = train_df[feature_columns]
+    y_train = train_df["home_win"].astype(int)
+
+    model = Pipeline(
+        [
+            (
+                "scaler",
+                StandardScaler(),
+            ),
+            (
+                "model",
+                LogisticRegression(
+                    max_iter=2000,
+                    C=0.1,
+                    random_state=42,
+                ),
+            ),
+        ]
+    )
+
+    model.fit(
+        X_train,
+        y_train,
+    )
+
+    return {
+        "model": model,
+        "feature_columns": feature_columns,
+        "training_games": len(train_df),
+    }
+
+
+def predict_balldontlie_with_trained_model(
+    trained_model,
+    matchup_features,
+):
+    """
+    Predict one NBA matchup using an already-trained
+    BALLDONTLIE model.
+    """
+
+    if matchup_features is None or len(
+        matchup_features
+    ) == 0:
+        raise ValueError(
+            "No future matchup features supplied."
+        )
+
+    model = trained_model["model"]
+    feature_columns = trained_model[
+        "feature_columns"
+    ]
+
+    future = matchup_features.copy()
+
+    missing_future_columns = [
+        column
+        for column in feature_columns
+        if column not in future.columns
+    ]
+
+    if missing_future_columns:
+        raise ValueError(
+            "Future matchup is missing model features: "
+            + ", ".join(missing_future_columns)
+        )
+
+    X_future = future[feature_columns]
+
+    if not np.isfinite(
+        X_future.to_numpy(dtype=float)
+    ).all():
+        raise ValueError(
+            "Future NBA matchup contains invalid "
+            "or infinite feature values."
+        )
+
+    home_probability = float(
+        model.predict_proba(
+            X_future
+        )[0][1]
+    )
+
+    away_probability = (
+        1.0 - home_probability
+    )
+
+    predicted_side = (
+        "HOME"
+        if home_probability >= 0.50
+        else "AWAY"
+    )
+
+    confidence = max(
+        home_probability,
+        away_probability,
+    )
+
+    return {
+        "home_win_probability":
+            home_probability,
+
+        "away_win_probability":
+            away_probability,
+
+        "predicted_side":
+            predicted_side,
+
+        "confidence":
+            confidence,
+
+        "feature_columns":
+            feature_columns,
+
+        "feature_count":
+            len(feature_columns),
+
+        "training_games":
+            trained_model["training_games"],
+    }
+
 def predict_balldontlie_matchup(feature_games, matchup_features):
     """
     Train the NBA model on historical pre-game features and
