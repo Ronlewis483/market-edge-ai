@@ -2839,7 +2839,7 @@ elif page == "🎟️ My Bets":
             st.session_state["parlay_leg_count"]
         ):
 
-                        leg_number = leg_index + 1
+            leg_number = leg_index + 1
 
             with st.container(border=True):
 
