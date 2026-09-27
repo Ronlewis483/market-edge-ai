@@ -978,11 +978,12 @@ if page == "🏠 Home":
 # NFL PLAYER PROP PREDICTIONS
 # ============================================
 
-with st.expander(
-    "🎯 NFL Player Prop Predictions",
-    expanded=False,
-):
-    render_nfl_player_props()
+if page == "🏠 Home":
+    with st.expander(
+        "🎯 NFL Player Prop Predictions",
+        expanded=False,
+    ):
+        render_nfl_player_props()
 
 
 # ============================================
