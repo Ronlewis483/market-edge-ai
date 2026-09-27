@@ -85,5 +85,107 @@ def update_bet_result(bet_id, status, profit_loss):
 
         return True, response.data
 
+    from datetime import datetime, timezone
+
+
+def save_prediction_snapshot(
+    league,
+    prediction,
+    opportunity=None,
+    model_version=None,
+):
+    """
+    Persist the exact state of a prediction when it was generated.
+
+    This creates an audit trail so predictions can later be
+    searched, graded, calibrated, and compared with actual results.
+    """
+
+    try:
+        client = get_supabase_client()
+
+        if client is None:
+            return {
+                "success": False,
+                "error": "Supabase client is not available.",
+            }
+
+        opportunity = opportunity or {}
+
+        record = {
+            "league": str(league).upper(),
+
+            "game_id": prediction.get("game_id"),
+            "game_time": prediction.get("commence_time"),
+
+            "away_team": prediction.get("away_team"),
+            "home_team": prediction.get("home_team"),
+
+            "predicted_team": prediction.get("predicted_team"),
+
+            "home_win_probability": prediction.get(
+                "home_win_probability"
+            ),
+
+            "away_win_probability": prediction.get(
+                "away_win_probability"
+            ),
+
+            "confidence": prediction.get("confidence"),
+
+            # Market information
+            "sportsbook": opportunity.get("sportsbook"),
+            "moneyline": opportunity.get("moneyline"),
+
+            "market_probability": opportunity.get(
+                "market_probability"
+            ),
+
+            "model_edge": opportunity.get("model_edge"),
+
+            "expected_value": opportunity.get(
+                "expected_value"
+            ),
+
+            # Decision layer
+            "recommendation": opportunity.get(
+                "recommendation"
+            ),
+
+            "reliability": opportunity.get(
+                "reliability"
+            ),
+
+            # Model tracking
+            "model_version": model_version,
+
+            # Result fields intentionally empty at prediction time
+            "result": None,
+            "actual_winner": None,
+
+            "generated_at": datetime.now(
+                timezone.utc
+            ).isoformat(),
+        }
+
+        response = (
+            client
+            .table("prediction_history")
+            .insert(record)
+            .execute()
+        )
+
+        return {
+            "success": True,
+            "data": response.data,
+        }
+
+    except Exception as exc:
+
+        return {
+            "success": False,
+            "error": str(exc),
+        }
+
     except Exception as e:
         return False, str(e)
