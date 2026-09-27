@@ -3,8 +3,8 @@ MARKET EDGE AI V5
 NFL PLAYER PROP PREDICTION PIPELINE
 
 Purpose:
-Build automated player-prop forecasts from live sportsbook
-lines and completed historical NFL player statistics.
+Generate and rank today's strongest NFL player-prop forecasts
+from live sportsbook lines and completed historical player data.
 
 This module does not execute wagers.
 """
@@ -102,10 +102,15 @@ def _estimate_prop(
     market,
 ):
     """
-    Produce a preliminary prop forecast.
+    Produce a ranked prop forecast.
 
-    The displayed strength is historical support,
-    not a calibrated future probability.
+    prediction_score is a ranking score built from:
+    - historical support
+    - projection distance from sportsbook line
+    - sample reliability
+    - historical consistency
+
+    It is NOT a calibrated future probability.
     """
 
     sample_size = len(values)
@@ -124,6 +129,14 @@ def _estimate_prop(
             values,
             weights=weights,
         )
+    )
+
+    mean_value = float(
+        np.mean(values)
+    )
+
+    std_value = float(
+        np.std(values)
     )
 
     if market == "Anytime touchdown":
@@ -152,7 +165,9 @@ def _estimate_prop(
             (values == line).sum()
         )
 
-        eligible = sample_size - pushes
+        eligible = (
+            sample_size - pushes
+        )
 
     if eligible <= 0:
         return None
@@ -176,49 +191,208 @@ def _estimate_prop(
             model_pick = "NO"
             support = under_support
 
-    elif projection > line:
+        line_edge = abs(
+            projection - 0.5
+        )
 
-        model_pick = "OVER"
-        support = over_support
-
-    elif projection < line:
-
-        model_pick = "UNDER"
-        support = under_support
+        normalized_edge = min(
+            line_edge / 0.5,
+            1.0,
+        )
 
     else:
 
-        model_pick = "PASS"
-        support = max(
-            over_support,
-            under_support,
+        if projection > line:
+            model_pick = "OVER"
+            support = over_support
+
+        elif projection < line:
+            model_pick = "UNDER"
+            support = under_support
+
+        else:
+            model_pick = "PASS"
+            support = max(
+                over_support,
+                under_support,
+            )
+
+        line_edge = abs(
+            projection - line
         )
 
+        denominator = max(
+            abs(line),
+            1.0,
+        )
+
+        normalized_edge = min(
+            line_edge / denominator,
+            1.0,
+        )
+
+    sample_reliability = min(
+        sample_size / 12.0,
+        1.0,
+    )
+
+    if abs(mean_value) > 0:
+
+        coefficient_variation = (
+            std_value
+            / abs(mean_value)
+        )
+
+        consistency = (
+            1.0
+            / (
+                1.0
+                + coefficient_variation
+            )
+        )
+
+    else:
+        consistency = 0.0
+
+    consistency = float(
+        np.clip(
+            consistency,
+            0.0,
+            1.0,
+        )
+    )
+
+    prediction_score = (
+        0.55 * support
+        + 0.20 * normalized_edge
+        + 0.15 * sample_reliability
+        + 0.10 * consistency
+    )
+
+    prediction_score = float(
+        np.clip(
+            prediction_score,
+            0.0,
+            1.0,
+        )
+    )
+
     return {
-        "model_pick": model_pick,
-        "projection": projection,
-        "historical_support": float(
-            support
-        ),
-        "over_support": float(
-            over_support
-        ),
-        "under_support": float(
-            under_support
-        ),
-        "sample_size": int(
-            sample_size
-        ),
+        "model_pick":
+            model_pick,
+        "projection":
+            projection,
+        "historical_support":
+            float(support),
+        "over_support":
+            float(over_support),
+        "under_support":
+            float(under_support),
+        "sample_size":
+            int(sample_size),
+        "line_edge":
+            float(line_edge),
+        "normalized_edge":
+            float(normalized_edge),
+        "consistency":
+            consistency,
+        "prediction_score":
+            prediction_score,
     }
+
+
+def _select_consensus_props(
+    prop_lines,
+):
+    """
+    Reduce sportsbook duplicates to one representative
+    line per game / player / market.
+
+    Median sportsbook line is used as the consensus line.
+    """
+
+    required_columns = [
+        "event_id",
+        "game_time",
+        "home_team",
+        "away_team",
+        "player",
+        "market_key",
+        "line",
+    ]
+
+    available = [
+        column
+        for column in required_columns
+        if column in prop_lines.columns
+    ]
+
+    if len(available) != len(
+        required_columns
+    ):
+        return pd.DataFrame()
+
+    props = prop_lines[
+        required_columns
+    ].copy()
+
+    props["line"] = pd.to_numeric(
+        props["line"],
+        errors="coerce",
+    )
+
+    props = props.dropna(
+        subset=[
+            "event_id",
+            "game_time",
+            "player",
+            "market_key",
+            "line",
+        ]
+    )
+
+    if props.empty:
+        return props
+
+    group_columns = [
+        "event_id",
+        "game_time",
+        "home_team",
+        "away_team",
+        "player",
+        "market_key",
+    ]
+
+    consensus = (
+        props
+        .groupby(
+            group_columns,
+            as_index=False,
+            dropna=False,
+        )
+        .agg(
+            line=(
+                "line",
+                "median",
+            ),
+            sportsbook_line_count=(
+                "line",
+                "count",
+            ),
+        )
+    )
+
+    return consensus
 
 
 def run_nfl_player_prop_prediction_pipeline(
     prop_lines,
     player_history,
     window=12,
+    max_results=20,
 ):
     """
-    Generate forecasts for a collection of live NFL props.
+    Generate and rank today's strongest player-prop forecasts.
     """
 
     if prop_lines is None:
@@ -260,30 +434,26 @@ def run_nfl_player_prop_prediction_pipeline(
 
     current_date_ct = (
         current_time
-        .tz_convert("America/Chicago")
+        .tz_convert(
+            "America/Chicago"
+        )
         .date()
     )
 
-    rows = []
-
-    # One forecast per player / market / line / game.
-    unique_props = (
-        prop_lines[
-            [
-                "event_id",
-                "game_time",
-                "home_team",
-                "away_team",
-                "player",
-                "market_key",
-                "line",
-            ]
-        ]
-        .drop_duplicates()
-        .copy()
+    consensus_props = (
+        _select_consensus_props(
+            prop_lines
+        )
     )
 
-    for _, prop in unique_props.iterrows():
+    if consensus_props.empty:
+        return pd.DataFrame()
+
+    rows = []
+
+    for _, prop in (
+        consensus_props.iterrows()
+    ):
 
         kickoff = pd.to_datetime(
             prop["game_time"],
@@ -294,18 +464,24 @@ def run_nfl_player_prop_prediction_pipeline(
         if pd.isna(kickoff):
             continue
 
-        # Do not forecast games already underway.
+        # Never forecast a game
+        # that has already started.
         if kickoff <= current_time:
             continue
 
-        # TODAY ONLY.
+        # Today's games only.
         kickoff_date_ct = (
             kickoff
-            .tz_convert("America/Chicago")
+            .tz_convert(
+                "America/Chicago"
+            )
             .date()
         )
 
-        if kickoff_date_ct != current_date_ct:
+        if (
+            kickoff_date_ct
+            != current_date_ct
+        ):
             continue
 
         market = market_lookup.get(
@@ -323,20 +499,25 @@ def run_nfl_player_prop_prediction_pipeline(
         if pd.isna(line):
             continue
 
-        games = _historical_player_games(
-            history=player_history,
-            player=prop["player"],
-            market=market,
-            kickoff=kickoff,
-            window=window,
+        games = (
+            _historical_player_games(
+                history=player_history,
+                player=prop["player"],
+                market=market,
+                kickoff=kickoff,
+                window=window,
+            )
         )
 
         if games.empty:
             continue
 
-        values = games[
-            "value"
-        ].to_numpy(dtype=float)
+        values = (
+            games["value"]
+            .to_numpy(
+                dtype=float
+            )
+        )
 
         estimate = _estimate_prop(
             values=values,
@@ -347,16 +528,34 @@ def run_nfl_player_prop_prediction_pipeline(
         if estimate is None:
             continue
 
-        support = estimate[
-            "historical_support"
+        # Avoid displaying extremely weak
+        # or essentially coin-flip forecasts.
+        if (
+            estimate[
+                "historical_support"
+            ]
+            < 0.55
+        ):
+            continue
+
+        if (
+            estimate[
+                "model_pick"
+            ]
+            == "PASS"
+        ):
+            continue
+
+        score = estimate[
+            "prediction_score"
         ]
 
-        if support >= 0.70:
+        if score >= 0.70:
             confidence_group = (
                 "HIGH CONFIDENCE"
             )
 
-        elif support >= 0.58:
+        elif score >= 0.60:
             confidence_group = (
                 "MODERATE"
             )
@@ -383,17 +582,45 @@ def run_nfl_player_prop_prediction_pipeline(
                 "line":
                     float(line),
                 "model_pick":
-                    estimate["model_pick"],
+                    estimate[
+                        "model_pick"
+                    ],
                 "projected_value":
-                    estimate["projection"],
+                    estimate[
+                        "projection"
+                    ],
                 "historical_support":
-                    support,
+                    estimate[
+                        "historical_support"
+                    ],
                 "over_support":
-                    estimate["over_support"],
+                    estimate[
+                        "over_support"
+                    ],
                 "under_support":
-                    estimate["under_support"],
+                    estimate[
+                        "under_support"
+                    ],
                 "sample_size":
-                    estimate["sample_size"],
+                    estimate[
+                        "sample_size"
+                    ],
+                "line_edge":
+                    estimate[
+                        "line_edge"
+                    ],
+                "consistency":
+                    estimate[
+                        "consistency"
+                    ],
+                "prediction_score":
+                    score,
+                "sportsbook_line_count":
+                    int(
+                        prop[
+                            "sportsbook_line_count"
+                        ]
+                    ),
                 "confidence_group":
                     confidence_group,
             }
@@ -406,17 +633,70 @@ def run_nfl_player_prop_prediction_pipeline(
     if results.empty:
         return results
 
-    return (
+    # ----------------------------------------------------------
+    # BEST PROP PER PLAYER / MARKET / GAME
+    # ----------------------------------------------------------
+
+    results = (
         results
         .sort_values(
             [
+                "prediction_score",
+                "historical_support",
+                "sample_size",
+            ],
+            ascending=[
+                False,
+                False,
+                False,
+            ],
+        )
+        .drop_duplicates(
+            subset=[
+                "event_id",
+                "player",
+                "market",
+            ],
+            keep="first",
+        )
+    )
+
+    # ----------------------------------------------------------
+    # PREVENT ONE GAME FROM DOMINATING THE BOARD
+    # Maximum 5 displayed candidates from any one game.
+    # ----------------------------------------------------------
+
+    results = (
+        results
+        .groupby(
+            "event_id",
+            group_keys=False,
+        )
+        .head(5)
+    )
+
+    # ----------------------------------------------------------
+    # FINAL RANKING
+    # ----------------------------------------------------------
+
+    results = (
+        results
+        .sort_values(
+            [
+                "prediction_score",
                 "historical_support",
                 "game_time",
             ],
             ascending=[
                 False,
+                False,
                 True,
             ],
         )
-        .reset_index(drop=True)
+        .head(max_results)
+        .reset_index(
+            drop=True
+        )
     )
+
+    return results
