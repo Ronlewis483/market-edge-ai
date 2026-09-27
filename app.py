@@ -990,53 +990,55 @@ if page == "🏠 Home":
 # NBA ONE-CLICK PREDICTION CENTER
 # ============================================
 
-st.divider()
+if page == "🏠 Home":
 
-
-st.caption(
-    "Generate upcoming NBA game predictions and "
-    "analyze model-vs-market opportunities."
-)
-
-if st.button(
-    "⚡ Generate NBA Predictions",
-    key="generate_nba_predictions_one_click",
-    type="primary",
-    use_container_width=True,
-):
-
-    try:
-        status_box = st.empty()
-
-        def update_nba_status(
-            stage,
-            elapsed,
-        ):
-            status_box.info(
-                f"🏀 {stage} — "
-                f"{elapsed:.1f} seconds"
+    st.divider()
+    
+    
+    st.caption(
+        "Generate upcoming NBA game predictions and "
+        "analyze model-vs-market opportunities."
+    )
+    
+    if st.button(
+        "⚡ Generate NBA Predictions",
+        key="generate_nba_predictions_one_click",
+        type="primary",
+        use_container_width=True,
+    ):
+    
+        try:
+            status_box = st.empty()
+    
+            def update_nba_status(
+                stage,
+                elapsed,
+            ):
+                status_box.info(
+                    f"🏀 {stage} — "
+                    f"{elapsed:.1f} seconds"
+                )
+    
+            nba_pipeline_result = (
+                run_nba_prediction_pipeline(
+                    progress_callback=update_nba_status,
+                )
             )
-
-        nba_pipeline_result = (
-            run_nba_prediction_pipeline(
-                progress_callback=update_nba_status,
+    
+            st.session_state[
+                "nba_prediction_pipeline_result"
+            ] = nba_pipeline_result
+    
+            status_box.success(
+                "✅ NBA predictions generated successfully."
             )
-        )
-
-        st.session_state[
-            "nba_prediction_pipeline_result"
-        ] = nba_pipeline_result
-
-        status_box.success(
-            "✅ NBA predictions generated successfully."
-        )
-
-    except Exception as error:
-        st.error(
-            f"NBA prediction pipeline failed: {error}"
-        )
-
-        st.exception(error)
+    
+        except Exception as error:
+            st.error(
+                f"NBA prediction pipeline failed: {error}"
+            )
+    
+            st.exception(error)
 
 # ============================================
 # NBA PREDICTION RESULTS
