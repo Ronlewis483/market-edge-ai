@@ -352,7 +352,7 @@ def run_nba_prediction_pipeline(
         .date()
     )
 
-            report(
+    report(
         "Loading historical NBA data/features..."
     )
 
