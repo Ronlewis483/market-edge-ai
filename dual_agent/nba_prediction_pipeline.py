@@ -252,7 +252,7 @@ def run_nba_prediction_pipeline(
     # 1. LOAD LIVE NBA MONEYLINES
     # ========================================================
 
-        report("Loading live NBA odds...")
+    report("Loading live NBA odds...")
 
     live_games = get_live_nba_moneylines()
 
