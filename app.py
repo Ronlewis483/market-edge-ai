@@ -1900,21 +1900,15 @@ if page=="🏠 Home":
 
     if page == "🏠 Home":
 
-    
         st.divider()
         st.subheader("🏀 NBA Prediction Center")
-    
+
         st.caption(
             "NBA game predictions, sportsbook comparison, "
             "and potential wager payouts."
         )
 
-    
-    # ==========================================
-    # NBA TEAM SELECTION
-    # ==========================================
-
-    NBA_TEAMS = [
+        NBA_TEAMS = [
         "Atlanta Hawks",
         "Boston Celtics",
         "Brooklyn Nets",
