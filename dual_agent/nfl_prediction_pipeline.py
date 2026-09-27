@@ -138,21 +138,19 @@ def run_nfl_prediction_pipeline(
     # 4. GENERATE UPCOMING NFL PREDICTIONS
     # ==========================================
 
-    prediction_rows = []
+       prediction_rows = []
     prediction_errors = []
 
     current_time = pd.Timestamp.now(
         tz="UTC"
     )
 
-    # Only predict games scheduled for TODAY.
-    # Convert kickoff times to Central Time so the
-    # prediction slate matches the app/user date.
     current_date_ct = current_time.tz_convert(
         "America/Chicago"
     ).date()
 
     for _, game in best_lines.iterrows():
+
         home_team = game["home_team"]
         away_team = game["away_team"]
 
@@ -167,6 +165,18 @@ def run_nfl_prediction_pipeline(
                 f"{away_team} at {home_team}: "
                 "invalid commence time."
             )
+            continue
+
+        # Do not predict games that already started.
+        if game_time <= current_time:
+            continue
+
+        # Only predict games scheduled TODAY.
+        game_date_ct = game_time.tz_convert(
+            "America/Chicago"
+        ).date()
+
+        if game_date_ct != current_date_ct:
             continue
 
          # Never predict a game that has already started
