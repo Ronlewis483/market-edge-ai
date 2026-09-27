@@ -2839,18 +2839,19 @@ elif page == "🎟️ My Bets":
             st.session_state["parlay_leg_count"]
         ):
 
-            leg_number = leg_index + 1
+                        leg_number = leg_index + 1
 
             with st.container(border=True):
 
-                st.markdown(
-                    f"#### LEG {leg_number}"
-                )
+                st.markdown(f"#### LEG {leg_number}")
 
-                col1, col2 = st.columns(2)
+                # ------------------------------
+                # SPORT + MARKET
+                # ------------------------------
+
+                col1, col2 = st.columns([1, 2])
 
                 with col1:
-
                     leg_sport = st.selectbox(
                         "Sport",
                         [
@@ -2864,7 +2865,6 @@ elif page == "🎟️ My Bets":
                     )
 
                 with col2:
-
                     leg_market = st.selectbox(
                         "Market",
                         [
@@ -2885,56 +2885,167 @@ elif page == "🎟️ My Bets":
                         key=f"parlay_market_{leg_index}",
                     )
 
-                col1, col2 = st.columns(2)
+                # ------------------------------
+                # GAME MARKETS
+                # ------------------------------
 
-                with col1:
+                game_markets = [
+                    "Game Winner",
+                    "Spread",
+                    "Game Total",
+                ]
 
-                    leg_player = st.text_input(
-                        "Player Name (optional)",
-                        key=f"parlay_player_{leg_index}",
-                    )
+                if leg_market in game_markets:
 
-                with col2:
+                    if leg_market == "Game Total":
 
-                    leg_team = st.text_input(
-                        "Team Name (optional)",
-                        key=f"parlay_team_{leg_index}",
-                    )
+                        col1, col2 = st.columns([2, 1])
 
-                leg_selection = st.text_input(
-                    "Selection",
-                    placeholder=(
-                        "Example: Ravens ML, 49ers -3.5, "
-                        "Jennings Over 1.5 Receptions"
-                    ),
-                    key=f"parlay_selection_{leg_index}",
-                )
+                        with col1:
+                            leg_team = st.text_input(
+                                "Matchup",
+                                placeholder="Example: Seahawks @ Cardinals",
+                                key=f"parlay_team_{leg_index}",
+                            )
 
-                col1, col2 = st.columns(2)
+                        with col2:
+                            leg_direction = st.selectbox(
+                                "Pick",
+                                ["Over", "Under"],
+                                key=f"parlay_direction_{leg_index}",
+                            )
 
-                with col1:
+                        leg_line = st.number_input(
+                            "Total",
+                            value=0.0,
+                            step=0.5,
+                            key=f"parlay_line_{leg_index}",
+                        )
 
-                    leg_direction = st.selectbox(
-                        "Direction",
-                        [
-                            "Moneyline",
-                            "Spread",
-                            "Over",
-                            "Under",
-                            "Yes",
-                            "No",
-                            "Other",
-                        ],
-                        key=f"parlay_direction_{leg_index}",
-                    )
+                        leg_player = ""
 
-                with col2:
+                        leg_selection = (
+                            f"{leg_team} "
+                            f"{leg_direction} {leg_line:g}"
+                        ).strip()
 
-                    leg_line = st.number_input(
-                        "Line",
-                        value=0.0,
-                        step=0.5,
-                        key=f"parlay_line_{leg_index}",
+                    elif leg_market == "Spread":
+
+                        col1, col2 = st.columns([2, 1])
+
+                        with col1:
+                            leg_team = st.text_input(
+                                "Team",
+                                placeholder="Example: 49ers",
+                                key=f"parlay_team_{leg_index}",
+                            )
+
+                        with col2:
+                            leg_line = st.number_input(
+                                "Spread",
+                                value=0.0,
+                                step=0.5,
+                                key=f"parlay_line_{leg_index}",
+                            )
+
+                        leg_player = ""
+                        leg_direction = "Spread"
+
+                        if leg_team.strip():
+                            leg_selection = (
+                                f"{leg_team} {leg_line:+g}"
+                            )
+                        else:
+                            leg_selection = ""
+
+                    else:
+
+                        leg_team = st.text_input(
+                            "Team",
+                            placeholder="Example: Seahawks",
+                            key=f"parlay_team_{leg_index}",
+                        )
+
+                        leg_player = ""
+                        leg_direction = "Moneyline"
+                        leg_line = 0.0
+
+                        if leg_team.strip():
+                            leg_selection = (
+                                f"{leg_team} ML"
+                            )
+                        else:
+                            leg_selection = ""
+
+                # ------------------------------
+                # PLAYER PROP MARKETS
+                # ------------------------------
+
+                else:
+
+                    col1, col2 = st.columns([2, 1])
+
+                    with col1:
+                        leg_player = st.text_input(
+                            "Player",
+                            placeholder="Example: Jauan Jennings",
+                            key=f"parlay_player_{leg_index}",
+                        )
+
+                    with col2:
+                        leg_direction = st.selectbox(
+                            "Pick",
+                            [
+                                "Over",
+                                "Under",
+                                "Yes",
+                                "No",
+                            ],
+                            key=f"parlay_direction_{leg_index}",
+                        )
+
+                    leg_team = ""
+
+                    if leg_market == "Anytime Touchdown":
+
+                        leg_line = 0.0
+
+                        if leg_player.strip():
+                            leg_selection = (
+                                f"{leg_player} "
+                                f"Anytime TD — "
+                                f"{leg_direction.upper()}"
+                            )
+                        else:
+                            leg_selection = ""
+
+                    else:
+
+                        leg_line = st.number_input(
+                            "Line",
+                            value=0.0,
+                            step=0.5,
+                            key=f"parlay_line_{leg_index}",
+                        )
+
+                        if leg_player.strip():
+                            leg_selection = (
+                                f"{leg_player} "
+                                f"{leg_direction.upper()} "
+                                f"{leg_line:g} "
+                                f"{leg_market}"
+                            )
+                        else:
+                            leg_selection = ""
+
+                # ------------------------------
+                # TICKET PREVIEW
+                # ------------------------------
+
+                if leg_selection:
+
+                    st.caption(
+                        f"✓ {leg_selection}"
                     )
 
                 parlay_legs.append(
