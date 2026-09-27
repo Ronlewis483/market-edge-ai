@@ -141,7 +141,7 @@ def run_nfl_prediction_pipeline(
     prediction_rows = []
     prediction_errors = []
 
-        current_time = pd.Timestamp.now(
+    current_time = pd.Timestamp.now(
         tz="UTC"
     )
 
