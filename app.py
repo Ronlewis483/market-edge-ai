@@ -1893,27 +1893,21 @@ if page=="🏠 Home":
         st.caption(sd["reason"])
         st.code("PICK THIS TEAM / PICK THIS PLAYER PROP\nor\nNO QUALIFYING SPORTS PICK")
 
-    # ==========================================    
-    # STOP MY BETS FROM FALLING THROUGH
-    # INTO HOME / PREDICTION SECTIONS
-    # ==========================================
-    
-    if page == "🧾 My Bets":
-        st.stop()
-
 
     # ============================================
     # NBA PREDICTION CENTER
     # ============================================
 
-    
-    st.divider()
-    st.subheader("🏀 NBA Prediction Center")
+    if page == "🏠 Home":
 
-    st.caption(
-        "NBA game predictions, sportsbook comparison, "
-        "and potential wager payouts."
-    )
+    
+        st.divider()
+        st.subheader("🏀 NBA Prediction Center")
+    
+        st.caption(
+            "NBA game predictions, sportsbook comparison, "
+            "and potential wager payouts."
+        )
 
     
     # ==========================================
