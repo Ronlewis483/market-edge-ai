@@ -2596,6 +2596,16 @@ elif page == "🎟️ My Bets":
 
     st.subheader("Record a New Bet")
 
+        bet_mode = st.segmented_control(
+        "Bet Type",
+        options=[
+            "Single",
+            "Parlay",
+        ],
+        default="Single",
+        key="bet_builder_mode",
+    )
+
     with st.form("new_bet_form"):
 
         sport = st.selectbox(
