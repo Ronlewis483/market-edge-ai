@@ -2594,6 +2594,175 @@ elif page == "🎟️ My Bets":
 
     st.divider()
 
+        # ==========================================
+    # AUTOMATIC BET SETTLEMENT
+    # ==========================================
+
+    st.subheader("Automatic Results")
+
+    st.caption(
+        "Check completed NFL, NBA, MLB, and College Football "
+        "games and automatically settle eligible pending bets."
+    )
+
+    if st.button(
+        "🔄 Check Results",
+        key="check_bet_results",
+        use_container_width=True,
+    ):
+
+        with st.spinner(
+            "Checking completed games..."
+        ):
+
+            settlement_bets = get_all_bets()
+
+            # Support either the direct-list return style
+            # or the (success, result) return style.
+            if (
+                isinstance(settlement_bets, tuple)
+                and len(settlement_bets) == 2
+            ):
+                bets_success, settlement_bets = settlement_bets
+
+                if not bets_success:
+                    settlement_bets = []
+
+            if settlement_bets is None:
+                settlement_bets = []
+
+            settlement_report = auto_settle_bets(
+                settlement_bets
+            )
+
+        settled_count = settlement_report.get(
+            "settled",
+            0,
+        )
+
+        checked_count = settlement_report.get(
+            "checked",
+            0,
+        )
+
+        skipped_count = settlement_report.get(
+            "skipped",
+            0,
+        )
+
+        if settled_count > 0:
+
+            st.success(
+                f"Settled {settled_count} bet"
+                f"{'' if settled_count == 1 else 's'}."
+            )
+
+            for update in settlement_report.get(
+                "updated",
+                [],
+            ):
+
+                result = update.get(
+                    "result",
+                    ""
+                )
+
+                description = update.get(
+                    "description",
+                    "Bet"
+                )
+
+                profit_loss = float(
+                    update.get(
+                        "profit_loss",
+                        0,
+                    )
+                )
+
+                if result == "Won":
+                    icon = "✅"
+
+                elif result == "Lost":
+                    icon = "❌"
+
+                else:
+                    icon = "➖"
+
+                st.write(
+                    f"{icon} **{description}** — "
+                    f"{result} "
+                    f"(${profit_loss:+,.2f})"
+                )
+
+        else:
+
+            st.info(
+                "No eligible bets were ready "
+                "to settle."
+            )
+
+        st.caption(
+            f"Checked: {checked_count} • "
+            f"Skipped/unsupported: {skipped_count}"
+        )
+
+        # --------------------------------------
+        # API USAGE
+        # --------------------------------------
+
+        quota = settlement_report.get(
+            "quota",
+            {},
+        )
+
+        if quota:
+
+            with st.expander(
+                "API usage"
+            ):
+
+                for sport, usage in quota.items():
+
+                    remaining = usage.get(
+                        "remaining",
+                        "—",
+                    )
+
+                    used = usage.get(
+                        "used",
+                        "—",
+                    )
+
+                    last = usage.get(
+                        "last",
+                        "—",
+                    )
+
+                    st.write(
+                        f"**{sport}** — "
+                        f"Used: {used} | "
+                        f"Remaining: {remaining} | "
+                        f"Last request: {last}"
+                    )
+
+        # --------------------------------------
+        # ERRORS
+        # --------------------------------------
+
+        errors = settlement_report.get(
+            "errors",
+            [],
+        )
+
+        if errors:
+
+            with st.expander(
+                "Settlement warnings"
+            ):
+
+                for error in errors:
+                    st.warning(error)
+
 
     st.subheader("Record a New Bet")
 
