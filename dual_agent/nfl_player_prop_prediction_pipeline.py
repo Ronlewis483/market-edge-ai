@@ -633,8 +633,8 @@ def run_nfl_player_prop_prediction_pipeline(
     if results.empty:
         return results
 
-    # ----------------------------------------------------------
-    # BEST PROP PER PLAYER / MARKET / GAME
+        # ----------------------------------------------------------
+    # RANK ALL QUALIFIED PROPS
     # ----------------------------------------------------------
 
     results = (
@@ -659,44 +659,146 @@ def run_nfl_player_prop_prediction_pipeline(
             ],
             keep="first",
         )
+        .reset_index(drop=True)
     )
 
     # ----------------------------------------------------------
-    # PREVENT ONE GAME FROM DOMINATING THE BOARD
-    # Maximum 5 displayed candidates from any one game.
+    # IDENTIFY EACH PLAYER'S STRONGEST PROP
+    #
+    # A player can only occupy ONE Top-10 position.
+    # Their strongest individual prop determines their rank.
     # ----------------------------------------------------------
 
-    results = (
-        results
-        .groupby(
-            "event_id",
-            group_keys=False,
-        )
-        .head(5)
-    )
-
-    # ----------------------------------------------------------
-    # FINAL RANKING
-    # ----------------------------------------------------------
-
-    results = (
+    best_prop_per_player = (
         results
         .sort_values(
             [
                 "prediction_score",
                 "historical_support",
-                "game_time",
+                "sample_size",
             ],
             ascending=[
                 False,
                 False,
-                True,
+                False,
             ],
         )
-        .head(max_results)
-        .reset_index(
-            drop=True
+        .drop_duplicates(
+            subset=[
+                "event_id",
+                "player",
+            ],
+            keep="first",
         )
+        .head(10)
+        .copy()
     )
 
-    return results
+    if best_prop_per_player.empty:
+        return pd.DataFrame()
+
+    # Assign visible player ranking.
+    best_prop_per_player[
+        "player_rank"
+    ] = range(
+        1,
+        len(best_prop_per_player) + 1,
+    )
+
+    # ----------------------------------------------------------
+    # RETAIN OTHER QUALIFIED PROPS FOR EACH TOP PLAYER
+    #
+    # These become the dropdown props in the UI.
+    # Maximum 4 props total per player.
+    # ----------------------------------------------------------
+
+    selected_players = (
+        best_prop_per_player[
+            [
+                "event_id",
+                "player",
+                "player_rank",
+            ]
+        ]
+        .copy()
+    )
+
+    top_player_props = results.merge(
+        selected_players,
+        on=[
+            "event_id",
+            "player",
+        ],
+        how="inner",
+    )
+
+    top_player_props = (
+        top_player_props
+        .sort_values(
+            [
+                "player_rank",
+                "prediction_score",
+                "historical_support",
+                "sample_size",
+            ],
+            ascending=[
+                True,
+                False,
+                False,
+                False,
+            ],
+        )
+        .groupby(
+            [
+                "event_id",
+                "player",
+            ],
+            group_keys=False,
+        )
+        .head(4)
+        .reset_index(drop=True)
+    )
+
+    # ----------------------------------------------------------
+    # MARK EACH PLAYER'S HEADLINE PROP
+    # ----------------------------------------------------------
+
+    top_player_props[
+        "is_best_prop"
+    ] = (
+        top_player_props
+        .groupby(
+            [
+                "event_id",
+                "player",
+            ]
+        )
+        .cumcount()
+        == 0
+    )
+
+    # ----------------------------------------------------------
+    # FINAL ORDER
+    #
+    # Player #1 first, then all of that player's props.
+    # Player #2 next, etc.
+    # ----------------------------------------------------------
+
+    top_player_props = (
+        top_player_props
+        .sort_values(
+            [
+                "player_rank",
+                "is_best_prop",
+                "prediction_score",
+            ],
+            ascending=[
+                True,
+                False,
+                False,
+            ],
+        )
+        .reset_index(drop=True)
+    )
+
+    return top_player_props
