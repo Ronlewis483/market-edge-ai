@@ -1899,9 +1899,9 @@ if page=="🏠 Home":
     # ============================================
 
             if page != "🏠 Home":
-        pass
-
-    else:
+                pass
+        
+            else:
     
             st.divider()
             st.subheader("🏀 NBA Prediction Center")
