@@ -138,7 +138,7 @@ def run_nfl_prediction_pipeline(
     # 4. GENERATE UPCOMING NFL PREDICTIONS
     # ==========================================
 
-       prediction_rows = []
+    prediction_rows = []
     prediction_errors = []
 
     current_time = pd.Timestamp.now(
@@ -167,6 +167,17 @@ def run_nfl_prediction_pipeline(
             )
             continue
 
+        # Do not predict games that already started.
+        if game_time <= current_time:
+            continue
+
+        # Only predict games scheduled TODAY.
+        game_date_ct = game_time.tz_convert(
+            "America/Chicago"
+        ).date()
+
+        if game_date_ct != current_date_ct:
+            continue
         # Do not predict games that already started.
         if game_time <= current_time:
             continue
