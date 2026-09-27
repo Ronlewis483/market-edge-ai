@@ -375,7 +375,7 @@ def run_nba_prediction_pipeline(
     # TRAIN LIVE MODEL ONCE FOR ENTIRE UPCOMING SLATE
     # ========================================================
 
-        report("Training NBA model...")
+    report("Training NBA model...")
 
     trained_model = train_balldontlie_live_model(
         feature_games=feature_games,
