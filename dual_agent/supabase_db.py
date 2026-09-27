@@ -1,7 +1,7 @@
 
 import streamlit as st
 from supabase import create_client
-
+from datetime import datetime, timezone
 
 @st.cache_resource
 def get_supabase_client():
@@ -85,7 +85,8 @@ def update_bet_result(bet_id, status, profit_loss):
 
         return True, response.data
 
-    from datetime import datetime, timezone
+    except Exception as e:
+        return False, str(e)
 
 
 def save_prediction_snapshot(
@@ -187,8 +188,6 @@ def save_prediction_snapshot(
             "error": str(exc),
         }
 
-    except Exception as e:
-        return False, str(e)
 
 def get_prediction_history(
     league=None,
