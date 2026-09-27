@@ -7,6 +7,9 @@ from dual_agent.nfl_player_props import (MARKETS, analyze, event_props, events,
 
 from dual_agent.nfl_player_history import load_player_history
 from dual_agent.nfl_player_props import canonical_name
+from dual_agent.nfl_player_prop_prediction_pipeline import (
+    run_nfl_player_prop_prediction_pipeline,
+)
 
 @st.cache_data(ttl=600, show_spinner=False)
 def cached_events(key):
