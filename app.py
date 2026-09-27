@@ -2590,11 +2590,15 @@ elif page == "🎟️ My Bets":
 
     st.divider()
 
-    # -----------------------------------
-    # Record a new bet
-    # -----------------------------------
 
     st.subheader("Record a New Bet")
+
+    # ==========================================
+    # BET BUILDER STATE
+    # ==========================================
+
+    if "parlay_leg_count" not in st.session_state:
+        st.session_state["parlay_leg_count"] = 2
 
     bet_mode = st.segmented_control(
         "Bet Type",
@@ -2606,140 +2610,532 @@ elif page == "🎟️ My Bets":
         key="bet_builder_mode",
     )
 
-    with st.form("new_bet_form"):
+    # ==========================================
+    # SINGLE BET
+    # ==========================================
 
-        sport = st.selectbox(
-            "Sport",
-            [
-                "NFL",
-                "NBA",
-                "College Football",
-                "MLB",
-                "Other",
-            ],
-        )
+    if bet_mode == "Single":
 
-        betting_market = st.selectbox(
-            "Betting Market",
-            [
-                "Game Winner",
-                "Player Points",
-                "Player Rebounds",
-                "Player Assists",
-                "Passing Yards",
-                "Rushing Yards",
-                "Receiving Yards",
-                "Three-Pointers",
-                "Other",
-            ],
-        )
+        with st.form("single_bet_form"):
 
-        player_name = st.text_input(
-            "Player Name (optional)"
-        )
-
-        team_name = st.text_input(
-            "Team Name (optional)"
-        )
-
-        bet_description = st.text_input(
-            "Describe Your Bet",
-            placeholder="Example: Player over 25.5 points",
-        )
-
-        bet_type = st.selectbox(
-            "Bet Direction",
-            [
-                "Over",
-                "Under",
-                "Moneyline",
-                "Spread",
-                "Other",
-            ],
-        )
-
-        betting_line = st.number_input(
-            "Betting Line",
-            value=0.0,
-            step=0.5,
-        )
-
-        odds = st.number_input(
-            "American Odds",
-            value=-110,
-            step=1,
-        )
-
-        wager = st.number_input(
-            "Amount Wagered ($)",
-            min_value=0.01,
-            value=10.00,
-            step=1.00,
-        )
-
-        sportsbook = st.text_input(
-            "Sportsbook (optional)"
-        )
-
-        notes = st.text_area(
-            "Notes (optional)"
-        )
-
-        submitted = st.form_submit_button(
-            "Save My Bet"
-        )
-
-    if submitted:
-
-        if not bet_description.strip():
-
-            st.error(
-                "Please enter a description of your bet."
+            sport = st.selectbox(
+                "Sport",
+                [
+                    "NFL",
+                    "NBA",
+                    "College Football",
+                    "MLB",
+                    "Other",
+                ],
+                key="single_sport",
             )
 
-        elif abs(odds) < 100:
-
-            st.error(
-                "Enter valid American odds, "
-                "such as -110 or +150."
+            betting_market = st.selectbox(
+                "Betting Market",
+                [
+                    "Game Winner",
+                    "Spread",
+                    "Game Total",
+                    "Player Points",
+                    "Player Rebounds",
+                    "Player Assists",
+                    "Passing Yards",
+                    "Rushing Yards",
+                    "Receiving Yards",
+                    "Receptions",
+                    "Anytime Touchdown",
+                    "Three-Pointers",
+                    "Other",
+                ],
+                key="single_market",
             )
 
-        else:
+            col1, col2 = st.columns(2)
 
-            bet_data = {
-                "sport": sport,
-                "betting_market": betting_market,
-                "player_name": player_name,
-                "team_name": team_name,
-                "bet_description": bet_description,
-                "bet_type": bet_type,
-                "betting_line": betting_line,
-                "odds": odds,
-                "wager": wager,
-                "status": "Pending",
-                "profit_loss": 0,
-                "sportsbook": sportsbook,
-                "strategy": betting_market,
-                "notes": notes,
-                "source": "Manual",
-            }
+            with col1:
+                player_name = st.text_input(
+                    "Player Name (optional)",
+                    key="single_player",
+                )
 
-            success, result = save_bet(
-                bet_data
+            with col2:
+                team_name = st.text_input(
+                    "Team Name (optional)",
+                    key="single_team",
+                )
+
+            bet_description = st.text_input(
+                "Describe Your Bet",
+                placeholder="Example: Ravens moneyline",
+                key="single_description",
             )
 
-            if success:
+            col1, col2 = st.columns(2)
 
-                st.success(
-                    "Your bet was saved successfully!"
+            with col1:
+                bet_type = st.selectbox(
+                    "Bet Direction",
+                    [
+                        "Over",
+                        "Under",
+                        "Moneyline",
+                        "Spread",
+                        "Yes",
+                        "No",
+                        "Other",
+                    ],
+                    key="single_direction",
+                )
+
+            with col2:
+                betting_line = st.number_input(
+                    "Betting Line",
+                    value=0.0,
+                    step=0.5,
+                    key="single_line",
+                )
+
+            col1, col2 = st.columns(2)
+
+            with col1:
+                odds = st.number_input(
+                    "American Odds",
+                    value=-110,
+                    step=1,
+                    key="single_odds",
+                )
+
+            with col2:
+                wager = st.number_input(
+                    "Amount Wagered ($)",
+                    min_value=0.01,
+                    value=10.00,
+                    step=1.00,
+                    key="single_wager",
+                )
+
+            sportsbook = st.text_input(
+                "Sportsbook (optional)",
+                key="single_sportsbook",
+            )
+
+            notes = st.text_area(
+                "Notes (optional)",
+                key="single_notes",
+            )
+
+            submitted = st.form_submit_button(
+                "Save Single Bet",
+                type="primary",
+                use_container_width=True,
+            )
+
+        if submitted:
+
+            if not bet_description.strip():
+
+                st.error(
+                    "Please enter a description of your bet."
+                )
+
+            elif abs(odds) < 100:
+
+                st.error(
+                    "Enter valid American odds, "
+                    "such as -110 or +150."
                 )
 
             else:
 
-                st.error(
-                    "Unable to save your bet."
+                bet_data = {
+                    "sport": sport,
+                    "betting_market": betting_market,
+                    "player_name": player_name,
+                    "team_name": team_name,
+                    "bet_description": bet_description,
+                    "bet_type": bet_type,
+                    "betting_line": betting_line,
+                    "odds": odds,
+                    "wager": wager,
+                    "status": "Pending",
+                    "profit_loss": 0,
+                    "sportsbook": sportsbook,
+                    "strategy": betting_market,
+                    "notes": notes,
+                    "source": "Manual",
+                }
+
+                success, result = save_bet(
+                    bet_data
                 )
 
+                if success:
+
+                    st.success(
+                        "Your bet was saved successfully!"
+                    )
+
+                else:
+
+                    st.error(
+                        "Unable to save your bet."
+                    )
+
+    # ==========================================
+    # PARLAY BET BUILDER
+    # ==========================================
+
+    else:
+
+        st.markdown("### 🎟️ Parlay Builder")
+
+        st.caption(
+            "Add each selection as a separate leg. "
+            "The entire parlay will be saved as one ticket."
+        )
+
+        # --------------------------------------
+        # ADD / REMOVE LEG CONTROLS
+        # --------------------------------------
+
+        control_col1, control_col2, control_col3 = st.columns(
+            [1, 1, 3]
+        )
+
+        with control_col1:
+
+            if st.button(
+                "＋ Add Leg",
+                key="add_parlay_leg",
+                use_container_width=True,
+            ):
+
+                st.session_state["parlay_leg_count"] += 1
+                st.rerun()
+
+        with control_col2:
+
+            if (
+                st.session_state["parlay_leg_count"] > 2
+                and st.button(
+                    "− Remove Leg",
+                    key="remove_parlay_leg",
+                    use_container_width=True,
+                )
+            ):
+
+                st.session_state["parlay_leg_count"] -= 1
+                st.rerun()
+
+        st.divider()
+
+        # --------------------------------------
+        # PARLAY LEGS
+        # --------------------------------------
+
+        parlay_legs = []
+
+        for leg_index in range(
+            st.session_state["parlay_leg_count"]
+        ):
+
+            leg_number = leg_index + 1
+
+            with st.container(border=True):
+
+                st.markdown(
+                    f"#### LEG {leg_number}"
+                )
+
+                col1, col2 = st.columns(2)
+
+                with col1:
+
+                    leg_sport = st.selectbox(
+                        "Sport",
+                        [
+                            "NFL",
+                            "NBA",
+                            "College Football",
+                            "MLB",
+                            "Other",
+                        ],
+                        key=f"parlay_sport_{leg_index}",
+                    )
+
+                with col2:
+
+                    leg_market = st.selectbox(
+                        "Market",
+                        [
+                            "Game Winner",
+                            "Spread",
+                            "Game Total",
+                            "Player Points",
+                            "Player Rebounds",
+                            "Player Assists",
+                            "Passing Yards",
+                            "Rushing Yards",
+                            "Receiving Yards",
+                            "Receptions",
+                            "Anytime Touchdown",
+                            "Three-Pointers",
+                            "Other",
+                        ],
+                        key=f"parlay_market_{leg_index}",
+                    )
+
+                col1, col2 = st.columns(2)
+
+                with col1:
+
+                    leg_player = st.text_input(
+                        "Player Name (optional)",
+                        key=f"parlay_player_{leg_index}",
+                    )
+
+                with col2:
+
+                    leg_team = st.text_input(
+                        "Team Name (optional)",
+                        key=f"parlay_team_{leg_index}",
+                    )
+
+                leg_selection = st.text_input(
+                    "Selection",
+                    placeholder=(
+                        "Example: Ravens ML, 49ers -3.5, "
+                        "Jennings Over 1.5 Receptions"
+                    ),
+                    key=f"parlay_selection_{leg_index}",
+                )
+
+                col1, col2 = st.columns(2)
+
+                with col1:
+
+                    leg_direction = st.selectbox(
+                        "Direction",
+                        [
+                            "Moneyline",
+                            "Spread",
+                            "Over",
+                            "Under",
+                            "Yes",
+                            "No",
+                            "Other",
+                        ],
+                        key=f"parlay_direction_{leg_index}",
+                    )
+
+                with col2:
+
+                    leg_line = st.number_input(
+                        "Line",
+                        value=0.0,
+                        step=0.5,
+                        key=f"parlay_line_{leg_index}",
+                    )
+
+                parlay_legs.append(
+                    {
+                        "sport": leg_sport,
+                        "market": leg_market,
+                        "player": leg_player,
+                        "team": leg_team,
+                        "selection": leg_selection,
+                        "direction": leg_direction,
+                        "line": leg_line,
+                    }
+                )
+
+        # ======================================
+        # TICKET DETAILS
+        # ======================================
+
+        st.markdown("### Ticket Details")
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+
+            parlay_odds = st.number_input(
+                "Combined American Odds",
+                value=200,
+                step=1,
+                key="parlay_combined_odds",
+            )
+
+        with col2:
+
+            parlay_wager = st.number_input(
+                "Amount Wagered ($)",
+                min_value=0.01,
+                value=10.00,
+                step=1.00,
+                key="parlay_wager",
+            )
+
+        parlay_sportsbook = st.text_input(
+            "Sportsbook (optional)",
+            key="parlay_sportsbook",
+        )
+
+        parlay_notes = st.text_area(
+            "Notes (optional)",
+            key="parlay_notes",
+        )
+
+        # --------------------------------------
+        # POTENTIAL PAYOUT
+        # --------------------------------------
+
+        if parlay_odds > 0:
+
+            potential_profit = (
+                parlay_wager
+                * parlay_odds
+                / 100
+            )
+
+        elif parlay_odds <= -100:
+
+            potential_profit = (
+                parlay_wager
+                * 100
+                / abs(parlay_odds)
+            )
+
+        else:
+
+            potential_profit = 0
+
+        potential_payout = (
+            parlay_wager
+            + potential_profit
+        )
+
+        metric_col1, metric_col2, metric_col3 = st.columns(3)
+
+        metric_col1.metric(
+            "Legs",
+            len(parlay_legs),
+        )
+
+        metric_col2.metric(
+            "Wager",
+            f"${parlay_wager:,.2f}",
+        )
+
+        metric_col3.metric(
+            "Potential Payout",
+            f"${potential_payout:,.2f}",
+        )
+
+        # ======================================
+        # SAVE PARLAY
+        # ======================================
+
+        if st.button(
+            "Save Parlay",
+            key="save_parlay_ticket",
+            type="primary",
+            use_container_width=True,
+        ):
+
+            valid_legs = [
+                leg
+                for leg in parlay_legs
+                if leg["selection"].strip()
+            ]
+
+            if len(valid_legs) < 2:
+
+                st.error(
+                    "A parlay must contain at least "
+                    "two completed legs."
+                )
+
+            elif abs(parlay_odds) < 100:
+
+                st.error(
+                    "Enter valid combined American odds, "
+                    "such as +250 or -110."
+                )
+
+            else:
+
+                # ----------------------------------
+                # Build readable ticket description.
+                #
+                # We intentionally use the existing
+                # bet record structure so no database
+                # changes are required.
+                # ----------------------------------
+
+                leg_descriptions = []
+
+                for index, leg in enumerate(
+                    valid_legs,
+                    start=1,
+                ):
+
+                    leg_descriptions.append(
+                        f"{index}. {leg['selection'].strip()}"
+                    )
+
+                parlay_description = " | ".join(
+                    leg_descriptions
+                )
+
+                sports = []
+
+                for leg in valid_legs:
+
+                    if leg["sport"] not in sports:
+                        sports.append(
+                            leg["sport"]
+                        )
+
+                if len(sports) == 1:
+                    parlay_sport = sports[0]
+                else:
+                    parlay_sport = "Multiple"
+
+                parlay_bet_data = {
+                    "sport": parlay_sport,
+                    "betting_market": "Parlay",
+                    "player_name": "",
+                    "team_name": "",
+                    "bet_description": parlay_description,
+                    "bet_type": "Parlay",
+                    "betting_line": 0,
+                    "odds": parlay_odds,
+                    "wager": parlay_wager,
+                    "status": "Pending",
+                    "profit_loss": 0,
+                    "sportsbook": parlay_sportsbook,
+                    "strategy": "Parlay",
+                    "notes": parlay_notes,
+                    "source": "Manual",
+                }
+
+                success, result = save_bet(
+                    parlay_bet_data
+                )
+
+                if success:
+
+                    st.success(
+                        f"Your {len(valid_legs)}-leg "
+                        "parlay was saved successfully!"
+                    )
+
+                else:
+
+                    st.error(
+                        "Unable to save your parlay."
+                    )
     st.divider()
 
     # -----------------------------------
