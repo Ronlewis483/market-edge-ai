@@ -207,7 +207,7 @@ def render_nfl_player_props():
             ] < 0.58
         ]
 
-                st.markdown(
+        st.markdown(
             "## 🏈 Top 10 NFL Player Prop Predictions"
         )
 
