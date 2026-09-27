@@ -1898,18 +1898,14 @@ if page=="🏠 Home":
     # NBA PREDICTION CENTER
     # ============================================
 
-            if page != "🏠 Home":
-                pass
-        
-            else:
     
-            st.divider()
-            st.subheader("🏀 NBA Prediction Center")
-    
-            st.caption(
-                "NBA game predictions, sportsbook comparison, "
-                "and potential wager payouts."
-            )
+    st.divider()
+    st.subheader("🏀 NBA Prediction Center")
+
+    st.caption(
+        "NBA game predictions, sportsbook comparison, "
+        "and potential wager payouts."
+    )
 
     
     # ==========================================
