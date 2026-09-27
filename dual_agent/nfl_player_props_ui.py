@@ -36,6 +36,286 @@ def render_nfl_player_props():
         st.warning('Add ODDS_API_KEY to Streamlit Community Cloud → App settings → Secrets.')
         return
     selected=st.multiselect('Markets', list(MARKETS), default=list(MARKETS), key='props_markets')
+      # ==========================================================
+    # AUTOMATIC TODAY'S PLAYER PROP PREDICTIONS
+    # ==========================================================
+
+    st.markdown("## 🎯 Today's NFL Player Prop Predictions")
+
+    st.caption(
+        "Scan today's remaining NFL games and generate "
+        "player-prop forecasts automatically."
+    )
+
+    if st.button(
+        "⚡ Generate Today's Player Prop Predictions",
+        key="generate_today_nfl_prop_predictions",
+        use_container_width=True,
+    ):
+        try:
+            with st.spinner(
+                "Scanning today's NFL player props..."
+            ):
+                live_events = cached_events(key)
+
+                now_utc = pd.Timestamp.now(
+                    tz="UTC"
+                )
+
+                today_ct = now_utc.tz_convert(
+                    "America/Chicago"
+                ).date()
+
+                today_events = []
+
+                for event in live_events:
+                    kickoff = pd.to_datetime(
+                        event.get("commence_time"),
+                        utc=True,
+                        errors="coerce",
+                    )
+
+                    if pd.isna(kickoff):
+                        continue
+
+                    if kickoff <= now_utc:
+                        continue
+
+                    if (
+                        kickoff.tz_convert(
+                            "America/Chicago"
+                        ).date()
+                        != today_ct
+                    ):
+                        continue
+
+                    today_events.append(event)
+
+                if not today_events:
+                    st.session_state[
+                        "nfl_auto_prop_predictions"
+                    ] = pd.DataFrame()
+
+                else:
+                    prop_frames = []
+
+                    market_keys = tuple(
+                        MARKETS[market]
+                        for market in selected
+                    )
+
+                    for event in today_events:
+                        try:
+                            event_data, _ = cached_props(
+                                key,
+                                event["id"],
+                                market_keys,
+                            )
+
+                            event_lines = normalize_props(
+                                event_data
+                            )
+
+                            if not event_lines.empty:
+                                prop_frames.append(
+                                    event_lines
+                                )
+
+                        except (
+                            requests.RequestException,
+                            ValueError,
+                        ):
+                            continue
+
+                    if prop_frames:
+                        all_today_props = pd.concat(
+                            prop_frames,
+                            ignore_index=True,
+                        )
+
+                        history_seasons = (
+                            2025,
+                            2026,
+                        )
+
+                        player_history = (
+                            cached_player_history(
+                                history_seasons
+                            )
+                        )
+
+                        predictions = (
+                            run_nfl_player_prop_prediction_pipeline(
+                                prop_lines=all_today_props,
+                                player_history=player_history,
+                                window=12,
+                            )
+                        )
+
+                    else:
+                        predictions = pd.DataFrame()
+
+                    st.session_state[
+                        "nfl_auto_prop_predictions"
+                    ] = predictions
+
+        except Exception as prop_error:
+            st.error(
+                "Unable to generate player prop predictions: "
+                f"{type(prop_error).__name__}: "
+                f"{prop_error}"
+            )
+
+    auto_prop_predictions = st.session_state.get(
+        "nfl_auto_prop_predictions"
+    )
+
+    if isinstance(
+        auto_prop_predictions,
+        pd.DataFrame,
+    ) and not auto_prop_predictions.empty:
+
+        st.success(
+            f"Generated "
+            f"{len(auto_prop_predictions)} "
+            "player-prop forecasts."
+        )
+
+        high_props = auto_prop_predictions.loc[
+            auto_prop_predictions[
+                "historical_support"
+            ] >= 0.70
+        ]
+
+        moderate_props = auto_prop_predictions.loc[
+            (
+                auto_prop_predictions[
+                    "historical_support"
+                ] >= 0.58
+            )
+            &
+            (
+                auto_prop_predictions[
+                    "historical_support"
+                ] < 0.70
+            )
+        ]
+
+        close_props = auto_prop_predictions.loc[
+            auto_prop_predictions[
+                "historical_support"
+            ] < 0.58
+        ]
+
+        prop_groups = [
+            (
+                "🔥 HIGH CONFIDENCE",
+                high_props,
+            ),
+            (
+                "⚡ MODERATE",
+                moderate_props,
+            ),
+            (
+                "⚖️ CLOSE / PASS",
+                close_props,
+            ),
+        ]
+
+        for group_name, group_df in prop_groups:
+
+            if group_df.empty:
+                continue
+
+            st.markdown(
+                f"### {group_name}"
+            )
+
+            for _, prop in group_df.iterrows():
+
+                with st.container(border=True):
+
+                    st.caption(
+                        f"{prop['away_team']} @ "
+                        f"{prop['home_team']}"
+                    )
+
+                    st.markdown(
+                        f"### {prop['player']}"
+                    )
+
+                    st.caption(
+                        str(prop["market"])
+                    )
+
+                    st.markdown(
+                        "#### 🏆 MODEL PICK"
+                    )
+
+                    st.markdown(
+                        f"## {prop['model_pick']} "
+                        f"{prop['line']:g}"
+                    )
+
+                    c1, c2 = st.columns(2)
+
+                    c1.metric(
+                        "Model Projection",
+                        f"{prop['projected_value']:.1f}",
+                    )
+
+                    c2.metric(
+                        "Historical Support",
+                        f"{prop['historical_support']:.1%}",
+                    )
+
+                    st.progress(
+                        float(
+                            prop[
+                                "historical_support"
+                            ]
+                        )
+                    )
+
+                    with st.expander(
+                        "View model details"
+                    ):
+                        st.write(
+                            "Historical games analyzed:",
+                            int(
+                                prop[
+                                    "sample_size"
+                                ]
+                            ),
+                        )
+
+                        st.write(
+                            "OVER historical support:",
+                            f"{prop['over_support']:.1%}",
+                        )
+
+                        st.write(
+                            "UNDER historical support:",
+                            f"{prop['under_support']:.1%}",
+                        )
+
+                        st.caption(
+                            "Historical support is a "
+                            "smoothed historical baseline, "
+                            "not yet a calibrated future "
+                            "outcome probability."
+                        )
+
+    elif isinstance(
+        auto_prop_predictions,
+        pd.DataFrame,
+    ):
+        st.info(
+            "No eligible player-prop forecasts were "
+            "generated for today's remaining games."
+        )
+
+    st.divider()
     if st.button('Load upcoming NFL games', key='props_load_games'):
         try: st.session_state['props_events']=cached_events(key)
         except (requests.RequestException,ValueError) as exc: st.error(f'Games unavailable: {exc}')
