@@ -2596,7 +2596,7 @@ elif page == "🎟️ My Bets":
 
     st.subheader("Record a New Bet")
 
-        bet_mode = st.segmented_control(
+    bet_mode = st.segmented_control(
         "Bet Type",
         options=[
             "Single",
