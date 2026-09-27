@@ -740,8 +740,6 @@ st.caption("Persistent validated model • lightweight daily inference • resea
 # MARKET EDGE AI — NAVIGATION V2
 # ==========================================
 
-if page == "🏀 Sports Center":
-
 with st.sidebar:
 
     st.markdown("## ⚡ MARKET EDGE AI")
