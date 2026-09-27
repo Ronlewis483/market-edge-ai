@@ -991,7 +991,6 @@ with st.expander(
 
 st.divider()
 
-st.subheader("🏀 NBA Prediction Center")
 
 st.caption(
     "Generate upcoming NBA game predictions and "
@@ -1895,17 +1894,19 @@ if page=="🏠 Home":
         st.code("PICK THIS TEAM / PICK THIS PLAYER PROP\nor\nNO QUALIFYING SPORTS PICK")
 
 
-    # ==========================================
+    # ============================================
     # NBA PREDICTION CENTER
-    # ==========================================
+    # ============================================
 
-    st.divider()
-    st.subheader("🏀 NBA Prediction Center")
-
-    st.caption(
-        "NBA game predictions, sportsbook comparison, "
-        "and potential wager payouts."
-    )
+        if page == "🏠 Home":
+    
+            st.divider()
+            st.subheader("🏀 NBA Prediction Center")
+    
+            st.caption(
+                "NBA game predictions, sportsbook comparison, "
+                "and potential wager payouts."
+            )
 
     
     # ==========================================
