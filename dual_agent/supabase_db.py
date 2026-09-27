@@ -189,3 +189,78 @@ def save_prediction_snapshot(
 
     except Exception as e:
         return False, str(e)
+
+def get_prediction_history(
+    league=None,
+    team=None,
+    limit=500,
+):
+    """
+    Retrieve historical prediction snapshots.
+
+    Optional filters:
+        league -> NFL / NBA / MLB
+        team   -> searches home and away teams
+    """
+
+    try:
+        client = get_supabase_client()
+
+        if client is None:
+            return []
+
+        query = (
+            client
+            .table("prediction_history")
+            .select("*")
+            .order(
+                "generated_at",
+                desc=True,
+            )
+            .limit(limit)
+        )
+
+        if league:
+            query = query.eq(
+                "league",
+                str(league).upper(),
+            )
+
+        response = query.execute()
+
+        rows = response.data or []
+
+        if team:
+
+            search_term = str(team).lower().strip()
+
+            rows = [
+                row
+                for row in rows
+                if (
+                    search_term
+                    in str(
+                        row.get(
+                            "home_team",
+                            "",
+                        )
+                    ).lower()
+                    or
+                    search_term
+                    in str(
+                        row.get(
+                            "away_team",
+                            "",
+                        )
+                    ).lower()
+                )
+            ]
+
+        return rows
+
+    except Exception as exc:
+        print(
+            "Prediction history lookup failed:",
+            exc,
+        )
+        return []
