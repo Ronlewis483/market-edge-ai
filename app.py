@@ -83,6 +83,10 @@ from dual_agent.supabase_db import (
     update_bet_result,
 )
 
+from dual_agent.bet_settlement import (
+    auto_settle_bets,
+)
+
 st.set_page_config(page_title="Market Edge AI V5", page_icon="📊", layout="wide")
 
 # ==========================================
