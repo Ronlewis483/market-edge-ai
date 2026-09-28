@@ -94,6 +94,8 @@ from dual_agent.bet_settlement import (
     auto_settle_bets,
 )
 
+from dual_agent.nfl_player_history import get_nfl_player_history
+
 st.set_page_config(page_title="Market Edge AI V5", page_icon="📊", layout="wide")
 
 # ==========================================
@@ -4207,7 +4209,7 @@ def render_research_lab():
     if page == "🧪 Research Lab":
         st.subheader("🧪 Research Lab - Optional Revalidation")
 
-                # ============================================================
+        # ============================================================
         # NFL V1 VS V2 MODEL BENCHMARK
         # ============================================================
 
@@ -4236,6 +4238,482 @@ def render_research_lab():
 
                 feature_games = st.session_state.get(
                     "nfl_feature_games"
+                )
+
+        # ============================================================
+        # NFL PLAYER PROP V1 VS V2A BENCHMARK
+        # ============================================================
+
+        st.divider()
+
+        st.subheader(
+            "🏈 NFL Player Prop V1 vs V2A Benchmark"
+        )
+
+        st.caption(
+            "Leakage-safe historical comparison of the existing "
+            "mean player-prop projection against the experimental "
+            "V2A recency-weighted projection."
+        )
+
+        st.info(
+            "This benchmark does not change the live Player Prop "
+            "engine. Lower MAE and RMSE are better. Bias closer "
+            "to zero is better."
+        )
+
+        if st.button(
+            "Run NFL Player Prop V1 vs V2A Benchmark",
+            key="run_nfl_prop_v1_v2a_benchmark",
+            type="primary",
+        ):
+
+            try:
+
+                # ----------------------------------------------------
+                # LOAD PLAYER HISTORY
+                # ----------------------------------------------------
+
+                with st.spinner(
+                    "Loading historical NFL player data..."
+                ):
+
+                    prop_history = (
+                        get_nfl_player_history()
+                    )
+
+                if (
+                    prop_history is None
+                    or prop_history.empty
+                ):
+
+                    raise ValueError(
+                        "NFL player history returned no data."
+                    )
+
+                # ----------------------------------------------------
+                # RUN PAIRED WALK-FORWARD TEST
+                # ----------------------------------------------------
+
+                with st.spinner(
+                    "Running NFL player-prop V1 vs V2A "
+                    "walk-forward benchmark..."
+                ):
+
+                    prop_benchmark = (
+                        compare_v1_v2_walkforward(
+                            history=prop_history,
+                            window=12,
+                            min_games=6,
+                            decay=0.88,
+                        )
+                    )
+
+                if (
+                    prop_benchmark is None
+                    or prop_benchmark.get(
+                        "comparison"
+                    ) is None
+                    or prop_benchmark[
+                        "comparison"
+                    ].empty
+                ):
+
+                    raise ValueError(
+                        "Player-prop benchmark produced "
+                        "no comparison results."
+                    )
+
+                st.session_state[
+                    "nfl_prop_v1_v2a_benchmark"
+                ] = prop_benchmark
+
+                st.success(
+                    "NFL player-prop V1 vs V2A "
+                    "benchmark completed."
+                )
+
+            except Exception as error:
+
+                st.error(
+                    "NFL player-prop benchmark failed."
+                )
+
+                st.exception(
+                    error
+                )
+
+        # ============================================================
+        # DISPLAY SAVED PLAYER PROP BENCHMARK
+        # ============================================================
+
+        prop_benchmark = st.session_state.get(
+            "nfl_prop_v1_v2a_benchmark"
+        )
+
+        if prop_benchmark:
+
+            prop_v1 = prop_benchmark.get(
+                "v1"
+            )
+
+            prop_v2 = prop_benchmark.get(
+                "v2"
+            )
+
+            if (
+                prop_v1 is not None
+                and prop_v2 is not None
+            ):
+
+                st.markdown(
+                    "### 📊 Player Prop Projection Comparison"
+                )
+
+                (
+                    prop_v1_col,
+                    prop_v2_col,
+                ) = st.columns(2)
+
+                # ----------------------------------------------------
+                # V1
+                # ----------------------------------------------------
+
+                with prop_v1_col:
+
+                    st.markdown(
+                        "#### V1 — Mean Baseline"
+                    )
+
+                    st.metric(
+                        "Predictions",
+                        f"{prop_v1['prediction_count']:,}",
+                    )
+
+                    st.metric(
+                        "MAE",
+                        f"{prop_v1['mae']:.3f}",
+                    )
+
+                    st.metric(
+                        "RMSE",
+                        f"{prop_v1['rmse']:.3f}",
+                    )
+
+                    st.metric(
+                        "Bias",
+                        f"{prop_v1['bias']:+.3f}",
+                    )
+
+                # ----------------------------------------------------
+                # V2A
+                # ----------------------------------------------------
+
+                with prop_v2_col:
+
+                    st.markdown(
+                        "#### V2A — Recency Weighted"
+                    )
+
+                    st.metric(
+                        "Predictions",
+                        f"{prop_v2['prediction_count']:,}",
+                    )
+
+                    st.metric(
+                        "MAE",
+                        f"{prop_v2['mae']:.3f}",
+                    )
+
+                    st.metric(
+                        "RMSE",
+                        f"{prop_v2['rmse']:.3f}",
+                    )
+
+                    st.metric(
+                        "Bias",
+                        f"{prop_v2['bias']:+.3f}",
+                    )
+
+                # ----------------------------------------------------
+                # CHANGE
+                # ----------------------------------------------------
+
+                st.markdown(
+                    "### 🔬 V2A Change vs V1"
+                )
+
+                (
+                    prop_change_1,
+                    prop_change_2,
+                ) = st.columns(2)
+
+                prop_mae_change = (
+                    prop_benchmark.get(
+                        "mae_change"
+                    )
+                )
+
+                prop_rmse_change = (
+                    prop_benchmark.get(
+                        "rmse_change"
+                    )
+                )
+
+                if prop_mae_change is not None:
+
+                    prop_change_1.metric(
+                        "MAE Change",
+                        f"{prop_mae_change:+.3f}",
+                    )
+
+                else:
+
+                    prop_change_1.metric(
+                        "MAE Change",
+                        "—",
+                    )
+
+                if prop_rmse_change is not None:
+
+                    prop_change_2.metric(
+                        "RMSE Change",
+                        f"{prop_rmse_change:+.3f}",
+                    )
+
+                else:
+
+                    prop_change_2.metric(
+                        "RMSE Change",
+                        "—",
+                    )
+
+                # ----------------------------------------------------
+                # FULL OVERALL COMPARISON
+                # ----------------------------------------------------
+
+                st.markdown(
+                    "### 📋 Overall Benchmark"
+                )
+
+                prop_comparison_df = (
+                    prop_benchmark[
+                        "comparison"
+                    ].copy()
+                )
+
+                st.dataframe(
+                    prop_comparison_df,
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                # ----------------------------------------------------
+                # MARKET-BY-MARKET ANALYSIS
+                # ----------------------------------------------------
+
+                paired_prop_predictions = (
+                    prop_benchmark.get(
+                        "paired_predictions"
+                    )
+                )
+
+                if (
+                    paired_prop_predictions
+                    is not None
+                    and not paired_prop_predictions.empty
+                ):
+
+                    market_rows = []
+
+                    for (
+                        prop_market,
+                        prop_market_df,
+                    ) in paired_prop_predictions.groupby(
+                        "market"
+                    ):
+
+                        v1_market_mae = (
+                            prop_market_df[
+                                "v1_absolute_error"
+                            ].mean()
+                        )
+
+                        v2_market_mae = (
+                            prop_market_df[
+                                "v2_absolute_error"
+                            ].mean()
+                        )
+
+                        v1_market_rmse = (
+                            np.sqrt(
+                                prop_market_df[
+                                    "v1_squared_error"
+                                ].mean()
+                            )
+                        )
+
+                        v2_market_rmse = (
+                            np.sqrt(
+                                prop_market_df[
+                                    "v2_squared_error"
+                                ].mean()
+                            )
+                        )
+
+                        v1_market_bias = (
+                            prop_market_df[
+                                "v1_error"
+                            ].mean()
+                        )
+
+                        v2_market_bias = (
+                            prop_market_df[
+                                "v2_error"
+                            ].mean()
+                        )
+
+                        market_rows.append(
+                            {
+                                "Market":
+                                    prop_market,
+
+                                "Predictions":
+                                    len(
+                                        prop_market_df
+                                    ),
+
+                                "V1 MAE":
+                                    round(
+                                        v1_market_mae,
+                                        3,
+                                    ),
+
+                                "V2A MAE":
+                                    round(
+                                        v2_market_mae,
+                                        3,
+                                    ),
+
+                                "MAE Change":
+                                    round(
+                                        v2_market_mae
+                                        - v1_market_mae,
+                                        3,
+                                    ),
+
+                                "V1 RMSE":
+                                    round(
+                                        v1_market_rmse,
+                                        3,
+                                    ),
+
+                                "V2A RMSE":
+                                    round(
+                                        v2_market_rmse,
+                                        3,
+                                    ),
+
+                                "RMSE Change":
+                                    round(
+                                        v2_market_rmse
+                                        - v1_market_rmse,
+                                        3,
+                                    ),
+
+                                "V1 Bias":
+                                    round(
+                                        v1_market_bias,
+                                        3,
+                                    ),
+
+                                "V2A Bias":
+                                    round(
+                                        v2_market_bias,
+                                        3,
+                                    ),
+                            }
+                        )
+
+                    market_comparison_df = (
+                        pd.DataFrame(
+                            market_rows
+                        )
+                    )
+
+                    if not market_comparison_df.empty:
+
+                        market_comparison_df = (
+                            market_comparison_df
+                            .sort_values(
+                                "MAE Change"
+                            )
+                            .reset_index(
+                                drop=True
+                            )
+                        )
+
+                        st.markdown(
+                            "### 🧬 Performance by Prop Market"
+                        )
+
+                        st.caption(
+                            "Negative MAE/RMSE change means "
+                            "V2A improved over V1 for that "
+                            "specific market."
+                        )
+
+                        st.dataframe(
+                            market_comparison_df,
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+
+                        # --------------------------------------------
+                        # MARKET SUMMARY
+                        # --------------------------------------------
+
+                        improved_markets = (
+                            market_comparison_df[
+                                market_comparison_df[
+                                    "MAE Change"
+                                ] < 0
+                            ]
+                        )
+
+                        worse_markets = (
+                            market_comparison_df[
+                                market_comparison_df[
+                                    "MAE Change"
+                                ] > 0
+                            ]
+                        )
+
+                        (
+                            improved_col,
+                            worse_col,
+                        ) = st.columns(2)
+
+                        improved_col.metric(
+                            "Markets Improved",
+                            len(
+                                improved_markets
+                            ),
+                        )
+
+                        worse_col.metric(
+                            "Markets Worse",
+                            len(
+                                worse_markets
+                            ),
+                        )
+
+                st.caption(
+                    "This test evaluates statistical projection "
+                    "accuracy only. It does not yet measure "
+                    "historical sportsbook ROI because historical "
+                    "prop lines and prices are not currently part "
+                    "of the player-history dataset."
                 )
 
                 # ----------------------------------------------------
