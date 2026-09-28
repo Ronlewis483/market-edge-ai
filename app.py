@@ -810,54 +810,52 @@ if page == "🏠 Home":
     ):
         try:
     
-                    feature_games = st.session_state.get(
-                        "nfl_feature_games"
-                    )
-                    
-                    # ============================================
-                    # AUTO-PREPARE NFL HISTORICAL FEATURES
-                    # ============================================
-                    
-                    required_nfl_feature_columns = {
-                        "start_time",
-                        "home_score",
-                        "away_score",
-                        "home_team",
-                        "away_team",
-                    }
-                    
-                    feature_schema_is_stale = (
-                        feature_games is not None
-                        and hasattr(feature_games, "columns")
-                        and not required_nfl_feature_columns.issubset(
-                            set(feature_games.columns)
-                        )
-                    )
-                    
-                    if (
-                        feature_games is None
-                        or (
-                            hasattr(feature_games, "empty")
-                            and feature_games.empty
-                        )
-                        or feature_schema_is_stale
-                    ):
-        
-                        with st.spinner(
-                            "Preparing NFL historical data automatically..."
-                        ):
-    
+            feature_games = st.session_state.get(
+                "nfl_feature_games"
+            )
+
+            # ============================================
+            # AUTO-PREPARE NFL HISTORICAL FEATURES
+            # ============================================
+
+            required_nfl_feature_columns = {
+                "start_time",
+                "home_score",
+                "away_score",
+                "home_team",
+                "away_team",
+            }
+
+            feature_schema_is_stale = (
+                feature_games is not None
+                and hasattr(feature_games, "columns")
+                and not required_nfl_feature_columns.issubset(
+                    set(feature_games.columns)
+                )
+            )
+
+            if (
+                feature_games is None
+                or (
+                    hasattr(feature_games, "empty")
+                    and feature_games.empty
+                )
+                or feature_schema_is_stale
+            ):
+                with st.spinner(
+                    "Preparing NFL historical data automatically..."
+                ):
                     season_ids = [
                         "sr:season:115087",
                         "sr:season:127985",
                     ]
-    
+
                     multi_nfl = get_multiple_nfl_seasons(
                         season_ids
                     )
-    
+
                     historical_games = multi_nfl["games"]
-    
+
                     if (
                         historical_games is None
                         or historical_games.empty
@@ -865,57 +863,53 @@ if page == "🏠 Home":
                         raise ValueError(
                             "NFL historical download returned no games."
                         )
-    
+
                     st.session_state[
                         "multi_nfl_games"
                     ] = historical_games
-    
+
                     feature_games = build_nfl_pregame_features(
                         historical_games
                     )
-    
+
                     if feature_games.empty:
                         raise ValueError(
                             "NFL historical feature generation "
                             "returned no data."
                         )
-    
+
                     st.session_state[
                         "nfl_feature_games"
                     ] = feature_games
-    
+
                     nfl_validation = run_nfl_walkforward_model(
                         feature_games
                     )
-    
+
                     st.session_state[
                         "nfl_walkforward_result"
                     ] = nfl_validation
-    
+
                     historical_predictions = (
                         nfl_validation.get("predictions")
                     )
-    
+
                     if historical_predictions is not None:
                         st.session_state[
                             "nfl_historical_predictions"
                         ] = historical_predictions
-    
+
                     st.session_state[
                         "nfl_historical_accuracy"
                     ] = nfl_validation.get(
                         "accuracy"
                     )
-    
+
                     st.session_state[
                         "nfl_historical_sample"
                     ] = nfl_validation.get(
                         "prediction_count"
                     )
-    
-            # ============================================
-            # RUN LIVE NFL PREDICTION PIPELINE
-            # ============================================
     
             with st.spinner(
                 "Generating NFL predictions and analyzing markets..."
