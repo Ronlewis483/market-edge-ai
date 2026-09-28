@@ -9281,6 +9281,267 @@ if st.button(
         )
 
 # ==========================================
+# MLB V1 WALK-FORWARD BENCHMARK
+# ==========================================
+
+st.divider()
+
+st.subheader("⚾ MLB V1 Walk-Forward Benchmark")
+
+st.caption(
+    "Tests the current MLB V1 model using expanding-history "
+    "walk-forward validation. Every prediction is generated "
+    "using only games that occurred before that matchup."
+)
+
+if st.button(
+    "Run MLB V1 Walk-Forward Benchmark",
+    key="run_mlb_v1_walkforward",
+):
+
+    try:
+
+        with st.spinner(
+            "Building MLB historical dataset and running "
+            "walk-forward predictions..."
+        ):
+
+            current_year = pd.Timestamp.now().year
+
+            start_date = (
+                pd.Timestamp(
+                    year=current_year - 3,
+                    month=3,
+                    day=1,
+                )
+                .strftime("%Y-%m-%d")
+            )
+
+            end_date = (
+                pd.Timestamp.now()
+                .strftime("%Y-%m-%d")
+            )
+
+            mlb_games = fetch_mlb_games(
+                start_date=start_date,
+                end_date=end_date,
+            )
+
+            if mlb_games.empty:
+                raise ValueError(
+                    "No completed MLB games were returned."
+                )
+
+            mlb_features = build_mlb_pregame_features(
+                mlb_games
+            )
+
+            if mlb_features.empty:
+                raise ValueError(
+                    "No MLB pregame features were generated."
+                )
+
+            mlb_v1_predictions = (
+                run_mlb_walkforward_v1(
+                    mlb_features,
+                    min_train_games=500,
+                    retrain_every=100,
+                )
+            )
+
+            mlb_v1_results = (
+                summarize_mlb_walkforward_v1(
+                    mlb_v1_predictions
+                )
+            )
+
+        st.success(
+            "MLB V1 walk-forward benchmark completed."
+        )
+
+        # ----------------------------------
+        # OVERALL RESULTS
+        # ----------------------------------
+
+        st.markdown("### Overall Performance")
+
+        col1, col2, col3, col4 = st.columns(4)
+
+        col1.metric(
+            "Predictions",
+            f"{mlb_v1_results['prediction_count']:,}",
+        )
+
+        col2.metric(
+            "Accuracy",
+            f"{mlb_v1_results['accuracy']:.1%}",
+        )
+
+        auc_value = mlb_v1_results["auc"]
+
+        col3.metric(
+            "AUC",
+            (
+                f"{auc_value:.3f}"
+                if auc_value is not None
+                else "N/A"
+            ),
+        )
+
+        col4.metric(
+            "Brier Score",
+            f"{mlb_v1_results['brier']:.3f}",
+        )
+
+        col5, col6, col7 = st.columns(3)
+
+        col5.metric(
+            "Log Loss",
+            f"{mlb_v1_results['log_loss']:.3f}",
+        )
+
+        col6.metric(
+            "Baseline Accuracy",
+            f"{mlb_v1_results['baseline_accuracy']:.1%}",
+        )
+
+        col7.metric(
+            "Accuracy vs Baseline",
+            (
+                f"{(
+                    mlb_v1_results['accuracy']
+                    - mlb_v1_results['baseline_accuracy']
+                ) * 100:+.2f} pp"
+            ),
+        )
+
+        # ----------------------------------
+        # PROBABILITY QUALITY
+        # ----------------------------------
+
+        st.markdown("### Probability Quality")
+
+        prob1, prob2 = st.columns(2)
+
+        prob1.metric(
+            "Model Brier",
+            f"{mlb_v1_results['brier']:.4f}",
+            delta=(
+                f"{(
+                    mlb_v1_results['brier']
+                    - mlb_v1_results['baseline_brier']
+                ):+.4f} vs baseline"
+            ),
+            delta_color="inverse",
+        )
+
+        prob2.metric(
+            "Model Log Loss",
+            f"{mlb_v1_results['log_loss']:.4f}",
+            delta=(
+                f"{(
+                    mlb_v1_results['log_loss']
+                    - mlb_v1_results['baseline_log_loss']
+                ):+.4f} vs baseline"
+            ),
+            delta_color="inverse",
+        )
+
+        # ----------------------------------
+        # CONFIDENCE PERFORMANCE
+        # ----------------------------------
+
+        st.markdown("### Confidence Buckets")
+
+        confidence_table = (
+            mlb_v1_results["confidence_summary"]
+            .copy()
+        )
+
+        confidence_table["accuracy"] = (
+            confidence_table["accuracy"]
+            .map(lambda value: f"{value:.1%}")
+        )
+
+        confidence_table[
+            "average_confidence"
+        ] = (
+            confidence_table[
+                "average_confidence"
+            ]
+            .map(lambda value: f"{value:.1%}")
+        )
+
+        confidence_table = confidence_table.rename(
+            columns={
+                "confidence_bucket":
+                    "Confidence",
+                "predictions":
+                    "Predictions",
+                "accuracy":
+                    "Accuracy",
+                "average_confidence":
+                    "Average Confidence",
+            }
+        )
+
+        st.dataframe(
+            confidence_table,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        # ----------------------------------
+        # SEASON STABILITY
+        # ----------------------------------
+
+        st.markdown("### Season-by-Season Performance")
+
+        season_table = (
+            mlb_v1_results["season_summary"]
+            .copy()
+        )
+
+        season_table["accuracy"] = (
+            season_table["accuracy"]
+            .map(lambda value: f"{value:.1%}")
+        )
+
+        season_table = season_table.rename(
+            columns={
+                "season_id":
+                    "Season",
+                "predictions":
+                    "Predictions",
+                "accuracy":
+                    "Accuracy",
+            }
+        )
+
+        st.dataframe(
+            season_table,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        # ----------------------------------
+        # TEST WINDOW
+        # ----------------------------------
+
+        st.caption(
+            "Walk-forward prediction window: "
+            f"{mlb_v1_results['first_prediction']} "
+            "through "
+            f"{mlb_v1_results['last_prediction']}"
+        )
+
+    except Exception as exc:
+
+        st.error(
+            f"MLB V1 benchmark failed: {exc}"
+        )
+
+# ==========================================
 # DISPLAY MLB VALIDATION RESULTS
 # ==========================================
 
