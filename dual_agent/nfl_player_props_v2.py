@@ -2443,9 +2443,8 @@ def walkforward_v2b(
                 continue
 
             player_projection = build_player_projection(
-                previous,
-                window=window,
-                min_games=min_games,
+                sample=previous,
+                market=market,
                 decay=decay,
             )
 
