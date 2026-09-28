@@ -99,6 +99,7 @@ def fetch_mlb_games(
             "endDate":
                 chunk_end.strftime("%Y-%m-%d"),
             "gameTypes": "R",
+            "hydrate": "probablePitcher",
         }
 
         response = requests.get(
