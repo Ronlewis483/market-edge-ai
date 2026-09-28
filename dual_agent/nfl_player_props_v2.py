@@ -1874,15 +1874,14 @@ def opponent_market_context(
     min_games=V2B_MIN_OPPONENT_GAMES,
 ):
     """
-    Build leakage-safe opponent context for one prop market.
+    Build leakage-safe opponent context from ACTUAL DEFENSIVE GAMES.
 
-    Only historical games before cutoff are used.
+    Important:
+    Historical player-prop data contains multiple player rows for the
+    same opponent/game. We therefore aggregate to one opponent/game row
+    before measuring how much production that defense allowed.
 
-    The defensive allowance is compared with the league-wide
-    allowance for the same market over the same historical
-    period.
-
-    Returns None when insufficient opponent history exists.
+    Only games strictly before `cutoff` are used.
     """
 
     required = {
@@ -1910,62 +1909,85 @@ def opponent_market_context(
     if prior.empty:
         return None
 
-    opponent_sample = (
-        prior[
-            prior["opponent"] == opponent
-        ]
-        .sort_values("game_time")
-        .tail(window)
+    prior["value"] = pd.to_numeric(
+        prior["value"],
+        errors="coerce",
     )
 
-    if len(opponent_sample) < min_games:
+    prior = prior.dropna(
+        subset=[
+            "value",
+            "opponent",
+            "game_time",
+        ]
+    )
+
+    if prior.empty:
         return None
 
-    opponent_values = (
-        pd.to_numeric(
-            opponent_sample["value"],
-            errors="coerce",
+    # ---------------------------------------------------------
+    # CRITICAL V2B FIX:
+    # Aggregate player rows into ONE defensive result per game.
+    #
+    # Example:
+    # BAL allows receiving yards to five different players.
+    # Those five player rows represent ONE BAL defensive game,
+    # not five separate matchup observations.
+    # ---------------------------------------------------------
+    defense_games = (
+        prior.groupby(
+            ["opponent", "game_time"],
+            as_index=False,
         )
-        .dropna()
+        .agg(
+            total_allowed=("value", "sum")
+        )
+        .sort_values("game_time")
     )
 
-    league_values = (
-        pd.to_numeric(
-            prior["value"],
-            errors="coerce",
-        )
-        .dropna()
+    opponent_games = (
+        defense_games[
+            defense_games["opponent"] == opponent
+        ]
+        .tail(window)
+        .copy()
     )
 
-    if (
-        len(opponent_values) < min_games
-        or league_values.empty
-    ):
+    sample_size = len(opponent_games)
+
+    if sample_size < min_games:
         return None
 
     opponent_average = float(
-        opponent_values.mean()
+        opponent_games["total_allowed"].mean()
     )
 
     league_average = float(
-        league_values.mean()
+        defense_games["total_allowed"].mean()
     )
 
-    if league_average <= 0:
+    if (
+        not np.isfinite(opponent_average)
+        or not np.isfinite(league_average)
+        or league_average <= 0
+    ):
         return None
 
+    # Raw defensive environment.
+    #
+    # > 1.0 = opponent has allowed more production than league average
+    # < 1.0 = opponent has allowed less production than league average
     raw_factor = (
         opponent_average
         / league_average
     )
 
-    # Shrink small samples toward neutral (1.0).
+    # ---------------------------------------------------------
+    # SHRINKAGE
     #
-    # 4 games  -> 50% of observed adjustment
-    # 8 games  -> 67%
-    # 12 games -> 75%
-    sample_size = len(opponent_values)
-
+    # Small samples should not be allowed to move the player's
+    # projection as aggressively as larger samples.
+    # ---------------------------------------------------------
     shrinkage = (
         sample_size
         / (sample_size + 4.0)
@@ -1973,43 +1995,30 @@ def opponent_market_context(
 
     shrunk_factor = (
         1.0
-        + (
-            raw_factor - 1.0
-        )
-        * shrinkage
+        + (raw_factor - 1.0) * shrinkage
     )
 
-    lower_bound = (
-        1.0
-        - V2B_MAX_ADJUSTMENT
-    )
-
-    upper_bound = (
-        1.0
-        + V2B_MAX_ADJUSTMENT
-    )
-
+    # ---------------------------------------------------------
+    # CAP MATCHUP EFFECT
+    #
+    # V2B is an adjustment to the player model, not a replacement
+    # for the player's own historical production.
+    # ---------------------------------------------------------
     matchup_factor = float(
         np.clip(
             shrunk_factor,
-            lower_bound,
-            upper_bound,
+            1.0 - V2B_MAX_ADJUSTMENT,
+            1.0 + V2B_MAX_ADJUSTMENT,
         )
     )
 
     return {
         "opponent": opponent,
-        "opponent_games": int(
-            sample_size
-        ),
-        "opponent_average_allowed":
-            opponent_average,
-        "league_average_allowed":
-            league_average,
-        "raw_matchup_factor":
-            float(raw_factor),
-        "matchup_factor":
-            matchup_factor,
+        "opponent_games": int(sample_size),
+        "opponent_average_allowed": opponent_average,
+        "league_average_allowed": league_average,
+        "raw_matchup_factor": float(raw_factor),
+        "matchup_factor": matchup_factor,
     }
 
 
