@@ -98,6 +98,15 @@ from dual_agent.bet_settlement import (
 
 from dual_agent.nfl_player_history import load_player_history
 
+from dual_agent.mlb_research import (
+    fetch_mlb_games,
+    build_mlb_pregame_features,
+    summarize_mlb_dataset,
+    train_mlb_prediction_model,
+    run_mlb_walkforward_v1,
+    summarize_mlb_walkforward_v1,
+)
+
 st.set_page_config(page_title="Market Edge AI V5", page_icon="📊", layout="wide")
 
 # ==========================================
