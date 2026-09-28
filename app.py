@@ -94,7 +94,7 @@ from dual_agent.bet_settlement import (
     auto_settle_bets,
 )
 
-from dual_agent.nfl_player_history import get_nfl_player_history
+from dual_agent.nfl_player_history import load_player_history
 
 st.set_page_config(page_title="Market Edge AI V5", page_icon="📊", layout="wide")
 
@@ -4668,8 +4668,14 @@ def render_research_lab():
                     "Loading historical NFL player data..."
                 ):
 
-                    prop_history = (
-                        get_nfl_player_history()
+                    current_nfl_season = pd.Timestamp.now().year
+
+                    prop_history = load_player_history(
+                        [
+                            current_nfl_season - 2,
+                            current_nfl_season - 1,
+                            current_nfl_season,
+                        ]
                     )
 
                 if (
