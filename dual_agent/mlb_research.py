@@ -1368,3 +1368,1152 @@ def summarize_mlb_walkforward_v1(
         "predictions":
             df,
     }
+
+# ==========================================
+# MLB V2A — STARTING PITCHER ENGINE
+# ==========================================
+
+MLB_BOXSCORE_URL = (
+    "https://statsapi.mlb.com/api/v1/game/{game_id}/boxscore"
+)
+
+
+def _innings_to_outs(innings):
+    """
+    Convert MLB innings notation to outs.
+
+    Examples:
+        5.0 -> 15 outs
+        5.1 -> 16 outs
+        5.2 -> 17 outs
+    """
+
+    if innings is None:
+        return 0
+
+    value = str(innings).strip()
+
+    if not value:
+        return 0
+
+    try:
+        if "." in value:
+            whole, partial = value.split(".", 1)
+
+            whole = int(whole)
+            partial = int(partial[:1] or 0)
+
+            partial = max(
+                0,
+                min(partial, 2),
+            )
+
+            return (
+                whole * 3
+                + partial
+            )
+
+        return int(float(value)) * 3
+
+    except (TypeError, ValueError):
+        return 0
+
+
+def _safe_number(value, default=0.0):
+    """
+    Convert an MLB API statistic to float safely.
+    """
+
+    try:
+        if value is None or value == "":
+            return float(default)
+
+        return float(value)
+
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def fetch_mlb_starting_pitcher_game_logs(
+    games,
+    timeout=30,
+):
+    """
+    Retrieve the completed-game pitching line for the
+    listed home and away starters.
+
+    This produces POSTGAME pitcher records.
+
+    These records are NOT themselves pregame features.
+    They are later accumulated chronologically so that
+    each game's features use only earlier starts.
+    """
+
+    if games is None or games.empty:
+        return pd.DataFrame()
+
+    required = [
+        "game_id",
+        "start_time",
+        "season_id",
+        "home_starting_pitcher_id",
+        "away_starting_pitcher_id",
+    ]
+
+    missing = [
+        column
+        for column in required
+        if column not in games.columns
+    ]
+
+    if missing:
+        raise ValueError(
+            "MLB pitcher log retrieval is missing "
+            f"columns: {missing}"
+        )
+
+    df = games.copy()
+
+    df["start_time"] = pd.to_datetime(
+        df["start_time"],
+        utc=True,
+        errors="coerce",
+    )
+
+    df = (
+        df.dropna(
+            subset=[
+                "game_id",
+                "start_time",
+            ]
+        )
+        .drop_duplicates(
+            subset=["game_id"]
+        )
+        .sort_values(
+            [
+                "start_time",
+                "game_id",
+            ]
+        )
+        .reset_index(drop=True)
+    )
+
+    rows = []
+
+    session = requests.Session()
+
+    for _, game in df.iterrows():
+
+        game_id = int(
+            game["game_id"]
+        )
+
+        url = MLB_BOXSCORE_URL.format(
+            game_id=game_id
+        )
+
+        try:
+
+            response = session.get(
+                url,
+                timeout=timeout,
+            )
+
+            response.raise_for_status()
+
+            payload = response.json()
+
+        except (
+            requests.RequestException,
+            ValueError,
+        ):
+            continue
+
+        teams = payload.get(
+            "teams",
+            {},
+        )
+
+        starter_targets = [
+            (
+                "home",
+                game.get(
+                    "home_starting_pitcher_id"
+                ),
+                game.get(
+                    "home_starting_pitcher"
+                ),
+            ),
+            (
+                "away",
+                game.get(
+                    "away_starting_pitcher_id"
+                ),
+                game.get(
+                    "away_starting_pitcher"
+                ),
+            ),
+        ]
+
+        for side, pitcher_id, pitcher_name in starter_targets:
+
+            if pd.isna(pitcher_id):
+                continue
+
+            pitcher_id = int(
+                pitcher_id
+            )
+
+            side_data = teams.get(
+                side,
+                {},
+            )
+
+            players = side_data.get(
+                "players",
+                {},
+            )
+
+            player = players.get(
+                f"ID{pitcher_id}",
+                {},
+            )
+
+            if not player:
+                continue
+
+            pitching = (
+                player.get(
+                    "stats",
+                    {},
+                )
+                .get(
+                    "pitching",
+                    {},
+                )
+            )
+
+            if not pitching:
+                continue
+
+            outs = _innings_to_outs(
+                pitching.get(
+                    "inningsPitched"
+                )
+            )
+
+            innings = (
+                outs / 3.0
+            )
+
+            hits = _safe_number(
+                pitching.get("hits")
+            )
+
+            runs = _safe_number(
+                pitching.get("runs")
+            )
+
+            earned_runs = _safe_number(
+                pitching.get(
+                    "earnedRuns"
+                )
+            )
+
+            walks = _safe_number(
+                pitching.get(
+                    "baseOnBalls"
+                )
+            )
+
+            strikeouts = _safe_number(
+                pitching.get(
+                    "strikeOuts"
+                )
+            )
+
+            home_runs = _safe_number(
+                pitching.get(
+                    "homeRuns"
+                )
+            )
+
+            batters_faced = _safe_number(
+                pitching.get(
+                    "battersFaced"
+                )
+            )
+
+            pitches = _safe_number(
+                pitching.get(
+                    "numberOfPitches"
+                )
+            )
+
+            strikes = _safe_number(
+                pitching.get(
+                    "strikes"
+                )
+            )
+
+            rows.append(
+                {
+                    "game_id":
+                        game_id,
+
+                    "season_id":
+                        game.get(
+                            "season_id"
+                        ),
+
+                    "start_time":
+                        game["start_time"],
+
+                    "side":
+                        side,
+
+                    "pitcher_id":
+                        pitcher_id,
+
+                    "pitcher_name":
+                        (
+                            player.get(
+                                "person",
+                                {},
+                            ).get(
+                                "fullName"
+                            )
+                            or pitcher_name
+                        ),
+
+                    "outs":
+                        int(outs),
+
+                    "innings":
+                        float(innings),
+
+                    "hits":
+                        float(hits),
+
+                    "runs":
+                        float(runs),
+
+                    "earned_runs":
+                        float(earned_runs),
+
+                    "walks":
+                        float(walks),
+
+                    "strikeouts":
+                        float(strikeouts),
+
+                    "home_runs":
+                        float(home_runs),
+
+                    "batters_faced":
+                        float(batters_faced),
+
+                    "pitches":
+                        float(pitches),
+
+                    "strikes":
+                        float(strikes),
+                }
+            )
+
+    return (
+        pd.DataFrame(rows)
+        .sort_values(
+            [
+                "start_time",
+                "game_id",
+                "side",
+            ]
+        )
+        .reset_index(drop=True)
+        if rows
+        else pd.DataFrame()
+    )
+
+
+# ==========================================
+# PREGAME PITCHER FEATURES
+# ==========================================
+
+def calculate_pitcher_features(
+    history,
+):
+    """
+    Calculate pitcher quality using only starts
+    completed before the current game.
+    """
+
+    if not history:
+
+        return {
+            "starter_prior_starts": 0.0,
+            "starter_prior_innings": 0.0,
+            "starter_era": 4.50,
+            "starter_whip": 1.30,
+            "starter_k_per_9": 8.00,
+            "starter_bb_per_9": 3.00,
+            "starter_hr_per_9": 1.20,
+            "starter_k_bb_ratio": 2.50,
+            "starter_recent_3_era": 4.50,
+            "starter_recent_3_whip": 1.30,
+            "starter_recent_3_k_per_9": 8.00,
+        }
+
+    df = pd.DataFrame(history)
+
+    outs = float(
+        df["outs"].sum()
+    )
+
+    innings = (
+        outs / 3.0
+    )
+
+    hits = float(
+        df["hits"].sum()
+    )
+
+    earned_runs = float(
+        df["earned_runs"].sum()
+    )
+
+    walks = float(
+        df["walks"].sum()
+    )
+
+    strikeouts = float(
+        df["strikeouts"].sum()
+    )
+
+    home_runs = float(
+        df["home_runs"].sum()
+    )
+
+    era = (
+        earned_runs * 9.0 / innings
+        if innings > 0
+        else 4.50
+    )
+
+    whip = (
+        (walks + hits) / innings
+        if innings > 0
+        else 1.30
+    )
+
+    k_per_9 = (
+        strikeouts * 9.0 / innings
+        if innings > 0
+        else 8.00
+    )
+
+    bb_per_9 = (
+        walks * 9.0 / innings
+        if innings > 0
+        else 3.00
+    )
+
+    hr_per_9 = (
+        home_runs * 9.0 / innings
+        if innings > 0
+        else 1.20
+    )
+
+    k_bb_ratio = (
+        strikeouts / walks
+        if walks > 0
+        else strikeouts
+    )
+
+    recent = df.tail(3)
+
+    recent_outs = float(
+        recent["outs"].sum()
+    )
+
+    recent_innings = (
+        recent_outs / 3.0
+    )
+
+    recent_hits = float(
+        recent["hits"].sum()
+    )
+
+    recent_walks = float(
+        recent["walks"].sum()
+    )
+
+    recent_earned_runs = float(
+        recent["earned_runs"].sum()
+    )
+
+    recent_strikeouts = float(
+        recent["strikeouts"].sum()
+    )
+
+    recent_era = (
+        recent_earned_runs
+        * 9.0
+        / recent_innings
+        if recent_innings > 0
+        else 4.50
+    )
+
+    recent_whip = (
+        (
+            recent_walks
+            + recent_hits
+        )
+        / recent_innings
+        if recent_innings > 0
+        else 1.30
+    )
+
+    recent_k_per_9 = (
+        recent_strikeouts
+        * 9.0
+        / recent_innings
+        if recent_innings > 0
+        else 8.00
+    )
+
+    return {
+        "starter_prior_starts":
+            float(len(df)),
+
+        "starter_prior_innings":
+            float(innings),
+
+        "starter_era":
+            float(era),
+
+        "starter_whip":
+            float(whip),
+
+        "starter_k_per_9":
+            float(k_per_9),
+
+        "starter_bb_per_9":
+            float(bb_per_9),
+
+        "starter_hr_per_9":
+            float(hr_per_9),
+
+        "starter_k_bb_ratio":
+            float(k_bb_ratio),
+
+        "starter_recent_3_era":
+            float(recent_era),
+
+        "starter_recent_3_whip":
+            float(recent_whip),
+
+        "starter_recent_3_k_per_9":
+            float(recent_k_per_9),
+    }
+
+
+MLB_V2A_PITCHER_FEATURES = [
+    "starter_prior_starts_diff",
+    "starter_prior_innings_diff",
+    "starter_era_diff",
+    "starter_whip_diff",
+    "starter_k_per_9_diff",
+    "starter_bb_per_9_diff",
+    "starter_hr_per_9_diff",
+    "starter_k_bb_ratio_diff",
+    "starter_recent_3_era_diff",
+    "starter_recent_3_whip_diff",
+    "starter_recent_3_k_per_9_diff",
+]
+
+
+MLB_V2A_MODEL_FEATURES = (
+    MLB_MODEL_FEATURES
+    + MLB_V2A_PITCHER_FEATURES
+)
+
+
+def build_mlb_v2a_features(
+    games,
+    team_features,
+    pitcher_logs,
+):
+    """
+    Add leakage-safe starting-pitcher features to the
+    existing V1 team feature dataset.
+
+    Pitcher histories are updated only AFTER all games
+    at the current timestamp receive their pregame
+    pitcher features.
+    """
+
+    if games is None or games.empty:
+        raise ValueError(
+            "No MLB games available for V2A."
+        )
+
+    if team_features is None or team_features.empty:
+        raise ValueError(
+            "No MLB V1 team features available for V2A."
+        )
+
+    if pitcher_logs is None or pitcher_logs.empty:
+        raise ValueError(
+            "No MLB pitcher logs available for V2A."
+        )
+
+    required_game_columns = [
+        "game_id",
+        "start_time",
+        "home_starting_pitcher_id",
+        "away_starting_pitcher_id",
+    ]
+
+    missing = [
+        column
+        for column in required_game_columns
+        if column not in games.columns
+    ]
+
+    if missing:
+        raise ValueError(
+            f"MLB V2A games are missing columns: {missing}"
+        )
+
+    game_df = games.copy()
+
+    game_df["start_time"] = pd.to_datetime(
+        game_df["start_time"],
+        utc=True,
+        errors="coerce",
+    )
+
+    game_df = (
+        game_df.dropna(
+            subset=[
+                "game_id",
+                "start_time",
+            ]
+        )
+        .drop_duplicates(
+            subset=["game_id"]
+        )
+        .sort_values(
+            [
+                "start_time",
+                "game_id",
+            ]
+        )
+        .reset_index(drop=True)
+    )
+
+    logs = pitcher_logs.copy()
+
+    logs["start_time"] = pd.to_datetime(
+        logs["start_time"],
+        utc=True,
+        errors="coerce",
+    )
+
+    logs = logs.dropna(
+        subset=[
+            "game_id",
+            "start_time",
+            "pitcher_id",
+        ]
+    )
+
+    logs_by_game = defaultdict(list)
+
+    for _, log_row in logs.iterrows():
+
+        logs_by_game[
+            int(log_row["game_id"])
+        ].append(
+            log_row.to_dict()
+        )
+
+    pitcher_history = defaultdict(list)
+
+    pitcher_rows = []
+
+    for game_time, group in game_df.groupby(
+        "start_time",
+        sort=True,
+    ):
+
+        pending_updates = []
+
+        for _, game in group.iterrows():
+
+            game_id = int(
+                game["game_id"]
+            )
+
+            home_pitcher_id = (
+                game.get(
+                    "home_starting_pitcher_id"
+                )
+            )
+
+            away_pitcher_id = (
+                game.get(
+                    "away_starting_pitcher_id"
+                )
+            )
+
+            if pd.isna(home_pitcher_id):
+                home_pitcher_id = None
+            else:
+                home_pitcher_id = int(
+                    home_pitcher_id
+                )
+
+            if pd.isna(away_pitcher_id):
+                away_pitcher_id = None
+            else:
+                away_pitcher_id = int(
+                    away_pitcher_id
+                )
+
+            home_history = (
+                pitcher_history[
+                    home_pitcher_id
+                ]
+                if home_pitcher_id is not None
+                else []
+            )
+
+            away_history = (
+                pitcher_history[
+                    away_pitcher_id
+                ]
+                if away_pitcher_id is not None
+                else []
+            )
+
+            home_features = (
+                calculate_pitcher_features(
+                    home_history
+                )
+            )
+
+            away_features = (
+                calculate_pitcher_features(
+                    away_history
+                )
+            )
+
+            row = {
+                "game_id":
+                    game_id,
+
+                "home_starting_pitcher_id":
+                    home_pitcher_id,
+
+                "away_starting_pitcher_id":
+                    away_pitcher_id,
+
+                "home_starting_pitcher":
+                    game.get(
+                        "home_starting_pitcher"
+                    ),
+
+                "away_starting_pitcher":
+                    game.get(
+                        "away_starting_pitcher"
+                    ),
+            }
+
+            feature_names = [
+                name.replace(
+                    "_diff",
+                    "",
+                )
+                for name
+                in MLB_V2A_PITCHER_FEATURES
+            ]
+
+            for name in feature_names:
+
+                home_value = (
+                    home_features[name]
+                )
+
+                away_value = (
+                    away_features[name]
+                )
+
+                row[
+                    f"home_{name}"
+                ] = home_value
+
+                row[
+                    f"away_{name}"
+                ] = away_value
+
+                row[
+                    f"{name}_diff"
+                ] = (
+                    home_value
+                    - away_value
+                )
+
+            pitcher_rows.append(
+                row
+            )
+
+            # Only update histories after the
+            # current timestamp group is scored.
+            for log_record in logs_by_game.get(
+                game_id,
+                [],
+            ):
+
+                pitcher_id = int(
+                    log_record[
+                        "pitcher_id"
+                    ]
+                )
+
+                pending_updates.append(
+                    (
+                        pitcher_id,
+                        {
+                            "outs":
+                                log_record[
+                                    "outs"
+                                ],
+
+                            "hits":
+                                log_record[
+                                    "hits"
+                                ],
+
+                            "earned_runs":
+                                log_record[
+                                    "earned_runs"
+                                ],
+
+                            "walks":
+                                log_record[
+                                    "walks"
+                                ],
+
+                            "strikeouts":
+                                log_record[
+                                    "strikeouts"
+                                ],
+
+                            "home_runs":
+                                log_record[
+                                    "home_runs"
+                                ],
+                        },
+                    )
+                )
+
+        for pitcher_id, result in pending_updates:
+
+            pitcher_history[
+                pitcher_id
+            ].append(
+                result
+            )
+
+    pitcher_features = pd.DataFrame(
+        pitcher_rows
+    )
+
+    combined = team_features.merge(
+        pitcher_features,
+        on="game_id",
+        how="left",
+        validate="one_to_one",
+    )
+
+    return (
+        combined
+        .sort_values(
+            [
+                "start_time",
+                "game_id",
+            ]
+        )
+        .reset_index(drop=True)
+    )
+
+
+# ==========================================
+# MLB V2A WALK-FORWARD CHALLENGER
+# ==========================================
+
+def run_mlb_walkforward_v2a(
+    features,
+    min_train_games=500,
+    retrain_every=100,
+):
+    """
+    Walk-forward evaluation for MLB V2A.
+
+    Uses:
+        V1 team features
+        +
+        leakage-safe starting-pitcher features
+    """
+
+    if features is None or features.empty:
+        raise ValueError(
+            "No MLB V2A features available."
+        )
+
+    df = features.copy()
+
+    required = (
+        [
+            "game_id",
+            "start_time",
+            "home_win",
+        ]
+        + MLB_V2A_MODEL_FEATURES
+    )
+
+    missing = [
+        column
+        for column in required
+        if column not in df.columns
+    ]
+
+    if missing:
+        raise ValueError(
+            f"MLB V2A data is missing columns: {missing}"
+        )
+
+    df["start_time"] = pd.to_datetime(
+        df["start_time"],
+        utc=True,
+        errors="coerce",
+    )
+
+    df = df.dropna(
+        subset=[
+            "game_id",
+            "start_time",
+            "home_win",
+        ]
+    )
+
+    df = (
+        df.sort_values(
+            [
+                "start_time",
+                "game_id",
+            ]
+        )
+        .reset_index(drop=True)
+    )
+
+    rows = []
+
+    model = None
+    trained_through_time = None
+    predictions_since_fit = retrain_every
+
+    for game_time, current_group in df.groupby(
+        "start_time",
+        sort=True,
+    ):
+
+        train = df[
+            df["start_time"] < game_time
+        ].copy()
+
+        if len(train) < min_train_games:
+            continue
+
+        y_train = (
+            train["home_win"]
+            .astype(int)
+        )
+
+        if y_train.nunique() < 2:
+            continue
+
+        needs_retrain = (
+            model is None
+            or predictions_since_fit
+            >= retrain_every
+        )
+
+        if needs_retrain:
+
+            X_train = (
+                train[
+                    MLB_V2A_MODEL_FEATURES
+                ]
+                .apply(
+                    pd.to_numeric,
+                    errors="coerce",
+                )
+                .fillna(0.0)
+            )
+
+            model = make_pipeline(
+                StandardScaler(),
+                LogisticRegression(
+                    max_iter=2000,
+                    random_state=42,
+                ),
+            )
+
+            model.fit(
+                X_train,
+                y_train,
+            )
+
+            trained_through_time = (
+                train["start_time"].max()
+            )
+
+            predictions_since_fit = 0
+
+        X_current = (
+            current_group[
+                MLB_V2A_MODEL_FEATURES
+            ]
+            .apply(
+                pd.to_numeric,
+                errors="coerce",
+            )
+            .fillna(0.0)
+        )
+
+        probabilities = (
+            model.predict_proba(
+                X_current
+            )[:, 1]
+        )
+
+        for position, (_, game) in enumerate(
+            current_group.iterrows()
+        ):
+
+            probability = float(
+                probabilities[position]
+            )
+
+            actual = int(
+                game["home_win"]
+            )
+
+            predicted = int(
+                probability >= 0.50
+            )
+
+            confidence = float(
+                max(
+                    probability,
+                    1.0 - probability,
+                )
+            )
+
+            rows.append(
+                {
+                    "game_id":
+                        game["game_id"],
+
+                    "season_id":
+                        game.get(
+                            "season_id"
+                        ),
+
+                    "start_time":
+                        game_time,
+
+                    "home_team":
+                        game.get(
+                            "home_team"
+                        ),
+
+                    "away_team":
+                        game.get(
+                            "away_team"
+                        ),
+
+                    "actual_home_win":
+                        actual,
+
+                    "home_win_probability":
+                        probability,
+
+                    "predicted_home_win":
+                        predicted,
+
+                    "confidence":
+                        confidence,
+
+                    "correct":
+                        int(
+                            predicted
+                            == actual
+                        ),
+
+                    "trained_through":
+                        trained_through_time,
+
+                    "model_version":
+                        "MLB_V2A",
+                }
+            )
+
+        predictions_since_fit += len(
+            current_group
+        )
+
+    predictions = pd.DataFrame(
+        rows
+    )
+
+    if predictions.empty:
+        raise ValueError(
+            "MLB V2A walk-forward produced no predictions."
+        )
+
+    return (
+        predictions
+        .sort_values(
+            [
+                "start_time",
+                "game_id",
+            ]
+        )
+        .reset_index(drop=True)
+    )
+
+
+def summarize_mlb_walkforward_v2a(
+    predictions,
+):
+    """
+    Use the same scoring methodology as V1 so
+    V1 and V2A remain directly comparable.
+    """
+
+    results = (
+        summarize_mlb_walkforward_v1(
+            predictions
+        )
+    )
+
+    results[
+        "model_version"
+    ] = "MLB_V2A"
+
+    return results
