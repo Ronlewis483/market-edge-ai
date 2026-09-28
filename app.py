@@ -9456,6 +9456,68 @@ if st.button(
         )
 
         # ----------------------------------
+        # STARTING PITCHER DATA COVERAGE
+        # ----------------------------------
+        
+        st.markdown(
+            "### Starting Pitcher Data Coverage"
+        )
+        
+        pitcher_col1, pitcher_col2, pitcher_col3 = (
+            st.columns(3)
+        )
+        
+        pitcher_col1.metric(
+            "Historical Games",
+            f"{total_pitcher_games:,}",
+        )
+        
+        pitcher_col2.metric(
+            "Both Starters Available",
+            f"{games_with_both_starters:,}",
+        )
+        
+        pitcher_col3.metric(
+            "Pitcher Coverage",
+            f"{overall_pitcher_coverage:.1%}",
+        )
+        
+        if not pitcher_coverage_by_season.empty:
+        
+            coverage_display = (
+                pitcher_coverage_by_season.copy()
+            )
+        
+            coverage_display["coverage"] = (
+                coverage_display["coverage"]
+                .map(
+                    lambda value:
+                        f"{value:.1%}"
+                )
+            )
+        
+            coverage_display = (
+                coverage_display.rename(
+                    columns={
+                        "season":
+                            "Season",
+                        "games":
+                            "Games",
+                        "games_with_both_starters":
+                            "Both Starters",
+                        "coverage":
+                            "Coverage",
+                    }
+                )
+            )
+        
+            st.dataframe(
+                coverage_display,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        # ----------------------------------
         # OVERALL RESULTS
         # ----------------------------------
 
