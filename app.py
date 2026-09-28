@@ -4240,7 +4240,397 @@ def render_research_lab():
                     "nfl_feature_games"
                 )
 
+        
+                # ----------------------------------------------------
+                # BUILD HISTORICAL FEATURES IF THEY ARE NOT LOADED
+                # ----------------------------------------------------
+
+                if (
+                    feature_games is None
+                    or (
+                        hasattr(
+                            feature_games,
+                            "empty",
+                        )
+                        and feature_games.empty
+                    )
+                ):
+
+                    with st.spinner(
+                        "Loading NFL historical data..."
+                    ):
+
+                        season_ids = [
+                            "sr:season:115087",
+                            "sr:season:127985",
+                        ]
+
+                        multi_nfl = (
+                            get_multiple_nfl_seasons(
+                                season_ids
+                            )
+                        )
+
+                        historical_games = (
+                            multi_nfl["games"]
+                        )
+
+                        if (
+                            historical_games is None
+                            or historical_games.empty
+                        ):
+
+                            raise ValueError(
+                                "NFL historical download "
+                                "returned no games."
+                            )
+
+                        feature_games = (
+                            build_nfl_pregame_features(
+                                historical_games
+                            )
+                        )
+
+                        if feature_games.empty:
+
+                            raise ValueError(
+                                "NFL historical feature "
+                                "generation returned no data."
+                            )
+
+                        st.session_state[
+                            "nfl_feature_games"
+                        ] = feature_games
+
+                # ----------------------------------------------------
+                # RUN V1 VS V2
+                # ----------------------------------------------------
+
+                with st.spinner(
+                    "Running NFL V1 and V2 walk-forward "
+                    "validation..."
+                ):
+
+                    benchmark = compare_nfl_v1_v2(
+                        feature_games=feature_games,
+                        min_train_games=100,
+                        retrain_every=25,
+                    )
+
+                st.session_state[
+                    "nfl_v1_v2_benchmark"
+                ] = benchmark
+
+                st.success(
+                    "NFL V1 vs V2 benchmark completed."
+                )
+
+            except Exception as error:
+
+                st.error(
+                    "NFL V1 vs V2 benchmark failed."
+                )
+
+                st.exception(error)
+
         # ============================================================
+        # DISPLAY SAVED BENCHMARK
+        # ============================================================
+
+        nfl_benchmark = st.session_state.get(
+            "nfl_v1_v2_benchmark"
+        )
+
+        if nfl_benchmark:
+
+            v1 = nfl_benchmark["v1"]
+            v2 = nfl_benchmark["v2"]
+
+            st.markdown(
+                "### 📊 Model Comparison"
+            )
+
+            # --------------------------------------------------------
+            # MODEL SUMMARY
+            # --------------------------------------------------------
+
+            (
+                v1_col,
+                v2_col,
+            ) = st.columns(2)
+
+            with v1_col:
+
+                st.markdown(
+                    "#### V1 — Current Model"
+                )
+
+                st.metric(
+                    "Accuracy",
+                    f"{v1['accuracy']:.1%}",
+                )
+
+                st.metric(
+                    "AUC",
+                    f"{v1['auc']:.3f}",
+                )
+
+                st.metric(
+                    "Brier Score",
+                    f"{v1['brier']:.3f}",
+                )
+
+                st.metric(
+                    "Log Loss",
+                    f"{v1['log_loss']:.3f}",
+                )
+
+                st.metric(
+                    "Features",
+                    len(
+                        v1["feature_columns"]
+                    ),
+                )
+
+                st.metric(
+                    "Predictions",
+                    v1["prediction_count"],
+                )
+
+            with v2_col:
+
+                st.markdown(
+                    "#### V2 — Expanded Model"
+                )
+
+                st.metric(
+                    "Accuracy",
+                    f"{v2['accuracy']:.1%}",
+                )
+
+                st.metric(
+                    "AUC",
+                    f"{v2['auc']:.3f}",
+                )
+
+                st.metric(
+                    "Brier Score",
+                    f"{v2['brier']:.3f}",
+                )
+
+                st.metric(
+                    "Log Loss",
+                    f"{v2['log_loss']:.3f}",
+                )
+
+                st.metric(
+                    "Features",
+                    len(
+                        v2["feature_columns"]
+                    ),
+                )
+
+                st.metric(
+                    "Predictions",
+                    v2["prediction_count"],
+                )
+
+            # --------------------------------------------------------
+            # CHANGE FROM V1 TO V2
+            # --------------------------------------------------------
+
+            st.markdown(
+                "### 🔬 V2 Change vs V1"
+            )
+
+            (
+                change_col1,
+                change_col2,
+                change_col3,
+                change_col4,
+            ) = st.columns(4)
+
+            accuracy_change = (
+                nfl_benchmark[
+                    "accuracy_change"
+                ]
+            )
+
+            auc_change = (
+                nfl_benchmark[
+                    "auc_change"
+                ]
+            )
+
+            brier_change = (
+                nfl_benchmark[
+                    "brier_change"
+                ]
+            )
+
+            log_loss_change = (
+                nfl_benchmark[
+                    "log_loss_change"
+                ]
+            )
+
+            change_col1.metric(
+                "Accuracy Change",
+                f"{accuracy_change:+.2%}",
+            )
+
+            if pd.notna(auc_change):
+
+                change_col2.metric(
+                    "AUC Change",
+                    f"{auc_change:+.3f}",
+                )
+
+            else:
+
+                change_col2.metric(
+                    "AUC Change",
+                    "—",
+                )
+
+            change_col3.metric(
+                "Brier Change",
+                f"{brier_change:+.3f}",
+            )
+
+            change_col4.metric(
+                "Log Loss Change",
+                f"{log_loss_change:+.3f}",
+            )
+
+            # --------------------------------------------------------
+            # HIGH CONFIDENCE PERFORMANCE
+            # --------------------------------------------------------
+
+            st.markdown(
+                "### 🔥 High-Confidence Performance"
+            )
+
+            (
+                confidence_col1,
+                confidence_col2,
+            ) = st.columns(2)
+
+            with confidence_col1:
+
+                st.markdown(
+                    "**V1**"
+                )
+
+                v1_high_count = (
+                    v1.get(
+                        "high_confidence_count",
+                        0,
+                    )
+                )
+
+                v1_high_accuracy = (
+                    v1.get(
+                        "high_confidence_accuracy"
+                    )
+                )
+
+                st.metric(
+                    "70%+ Predictions",
+                    v1_high_count,
+                )
+
+                if (
+                    v1_high_accuracy
+                    is not None
+                    and pd.notna(
+                        v1_high_accuracy
+                    )
+                ):
+
+                    st.metric(
+                        "70%+ Accuracy",
+                        f"{v1_high_accuracy:.1%}",
+                    )
+
+                else:
+
+                    st.metric(
+                        "70%+ Accuracy",
+                        "—",
+                    )
+
+            with confidence_col2:
+
+                st.markdown(
+                    "**V2**"
+                )
+
+                v2_high_count = (
+                    v2.get(
+                        "high_confidence_count",
+                        0,
+                    )
+                )
+
+                v2_high_accuracy = (
+                    v2.get(
+                        "high_confidence_accuracy"
+                    )
+                )
+
+                st.metric(
+                    "70%+ Predictions",
+                    v2_high_count,
+                )
+
+                if (
+                    v2_high_accuracy
+                    is not None
+                    and pd.notna(
+                        v2_high_accuracy
+                    )
+                ):
+
+                    st.metric(
+                        "70%+ Accuracy",
+                        f"{v2_high_accuracy:.1%}",
+                    )
+
+                else:
+
+                    st.metric(
+                        "70%+ Accuracy",
+                        "—",
+                    )
+
+            # --------------------------------------------------------
+            # FULL COMPARISON TABLE
+            # --------------------------------------------------------
+
+            comparison_df = (
+                nfl_benchmark[
+                    "comparison"
+                ].copy()
+            )
+
+            st.markdown(
+                "### 📋 Full Benchmark"
+            )
+
+            st.dataframe(
+                comparison_df,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            st.caption(
+                "Higher accuracy and AUC are better. "
+                "Lower Brier score and log loss are better. "
+                "V2 is experimental and has not replaced V1."
+            )
+
+                # ============================================================
         # NFL PLAYER PROP V1 VS V2A BENCHMARK
         # ============================================================
 
@@ -4715,395 +5105,6 @@ def render_research_lab():
                     "prop lines and prices are not currently part "
                     "of the player-history dataset."
                 )
-
-                # ----------------------------------------------------
-                # BUILD HISTORICAL FEATURES IF THEY ARE NOT LOADED
-                # ----------------------------------------------------
-
-                if (
-                    feature_games is None
-                    or (
-                        hasattr(
-                            feature_games,
-                            "empty",
-                        )
-                        and feature_games.empty
-                    )
-                ):
-
-                    with st.spinner(
-                        "Loading NFL historical data..."
-                    ):
-
-                        season_ids = [
-                            "sr:season:115087",
-                            "sr:season:127985",
-                        ]
-
-                        multi_nfl = (
-                            get_multiple_nfl_seasons(
-                                season_ids
-                            )
-                        )
-
-                        historical_games = (
-                            multi_nfl["games"]
-                        )
-
-                        if (
-                            historical_games is None
-                            or historical_games.empty
-                        ):
-
-                            raise ValueError(
-                                "NFL historical download "
-                                "returned no games."
-                            )
-
-                        feature_games = (
-                            build_nfl_pregame_features(
-                                historical_games
-                            )
-                        )
-
-                        if feature_games.empty:
-
-                            raise ValueError(
-                                "NFL historical feature "
-                                "generation returned no data."
-                            )
-
-                        st.session_state[
-                            "nfl_feature_games"
-                        ] = feature_games
-
-                # ----------------------------------------------------
-                # RUN V1 VS V2
-                # ----------------------------------------------------
-
-                with st.spinner(
-                    "Running NFL V1 and V2 walk-forward "
-                    "validation..."
-                ):
-
-                    benchmark = compare_nfl_v1_v2(
-                        feature_games=feature_games,
-                        min_train_games=100,
-                        retrain_every=25,
-                    )
-
-                st.session_state[
-                    "nfl_v1_v2_benchmark"
-                ] = benchmark
-
-                st.success(
-                    "NFL V1 vs V2 benchmark completed."
-                )
-
-            except Exception as error:
-
-                st.error(
-                    "NFL V1 vs V2 benchmark failed."
-                )
-
-                st.exception(error)
-
-        # ============================================================
-        # DISPLAY SAVED BENCHMARK
-        # ============================================================
-
-        nfl_benchmark = st.session_state.get(
-            "nfl_v1_v2_benchmark"
-        )
-
-        if nfl_benchmark:
-
-            v1 = nfl_benchmark["v1"]
-            v2 = nfl_benchmark["v2"]
-
-            st.markdown(
-                "### 📊 Model Comparison"
-            )
-
-            # --------------------------------------------------------
-            # MODEL SUMMARY
-            # --------------------------------------------------------
-
-            (
-                v1_col,
-                v2_col,
-            ) = st.columns(2)
-
-            with v1_col:
-
-                st.markdown(
-                    "#### V1 — Current Model"
-                )
-
-                st.metric(
-                    "Accuracy",
-                    f"{v1['accuracy']:.1%}",
-                )
-
-                st.metric(
-                    "AUC",
-                    f"{v1['auc']:.3f}",
-                )
-
-                st.metric(
-                    "Brier Score",
-                    f"{v1['brier']:.3f}",
-                )
-
-                st.metric(
-                    "Log Loss",
-                    f"{v1['log_loss']:.3f}",
-                )
-
-                st.metric(
-                    "Features",
-                    len(
-                        v1["feature_columns"]
-                    ),
-                )
-
-                st.metric(
-                    "Predictions",
-                    v1["prediction_count"],
-                )
-
-            with v2_col:
-
-                st.markdown(
-                    "#### V2 — Expanded Model"
-                )
-
-                st.metric(
-                    "Accuracy",
-                    f"{v2['accuracy']:.1%}",
-                )
-
-                st.metric(
-                    "AUC",
-                    f"{v2['auc']:.3f}",
-                )
-
-                st.metric(
-                    "Brier Score",
-                    f"{v2['brier']:.3f}",
-                )
-
-                st.metric(
-                    "Log Loss",
-                    f"{v2['log_loss']:.3f}",
-                )
-
-                st.metric(
-                    "Features",
-                    len(
-                        v2["feature_columns"]
-                    ),
-                )
-
-                st.metric(
-                    "Predictions",
-                    v2["prediction_count"],
-                )
-
-            # --------------------------------------------------------
-            # CHANGE FROM V1 TO V2
-            # --------------------------------------------------------
-
-            st.markdown(
-                "### 🔬 V2 Change vs V1"
-            )
-
-            (
-                change_col1,
-                change_col2,
-                change_col3,
-                change_col4,
-            ) = st.columns(4)
-
-            accuracy_change = (
-                nfl_benchmark[
-                    "accuracy_change"
-                ]
-            )
-
-            auc_change = (
-                nfl_benchmark[
-                    "auc_change"
-                ]
-            )
-
-            brier_change = (
-                nfl_benchmark[
-                    "brier_change"
-                ]
-            )
-
-            log_loss_change = (
-                nfl_benchmark[
-                    "log_loss_change"
-                ]
-            )
-
-            change_col1.metric(
-                "Accuracy Change",
-                f"{accuracy_change:+.2%}",
-            )
-
-            if pd.notna(auc_change):
-
-                change_col2.metric(
-                    "AUC Change",
-                    f"{auc_change:+.3f}",
-                )
-
-            else:
-
-                change_col2.metric(
-                    "AUC Change",
-                    "—",
-                )
-
-            change_col3.metric(
-                "Brier Change",
-                f"{brier_change:+.3f}",
-            )
-
-            change_col4.metric(
-                "Log Loss Change",
-                f"{log_loss_change:+.3f}",
-            )
-
-            # --------------------------------------------------------
-            # HIGH CONFIDENCE PERFORMANCE
-            # --------------------------------------------------------
-
-            st.markdown(
-                "### 🔥 High-Confidence Performance"
-            )
-
-            (
-                confidence_col1,
-                confidence_col2,
-            ) = st.columns(2)
-
-            with confidence_col1:
-
-                st.markdown(
-                    "**V1**"
-                )
-
-                v1_high_count = (
-                    v1.get(
-                        "high_confidence_count",
-                        0,
-                    )
-                )
-
-                v1_high_accuracy = (
-                    v1.get(
-                        "high_confidence_accuracy"
-                    )
-                )
-
-                st.metric(
-                    "70%+ Predictions",
-                    v1_high_count,
-                )
-
-                if (
-                    v1_high_accuracy
-                    is not None
-                    and pd.notna(
-                        v1_high_accuracy
-                    )
-                ):
-
-                    st.metric(
-                        "70%+ Accuracy",
-                        f"{v1_high_accuracy:.1%}",
-                    )
-
-                else:
-
-                    st.metric(
-                        "70%+ Accuracy",
-                        "—",
-                    )
-
-            with confidence_col2:
-
-                st.markdown(
-                    "**V2**"
-                )
-
-                v2_high_count = (
-                    v2.get(
-                        "high_confidence_count",
-                        0,
-                    )
-                )
-
-                v2_high_accuracy = (
-                    v2.get(
-                        "high_confidence_accuracy"
-                    )
-                )
-
-                st.metric(
-                    "70%+ Predictions",
-                    v2_high_count,
-                )
-
-                if (
-                    v2_high_accuracy
-                    is not None
-                    and pd.notna(
-                        v2_high_accuracy
-                    )
-                ):
-
-                    st.metric(
-                        "70%+ Accuracy",
-                        f"{v2_high_accuracy:.1%}",
-                    )
-
-                else:
-
-                    st.metric(
-                        "70%+ Accuracy",
-                        "—",
-                    )
-
-            # --------------------------------------------------------
-            # FULL COMPARISON TABLE
-            # --------------------------------------------------------
-
-            comparison_df = (
-                nfl_benchmark[
-                    "comparison"
-                ].copy()
-            )
-
-            st.markdown(
-                "### 📋 Full Benchmark"
-            )
-
-            st.dataframe(
-                comparison_df,
-                use_container_width=True,
-                hide_index=True,
-            )
-
-            st.caption(
-                "Higher accuracy and AUC are better. "
-                "Lower Brier score and log loss are better. "
-                "V2 is experimental and has not replaced V1."
-            )
 
         # ==========================================
         # STOCK MODEL TRAINING CENTER
