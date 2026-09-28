@@ -145,10 +145,6 @@ def run_nfl_prediction_pipeline(
         tz="UTC"
     )
 
-    current_date_ct = current_time.tz_convert(
-        "America/Chicago"
-    ).date()
-
     for _, game in best_lines.iterrows():
 
         home_team = game["home_team"]
@@ -171,26 +167,6 @@ def run_nfl_prediction_pipeline(
         if game_time <= current_time:
             continue
 
-        # Only predict games scheduled TODAY.
-        game_date_ct = game_time.tz_convert(
-            "America/Chicago"
-        ).date()
-
-        if game_date_ct != current_date_ct:
-            continue
-        # Do not predict games that already started.
-        if game_time <= current_time:
-            continue
-
-        # Only predict games scheduled TODAY.
-        game_date_ct = game_time.tz_convert(
-            "America/Chicago"
-        ).date()
-
-        if game_date_ct != current_date_ct:
-            continue
-
-         # Never predict a game that has already started
 
         try:
 
