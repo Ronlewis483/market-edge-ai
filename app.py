@@ -76,6 +76,10 @@ from dual_agent.nba_prediction_pipeline import (
 
 from dual_agent.nfl_player_props_ui import render_nfl_player_props
 
+from dual_agent.nfl_player_props_v2 import (
+    compare_v1_v2_walkforward,
+)
+
 import streamlit as st
 
 from dual_agent.supabase_db import (
