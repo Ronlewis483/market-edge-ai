@@ -2540,11 +2540,11 @@ def walkforward_v2b(
 
     results = pd.DataFrame(rows)
 
-    results["v2a_abs_error"] = (
+   results["v2a_absolute_error"] = (
         results["v2a_error"].abs()
     )
 
-    results["v2b_abs_error"] = (
+    results["v2b_absolute_error"] = (
         results["v2b_error"].abs()
     )
 
