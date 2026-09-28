@@ -2540,7 +2540,7 @@ def walkforward_v2b(
 
     results = pd.DataFrame(rows)
 
-   results["v2a_absolute_error"] = (
+    results["v2a_absolute_error"] = (
         results["v2a_error"].abs()
     )
 
@@ -2561,7 +2561,6 @@ def walkforward_v2b(
         .sort_values("game_time")
         .reset_index(drop=True)
     )
-
 # ============================================================
 # V1 VS V2A VS V2B COMPARISON
 # ============================================================
