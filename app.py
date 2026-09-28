@@ -9472,9 +9472,9 @@ if st.button(
             st.success(
                 "MLB V1 walk-forward benchmark completed."
             )
-
+    
             except Exception as exc:
-
+        
             st.error(
                 f"MLB V1 benchmark failed: {exc}"
             )
