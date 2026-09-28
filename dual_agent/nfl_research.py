@@ -154,20 +154,20 @@ def build_nfl_pregame_features(games):
             home_win = int(home_score > away_score)
 
         feature_row = {
-    "game_id": game.get("game_id"),
-    "season_id": game.get("season_id"),
-    "start_time": game_time,
-    "home_team": home_team,
-    "away_team": away_team,
-
-    # Final result data
-    # Used only AFTER a game is completed when constructing
-    # features for future games.
-    "home_score": home_score,
-    "away_score": away_score,
-
-    # Target
-    "home_win": home_win,
+            "game_id": game.get("game_id"),
+            "season_id": game.get("season_id"),
+            "start_time": game_time,
+            "home_team": home_team,
+            "away_team": away_team,
+        
+            # Final result data
+            # Used only AFTER a game is completed when constructing
+            # features for future games.
+            "home_score": home_score,
+            "away_score": away_score,
+        
+            # Target
+            "home_win": home_win,
 
             # Home pregame information
             "home_games_played":
