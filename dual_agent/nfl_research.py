@@ -643,7 +643,7 @@ def analyze_nfl_probability_bands(predictions_df):
 
 
 def build_nfl_future_matchup_features(
-    feature_df,
+    feature_games,
     home_team,
     away_team,
     game_time,
@@ -664,7 +664,7 @@ def build_nfl_future_matchup_features(
             "NFL feature dataframe is empty."
         )
 
-    df = feature_df.copy()
+    df = feature_games.copy()
 
     df["start_time"] = pd.to_datetime(
         df["start_time"],
