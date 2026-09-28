@@ -865,10 +865,14 @@ def build_nfl_future_matchup_features(
     # ============================================
 
     future_features = {
+        "start_time": prediction_time,
+        "home_team": home_team,
+        "away_team": away_team,
+    
         "win_pct_diff":
             home_state["win_pct"]
             - away_state["win_pct"],
-
+            
         "avg_point_diff_diff":
             home_state["avg_point_diff"]
             - away_state["avg_point_diff"],
