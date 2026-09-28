@@ -472,6 +472,993 @@ def run_nfl_walkforward_model(
         ),
     }
 
+# ============================================================
+# NFL MODEL V2
+# Expanded leakage-safe winner prediction model
+#
+# IMPORTANT:
+# - V1 remains untouched.
+# - V2 uses only information available before kickoff.
+# - V2 can be benchmarked against V1 before becoming live.
+# ============================================================
+
+
+def build_nfl_v2_model_features(feature_games):
+    """
+    Build the expanded NFL V2 model feature set from the
+    leakage-safe pregame information already created by
+    build_nfl_pregame_features().
+
+    This function does NOT use final scores from the game
+    being predicted.
+
+    Final scores stored in feature_games are used only by
+    the historical feature builder to construct FUTURE
+    team state.
+    """
+
+    if feature_games is None or feature_games.empty:
+        raise ValueError(
+            "NFL feature dataset is empty."
+        )
+
+    df = feature_games.copy()
+
+    # --------------------------------------------------------
+    # REQUIRED PREGAME COLUMNS
+    # --------------------------------------------------------
+
+    required_columns = [
+        "start_time",
+        "home_win",
+
+        "home_games_played",
+        "away_games_played",
+
+        "home_win_pct",
+        "away_win_pct",
+
+        "home_avg_points_for",
+        "away_avg_points_for",
+
+        "home_avg_points_against",
+        "away_avg_points_against",
+
+        "home_avg_point_diff",
+        "away_avg_point_diff",
+
+        "home_recent_3_win_pct",
+        "away_recent_3_win_pct",
+
+        "home_recent_5_win_pct",
+        "away_recent_5_win_pct",
+
+        "home_recent_5_point_diff",
+        "away_recent_5_point_diff",
+
+        "home_days_rest",
+        "away_days_rest",
+    ]
+
+    missing_columns = [
+        column
+        for column in required_columns
+        if column not in df.columns
+    ]
+
+    if missing_columns:
+        raise ValueError(
+            "NFL V2 missing required pregame columns: "
+            f"{missing_columns}"
+        )
+
+    # --------------------------------------------------------
+    # CLEAN TIME
+    # --------------------------------------------------------
+
+    df["start_time"] = pd.to_datetime(
+        df["start_time"],
+        utc=True,
+        errors="coerce",
+    )
+
+    # ========================================================
+    # V2 DIFFERENTIAL FEATURES
+    # ========================================================
+
+    # --------------------------------------------------------
+    # OVERALL TEAM QUALITY
+    # --------------------------------------------------------
+
+    df["v2_win_pct_diff"] = (
+        df["home_win_pct"]
+        - df["away_win_pct"]
+    )
+
+    df["v2_point_diff_diff"] = (
+        df["home_avg_point_diff"]
+        - df["away_avg_point_diff"]
+    )
+
+    # --------------------------------------------------------
+    # OFFENSIVE STRENGTH
+    #
+    # Positive =
+    # home team historically scores more points.
+    # --------------------------------------------------------
+
+    df["v2_offense_diff"] = (
+        df["home_avg_points_for"]
+        - df["away_avg_points_for"]
+    )
+
+    # --------------------------------------------------------
+    # DEFENSIVE STRENGTH
+    #
+    # Positive =
+    # away team allows more points than home team.
+    #
+    # This orientation means positive values generally favor
+    # the home defense.
+    # --------------------------------------------------------
+
+    df["v2_defense_diff"] = (
+        df["away_avg_points_against"]
+        - df["home_avg_points_against"]
+    )
+
+    # --------------------------------------------------------
+    # OFFENSE VS OPPOSING DEFENSE
+    #
+    # Home offense scoring ability compared with how many
+    # points the away defense typically allows.
+    # --------------------------------------------------------
+
+    df["v2_home_offense_matchup"] = (
+        df["home_avg_points_for"]
+        - df["away_avg_points_against"]
+    )
+
+    # --------------------------------------------------------
+    # AWAY OFFENSE VS HOME DEFENSE
+    #
+    # Converted so positive values favor the HOME team.
+    # --------------------------------------------------------
+
+    df["v2_away_offense_matchup"] = (
+        df["home_avg_points_against"]
+        - df["away_avg_points_for"]
+    )
+
+    # --------------------------------------------------------
+    # COMBINED MATCHUP ADVANTAGE
+    # --------------------------------------------------------
+
+    df["v2_matchup_advantage"] = (
+        df["v2_home_offense_matchup"]
+        + df["v2_away_offense_matchup"]
+    )
+
+    # --------------------------------------------------------
+    # SHORT-TERM FORM
+    # --------------------------------------------------------
+
+    df["v2_recent_3_win_diff"] = (
+        df["home_recent_3_win_pct"]
+        - df["away_recent_3_win_pct"]
+    )
+
+    df["v2_recent_5_win_diff"] = (
+        df["home_recent_5_win_pct"]
+        - df["away_recent_5_win_pct"]
+    )
+
+    df["v2_recent_5_point_diff"] = (
+        df["home_recent_5_point_diff"]
+        - df["away_recent_5_point_diff"]
+    )
+
+    # --------------------------------------------------------
+    # FORM TREND
+    #
+    # Measures whether recent performance is stronger or
+    # weaker than the team's longer-term performance.
+    # --------------------------------------------------------
+
+    df["v2_home_form_trend"] = (
+        df["home_recent_5_win_pct"]
+        - df["home_win_pct"]
+    )
+
+    df["v2_away_form_trend"] = (
+        df["away_recent_5_win_pct"]
+        - df["away_win_pct"]
+    )
+
+    df["v2_form_trend_diff"] = (
+        df["v2_home_form_trend"]
+        - df["v2_away_form_trend"]
+    )
+
+    # --------------------------------------------------------
+    # REST / FATIGUE
+    # --------------------------------------------------------
+
+    df["v2_rest_diff"] = (
+        df["home_days_rest"]
+        - df["away_days_rest"]
+    )
+
+    # Cap extreme values.
+    df["v2_rest_diff"] = (
+        df["v2_rest_diff"]
+        .clip(
+            lower=-14.0,
+            upper=14.0,
+        )
+    )
+
+    # --------------------------------------------------------
+    # EXPERIENCE / SAMPLE DEPTH
+    #
+    # Helps the model distinguish early-season estimates
+    # from teams with larger current-season samples.
+    # --------------------------------------------------------
+
+    df["v2_games_played_diff"] = (
+        df["home_games_played"]
+        - df["away_games_played"]
+    )
+
+    df["v2_home_sample_size"] = (
+        df["home_games_played"]
+    )
+
+    df["v2_away_sample_size"] = (
+        df["away_games_played"]
+    )
+
+    # --------------------------------------------------------
+    # EARLY-SEASON FLAG
+    #
+    # 1 when either team has fewer than four historical
+    # games feeding its pregame statistics.
+    # --------------------------------------------------------
+
+    df["v2_early_season"] = (
+        (
+            (df["home_games_played"] < 4)
+            | (df["away_games_played"] < 4)
+        )
+        .astype(int)
+    )
+
+    return df
+
+
+# ============================================================
+# V2 FEATURE LIST
+# ============================================================
+
+
+def get_nfl_v2_feature_columns():
+    """
+    Return the exact feature set used by NFL V2.
+
+    Keeping this centralized prevents the historical
+    validator and future prediction engine from silently
+    using different feature sets.
+    """
+
+    return [
+        "v2_win_pct_diff",
+        "v2_point_diff_diff",
+
+        "v2_offense_diff",
+        "v2_defense_diff",
+
+        "v2_home_offense_matchup",
+        "v2_away_offense_matchup",
+        "v2_matchup_advantage",
+
+        "v2_recent_3_win_diff",
+        "v2_recent_5_win_diff",
+        "v2_recent_5_point_diff",
+
+        "v2_home_form_trend",
+        "v2_away_form_trend",
+        "v2_form_trend_diff",
+
+        "v2_rest_diff",
+
+        "v2_games_played_diff",
+        "v2_home_sample_size",
+        "v2_away_sample_size",
+
+        "v2_early_season",
+    ]
+
+
+# ============================================================
+# NFL V2 WALK-FORWARD VALIDATION
+# ============================================================
+
+
+def run_nfl_walkforward_model_v2(
+    feature_games,
+    min_train_games=100,
+    retrain_every=25,
+):
+    """
+    Leakage-safe walk-forward validation for NFL V2.
+
+    V2 remains separate from V1.
+
+    Every prediction is generated using ONLY games whose
+    kickoff occurred before the game being predicted.
+    """
+
+    from sklearn.linear_model import LogisticRegression
+
+    from sklearn.metrics import (
+        accuracy_score,
+        roc_auc_score,
+        brier_score_loss,
+        log_loss,
+    )
+
+    from sklearn.pipeline import Pipeline
+
+    from sklearn.preprocessing import StandardScaler
+
+    # --------------------------------------------------------
+    # VALIDATE INPUT
+    # --------------------------------------------------------
+
+    if feature_games is None or feature_games.empty:
+        raise ValueError(
+            "NFL V2 feature dataset is empty."
+        )
+
+    if min_train_games < 1:
+        raise ValueError(
+            "NFL V2 min_train_games must be positive."
+        )
+
+    if retrain_every < 1:
+        raise ValueError(
+            "NFL V2 retrain_every must be positive."
+        )
+
+    # --------------------------------------------------------
+    # BUILD V2 FEATURES
+    # --------------------------------------------------------
+
+    df = build_nfl_v2_model_features(
+        feature_games
+    )
+
+    feature_columns = (
+        get_nfl_v2_feature_columns()
+    )
+
+    # --------------------------------------------------------
+    # CLEAN DATA
+    # --------------------------------------------------------
+
+    df = df.dropna(
+        subset=[
+            "start_time",
+            "home_win",
+        ]
+    ).copy()
+
+    df = df.sort_values(
+        "start_time"
+    ).reset_index(
+        drop=True
+    )
+
+    # --------------------------------------------------------
+    # NUMERIC CLEANING
+    # --------------------------------------------------------
+
+    for column in feature_columns:
+
+        df[column] = pd.to_numeric(
+            df[column],
+            errors="coerce",
+        )
+
+        df[column] = df[column].replace(
+            [
+                np.inf,
+                -np.inf,
+            ],
+            np.nan,
+        )
+
+    df = df.dropna(
+        subset=feature_columns
+    ).copy()
+
+    if len(df) <= min_train_games:
+        raise ValueError(
+            "Not enough NFL games for V2 "
+            "walk-forward validation. "
+            f"Found {len(df)}, "
+            f"need more than {min_train_games}."
+        )
+
+    # ========================================================
+    # WALK-FORWARD
+    # ========================================================
+
+    predictions = []
+
+    model = None
+    model_training_end = None
+
+    for i in range(
+        min_train_games,
+        len(df),
+    ):
+
+        test_row = df.iloc[
+            [i]
+        ].copy()
+
+        prediction_time = (
+            test_row[
+                "start_time"
+            ].iloc[0]
+        )
+
+        # ----------------------------------------------------
+        # STRICT LEAKAGE PROTECTION
+        # ----------------------------------------------------
+
+        train_df = df[
+            df["start_time"]
+            < prediction_time
+        ].copy()
+
+        if len(train_df) < min_train_games:
+            continue
+
+        X_train = train_df[
+            feature_columns
+        ]
+
+        y_train = train_df[
+            "home_win"
+        ].astype(int)
+
+        X_test = test_row[
+            feature_columns
+        ]
+
+        # Logistic regression requires both outcomes.
+        if y_train.nunique() < 2:
+            continue
+
+        # ----------------------------------------------------
+        # RETRAIN MODEL
+        # ----------------------------------------------------
+
+        should_retrain = (
+            model is None
+            or (
+                (i - min_train_games)
+                % retrain_every
+                == 0
+            )
+        )
+
+        if (
+            model_training_end
+            is not None
+            and model_training_end
+            >= prediction_time
+        ):
+            should_retrain = True
+
+        if should_retrain:
+
+            model = Pipeline(
+                steps=[
+                    (
+                        "scaler",
+                        StandardScaler(),
+                    ),
+                    (
+                        "model",
+                        LogisticRegression(
+                            max_iter=3000,
+                            C=1.0,
+                        ),
+                    ),
+                ]
+            )
+
+            model.fit(
+                X_train,
+                y_train,
+            )
+
+            model_training_end = (
+                train_df[
+                    "start_time"
+                ].max()
+            )
+
+        # ----------------------------------------------------
+        # PREDICT
+        # ----------------------------------------------------
+
+        home_probability = float(
+            model.predict_proba(
+                X_test
+            )[0][1]
+        )
+
+        away_probability = (
+            1.0
+            - home_probability
+        )
+
+        prediction = int(
+            home_probability
+            >= 0.50
+        )
+
+        actual = int(
+            test_row[
+                "home_win"
+            ].iloc[0]
+        )
+
+        confidence = max(
+            home_probability,
+            away_probability,
+        )
+
+        # ----------------------------------------------------
+        # SAVE OUT-OF-SAMPLE PREDICTION
+        # ----------------------------------------------------
+
+        predictions.append(
+            {
+                "game_id":
+                    test_row[
+                        "game_id"
+                    ].iloc[0],
+
+                "season_id":
+                    test_row[
+                        "season_id"
+                    ].iloc[0],
+
+                "start_time":
+                    prediction_time,
+
+                "home_team":
+                    test_row[
+                        "home_team"
+                    ].iloc[0],
+
+                "away_team":
+                    test_row[
+                        "away_team"
+                    ].iloc[0],
+
+                "probability":
+                    home_probability,
+
+                "home_probability":
+                    home_probability,
+
+                "away_probability":
+                    away_probability,
+
+                "confidence":
+                    confidence,
+
+                "prediction":
+                    prediction,
+
+                "actual":
+                    actual,
+
+                "correct":
+                    int(
+                        prediction
+                        == actual
+                    ),
+            }
+        )
+
+    # ========================================================
+    # RESULTS
+    # ========================================================
+
+    predictions_df = pd.DataFrame(
+        predictions
+    )
+
+    if predictions_df.empty:
+        raise ValueError(
+            "NFL V2 walk-forward model "
+            "produced no predictions."
+        )
+
+    y_true = predictions_df[
+        "actual"
+    ]
+
+    y_prob = predictions_df[
+        "probability"
+    ]
+
+    y_pred = predictions_df[
+        "prediction"
+    ]
+
+    # --------------------------------------------------------
+    # ACCURACY
+    # --------------------------------------------------------
+
+    accuracy = accuracy_score(
+        y_true,
+        y_pred,
+    )
+
+    # --------------------------------------------------------
+    # BRIER SCORE
+    #
+    # Lower is better.
+    # --------------------------------------------------------
+
+    brier = brier_score_loss(
+        y_true,
+        y_prob,
+    )
+
+    # --------------------------------------------------------
+    # LOG LOSS
+    #
+    # Lower is better.
+    # --------------------------------------------------------
+
+    logloss = log_loss(
+        y_true,
+        y_prob,
+        labels=[
+            0,
+            1,
+        ],
+    )
+
+    # --------------------------------------------------------
+    # AUC
+    #
+    # Higher is better.
+    # --------------------------------------------------------
+
+    if y_true.nunique() > 1:
+
+        auc = roc_auc_score(
+            y_true,
+            y_prob,
+        )
+
+    else:
+
+        auc = np.nan
+
+    # --------------------------------------------------------
+    # HOME-TEAM BASELINE
+    # --------------------------------------------------------
+
+    baseline_home_prediction = np.ones(
+        len(y_true),
+        dtype=int,
+    )
+
+    baseline_accuracy = accuracy_score(
+        y_true,
+        baseline_home_prediction,
+    )
+
+    # --------------------------------------------------------
+    # CONFIDENCE PERFORMANCE
+    # --------------------------------------------------------
+
+    high_confidence_df = (
+        predictions_df[
+            predictions_df[
+                "confidence"
+            ]
+            >= 0.70
+        ]
+    )
+
+    if high_confidence_df.empty:
+
+        high_confidence_accuracy = (
+            np.nan
+        )
+
+        high_confidence_count = 0
+
+    else:
+
+        high_confidence_accuracy = float(
+            high_confidence_df[
+                "correct"
+            ].mean()
+        )
+
+        high_confidence_count = len(
+            high_confidence_df
+        )
+
+    # ========================================================
+    # RETURN V2 VALIDATION
+    # ========================================================
+
+    return {
+        "success": True,
+
+        "model_version":
+            "V2",
+
+        "model_name":
+            "NFL V2 Expanded Logistic Regression",
+
+        "feature_columns":
+            feature_columns,
+
+        "feature_count":
+            len(feature_columns),
+
+        "total_feature_games":
+            len(df),
+
+        "training_start_games":
+            min_train_games,
+
+        "prediction_count":
+            len(predictions_df),
+
+        "accuracy":
+            float(accuracy),
+
+        "auc":
+            (
+                float(auc)
+                if not np.isnan(auc)
+                else np.nan
+            ),
+
+        "brier":
+            float(brier),
+
+        "log_loss":
+            float(logloss),
+
+        "baseline_home_accuracy":
+            float(baseline_accuracy),
+
+        "accuracy_vs_baseline":
+            float(
+                accuracy
+                - baseline_accuracy
+            ),
+
+        "high_confidence_count":
+            int(
+                high_confidence_count
+            ),
+
+        "high_confidence_accuracy":
+            (
+                float(
+                    high_confidence_accuracy
+                )
+                if not np.isnan(
+                    high_confidence_accuracy
+                )
+                else np.nan
+            ),
+
+        "predictions":
+            predictions_df,
+
+        "probability_bands":
+            analyze_nfl_probability_bands(
+                predictions_df
+            ),
+    }
+
+
+# ============================================================
+# V1 VS V2 BENCHMARK
+# ============================================================
+
+
+def compare_nfl_v1_v2(
+    feature_games,
+    min_train_games=100,
+    retrain_every=25,
+):
+    """
+    Run V1 and V2 against the same historical dataset.
+
+    This function does NOT promote V2.
+
+    It only returns an apples-to-apples benchmark so we can
+    determine whether V2 actually improved the NFL model.
+    """
+
+    v1 = run_nfl_walkforward_model(
+        feature_games=feature_games,
+        min_train_games=min_train_games,
+        retrain_every=retrain_every,
+    )
+
+    v2 = run_nfl_walkforward_model_v2(
+        feature_games=feature_games,
+        min_train_games=min_train_games,
+        retrain_every=retrain_every,
+    )
+
+    comparison = pd.DataFrame(
+        [
+            {
+                "model":
+                    "V1",
+
+                "features":
+                    len(
+                        v1[
+                            "feature_columns"
+                        ]
+                    ),
+
+                "predictions":
+                    v1[
+                        "prediction_count"
+                    ],
+
+                "accuracy":
+                    v1[
+                        "accuracy"
+                    ],
+
+                "auc":
+                    v1[
+                        "auc"
+                    ],
+
+                "brier":
+                    v1[
+                        "brier"
+                    ],
+
+                "log_loss":
+                    v1[
+                        "log_loss"
+                    ],
+
+                "baseline_accuracy":
+                    v1[
+                        "baseline_home_accuracy"
+                    ],
+
+                "accuracy_vs_baseline":
+                    v1[
+                        "accuracy_vs_baseline"
+                    ],
+            },
+
+            {
+                "model":
+                    "V2",
+
+                "features":
+                    len(
+                        v2[
+                            "feature_columns"
+                        ]
+                    ),
+
+                "predictions":
+                    v2[
+                        "prediction_count"
+                    ],
+
+                "accuracy":
+                    v2[
+                        "accuracy"
+                    ],
+
+                "auc":
+                    v2[
+                        "auc"
+                    ],
+
+                "brier":
+                    v2[
+                        "brier"
+                    ],
+
+                "log_loss":
+                    v2[
+                        "log_loss"
+                    ],
+
+                "baseline_accuracy":
+                    v2[
+                        "baseline_home_accuracy"
+                    ],
+
+                "accuracy_vs_baseline":
+                    v2[
+                        "accuracy_vs_baseline"
+                    ],
+            },
+        ]
+    )
+
+    return {
+        "success": True,
+
+        "v1":
+            v1,
+
+        "v2":
+            v2,
+
+        "comparison":
+            comparison,
+
+        "accuracy_change":
+            float(
+                v2["accuracy"]
+                - v1["accuracy"]
+            ),
+
+        "auc_change":
+            (
+                float(
+                    v2["auc"]
+                    - v1["auc"]
+                )
+                if (
+                    not np.isnan(
+                        v1["auc"]
+                    )
+                    and not np.isnan(
+                        v2["auc"]
+                    )
+                )
+                else np.nan
+            ),
+
+        "brier_change":
+            float(
+                v2["brier"]
+                - v1["brier"]
+            ),
+
+        "log_loss_change":
+            float(
+                v2["log_loss"]
+                - v1["log_loss"]
+            ),
+    }
+
 def predict_nfl_matchup(feature_games, future_features):
     """Predict one future matchup from completed games before its kickoff."""
     from sklearn.linear_model import LogisticRegression
