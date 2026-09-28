@@ -79,6 +79,7 @@ from dual_agent.nfl_player_props_ui import render_nfl_player_props
 
 from dual_agent.nfl_player_props_v2 import (
     compare_v1_v2_walkforward,
+    compare_v1_v2a_v2b_walkforward,
 )
 
 import streamlit as st
