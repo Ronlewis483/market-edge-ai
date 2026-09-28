@@ -169,6 +169,20 @@ def fetch_mlb_games(
                     {},
                 )
 
+                home_probable_pitcher = (
+                    home.get(
+                        "probablePitcher",
+                        {},
+                    )
+                )
+                
+                away_probable_pitcher = (
+                    away.get(
+                        "probablePitcher",
+                        {},
+                    )
+                )
+
                 away_team = away.get(
                     "team",
                     {},
@@ -202,14 +216,26 @@ def fetch_mlb_games(
 
                         "away_team_id":
                             away_team.get("id"),
-
+            
+                        "home_starting_pitcher_id":
+                            home_probable_pitcher.get("id"),
+            
+                        "home_starting_pitcher":
+                            home_probable_pitcher.get("fullName"),
+            
+                        "away_starting_pitcher_id":
+                            away_probable_pitcher.get("id"),
+            
+                        "away_starting_pitcher":
+                            away_probable_pitcher.get("fullName"),
+            
                         "home_score":
                             home_score,
-
+            
                         "away_score":
                             away_score,
-                    }
-                )
+                                }
+                            )
 
     # --------------------------------------
     # BUILD COMBINED HISTORICAL DATASET
