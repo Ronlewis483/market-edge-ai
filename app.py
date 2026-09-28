@@ -843,9 +843,9 @@ if page == "🏠 Home":
                         or feature_schema_is_stale
                     ):
         
-                    with st.spinner(
-                        "Preparing NFL historical data automatically..."
-                    ):
+                        with st.spinner(
+                            "Preparing NFL historical data automatically..."
+                        ):
     
                     season_ids = [
                         "sr:season:115087",
