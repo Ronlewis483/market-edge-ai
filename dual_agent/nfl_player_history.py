@@ -53,9 +53,34 @@ def load_player_history(seasons):
     schedule['game_time'] = (pd.to_datetime(schedule[kickoff_col], utc=True, errors='coerce')
                              + pd.Timedelta(days=1))
     schedule = schedule[schedule['game_time'] < pd.Timestamp.now(tz='UTC')]
-    home = schedule[['season', 'week', 'home_team', 'game_time']].rename(columns={'home_team': 'team'})
-    away = schedule[['season', 'week', 'away_team', 'game_time']].rename(columns={'away_team': 'team'})
-    games = pd.concat([home, away], ignore_index=True).dropna(subset=['game_time'])
+    home = schedule[
+    ['season', 'week', 'home_team', 'away_team', 'game_time']
+].rename(
+    columns={
+        'home_team': 'team',
+        'away_team': 'opponent',
+    }
+)
+
+home['is_home'] = True
+
+away = schedule[
+    ['season', 'week', 'away_team', 'home_team', 'game_time']
+].rename(
+    columns={
+        'away_team': 'team',
+        'home_team': 'opponent',
+    }
+)
+
+away['is_home'] = False
+
+games = pd.concat(
+    [home, away],
+    ignore_index=True,
+).dropna(
+    subset=['game_time', 'team', 'opponent']
+)
     # Never assign a game if season/week/team is not unique.
     games = games.drop_duplicates(['season', 'week', 'team'], keep=False)
 
@@ -69,27 +94,47 @@ def load_player_history(seasons):
         column = _column(stats, *aliases)
         if column:
             records.append(pd.DataFrame({
-                'player': stats['player'], 'market': label,
-                'game_time': stats['game_time'], 'value': pd.to_numeric(stats[column], errors='coerce')
-            }))
+    'player': stats['player'],
+    'team': stats['team'],
+    'opponent': stats['opponent'],
+    'is_home': stats['is_home'],
+    'market': label,
+    'game_time': stats['game_time'],
+    'value': pd.to_numeric(
+        stats[column],
+        errors='coerce',
+    ),
+}))
     rush = _column(stats, 'rushing_yards')
     rec = _column(stats, 'receiving_yards')
     if rush and rec:
         records.append(pd.DataFrame({
-            'player': stats['player'], 'market': 'Rushing + receiving yards',
-            'game_time': stats['game_time'],
-            'value': pd.to_numeric(stats[rush], errors='coerce').fillna(0)
-                     + pd.to_numeric(stats[rec], errors='coerce').fillna(0)
-        }))
+    'player': stats['player'],
+    'team': stats['team'],
+    'opponent': stats['opponent'],
+    'is_home': stats['is_home'],
+    'market': 'Rushing + receiving yards',
+    'game_time': stats['game_time'],
+    'value': (
+        pd.to_numeric(stats[rush], errors='coerce').fillna(0)
+        + pd.to_numeric(stats[rec], errors='coerce').fillna(0)
+    ),
+}))
     rush_td = _column(stats, 'rushing_tds', 'rushing_touchdowns')
     rec_td = _column(stats, 'receiving_tds', 'receiving_touchdowns')
     if rush_td and rec_td:
         records.append(pd.DataFrame({
-            'player': stats['player'], 'market': 'Anytime touchdown',
-            'game_time': stats['game_time'],
-            'value': pd.to_numeric(stats[rush_td], errors='coerce').fillna(0)
-                     + pd.to_numeric(stats[rec_td], errors='coerce').fillna(0)
-        }))
+    'player': stats['player'],
+    'team': stats['team'],
+    'opponent': stats['opponent'],
+    'is_home': stats['is_home'],
+    'market': 'Anytime touchdown',
+    'game_time': stats['game_time'],
+    'value': (
+        pd.to_numeric(stats[rush_td], errors='coerce').fillna(0)
+        + pd.to_numeric(stats[rec_td], errors='coerce').fillna(0)
+    ),
+}))
     if not records:
         raise ValueError('No supported player statistic columns were returned.')
     result = pd.concat(records, ignore_index=True).dropna(subset=['player', 'game_time', 'value'])
