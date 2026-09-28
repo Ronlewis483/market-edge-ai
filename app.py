@@ -1,4 +1,5 @@
 import pandas as pd
+import numpy as np
 from dual_agent.nba_data import test_nba_connections
 from dual_agent.nba_history import test_nba_history
 
