@@ -1,3 +1,4 @@
+import time
 import requests
 import pandas as pd
 import streamlit as st
@@ -20,9 +21,16 @@ def _get_sportradar_api_key():
         )
 
 
-def _sportradar_get(endpoint, params=None):
+def _sportradar_get(
+    endpoint,
+    params=None,
+    max_retries=2,
+):
     """
     Make an authenticated request to Sportradar.
+
+    Handles temporary rate limiting with a small retry
+    delay instead of immediately crashing the pipeline.
     """
 
     api_key = _get_sportradar_api_key()
@@ -33,6 +41,57 @@ def _sportradar_get(endpoint, params=None):
         "x-api-key": api_key,
         "Accept": "application/json",
     }
+
+    for attempt in range(max_retries + 1):
+
+        response = requests.get(
+            url,
+            headers=headers,
+            params=params,
+            timeout=30,
+        )
+
+        # Successful request
+        if response.status_code == 200:
+            return response.json()
+
+        # Sportradar rate limit
+        if response.status_code == 429:
+
+            if attempt >= max_retries:
+                raise RuntimeError(
+                    "Sportradar rate limit reached. "
+                    "NFL data could not be refreshed "
+                    "after retrying."
+                )
+
+            retry_after = response.headers.get(
+                "Retry-After"
+            )
+
+            try:
+                wait_seconds = float(retry_after)
+            except (TypeError, ValueError):
+                wait_seconds = 2 ** (attempt + 1)
+
+            wait_seconds = min(
+                max(wait_seconds, 1),
+                15,
+            )
+
+            time.sleep(wait_seconds)
+            continue
+
+        # Any other API error
+        raise RuntimeError(
+            f"Sportradar error "
+            f"{response.status_code}: "
+            f"{response.text}"
+        )
+
+    raise RuntimeError(
+        "Sportradar request failed unexpectedly."
+    )
 
     response = requests.get(
         url,
@@ -121,6 +180,10 @@ def get_nfl_seasons():
         "seasons": df,
     }
 
+@st.cache_data(
+    ttl=21600,
+    show_spinner=False,
+)
 def get_nfl_season_games(season_id):
     """
     Retrieve NFL games for a specific Sportradar season.
