@@ -9499,306 +9499,109 @@ if st.button(
             "MLB V1 walk-forward benchmark completed."
         )
 
-        # ----------------------------------
+        # ==========================================
         # MLB V2A PITCHER RESEARCH
-        # ----------------------------------
+        # ==========================================
         
-        st.markdown(
-            "### MLB V2A Pitcher Research"
+        mlb_v2a_games = st.session_state.get(
+            "mlb_v2a_games"
         )
         
-        cache_col1, cache_col2, cache_col3 = (
-            st.columns(3)
+        cached_pitcher_logs = st.session_state.get(
+            "mlb_v2a_pitcher_logs",
+            pd.DataFrame(),
         )
         
-        cache_col1.metric(
-            "Pitcher Rows Collected",
-            f"{len(cached_pitcher_logs):,}",
-        )
-        
-        cache_col2.metric(
-            "Games Remaining",
-            f"{len(missing_pitcher_games):,}",
-        )
-        
-        cache_col3.metric(
-            "V2A Data Progress",
-            f"{coverage_pct:.1%}",
-        )
-        
-        if st.button(
-            "Collect Next 250 MLB Pitcher Games",
-            key="collect_mlb_v2a_pitchers",
+        if (
+            mlb_v2a_games is not None
+            and not mlb_v2a_games.empty
         ):
         
-            with st.spinner(
-                "Collecting the next 250 MLB pitcher games..."
+            st.divider()
+        
+            st.subheader(
+                "⚾ MLB V2A Pitcher Research"
+            )
+        
+            missing_pitcher_games = (
+                get_missing_mlb_pitcher_log_games(
+                    mlb_v2a_games,
+                    cached_pitcher_logs,
+                )
+            )
+        
+            coverage_games = (
+                len(mlb_v2a_games)
+                - len(missing_pitcher_games)
+            )
+        
+            coverage_pct = (
+                coverage_games / len(mlb_v2a_games)
+                if len(mlb_v2a_games)
+                else 0.0
+            )
+        
+            cache_col1, cache_col2, cache_col3 = (
+                st.columns(3)
+            )
+        
+            cache_col1.metric(
+                "Pitcher Rows Collected",
+                f"{len(cached_pitcher_logs):,}",
+            )
+        
+            cache_col2.metric(
+                "Games Remaining",
+                f"{len(missing_pitcher_games):,}",
+            )
+        
+            cache_col3.metric(
+                "V2A Data Progress",
+                f"{coverage_pct:.1%}",
+            )
+        
+            if st.button(
+                "Collect Next 250 MLB Pitcher Games",
+                key="collect_mlb_v2a_pitchers",
             ):
         
-                collection = (
-                    collect_mlb_pitcher_logs_batch(
-                        games=mlb_games,
-                        existing_logs=cached_pitcher_logs,
-                        batch_size=250,
+                try:
+        
+                    with st.spinner(
+                        "Collecting the next 250 MLB "
+                        "pitcher games..."
+                    ):
+        
+                        collection = (
+                            collect_mlb_pitcher_logs_batch(
+                                games=mlb_v2a_games,
+                                existing_logs=cached_pitcher_logs,
+                                batch_size=250,
+                            )
+                        )
+        
+                        st.session_state[
+                            "mlb_v2a_pitcher_logs"
+                        ] = collection["logs"]
+        
+                    st.success(
+                        "Pitcher batch completed — "
+                        f"{collection['requested_games']:,} "
+                        "games requested, "
+                        f"{collection['new_pitcher_rows']:,} "
+                        "pitcher rows returned, "
+                        f"{collection['remaining_games']:,} "
+                        "games remaining."
                     )
-                )
         
-                st.session_state[
-                    "mlb_v2a_pitcher_logs"
-                ] = collection["logs"]
+                except Exception as exc:
         
-            st.success(
-                "Pitcher batch completed — "
-                f"{collection['requested_games']:,} games requested, "
-                f"{collection['new_pitcher_rows']:,} pitcher rows returned, "
-                f"{collection['remaining_games']:,} games remaining."
-            )
+                    st.error(
+                        f"MLB V2A pitcher collection failed: "
+                        f"{exc}"
+                    )
         
-            st.rerun()
-
-        # ----------------------------------
-        # STARTING PITCHER DATA COVERAGE
-        # ----------------------------------
-        
-        st.markdown(
-            "### Starting Pitcher Data Coverage"
-        )
-        
-        pitcher_col1, pitcher_col2, pitcher_col3 = (
-            st.columns(3)
-        )
-        
-        pitcher_col1.metric(
-            "Historical Games",
-            f"{total_pitcher_games:,}",
-        )
-        
-        pitcher_col2.metric(
-            "Both Starters Available",
-            f"{games_with_both_starters:,}",
-        )
-        
-        pitcher_col3.metric(
-            "Pitcher Coverage",
-            f"{overall_pitcher_coverage:.1%}",
-        )
-        
-        if not pitcher_coverage_by_season.empty:
-        
-            coverage_display = (
-                pitcher_coverage_by_season.copy()
-            )
-        
-            coverage_display["coverage"] = (
-                coverage_display["coverage"]
-                .map(
-                    lambda value:
-                        f"{value:.1%}"
-                )
-            )
-        
-            coverage_display = (
-                coverage_display.rename(
-                    columns={
-                        "season":
-                            "Season",
-                        "games":
-                            "Games",
-                        "games_with_both_starters":
-                            "Both Starters",
-                        "coverage":
-                            "Coverage",
-                    }
-                )
-            )
-        
-            st.dataframe(
-                coverage_display,
-                use_container_width=True,
-                hide_index=True,
-            )
-
-        # ----------------------------------
-        # OVERALL RESULTS
-        # ----------------------------------
-
-        st.markdown("### Overall Performance")
-
-        col1, col2, col3, col4 = st.columns(4)
-
-        col1.metric(
-            "Predictions",
-            f"{mlb_v1_results['prediction_count']:,}",
-        )
-
-        col2.metric(
-            "Accuracy",
-            f"{mlb_v1_results['accuracy']:.1%}",
-        )
-
-        auc_value = mlb_v1_results["auc"]
-
-        col3.metric(
-            "AUC",
-            (
-                f"{auc_value:.3f}"
-                if auc_value is not None
-                else "N/A"
-            ),
-        )
-
-        col4.metric(
-            "Brier Score",
-            f"{mlb_v1_results['brier']:.3f}",
-        )
-
-        col5, col6, col7 = st.columns(3)
-
-        col5.metric(
-            "Log Loss",
-            f"{mlb_v1_results['log_loss']:.3f}",
-        )
-
-        col6.metric(
-            "Baseline Accuracy",
-            f"{mlb_v1_results['baseline_accuracy']:.1%}",
-        )
-
-        col7.metric(
-            "Accuracy vs Baseline",
-            (
-                f"{(
-                    mlb_v1_results['accuracy']
-                    - mlb_v1_results['baseline_accuracy']
-                ) * 100:+.2f} pp"
-            ),
-        )
-
-        # ----------------------------------
-        # PROBABILITY QUALITY
-        # ----------------------------------
-
-        st.markdown("### Probability Quality")
-
-        prob1, prob2 = st.columns(2)
-
-        prob1.metric(
-            "Model Brier",
-            f"{mlb_v1_results['brier']:.4f}",
-            delta=(
-                f"{(
-                    mlb_v1_results['brier']
-                    - mlb_v1_results['baseline_brier']
-                ):+.4f} vs baseline"
-            ),
-            delta_color="inverse",
-        )
-
-        prob2.metric(
-            "Model Log Loss",
-            f"{mlb_v1_results['log_loss']:.4f}",
-            delta=(
-                f"{(
-                    mlb_v1_results['log_loss']
-                    - mlb_v1_results['baseline_log_loss']
-                ):+.4f} vs baseline"
-            ),
-            delta_color="inverse",
-        )
-
-        # ----------------------------------
-        # CONFIDENCE PERFORMANCE
-        # ----------------------------------
-
-        st.markdown("### Confidence Buckets")
-
-        confidence_table = (
-            mlb_v1_results["confidence_summary"]
-            .copy()
-        )
-
-        confidence_table["accuracy"] = (
-            confidence_table["accuracy"]
-            .map(lambda value: f"{value:.1%}")
-        )
-
-        confidence_table[
-            "average_confidence"
-        ] = (
-            confidence_table[
-                "average_confidence"
-            ]
-            .map(lambda value: f"{value:.1%}")
-        )
-
-        confidence_table = confidence_table.rename(
-            columns={
-                "confidence_bucket":
-                    "Confidence",
-                "predictions":
-                    "Predictions",
-                "accuracy":
-                    "Accuracy",
-                "average_confidence":
-                    "Average Confidence",
-            }
-        )
-
-        st.dataframe(
-            confidence_table,
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        # ----------------------------------
-        # SEASON STABILITY
-        # ----------------------------------
-
-        st.markdown("### Season-by-Season Performance")
-
-        season_table = (
-            mlb_v1_results["season_summary"]
-            .copy()
-        )
-
-        season_table["accuracy"] = (
-            season_table["accuracy"]
-            .map(lambda value: f"{value:.1%}")
-        )
-
-        season_table = season_table.rename(
-            columns={
-                "season_id":
-                    "Season",
-                "predictions":
-                    "Predictions",
-                "accuracy":
-                    "Accuracy",
-            }
-        )
-
-        st.dataframe(
-            season_table,
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        # ----------------------------------
-        # TEST WINDOW
-        # ----------------------------------
-
-        st.caption(
-            "Walk-forward prediction window: "
-            f"{mlb_v1_results['first_prediction']} "
-            "through "
-            f"{mlb_v1_results['last_prediction']}"
-        )
-
-    except Exception as exc:
-
-        st.error(
-            f"MLB V1 benchmark failed: {exc}"
-        )
+                    st.exception(exc)
 
 # ==========================================
 # DISPLAY MLB VALIDATION RESULTS
