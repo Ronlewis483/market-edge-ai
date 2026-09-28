@@ -105,8 +105,12 @@ from dual_agent.mlb_research import (
     train_mlb_prediction_model,
     run_mlb_walkforward_v1,
     summarize_mlb_walkforward_v1,
+    get_missing_mlb_pitcher_log_games,
+    collect_mlb_pitcher_logs_batch,
+    build_mlb_v2a_features,
+    run_mlb_walkforward_v2a,
+    summarize_mlb_walkforward_v2a,
 )
-
 st.set_page_config(page_title="Market Edge AI V5", page_icon="📊", layout="wide")
 
 # ==========================================
