@@ -650,13 +650,6 @@ def build_nfl_future_matchup_features(
 ):
     """
     Build leakage-safe features for a future NFL matchup.
-
-    Unlike the old implementation, this reconstructs each team's
-    CURRENT state through its most recently completed game.
-
-    The final score of a historical game is only used when building
-    a prediction for a LATER game, so this does not introduce
-    target leakage.
     """
 
     if feature_games is None or feature_games.empty:
@@ -664,7 +657,12 @@ def build_nfl_future_matchup_features(
             "NFL feature dataframe is empty."
         )
 
-    df = feature_games.copy()
+    print(
+        "NFL FUTURE DEBUG | columns:",
+        list(feature_games.columns),
+    )
+
+    df = feature_games.copy())
 
     df["start_time"] = pd.to_datetime(
         df["start_time"],
