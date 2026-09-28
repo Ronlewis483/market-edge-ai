@@ -53,39 +53,38 @@ def load_player_history(seasons):
     schedule['game_time'] = (pd.to_datetime(schedule[kickoff_col], utc=True, errors='coerce')
                              + pd.Timedelta(days=1))
     schedule = schedule[schedule['game_time'] < pd.Timestamp.now(tz='UTC')]
-    home = schedule[
-    ['season', 'week', 'home_team', 'away_team', 'game_time']
-].rename(
-    columns={
-        'home_team': 'team',
-        'away_team': 'opponent',
-    }
-)
+        home = schedule[
+        ['season', 'week', 'home_team', 'away_team', 'game_time']
+    ].rename(
+        columns={
+            'home_team': 'team',
+            'away_team': 'opponent',
+        }
+    )
+    home['is_home'] = True
 
-home['is_home'] = True
+    away = schedule[
+        ['season', 'week', 'away_team', 'home_team', 'game_time']
+    ].rename(
+        columns={
+            'away_team': 'team',
+            'home_team': 'opponent',
+        }
+    )
+    away['is_home'] = False
 
-away = schedule[
-    ['season', 'week', 'away_team', 'home_team', 'game_time']
-].rename(
-    columns={
-        'away_team': 'team',
-        'home_team': 'opponent',
-    }
-)
+    games = pd.concat(
+        [home, away],
+        ignore_index=True,
+    ).dropna(
+        subset=['game_time', 'team', 'opponent']
+    )
 
-away['is_home'] = False
-
-games = pd.concat(
-    [home, away],
-    ignore_index=True,
-).dropna(
-    subset=['game_time', 'team', 'opponent']
-)
     # Never assign a game if season/week/team is not unique.
     games = games.drop_duplicates(
-    ['season', 'week', 'team'],
-    keep=False
-)
+        ['season', 'week', 'team'],
+        keep=False
+    )
 
     stats = stats.copy().rename(columns={name_col: 'player', team_col: 'team'})
     stats = stats.merge(games, on=['season', 'week', 'team'], how='inner', validate='many_to_one')
