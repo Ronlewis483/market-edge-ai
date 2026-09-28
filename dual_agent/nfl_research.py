@@ -662,7 +662,7 @@ def build_nfl_future_matchup_features(
         list(feature_games.columns),
     )
 
-    df = feature_games.copy())
+    df = feature_games.copy()
 
     df["start_time"] = pd.to_datetime(
         df["start_time"],
