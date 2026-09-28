@@ -9327,6 +9327,102 @@ if st.button(
                 end_date=end_date,
             )
 
+            # ----------------------------------
+            # STARTING PITCHER COVERAGE CHECK
+            # ----------------------------------
+            
+            pitcher_columns = [
+                "home_starting_pitcher_id",
+                "away_starting_pitcher_id",
+            ]
+            
+            if all(
+                column in mlb_games.columns
+                for column in pitcher_columns
+            ):
+            
+                pitcher_coverage = mlb_games.copy()
+            
+                pitcher_coverage["season"] = (
+                    pd.to_datetime(
+                        pitcher_coverage["start_time"],
+                        utc=True,
+                        errors="coerce",
+                    )
+                    .dt.year
+                )
+            
+                pitcher_coverage["both_starters"] = (
+                    pitcher_coverage[
+                        "home_starting_pitcher_id"
+                    ].notna()
+                    &
+                    pitcher_coverage[
+                        "away_starting_pitcher_id"
+                    ].notna()
+                )
+            
+                total_pitcher_games = len(
+                    pitcher_coverage
+                )
+            
+                games_with_both_starters = int(
+                    pitcher_coverage[
+                        "both_starters"
+                    ].sum()
+                )
+            
+                overall_pitcher_coverage = (
+                    games_with_both_starters
+                    / total_pitcher_games
+                    if total_pitcher_games
+                    else 0.0
+                )
+            
+                pitcher_coverage_by_season = (
+                    pitcher_coverage
+                    .groupby(
+                        "season",
+                        as_index=False,
+                    )
+                    .agg(
+                        games=(
+                            "game_id",
+                            "count",
+                        ),
+                        games_with_both_starters=(
+                            "both_starters",
+                            "sum",
+                        ),
+                    )
+                )
+            
+                pitcher_coverage_by_season[
+                    "coverage"
+                ] = (
+                    pitcher_coverage_by_season[
+                        "games_with_both_starters"
+                    ]
+                    /
+                    pitcher_coverage_by_season[
+                        "games"
+                    ]
+                )
+            
+            else:
+            
+                total_pitcher_games = len(
+                    mlb_games
+                )
+            
+                games_with_both_starters = 0
+            
+                overall_pitcher_coverage = 0.0
+            
+                pitcher_coverage_by_season = (
+                    pd.DataFrame()
+                )
+
             if mlb_games.empty:
                 raise ValueError(
                     "No completed MLB games were returned."
