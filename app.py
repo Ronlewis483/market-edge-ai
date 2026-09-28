@@ -810,42 +810,42 @@ if page == "🏠 Home":
     ):
         try:
     
-                feature_games = st.session_state.get(
-                    "nfl_feature_games"
-                )
-                
-                # ============================================
-                # AUTO-PREPARE NFL HISTORICAL FEATURES
-                # ============================================
-                
-                required_nfl_feature_columns = {
-                    "start_time",
-                    "home_score",
-                    "away_score",
-                    "home_team",
-                    "away_team",
-                }
-                
-                feature_schema_is_stale = (
-                    feature_games is not None
-                    and hasattr(feature_games, "columns")
-                    and not required_nfl_feature_columns.issubset(
-                        set(feature_games.columns)
+                    feature_games = st.session_state.get(
+                        "nfl_feature_games"
                     )
-                )
-                
-                if (
-                    feature_games is None
-                    or (
-                        hasattr(feature_games, "empty")
-                        and feature_games.empty
+                    
+                    # ============================================
+                    # AUTO-PREPARE NFL HISTORICAL FEATURES
+                    # ============================================
+                    
+                    required_nfl_feature_columns = {
+                        "start_time",
+                        "home_score",
+                        "away_score",
+                        "home_team",
+                        "away_team",
+                    }
+                    
+                    feature_schema_is_stale = (
+                        feature_games is not None
+                        and hasattr(feature_games, "columns")
+                        and not required_nfl_feature_columns.issubset(
+                            set(feature_games.columns)
+                        )
                     )
-                    or feature_schema_is_stale
-                ):
-    
-                with st.spinner(
-                    "Preparing NFL historical data automatically..."
-                ):
+                    
+                    if (
+                        feature_games is None
+                        or (
+                            hasattr(feature_games, "empty")
+                            and feature_games.empty
+                        )
+                        or feature_schema_is_stale
+                    ):
+        
+                    with st.spinner(
+                        "Preparing NFL historical data automatically..."
+                    ):
     
                     season_ids = [
                         "sr:season:115087",
