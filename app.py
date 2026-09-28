@@ -9469,9 +9469,9 @@ if st.button(
                 )
             )
 
-        st.success(
-            "MLB V1 walk-forward benchmark completed."
-        )
+            st.success(
+                "MLB V1 walk-forward benchmark completed."
+            )
 
         # ==========================================
         # MLB V2A PITCHER RESEARCH
