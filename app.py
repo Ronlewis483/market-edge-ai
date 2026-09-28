@@ -9496,6 +9496,63 @@ if st.button(
         )
 
         # ----------------------------------
+        # MLB V2A PITCHER RESEARCH
+        # ----------------------------------
+        
+        st.markdown(
+            "### MLB V2A Pitcher Research"
+        )
+        
+        cache_col1, cache_col2, cache_col3 = (
+            st.columns(3)
+        )
+        
+        cache_col1.metric(
+            "Pitcher Rows Collected",
+            f"{len(cached_pitcher_logs):,}",
+        )
+        
+        cache_col2.metric(
+            "Games Remaining",
+            f"{len(missing_pitcher_games):,}",
+        )
+        
+        cache_col3.metric(
+            "V2A Data Progress",
+            f"{coverage_pct:.1%}",
+        )
+        
+        if st.button(
+            "Collect Next 250 MLB Pitcher Games",
+            key="collect_mlb_v2a_pitchers",
+        ):
+        
+            with st.spinner(
+                "Collecting the next 250 MLB pitcher games..."
+            ):
+        
+                collection = (
+                    collect_mlb_pitcher_logs_batch(
+                        games=mlb_games,
+                        existing_logs=cached_pitcher_logs,
+                        batch_size=250,
+                    )
+                )
+        
+                st.session_state[
+                    "mlb_v2a_pitcher_logs"
+                ] = collection["logs"]
+        
+            st.success(
+                "Pitcher batch completed — "
+                f"{collection['requested_games']:,} games requested, "
+                f"{collection['new_pitcher_rows']:,} pitcher rows returned, "
+                f"{collection['remaining_games']:,} games remaining."
+            )
+        
+            st.rerun()
+
+        # ----------------------------------
         # STARTING PITCHER DATA COVERAGE
         # ----------------------------------
         
