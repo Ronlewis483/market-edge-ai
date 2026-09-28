@@ -945,9 +945,146 @@ if page == "🏠 Home":
                 ] = nfl_pipeline_result[
                     "opportunities"
                 ]
+
+        # ============================================
+        # SAVE NFL PREDICTIONS TO AUDIT HISTORY
+        # ============================================
+        
+        predictions_to_save = nfl_pipeline_result.get(
+            "predictions"
+        )
+        
+        opportunities_to_save = nfl_pipeline_result.get(
+            "opportunities"
+        )
+        
+        saved_prediction_count = 0
+        failed_prediction_count = 0
+        
+        if (
+            predictions_to_save is not None
+            and not predictions_to_save.empty
+        ):
+        
+            prediction_records = (
+                predictions_to_save.to_dict("records")
+            )
+        
+            opportunity_records = []
+        
+            if (
+                opportunities_to_save is not None
+                and not opportunities_to_save.empty
+            ):
+                opportunity_records = (
+                    opportunities_to_save.to_dict("records")
+                )
+        
+            for prediction in prediction_records:
+        
+                matched_opportunity = {}
+        
+                home_team = prediction.get("home_team")
+                away_team = prediction.get("away_team")
+                predicted_team = prediction.get(
+                    "predicted_team"
+                )
+        
+                # ------------------------------------
+                # MATCH PREDICTION TO MARKET RECORD
+                # ------------------------------------
+        
+                for opportunity in opportunity_records:
+        
+                    opportunity_home = opportunity.get(
+                        "home_team"
+                    )
+        
+                    opportunity_away = opportunity.get(
+                        "away_team"
+                    )
+        
+                    opportunity_team = (
+                        opportunity.get("team")
+                        or opportunity.get("predicted_team")
+                        or opportunity.get("selection")
+                    )
+        
+                    same_game = (
+                        opportunity_home == home_team
+                        and opportunity_away == away_team
+                    )
+        
+                    same_pick = (
+                        opportunity_team is None
+                        or opportunity_team == predicted_team
+                    )
+        
+                    if same_game and same_pick:
+                        matched_opportunity = opportunity
+                        break
+        
+                # ------------------------------------
+                # SAVE PERMANENT SNAPSHOT
+                # ------------------------------------
+        
+                save_result = save_prediction_snapshot(
+                    league="NFL",
+                    prediction=prediction,
+                    opportunity=matched_opportunity,
+                    model_version="NFL_V1",
+                )
+        
+                # Supports either return style from helper
+                if isinstance(save_result, tuple):
+                    save_success = bool(save_result[0])
+        
+                elif isinstance(save_result, dict):
+                    save_success = bool(
+                        save_result.get("success")
+                    )
+        
+                else:
+                    save_success = bool(save_result)
+        
+                if save_success:
+                    saved_prediction_count += 1
+                else:
+                    failed_prediction_count += 1
+        
+        
+        st.session_state[
+            "nfl_predictions_saved_count"
+        ] = saved_prediction_count
+        
+        st.session_state[
+            "nfl_predictions_failed_count"
+        ] = failed_prediction_count
     
             st.success(
                 "NFL predictions generated successfully."
+            )
+
+        saved_count = st.session_state.get(
+            "nfl_predictions_saved_count",
+            0,
+        )
+        
+        failed_count = st.session_state.get(
+            "nfl_predictions_failed_count",
+            0,
+        )
+        
+        if saved_count > 0:
+            st.success(
+                f"📚 {saved_count} NFL predictions "
+                f"saved to Prediction History."
+            )
+        
+        if failed_count > 0:
+            st.warning(
+                f"⚠️ {failed_count} predictions could "
+                f"not be saved to Prediction History."
             )
     
         except Exception as error:
