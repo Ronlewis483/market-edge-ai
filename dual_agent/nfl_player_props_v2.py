@@ -1855,3 +1855,809 @@ def compare_v1_v2_walkforward(
         "paired_predictions":
             paired,
     }
+
+# ============================================================
+# V2B — OPPONENT / MATCHUP CONTEXT
+# ============================================================
+
+V2B_MIN_OPPONENT_GAMES = 4
+V2B_OPPONENT_WINDOW = 12
+V2B_MAX_ADJUSTMENT = 0.15
+
+
+def opponent_market_context(
+    history,
+    opponent,
+    market,
+    cutoff,
+    window=V2B_OPPONENT_WINDOW,
+    min_games=V2B_MIN_OPPONENT_GAMES,
+):
+    """
+    Build leakage-safe opponent context for one prop market.
+
+    Only historical games before cutoff are used.
+
+    The defensive allowance is compared with the league-wide
+    allowance for the same market over the same historical
+    period.
+
+    Returns None when insufficient opponent history exists.
+    """
+
+    required = {
+        "opponent",
+        "market",
+        "game_time",
+        "value",
+    }
+
+    if not required.issubset(history.columns):
+        return None
+
+    cutoff = pd.Timestamp(cutoff)
+
+    if cutoff.tzinfo is None:
+        cutoff = cutoff.tz_localize("UTC")
+    else:
+        cutoff = cutoff.tz_convert("UTC")
+
+    prior = history[
+        (history["market"] == market)
+        & (history["game_time"] < cutoff)
+    ].copy()
+
+    if prior.empty:
+        return None
+
+    opponent_sample = (
+        prior[
+            prior["opponent"] == opponent
+        ]
+        .sort_values("game_time")
+        .tail(window)
+    )
+
+    if len(opponent_sample) < min_games:
+        return None
+
+    opponent_values = (
+        pd.to_numeric(
+            opponent_sample["value"],
+            errors="coerce",
+        )
+        .dropna()
+    )
+
+    league_values = (
+        pd.to_numeric(
+            prior["value"],
+            errors="coerce",
+        )
+        .dropna()
+    )
+
+    if (
+        len(opponent_values) < min_games
+        or league_values.empty
+    ):
+        return None
+
+    opponent_average = float(
+        opponent_values.mean()
+    )
+
+    league_average = float(
+        league_values.mean()
+    )
+
+    if league_average <= 0:
+        return None
+
+    raw_factor = (
+        opponent_average
+        / league_average
+    )
+
+    # Shrink small samples toward neutral (1.0).
+    #
+    # 4 games  -> 50% of observed adjustment
+    # 8 games  -> 67%
+    # 12 games -> 75%
+    sample_size = len(opponent_values)
+
+    shrinkage = (
+        sample_size
+        / (sample_size + 4.0)
+    )
+
+    shrunk_factor = (
+        1.0
+        + (
+            raw_factor - 1.0
+        )
+        * shrinkage
+    )
+
+    lower_bound = (
+        1.0
+        - V2B_MAX_ADJUSTMENT
+    )
+
+    upper_bound = (
+        1.0
+        + V2B_MAX_ADJUSTMENT
+    )
+
+    matchup_factor = float(
+        np.clip(
+            shrunk_factor,
+            lower_bound,
+            upper_bound,
+        )
+    )
+
+    return {
+        "opponent": opponent,
+        "opponent_games": int(
+            sample_size
+        ),
+        "opponent_average_allowed":
+            opponent_average,
+        "league_average_allowed":
+            league_average,
+        "raw_matchup_factor":
+            float(raw_factor),
+        "matchup_factor":
+            matchup_factor,
+    }
+
+
+def build_v2b_projection(
+    player_projection,
+    matchup_context,
+):
+    """
+    Apply opponent context to the V2A player projection.
+
+    V2A remains untouched.
+
+    If matchup information is unavailable, V2B falls back
+    to the V2A projection.
+    """
+
+    baseline = float(
+        player_projection["projection"]
+    )
+
+    if matchup_context is None:
+
+        return {
+            **player_projection,
+            "v2a_projection":
+                baseline,
+            "v2b_projection":
+                baseline,
+            "matchup_factor":
+                1.0,
+            "opponent_games":
+                0,
+            "opponent_average_allowed":
+                None,
+            "league_average_allowed":
+                None,
+            "matchup_available":
+                False,
+        }
+
+    factor = float(
+        matchup_context[
+            "matchup_factor"
+        ]
+    )
+
+    adjusted = (
+        baseline
+        * factor
+    )
+
+    return {
+        **player_projection,
+        "v2a_projection":
+            baseline,
+        "v2b_projection":
+            float(adjusted),
+        "matchup_factor":
+            factor,
+        "opponent_games":
+            matchup_context[
+                "opponent_games"
+            ],
+        "opponent_average_allowed":
+            matchup_context[
+                "opponent_average_allowed"
+            ],
+        "league_average_allowed":
+            matchup_context[
+                "league_average_allowed"
+            ],
+        "matchup_available":
+            True,
+    }
+
+
+# ============================================================
+# V2B WALK-FORWARD TEST
+# ============================================================
+
+def walkforward_v2b(
+    history,
+    window=DEFAULT_WINDOW,
+    min_games=DEFAULT_MIN_GAMES,
+    decay=0.88,
+):
+    """
+    Leakage-safe V2B walk-forward test.
+
+    For each historical player game:
+
+        1. Build V2A using only that player's earlier games.
+        2. Measure opponent allowance using only games before
+           the current game.
+        3. Adjust the V2A projection by the matchup factor.
+        4. Compare V2B with the actual result.
+
+    No future opponent information is used.
+    """
+
+    history = validate_history(
+        history
+    )
+
+    required = {
+        "opponent",
+        "team",
+        "is_home",
+    }
+
+    missing = (
+        required
+        - set(history.columns)
+    )
+
+    if missing:
+        raise ValueError(
+            "V2B requires enriched player history columns: "
+            + ", ".join(
+                sorted(missing)
+            )
+        )
+
+    history = history[
+        history["market"].isin(
+            V2_MARKETS
+        )
+    ].copy()
+
+    rows = []
+
+    grouped = history.groupby(
+        [
+            "player_key",
+            "market",
+        ]
+    )
+
+    for (
+        player_key,
+        market,
+    ), group in grouped:
+
+        group = (
+            group
+            .sort_values(
+                "game_time"
+            )
+            .drop_duplicates(
+                subset=[
+                    "game_time"
+                ],
+                keep="last",
+            )
+            .reset_index(
+                drop=True
+            )
+        )
+
+        if len(group) <= min_games:
+            continue
+
+        for index in range(
+            min_games,
+            len(group),
+        ):
+
+            current = group.iloc[
+                index
+            ]
+
+            previous = group.iloc[
+                max(
+                    0,
+                    index - window,
+                ):
+                index
+            ].copy()
+
+            if len(previous) < min_games:
+                continue
+
+            player_projection = (
+                build_player_projection(
+                    sample=previous,
+                    market=market,
+                    decay=decay,
+                )
+            )
+
+            if player_projection is None:
+                continue
+
+            opponent = current.get(
+                "opponent"
+            )
+
+            if pd.isna(opponent):
+                continue
+
+            matchup_context = (
+                opponent_market_context(
+                    history=history,
+                    opponent=opponent,
+                    market=market,
+                    cutoff=current[
+                        "game_time"
+                    ],
+                )
+            )
+
+            projection_data = (
+                build_v2b_projection(
+                    player_projection=
+                        player_projection,
+                    matchup_context=
+                        matchup_context,
+                )
+            )
+
+            actual = float(
+                current["value"]
+            )
+
+            v2a_forecast = float(
+                projection_data[
+                    "v2a_projection"
+                ]
+            )
+
+            v2b_forecast = float(
+                projection_data[
+                    "v2b_projection"
+                ]
+            )
+
+            rows.append(
+                {
+                    "player":
+                        current["player"],
+
+                    "player_key":
+                        player_key,
+
+                    "team":
+                        current["team"],
+
+                    "opponent":
+                        opponent,
+
+                    "is_home":
+                        current["is_home"],
+
+                    "market":
+                        market,
+
+                    "game_time":
+                        current[
+                            "game_time"
+                        ],
+
+                    "actual":
+                        actual,
+
+                    "v2a_forecast":
+                        v2a_forecast,
+
+                    "v2b_forecast":
+                        v2b_forecast,
+
+                    "v2a_error":
+                        (
+                            v2a_forecast
+                            - actual
+                        ),
+
+                    "v2b_error":
+                        (
+                            v2b_forecast
+                            - actual
+                        ),
+
+                    "matchup_factor":
+                        projection_data[
+                            "matchup_factor"
+                        ],
+
+                    "opponent_games":
+                        projection_data[
+                            "opponent_games"
+                        ],
+
+                    "matchup_available":
+                        projection_data[
+                            "matchup_available"
+                        ],
+
+                    "model_version":
+                        "NFL_PROP_V2B",
+                }
+            )
+
+    result = pd.DataFrame(
+        rows
+    )
+
+    if result.empty:
+        return result
+
+    result[
+        "v2a_absolute_error"
+    ] = np.abs(
+        result["v2a_error"]
+    )
+
+    result[
+        "v2b_absolute_error"
+    ] = np.abs(
+        result["v2b_error"]
+    )
+
+    result[
+        "v2a_squared_error"
+    ] = np.square(
+        result["v2a_error"]
+    )
+
+    result[
+        "v2b_squared_error"
+    ] = np.square(
+        result["v2b_error"]
+    )
+
+    return result
+
+
+# ============================================================
+# V1 VS V2A VS V2B COMPARISON
+# ============================================================
+
+def compare_v1_v2a_v2b_walkforward(
+    history,
+    window=DEFAULT_WINDOW,
+    min_games=DEFAULT_MIN_GAMES,
+    decay=0.88,
+):
+    """
+    Compare:
+
+        V1  = rolling mean
+        V2A = recency weighted
+        V2B = recency weighted + opponent matchup
+
+    All three models are evaluated on the exact same
+    historical prediction opportunities.
+    """
+
+    history = validate_history(
+        history
+    )
+
+    v2b = walkforward_v2b(
+        history=history,
+        window=window,
+        min_games=min_games,
+        decay=decay,
+    )
+
+    if v2b.empty:
+
+        return {
+            "v1": None,
+            "v2a": None,
+            "v2b": None,
+            "comparison":
+                pd.DataFrame(),
+            "paired_predictions":
+                pd.DataFrame(),
+        }
+
+    v1_forecasts = []
+
+    grouped = history[
+        history["market"].isin(
+            V2_MARKETS
+        )
+    ].groupby(
+        [
+            "player_key",
+            "market",
+        ]
+    )
+
+    for (
+        player_key,
+        market,
+    ), group in grouped:
+
+        group = (
+            group
+            .sort_values(
+                "game_time"
+            )
+            .drop_duplicates(
+                subset=[
+                    "game_time"
+                ],
+                keep="last",
+            )
+            .reset_index(
+                drop=True
+            )
+        )
+
+        for index in range(
+            min_games,
+            len(group),
+        ):
+
+            current = group.iloc[
+                index
+            ]
+
+            previous = (
+                group.iloc[
+                    max(
+                        0,
+                        index - window,
+                    ):
+                    index
+                ]["value"]
+                .to_numpy(
+                    dtype=float
+                )
+            )
+
+            if len(previous) < min_games:
+                continue
+
+            v1_forecasts.append(
+                {
+                    "player_key":
+                        player_key,
+
+                    "market":
+                        market,
+
+                    "game_time":
+                        current[
+                            "game_time"
+                        ],
+
+                    "v1_forecast":
+                        float(
+                            np.mean(
+                                previous
+                            )
+                        ),
+                }
+            )
+
+    v1 = pd.DataFrame(
+        v1_forecasts
+    )
+
+    paired = v2b.merge(
+        v1,
+        on=[
+            "player_key",
+            "market",
+            "game_time",
+        ],
+        how="inner",
+        validate="one_to_one",
+    )
+
+    if paired.empty:
+
+        return {
+            "v1": None,
+            "v2a": None,
+            "v2b": None,
+            "comparison":
+                pd.DataFrame(),
+            "paired_predictions":
+                pd.DataFrame(),
+        }
+
+    paired[
+        "v1_error"
+    ] = (
+        paired["v1_forecast"]
+        - paired["actual"]
+    )
+
+    paired[
+        "v1_absolute_error"
+    ] = np.abs(
+        paired["v1_error"]
+    )
+
+    paired[
+        "v1_squared_error"
+    ] = np.square(
+        paired["v1_error"]
+    )
+
+    def summarize_model(
+        forecast_column,
+        error_column,
+        absolute_error_column,
+        squared_error_column,
+    ):
+
+        return {
+            "prediction_count":
+                int(
+                    len(paired)
+                ),
+
+            "mae":
+                float(
+                    paired[
+                        absolute_error_column
+                    ].mean()
+                ),
+
+            "rmse":
+                float(
+                    math.sqrt(
+                        paired[
+                            squared_error_column
+                        ].mean()
+                    )
+                ),
+
+            "bias":
+                float(
+                    paired[
+                        error_column
+                    ].mean()
+                ),
+
+            "average_forecast":
+                float(
+                    paired[
+                        forecast_column
+                    ].mean()
+                ),
+        }
+
+    v1_summary = summarize_model(
+        "v1_forecast",
+        "v1_error",
+        "v1_absolute_error",
+        "v1_squared_error",
+    )
+
+    v2a_summary = summarize_model(
+        "v2a_forecast",
+        "v2a_error",
+        "v2a_absolute_error",
+        "v2a_squared_error",
+    )
+
+    v2b_summary = summarize_model(
+        "v2b_forecast",
+        "v2b_error",
+        "v2b_absolute_error",
+        "v2b_squared_error",
+    )
+
+    comparison = pd.DataFrame(
+        [
+            {
+                "model":
+                    "V1 Mean Baseline",
+                **v1_summary,
+            },
+            {
+                "model":
+                    "V2A Recency Weighted",
+                **v2a_summary,
+            },
+            {
+                "model":
+                    "V2B Matchup Adjusted",
+                **v2b_summary,
+            },
+        ]
+    )
+
+    return {
+        "v1":
+            v1_summary,
+
+        "v2a":
+            v2a_summary,
+
+        "v2b":
+            v2b_summary,
+
+        "v2a_vs_v1_mae_change":
+            (
+                v2a_summary["mae"]
+                - v1_summary["mae"]
+            ),
+
+        "v2b_vs_v2a_mae_change":
+            (
+                v2b_summary["mae"]
+                - v2a_summary["mae"]
+            ),
+
+        "v2b_vs_v1_mae_change":
+            (
+                v2b_summary["mae"]
+                - v1_summary["mae"]
+            ),
+
+        "v2a_vs_v1_rmse_change":
+            (
+                v2a_summary["rmse"]
+                - v1_summary["rmse"]
+            ),
+
+        "v2b_vs_v2a_rmse_change":
+            (
+                v2b_summary["rmse"]
+                - v2a_summary["rmse"]
+            ),
+
+        "v2b_vs_v1_rmse_change":
+            (
+                v2b_summary["rmse"]
+                - v1_summary["rmse"]
+            ),
+
+        "matchup_coverage":
+            float(
+                paired[
+                    "matchup_available"
+                ].mean()
+            ),
+
+        "comparison":
+            comparison,
+
+        "paired_predictions":
+            paired,
+    }
