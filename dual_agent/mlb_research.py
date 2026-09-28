@@ -724,3 +724,507 @@ def train_mlb_prediction_model(features):
         "model": model,
         "metrics": metrics,
     }
+
+# ==========================================
+# MLB V1 WALK-FORWARD BENCHMARK
+# ==========================================
+
+def run_mlb_walkforward_v1(
+    features,
+    min_train_games=500,
+    retrain_every=100,
+):
+    """
+    Leakage-safe expanding-window walk-forward benchmark
+    for the existing MLB V1 feature set.
+
+    Each prediction is generated using only games that
+    occurred before that game's start_time.
+
+    Games sharing the same start timestamp are predicted
+    together so results from simultaneous games cannot
+    leak into one another.
+    """
+
+    if features is None or features.empty:
+        raise ValueError(
+            "No MLB features available for walk-forward testing."
+        )
+
+    df = features.copy()
+
+    required = (
+        [
+            "game_id",
+            "start_time",
+            "home_win",
+        ]
+        + MLB_MODEL_FEATURES
+    )
+
+    missing = [
+        column
+        for column in required
+        if column not in df.columns
+    ]
+
+    if missing:
+        raise ValueError(
+            f"MLB walk-forward data is missing columns: {missing}"
+        )
+
+    df["start_time"] = pd.to_datetime(
+        df["start_time"],
+        utc=True,
+        errors="coerce",
+    )
+
+    df = df.dropna(
+        subset=[
+            "game_id",
+            "start_time",
+            "home_win",
+        ]
+    )
+
+    df = df.sort_values(
+        [
+            "start_time",
+            "game_id",
+        ]
+    ).reset_index(drop=True)
+
+    if len(df) <= min_train_games:
+        raise ValueError(
+            "Not enough MLB games for walk-forward testing."
+        )
+
+    rows = []
+
+    model = None
+    trained_through_time = None
+    predictions_since_fit = retrain_every
+
+    # Process identical timestamps as a single prediction batch.
+    time_groups = list(
+        df.groupby(
+            "start_time",
+            sort=True,
+        )
+    )
+
+    for game_time, current_group in time_groups:
+
+        train = df[
+            df["start_time"] < game_time
+        ].copy()
+
+        if len(train) < min_train_games:
+            continue
+
+        y_train = (
+            train["home_win"]
+            .astype(int)
+        )
+
+        if y_train.nunique() < 2:
+            continue
+
+        needs_retrain = (
+            model is None
+            or predictions_since_fit >= retrain_every
+        )
+
+        if needs_retrain:
+
+            X_train = (
+                train[MLB_MODEL_FEATURES]
+                .apply(
+                    pd.to_numeric,
+                    errors="coerce",
+                )
+                .fillna(0.0)
+            )
+
+            model = make_pipeline(
+                StandardScaler(),
+                LogisticRegression(
+                    max_iter=2000,
+                    random_state=42,
+                ),
+            )
+
+            model.fit(
+                X_train,
+                y_train,
+            )
+
+            trained_through_time = (
+                train["start_time"].max()
+            )
+
+            predictions_since_fit = 0
+
+        X_current = (
+            current_group[MLB_MODEL_FEATURES]
+            .apply(
+                pd.to_numeric,
+                errors="coerce",
+            )
+            .fillna(0.0)
+        )
+
+        probabilities = model.predict_proba(
+            X_current
+        )[:, 1]
+
+        for position, (_, game) in enumerate(
+            current_group.iterrows()
+        ):
+
+            probability = float(
+                probabilities[position]
+            )
+
+            actual = int(
+                game["home_win"]
+            )
+
+            predicted = int(
+                probability >= 0.50
+            )
+
+            confidence = float(
+                max(
+                    probability,
+                    1.0 - probability,
+                )
+            )
+
+            rows.append(
+                {
+                    "game_id":
+                        game["game_id"],
+
+                    "season_id":
+                        game.get("season_id"),
+
+                    "start_time":
+                        game_time,
+
+                    "home_team":
+                        game.get("home_team"),
+
+                    "away_team":
+                        game.get("away_team"),
+
+                    "actual_home_win":
+                        actual,
+
+                    "home_win_probability":
+                        probability,
+
+                    "predicted_home_win":
+                        predicted,
+
+                    "confidence":
+                        confidence,
+
+                    "correct":
+                        int(
+                            predicted == actual
+                        ),
+
+                    "trained_through":
+                        trained_through_time,
+
+                    "model_version":
+                        "MLB_V1",
+                }
+            )
+
+        predictions_since_fit += len(
+            current_group
+        )
+
+    predictions = pd.DataFrame(rows)
+
+    if predictions.empty:
+        raise ValueError(
+            "MLB V1 walk-forward produced no predictions."
+        )
+
+    return (
+        predictions
+        .sort_values(
+            [
+                "start_time",
+                "game_id",
+            ]
+        )
+        .reset_index(drop=True)
+    )
+
+
+def summarize_mlb_walkforward_v1(
+    predictions,
+):
+    """
+    Summarize out-of-sample MLB V1 walk-forward performance.
+    """
+
+    if predictions is None or predictions.empty:
+        raise ValueError(
+            "No MLB walk-forward predictions to summarize."
+        )
+
+    df = predictions.copy()
+
+    y_true = (
+        df["actual_home_win"]
+        .astype(int)
+    )
+
+    probabilities = (
+        pd.to_numeric(
+            df["home_win_probability"],
+            errors="coerce",
+        )
+        .clip(
+            1e-6,
+            1.0 - 1e-6,
+        )
+    )
+
+    predicted = (
+        df["predicted_home_win"]
+        .astype(int)
+    )
+
+    valid = (
+        probabilities.notna()
+        & y_true.notna()
+    )
+
+    df = df.loc[valid].copy()
+    y_true = y_true.loc[valid]
+    probabilities = probabilities.loc[valid]
+    predicted = predicted.loc[valid]
+
+    if df.empty:
+        raise ValueError(
+            "No valid MLB walk-forward predictions."
+        )
+
+    accuracy = float(
+        accuracy_score(
+            y_true,
+            predicted,
+        )
+    )
+
+    brier = float(
+        brier_score_loss(
+            y_true,
+            probabilities,
+        )
+    )
+
+    model_log_loss = float(
+        log_loss(
+            y_true,
+            probabilities,
+            labels=[0, 1],
+        )
+    )
+
+    auc = None
+
+    if y_true.nunique() == 2:
+        auc = float(
+            roc_auc_score(
+                y_true,
+                probabilities,
+            )
+        )
+
+    # --------------------------------------
+    # SIMPLE HOME-RATE BASELINE
+    # --------------------------------------
+    #
+    # This is intentionally simple.
+    # The more important comparison later
+    # will be V2A against this exact V1.
+    # --------------------------------------
+
+    baseline_probability = float(
+        y_true.mean()
+    )
+
+    baseline_probabilities = np.full(
+        len(y_true),
+        baseline_probability,
+        dtype=float,
+    )
+
+    baseline_prediction = int(
+        baseline_probability >= 0.50
+    )
+
+    baseline_predictions = np.full(
+        len(y_true),
+        baseline_prediction,
+        dtype=int,
+    )
+
+    baseline_accuracy = float(
+        accuracy_score(
+            y_true,
+            baseline_predictions,
+        )
+    )
+
+    baseline_brier = float(
+        brier_score_loss(
+            y_true,
+            baseline_probabilities,
+        )
+    )
+
+    baseline_log_loss = float(
+        log_loss(
+            y_true,
+            baseline_probabilities,
+            labels=[0, 1],
+        )
+    )
+
+    # --------------------------------------
+    # CONFIDENCE BUCKETS
+    # --------------------------------------
+
+    def confidence_bucket(value):
+
+        if value >= 0.70:
+            return "70%+"
+
+        if value >= 0.60:
+            return "60-69.9%"
+
+        if value >= 0.55:
+            return "55-59.9%"
+
+        return "50-54.9%"
+
+    df["confidence_bucket"] = (
+        df["confidence"]
+        .apply(confidence_bucket)
+    )
+
+    confidence_summary = (
+        df.groupby(
+            "confidence_bucket",
+            as_index=False,
+        )
+        .agg(
+            predictions=(
+                "correct",
+                "size",
+            ),
+            accuracy=(
+                "correct",
+                "mean",
+            ),
+            average_confidence=(
+                "confidence",
+                "mean",
+            ),
+        )
+    )
+
+    bucket_order = {
+        "50-54.9%": 0,
+        "55-59.9%": 1,
+        "60-69.9%": 2,
+        "70%+": 3,
+    }
+
+    confidence_summary[
+        "_order"
+    ] = confidence_summary[
+        "confidence_bucket"
+    ].map(bucket_order)
+
+    confidence_summary = (
+        confidence_summary
+        .sort_values("_order")
+        .drop(columns="_order")
+        .reset_index(drop=True)
+    )
+
+    # --------------------------------------
+    # SEASON-BY-SEASON PERFORMANCE
+    # --------------------------------------
+
+    season_summary = (
+        df.groupby(
+            "season_id",
+            dropna=False,
+            as_index=False,
+        )
+        .agg(
+            predictions=(
+                "correct",
+                "size",
+            ),
+            accuracy=(
+                "correct",
+                "mean",
+            ),
+        )
+    )
+
+    return {
+        "prediction_count":
+            int(len(df)),
+
+        "accuracy":
+            accuracy,
+
+        "auc":
+            auc,
+
+        "brier":
+            brier,
+
+        "log_loss":
+            model_log_loss,
+
+        "baseline_accuracy":
+            baseline_accuracy,
+
+        "baseline_brier":
+            baseline_brier,
+
+        "baseline_log_loss":
+            baseline_log_loss,
+
+        "first_prediction":
+            str(
+                df["start_time"].min()
+            ),
+
+        "last_prediction":
+            str(
+                df["start_time"].max()
+            ),
+
+        "confidence_summary":
+            confidence_summary,
+
+        "season_summary":
+            season_summary,
+
+        "predictions":
+            df,
+    }
