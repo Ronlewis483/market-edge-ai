@@ -2517,3 +2517,272 @@ def summarize_mlb_walkforward_v2a(
     ] = "MLB_V2A"
 
     return results
+
+# ==========================================
+# MLB V2A — BATCHED PITCHER LOG COLLECTOR
+# ==========================================
+
+def get_missing_mlb_pitcher_log_games(
+    games,
+    existing_logs=None,
+):
+    """
+    Determine which MLB games still need starting-pitcher
+    boxscore data.
+
+    A game is considered complete when both expected
+    starting pitchers have matching pitcher-log records.
+    """
+
+    if games is None or games.empty:
+        return pd.DataFrame()
+
+    df = games.copy()
+
+    required = [
+        "game_id",
+        "home_starting_pitcher_id",
+        "away_starting_pitcher_id",
+    ]
+
+    missing_columns = [
+        column
+        for column in required
+        if column not in df.columns
+    ]
+
+    if missing_columns:
+        raise ValueError(
+            "MLB pitcher cache check is missing columns: "
+            f"{missing_columns}"
+        )
+
+    # No existing cache yet.
+    if existing_logs is None or existing_logs.empty:
+        return df.reset_index(drop=True)
+
+    logs = existing_logs.copy()
+
+    if (
+        "game_id" not in logs.columns
+        or "pitcher_id" not in logs.columns
+    ):
+        return df.reset_index(drop=True)
+
+    logs["game_id"] = pd.to_numeric(
+        logs["game_id"],
+        errors="coerce",
+    )
+
+    logs["pitcher_id"] = pd.to_numeric(
+        logs["pitcher_id"],
+        errors="coerce",
+    )
+
+    logs = logs.dropna(
+        subset=[
+            "game_id",
+            "pitcher_id",
+        ]
+    )
+
+    cached_pairs = set(
+        zip(
+            logs["game_id"].astype(int),
+            logs["pitcher_id"].astype(int),
+        )
+    )
+
+    missing_indexes = []
+
+    for index, game in df.iterrows():
+
+        game_id = int(
+            game["game_id"]
+        )
+
+        expected_pitchers = []
+
+        home_pitcher = game.get(
+            "home_starting_pitcher_id"
+        )
+
+        away_pitcher = game.get(
+            "away_starting_pitcher_id"
+        )
+
+        if pd.notna(home_pitcher):
+            expected_pitchers.append(
+                int(home_pitcher)
+            )
+
+        if pd.notna(away_pitcher):
+            expected_pitchers.append(
+                int(away_pitcher)
+            )
+
+        # If pitcher identities are unavailable,
+        # this game cannot be completed by V2A.
+        if len(expected_pitchers) < 2:
+            continue
+
+        complete = all(
+            (
+                game_id,
+                pitcher_id,
+            )
+            in cached_pairs
+            for pitcher_id
+            in expected_pitchers
+        )
+
+        if not complete:
+            missing_indexes.append(
+                index
+            )
+
+    return (
+        df.loc[missing_indexes]
+        .copy()
+        .reset_index(drop=True)
+    )
+
+
+def collect_mlb_pitcher_logs_batch(
+    games,
+    existing_logs=None,
+    batch_size=250,
+):
+    """
+    Collect one batch of missing MLB starting-pitcher logs.
+
+    This deliberately does NOT attempt the entire historical
+    archive in one request cycle.
+
+    Returns:
+        logs
+        requested_games
+        remaining_games
+        complete
+    """
+
+    if games is None or games.empty:
+        raise ValueError(
+            "No MLB games supplied to pitcher-log collector."
+        )
+
+    if existing_logs is None:
+        existing_logs = pd.DataFrame()
+
+    missing_games = (
+        get_missing_mlb_pitcher_log_games(
+            games,
+            existing_logs,
+        )
+    )
+
+    if missing_games.empty:
+
+        return {
+            "logs":
+                existing_logs.copy(),
+
+            "requested_games":
+                0,
+
+            "remaining_games":
+                0,
+
+            "complete":
+                True,
+        }
+
+    batch_size = max(
+        1,
+        int(batch_size),
+    )
+
+    batch = (
+        missing_games
+        .head(batch_size)
+        .copy()
+    )
+
+    new_logs = (
+        fetch_mlb_starting_pitcher_game_logs(
+            batch
+        )
+    )
+
+    if (
+        existing_logs.empty
+        and new_logs.empty
+    ):
+
+        combined = pd.DataFrame()
+
+    elif existing_logs.empty:
+
+        combined = new_logs.copy()
+
+    elif new_logs.empty:
+
+        combined = existing_logs.copy()
+
+    else:
+
+        combined = pd.concat(
+            [
+                existing_logs,
+                new_logs,
+            ],
+            ignore_index=True,
+        )
+
+    if not combined.empty:
+
+        combined = (
+            combined
+            .drop_duplicates(
+                subset=[
+                    "game_id",
+                    "pitcher_id",
+                ],
+                keep="last",
+            )
+            .sort_values(
+                [
+                    "start_time",
+                    "game_id",
+                    "side",
+                ]
+            )
+            .reset_index(drop=True)
+        )
+
+    remaining = (
+        get_missing_mlb_pitcher_log_games(
+            games,
+            combined,
+        )
+    )
+
+    return {
+        "logs":
+            combined,
+
+        "requested_games":
+            int(len(batch)),
+
+        "new_pitcher_rows":
+            int(len(new_logs)),
+
+        "cached_pitcher_rows":
+            int(len(combined)),
+
+        "remaining_games":
+            int(len(remaining)),
+
+        "complete":
+            bool(remaining.empty),
+    }
