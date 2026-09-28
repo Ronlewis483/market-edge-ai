@@ -9473,6 +9473,12 @@ if st.button(
                 "MLB V1 walk-forward benchmark completed."
             )
 
+            except Exception as exc:
+
+            st.error(
+                f"MLB V1 benchmark failed: {exc}"
+            )
+
         # ==========================================
         # MLB V2A PITCHER RESEARCH
         # ==========================================
@@ -9577,76 +9583,76 @@ if st.button(
         
                     st.exception(exc)
 
-                # ==========================================
-                # DISPLAY MLB VALIDATION RESULTS
-                # ==========================================
-                
-                mlb_metrics = st.session_state.get(
-                    "mlb_training_metrics"
-                )
-                
-                if mlb_metrics:
-                
-                    st.subheader("MLB Model Validation Results")
-                
-                    if mlb_metrics["passes_benchmarks"]:
-                
-                        st.success(
-                            "Historical validation benchmarks passed."
-                        )
-                
-                    else:
-                
-                        st.warning(
-                            "Historical validation benchmarks not passed. "
-                            "Further model evaluation is required."
-                        )
-                
-                    col1, col2, col3 = st.columns(3)
-                
-                    with col1:
-                
-                        st.metric(
-                            "Model Accuracy",
-                            f"{mlb_metrics['model_accuracy']:.2%}",
-                        )
-                
-                        st.metric(
-                            "Baseline Accuracy",
-                            f"{mlb_metrics['baseline_accuracy']:.2%}",
-                        )
-                
-                    with col2:
-                
-                        st.metric(
-                            "Model Brier Score",
-                            f"{mlb_metrics['model_brier']:.4f}",
-                        )
-                
-                        st.metric(
-                            "Baseline Brier Score",
-                            f"{mlb_metrics['baseline_brier']:.4f}",
-                        )
-                
-                    with col3:
-                
-                        st.metric(
-                            "Model Log Loss",
-                            f"{mlb_metrics['model_log_loss']:.4f}",
-                        )
-                
-                        st.metric(
-                            "AUC Score",
-                            (
-                                f"{mlb_metrics['auc']:.3f}"
-                                if mlb_metrics["auc"] is not None
-                                else "N/A"
-                            ),
-                        )
-                
-                    
-                    st.subheader("Historical Training Summary")
-                    
-                    st.json(mlb_metrics)
-                    
+# ==========================================
+# DISPLAY MLB VALIDATION RESULTS
+# ==========================================
+
+mlb_metrics = st.session_state.get(
+"mlb_training_metrics"
+)
+
+if mlb_metrics:
+
+st.subheader("MLB Model Validation Results")
+
+if mlb_metrics["passes_benchmarks"]:
+
+    st.success(
+        "Historical validation benchmarks passed."
+    )
+
+else:
+
+    st.warning(
+        "Historical validation benchmarks not passed. "
+        "Further model evaluation is required."
+    )
+
+col1, col2, col3 = st.columns(3)
+
+with col1:
+
+    st.metric(
+        "Model Accuracy",
+        f"{mlb_metrics['model_accuracy']:.2%}",
+    )
+
+    st.metric(
+        "Baseline Accuracy",
+        f"{mlb_metrics['baseline_accuracy']:.2%}",
+    )
+
+with col2:
+
+    st.metric(
+        "Model Brier Score",
+        f"{mlb_metrics['model_brier']:.4f}",
+    )
+
+    st.metric(
+        "Baseline Brier Score",
+        f"{mlb_metrics['baseline_brier']:.4f}",
+    )
+
+with col3:
+
+    st.metric(
+        "Model Log Loss",
+        f"{mlb_metrics['model_log_loss']:.4f}",
+    )
+
+    st.metric(
+        "AUC Score",
+        (
+            f"{mlb_metrics['auc']:.3f}"
+            if mlb_metrics["auc"] is not None
+            else "N/A"
+        ),
+    )
+
+
+st.subheader("Historical Training Summary")
+
+st.json(mlb_metrics)
+
 
