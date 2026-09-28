@@ -82,7 +82,10 @@ games = pd.concat(
     subset=['game_time', 'team', 'opponent']
 )
     # Never assign a game if season/week/team is not unique.
-    games = games.drop_duplicates(['season', 'week', 'team'], keep=False)
+    games = games.drop_duplicates(
+    ['season', 'week', 'team'],
+    keep=False
+)
 
     stats = stats.copy().rename(columns={name_col: 'player', team_col: 'team'})
     stats = stats.merge(games, on=['season', 'week', 'team'], how='inner', validate='many_to_one')
