@@ -810,21 +810,38 @@ if page == "🏠 Home":
     ):
         try:
     
-            feature_games = st.session_state.get(
-                "nfl_feature_games"
-            )
-    
-            # ============================================
-            # AUTO-PREPARE NFL HISTORICAL FEATURES
-            # ============================================
-    
-            if (
-                feature_games is None
-                or (
-                    hasattr(feature_games, "empty")
-                    and feature_games.empty
-                )
-            ):
+feature_games = st.session_state.get(
+    "nfl_feature_games"
+)
+
+# ============================================
+# AUTO-PREPARE NFL HISTORICAL FEATURES
+# ============================================
+
+required_nfl_feature_columns = {
+    "start_time",
+    "home_score",
+    "away_score",
+    "home_team",
+    "away_team",
+}
+
+feature_schema_is_stale = (
+    feature_games is not None
+    and hasattr(feature_games, "columns")
+    and not required_nfl_feature_columns.issubset(
+        set(feature_games.columns)
+    )
+)
+
+if (
+    feature_games is None
+    or (
+        hasattr(feature_games, "empty")
+        and feature_games.empty
+    )
+    or feature_schema_is_stale
+):
     
                 with st.spinner(
                     "Preparing NFL historical data automatically..."
