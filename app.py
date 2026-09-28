@@ -5114,6 +5114,397 @@ def render_research_lab():
                     "of the player-history dataset."
                 )
 
+# ==========================================
+# NFL PLAYER PROP V1 VS V2A VS V2B BENCHMARK
+# ==========================================
+
+st.divider()
+
+st.subheader(
+    "🏈 NFL Player Prop V1 vs V2A vs V2B Benchmark"
+)
+
+st.caption(
+    "Leakage-safe historical comparison of the mean baseline, "
+    "recency-weighted model, and opponent matchup-adjusted model."
+)
+
+st.info(
+    "V2B adds opponent defensive context to V2A. "
+    "Lower MAE and RMSE are better. "
+    "Bias closer to zero is better."
+)
+
+if st.button(
+    "Run NFL Player Prop V2B Benchmark",
+    key="run_nfl_prop_v2b_benchmark",
+):
+
+    with st.spinner(
+        "Running V1 vs V2A vs V2B walk-forward benchmark..."
+    ):
+
+        current_nfl_season = pd.Timestamp.now().year
+
+        prop_history_v2b = load_player_history(
+            [
+                current_nfl_season - 2,
+                current_nfl_season - 1,
+                current_nfl_season,
+            ]
+        )
+
+        v2b_benchmark = (
+            compare_v1_v2a_v2b_walkforward(
+                history=prop_history_v2b,
+                window=12,
+                min_games=6,
+                decay=0.88,
+            )
+        )
+
+        st.session_state[
+            "nfl_prop_v2b_benchmark"
+        ] = v2b_benchmark
+
+        st.success(
+            "NFL Player Prop V2B benchmark completed."
+        )
+
+
+v2b_benchmark = st.session_state.get(
+    "nfl_prop_v2b_benchmark"
+)
+
+if v2b_benchmark:
+
+    v1 = v2b_benchmark.get("v1")
+    v2a = v2b_benchmark.get("v2a")
+    v2b = v2b_benchmark.get("v2b")
+
+    if (
+        v1 is not None
+        and v2a is not None
+        and v2b is not None
+    ):
+
+        st.subheader(
+            "📊 V1 vs V2A vs V2B"
+        )
+
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+
+            st.markdown(
+                "### V1 — Mean Baseline"
+            )
+
+            st.metric(
+                "Predictions",
+                f"{v1['prediction_count']:,}",
+            )
+
+            st.metric(
+                "MAE",
+                f"{v1['mae']:.3f}",
+            )
+
+            st.metric(
+                "RMSE",
+                f"{v1['rmse']:.3f}",
+            )
+
+            st.metric(
+                "Bias",
+                f"{v1['bias']:+.3f}",
+            )
+
+        with col2:
+
+            st.markdown(
+                "### V2A — Recency Weighted"
+            )
+
+            st.metric(
+                "Predictions",
+                f"{v2a['prediction_count']:,}",
+            )
+
+            st.metric(
+                "MAE",
+                f"{v2a['mae']:.3f}",
+            )
+
+            st.metric(
+                "RMSE",
+                f"{v2a['rmse']:.3f}",
+            )
+
+            st.metric(
+                "Bias",
+                f"{v2a['bias']:+.3f}",
+            )
+
+        with col3:
+
+            st.markdown(
+                "### V2B — Matchup Adjusted"
+            )
+
+            st.metric(
+                "Predictions",
+                f"{v2b['prediction_count']:,}",
+            )
+
+            st.metric(
+                "MAE",
+                f"{v2b['mae']:.3f}",
+            )
+
+            st.metric(
+                "RMSE",
+                f"{v2b['rmse']:.3f}",
+            )
+
+            st.metric(
+                "Bias",
+                f"{v2b['bias']:+.3f}",
+            )
+
+        st.subheader(
+            "🔬 V2B Change"
+        )
+
+        change_col1, change_col2 = (
+            st.columns(2)
+        )
+
+        with change_col1:
+
+            st.metric(
+                "MAE vs V2A",
+                (
+                    f"{v2b_benchmark['v2b_vs_v2a_mae_change']:+.3f}"
+                ),
+            )
+
+            st.metric(
+                "MAE vs V1",
+                (
+                    f"{v2b_benchmark['v2b_vs_v1_mae_change']:+.3f}"
+                ),
+            )
+
+        with change_col2:
+
+            st.metric(
+                "RMSE vs V2A",
+                (
+                    f"{v2b_benchmark['v2b_vs_v2a_rmse_change']:+.3f}"
+                ),
+            )
+
+            st.metric(
+                "RMSE vs V1",
+                (
+                    f"{v2b_benchmark['v2b_vs_v1_rmse_change']:+.3f}"
+                ),
+            )
+
+        st.metric(
+            "Matchup Coverage",
+            (
+                f"{v2b_benchmark['matchup_coverage'] * 100:.1f}%"
+            ),
+        )
+
+        st.subheader(
+            "📋 Overall Benchmark"
+        )
+
+        comparison = (
+            v2b_benchmark[
+                "comparison"
+            ].copy()
+        )
+
+        numeric_columns = [
+            "mae",
+            "rmse",
+            "bias",
+            "average_forecast",
+        ]
+
+        for column in numeric_columns:
+
+            if column in comparison.columns:
+
+                comparison[column] = (
+                    comparison[column]
+                    .round(4)
+                )
+
+        st.dataframe(
+            comparison,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        paired = (
+            v2b_benchmark[
+                "paired_predictions"
+            ].copy()
+        )
+
+        if not paired.empty:
+
+            st.subheader(
+                "🧬 Performance by Prop Market"
+            )
+
+            market_rows = []
+
+            for (
+                market,
+                market_data,
+            ) in paired.groupby(
+                "market"
+            ):
+
+                market_rows.append(
+                    {
+                        "Market":
+                            market,
+
+                        "Predictions":
+                            len(
+                                market_data
+                            ),
+
+                        "V1 MAE":
+                            market_data[
+                                "v1_absolute_error"
+                            ].mean(),
+
+                        "V2A MAE":
+                            market_data[
+                                "v2a_absolute_error"
+                            ].mean(),
+
+                        "V2B MAE":
+                            market_data[
+                                "v2b_absolute_error"
+                            ].mean(),
+
+                        "V2B vs V2A MAE":
+                            (
+                                market_data[
+                                    "v2b_absolute_error"
+                                ].mean()
+                                - market_data[
+                                    "v2a_absolute_error"
+                                ].mean()
+                            ),
+
+                        "V1 RMSE":
+                            np.sqrt(
+                                market_data[
+                                    "v1_squared_error"
+                                ].mean()
+                            ),
+
+                        "V2A RMSE":
+                            np.sqrt(
+                                market_data[
+                                    "v2a_squared_error"
+                                ].mean()
+                            ),
+
+                        "V2B RMSE":
+                            np.sqrt(
+                                market_data[
+                                    "v2b_squared_error"
+                                ].mean()
+                            ),
+
+                        "V2B vs V2A RMSE":
+                            (
+                                np.sqrt(
+                                    market_data[
+                                        "v2b_squared_error"
+                                    ].mean()
+                                )
+                                - np.sqrt(
+                                    market_data[
+                                        "v2a_squared_error"
+                                    ].mean()
+                                )
+                            ),
+
+                        "Matchup Coverage":
+                            market_data[
+                                "matchup_available"
+                            ].mean(),
+                    }
+                )
+
+            market_table = pd.DataFrame(
+                market_rows
+            )
+
+            market_table[
+                "Matchup Coverage"
+            ] = (
+                market_table[
+                    "Matchup Coverage"
+                ]
+                * 100.0
+            )
+
+            numeric_market_columns = [
+                "V1 MAE",
+                "V2A MAE",
+                "V2B MAE",
+                "V2B vs V2A MAE",
+                "V1 RMSE",
+                "V2A RMSE",
+                "V2B RMSE",
+                "V2B vs V2A RMSE",
+                "Matchup Coverage",
+            ]
+
+            market_table[
+                numeric_market_columns
+            ] = (
+                market_table[
+                    numeric_market_columns
+                ].round(3)
+            )
+
+            market_table = (
+                market_table
+                .sort_values(
+                    "V2B vs V2A MAE"
+                )
+                .reset_index(
+                    drop=True
+                )
+            )
+
+            st.dataframe(
+                market_table,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        st.caption(
+            "Negative V2B-vs-V2A MAE/RMSE changes mean "
+            "the matchup adjustment improved projection accuracy. "
+            "This remains a projection benchmark, not a historical "
+            "sportsbook ROI test."
+        )
+
         # ==========================================
         # STOCK MODEL TRAINING CENTER
         # ==========================================
