@@ -82,8 +82,6 @@ from dual_agent.supabase_db import (
     get_all_bets,
     update_bet_result,
     save_prediction_snapshot,
-    get_prediction_history,
-    update_prediction_result,
 )
 
 from dual_agent.bet_settlement import (
