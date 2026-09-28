@@ -46,72 +46,173 @@ def fetch_mlb_games(
     """
     Retrieve completed MLB regular-season games.
 
+    Long historical ranges are requested one calendar
+    year at a time and then combined. This avoids relying
+    on one large multi-season MLB Stats API response.
+
     Only games with a final result are included.
 
     Returns one row per completed game.
     """
 
-    params = {
-        "sportId": 1,
-        "startDate": start_date,
-        "endDate": end_date,
-        "gameTypes": "R",
-    }
+    start_ts = pd.Timestamp(start_date)
+    end_ts = pd.Timestamp(end_date)
 
-    response = requests.get(
-        MLB_API_URL,
-        params=params,
-        timeout=30,
-    )
-
-    response.raise_for_status()
-
-    data = response.json()
+    if start_ts > end_ts:
+        raise ValueError(
+            "MLB start_date must be before end_date."
+        )
 
     games = []
 
-    for date_entry in data.get("dates", []):
+    # --------------------------------------
+    # REQUEST ONE CALENDAR YEAR AT A TIME
+    # --------------------------------------
 
-        for game in date_entry.get("games", []):
+    for year in range(
+        start_ts.year,
+        end_ts.year + 1,
+    ):
 
-            status = game.get("status", {})
+        chunk_start = max(
+            start_ts,
+            pd.Timestamp(
+                year=year,
+                month=1,
+                day=1,
+            ),
+        )
 
-            if status.get("abstractGameState") != "Final":
-                continue
+        chunk_end = min(
+            end_ts,
+            pd.Timestamp(
+                year=year,
+                month=12,
+                day=31,
+            ),
+        )
 
-            teams = game.get("teams", {})
+        params = {
+            "sportId": 1,
+            "startDate":
+                chunk_start.strftime("%Y-%m-%d"),
+            "endDate":
+                chunk_end.strftime("%Y-%m-%d"),
+            "gameTypes": "R",
+        }
 
-            home = teams.get("home", {})
-            away = teams.get("away", {})
+        response = requests.get(
+            MLB_API_URL,
+            params=params,
+            timeout=60,
+        )
 
-            home_score = home.get("score")
-            away_score = away.get("score")
+        response.raise_for_status()
 
-            if home_score is None or away_score is None:
-                continue
+        data = response.json()
 
-            home_team = home.get("team", {})
-            away_team = away.get("team", {})
+        for date_entry in data.get(
+            "dates",
+            [],
+        ):
 
-            if not home_team.get("id") or not away_team.get("id"):
-                continue
+            for game in date_entry.get(
+                "games",
+                [],
+            ):
 
-            games.append(
-                {
-                    "game_id": game.get("gamePk"),
-                    "season_id": game.get("season"),
-                    "start_time": game.get("gameDate"),
+                status = game.get(
+                    "status",
+                    {},
+                )
 
-                    "home_team": home_team.get("name"),
-                    "away_team": away_team.get("name"),
+                if (
+                    status.get(
+                        "abstractGameState"
+                    )
+                    != "Final"
+                ):
+                    continue
 
-                    "home_team_id": home_team.get("id"),
-                    "away_team_id": away_team.get("id"),
+                teams = game.get(
+                    "teams",
+                    {},
+                )
 
-                    "home_score": home_score,
-                    "away_score": away_score,
-                }
-            )
+                home = teams.get(
+                    "home",
+                    {},
+                )
+
+                away = teams.get(
+                    "away",
+                    {},
+                )
+
+                home_score = home.get(
+                    "score"
+                )
+
+                away_score = away.get(
+                    "score"
+                )
+
+                if (
+                    home_score is None
+                    or away_score is None
+                ):
+                    continue
+
+                home_team = home.get(
+                    "team",
+                    {},
+                )
+
+                away_team = away.get(
+                    "team",
+                    {},
+                )
+
+                if (
+                    not home_team.get("id")
+                    or not away_team.get("id")
+                ):
+                    continue
+
+                games.append(
+                    {
+                        "game_id":
+                            game.get("gamePk"),
+
+                        "season_id":
+                            game.get("season"),
+
+                        "start_time":
+                            game.get("gameDate"),
+
+                        "home_team":
+                            home_team.get("name"),
+
+                        "away_team":
+                            away_team.get("name"),
+
+                        "home_team_id":
+                            home_team.get("id"),
+
+                        "away_team_id":
+                            away_team.get("id"),
+
+                        "home_score":
+                            home_score,
+
+                        "away_score":
+                            away_score,
+                    }
+                )
+
+    # --------------------------------------
+    # BUILD COMBINED HISTORICAL DATASET
+    # --------------------------------------
 
     df = pd.DataFrame(games)
 
@@ -125,17 +226,29 @@ def fetch_mlb_games(
     )
 
     df = df.dropna(
-        subset=["start_time"]
+        subset=[
+            "game_id",
+            "start_time",
+            "home_team_id",
+            "away_team_id",
+            "home_score",
+            "away_score",
+        ]
     )
 
     df = df.drop_duplicates(
-        subset=["game_id"]
+        subset=["game_id"],
+        keep="first",
     )
 
-    return df.sort_values(
-        ["start_time", "game_id"]
+    df = df.sort_values(
+        [
+            "start_time",
+            "game_id",
+        ]
     ).reset_index(drop=True)
 
+    return df
 
 # ==========================================
 # TEAM HISTORICAL STATISTICS
