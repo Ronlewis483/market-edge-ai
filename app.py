@@ -9343,33 +9343,7 @@ if st.button(
             st.session_state[
                 "mlb_v2a_games"
             ] = mlb_games
-
-            # ----------------------------------
-            # MLB V2A PITCHER RESEARCH CACHE
-            # ----------------------------------
             
-            cached_pitcher_logs = st.session_state.get(
-                "mlb_v2a_pitcher_logs",
-                pd.DataFrame(),
-            )
-            
-            missing_pitcher_games = (
-                get_missing_mlb_pitcher_log_games(
-                    mlb_games,
-                    cached_pitcher_logs,
-                )
-            )
-            
-            coverage_games = (
-                len(mlb_games)
-                - len(missing_pitcher_games)
-            )
-            
-            coverage_pct = (
-                coverage_games / len(mlb_games)
-                if len(mlb_games)
-                else 0.0
-            )
 
             # ----------------------------------
             # STARTING PITCHER COVERAGE CHECK
