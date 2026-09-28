@@ -9285,6 +9285,15 @@ if st.button(
         )
 
 # ==========================================
+# MLB V2A RESEARCH CACHE
+# ==========================================
+
+if "mlb_v2a_pitcher_logs" not in st.session_state:
+    st.session_state[
+        "mlb_v2a_pitcher_logs"
+    ] = pd.DataFrame()
+
+# ==========================================
 # MLB V1 WALK-FORWARD BENCHMARK
 # ==========================================
 
@@ -9329,6 +9338,33 @@ if st.button(
             mlb_games = fetch_mlb_games(
                 start_date=start_date,
                 end_date=end_date,
+            )
+
+            # ----------------------------------
+            # MLB V2A PITCHER RESEARCH CACHE
+            # ----------------------------------
+            
+            cached_pitcher_logs = st.session_state.get(
+                "mlb_v2a_pitcher_logs",
+                pd.DataFrame(),
+            )
+            
+            missing_pitcher_games = (
+                get_missing_mlb_pitcher_log_games(
+                    mlb_games,
+                    cached_pitcher_logs,
+                )
+            )
+            
+            coverage_games = (
+                len(mlb_games)
+                - len(missing_pitcher_games)
+            )
+            
+            coverage_pct = (
+                coverage_games / len(mlb_games)
+                if len(mlb_games)
+                else 0.0
             )
 
             # ----------------------------------
