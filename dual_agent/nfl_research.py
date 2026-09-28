@@ -659,7 +659,7 @@ def build_nfl_future_matchup_features(
     target leakage.
     """
 
-    if feature_df is None or feature_df.empty:
+    if feature_games is None or feature_games.empty:
         raise ValueError(
             "NFL feature dataframe is empty."
         )
