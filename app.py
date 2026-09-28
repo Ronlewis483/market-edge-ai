@@ -9340,6 +9340,10 @@ if st.button(
                 end_date=end_date,
             )
 
+            st.session_state[
+                "mlb_v2a_games"
+            ] = mlb_games
+
             # ----------------------------------
             # MLB V2A PITCHER RESEARCH CACHE
             # ----------------------------------
