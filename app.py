@@ -9510,14 +9510,16 @@ if (
         )
     )
 
+    total_games = len(mlb_v2a_games)
+
     coverage_games = (
-        len(mlb_v2a_games)
+        total_games
         - len(missing_pitcher_games)
     )
 
     coverage_pct = (
-        coverage_games / len(mlb_v2a_games)
-        if len(mlb_v2a_games)
+        coverage_games / total_games
+        if total_games
         else 0.0
     )
 
@@ -9540,177 +9542,222 @@ if (
         f"{coverage_pct:.1%}",
     )
 
-    st.caption(
-        "Collection runs in 250-game chunks. "
-        "Each successful chunk is saved to the current "
-        "session before the next chunk begins."
-    )
+    if missing_pitcher_games.empty:
 
-    batches_to_run = st.selectbox(
-        "Pitcher collection size",
-        options=[1, 2, 4],
-        index=2,
-        format_func=lambda value: (
-            f"{value * 250:,} games "
-            f"({value} batch"
-            f"{'' if value == 1 else 'es'})"
-        ),
-        key="mlb_v2a_batch_count",
-    )
+        st.success(
+            "Historical MLB starting-pitcher "
+            "dataset is complete."
+        )
 
-    requested_target = min(
-        len(missing_pitcher_games),
-        batches_to_run * 250,
-    )
+    else:
 
-    if st.button(
-        f"Collect Next {requested_target:,} "
-        "MLB Pitcher Games",
-        key="collect_mlb_v2a_pitchers",
-        disabled=requested_target == 0,
-    ):
-        try:
+        st.caption(
+            "Historical pitcher data only needs to be "
+            "built once. The automated builder works "
+            "in 250-game checkpoints and preserves "
+            "each successful checkpoint."
+        )
+
+        if st.button(
+            "Build Remaining MLB Pitcher History",
+            key="build_remaining_mlb_pitcher_history",
+            type="primary",
+        ):
+
             working_logs = (
                 cached_pitcher_logs.copy()
             )
 
-            total_requested = 0
-            total_new_rows = 0
-
-            progress_bar = st.progress(0.0)
-
-            status_box = st.empty()
-
-            completed_batches = 0
-            last_remaining = len(
+            initial_remaining = len(
                 missing_pitcher_games
             )
 
-            for batch_number in range(
-                1,
-                batches_to_run + 1,
-            ):
-                status_box.info(
-                    f"Collecting pitcher batch "
-                    f"{batch_number} of "
-                    f"{batches_to_run}..."
-                )
+            total_requested = 0
+            total_new_rows = 0
+            completed_batches = 0
 
-                collection = (
-                    collect_mlb_pitcher_logs_batch(
-                        games=mlb_v2a_games,
-                        existing_logs=working_logs,
-                        batch_size=250,
+            progress_bar = st.progress(
+                coverage_pct
+            )
+
+            status_box = st.empty()
+
+            try:
+
+                while True:
+
+                    remaining_before = (
+                        get_missing_mlb_pitcher_log_games(
+                            mlb_v2a_games,
+                            working_logs,
+                        )
                     )
-                )
 
-                working_logs = collection[
-                    "logs"
-                ]
+                    if remaining_before.empty:
+                        break
 
-                # Save every successful chunk immediately.
-                # If a later chunk fails, completed work
-                # from earlier chunks is still preserved.
+                    completed_batches += 1
+
+                    batch_target = min(
+                        250,
+                        len(remaining_before),
+                    )
+
+                    status_box.info(
+                        "Building historical pitcher data — "
+                        f"checkpoint {completed_batches:,} | "
+                        f"{len(remaining_before):,} games "
+                        "remaining..."
+                    )
+
+                    collection = (
+                        collect_mlb_pitcher_logs_batch(
+                            games=mlb_v2a_games,
+                            existing_logs=working_logs,
+                            batch_size=batch_target,
+                        )
+                    )
+
+                    batch_requested = int(
+                        collection.get(
+                            "requested_games",
+                            0,
+                        )
+                    )
+
+                    batch_new_rows = int(
+                        collection.get(
+                            "new_pitcher_rows",
+                            0,
+                        )
+                    )
+
+                    updated_logs = collection.get(
+                        "logs",
+                        working_logs,
+                    )
+
+                    # ------------------------------
+                    # CHECKPOINT SUCCESSFUL WORK
+                    # ------------------------------
+
+                    working_logs = (
+                        updated_logs.copy()
+                    )
+
+                    st.session_state[
+                        "mlb_v2a_pitcher_logs"
+                    ] = working_logs
+
+                    total_requested += (
+                        batch_requested
+                    )
+
+                    total_new_rows += (
+                        batch_new_rows
+                    )
+
+                    remaining_after = (
+                        get_missing_mlb_pitcher_log_games(
+                            mlb_v2a_games,
+                            working_logs,
+                        )
+                    )
+
+                    completed_games = (
+                        total_games
+                        - len(remaining_after)
+                    )
+
+                    current_progress = (
+                        completed_games
+                        / total_games
+                        if total_games
+                        else 0.0
+                    )
+
+                    progress_bar.progress(
+                        min(
+                            max(
+                                current_progress,
+                                0.0,
+                            ),
+                            1.0,
+                        )
+                    )
+
+                    status_box.info(
+                        "Building historical pitcher data — "
+                        f"{len(working_logs):,} pitcher rows "
+                        f"cached | "
+                        f"{len(remaining_after):,} games "
+                        "remaining | "
+                        f"{current_progress:.1%} complete"
+                    )
+
+                    # ------------------------------
+                    # COMPLETE
+                    # ------------------------------
+
+                    if remaining_after.empty:
+                        break
+
+                    if collection.get(
+                        "complete",
+                        False,
+                    ):
+                        break
+
+                    # ------------------------------
+                    # SAFETY: NO PROGRESS
+                    # ------------------------------
+
+                    if (
+                        len(remaining_after)
+                        >= len(remaining_before)
+                    ):
+                        st.warning(
+                            "Historical pitcher build stopped "
+                            "because the latest checkpoint made "
+                            "no additional progress. Completed "
+                            "data was preserved."
+                        )
+                        break
+
+                    if batch_requested == 0:
+                        break
+
+            except Exception as exc:
+
                 st.session_state[
                     "mlb_v2a_pitcher_logs"
                 ] = working_logs
 
-                batch_requested = int(
-                    collection.get(
-                        "requested_games",
-                        0,
-                    )
+                status_box.error(
+                    "Historical pitcher build encountered "
+                    "an error. All completed checkpoints "
+                    "were preserved."
                 )
 
-                batch_new_rows = int(
-                    collection.get(
-                        "new_pitcher_rows",
-                        0,
-                    )
-                )
+                st.exception(exc)
 
-                last_remaining = int(
-                    collection.get(
-                        "remaining_games",
-                        0,
-                    )
-                )
-
-                total_requested += (
-                    batch_requested
-                )
-
-                total_new_rows += (
-                    batch_new_rows
-                )
-
-                completed_batches += 1
-
-                progress_bar.progress(
-                    completed_batches
-                    / batches_to_run
-                )
-
-                # Nothing else remains to collect.
-                if collection.get(
-                    "complete",
-                    False,
-                ):
-                    break
-
-                # Safety stop:
-                # if a batch was requested but returned
-                # zero usable pitcher rows, don't hammer
-                # the same unresolved games repeatedly.
-                if (
-                    batch_requested > 0
-                    and batch_new_rows == 0
-                ):
-                    st.warning(
-                        "Pitcher collection stopped because "
-                        "the latest batch returned no usable "
-                        "pitcher rows. Completed earlier "
-                        "batches were preserved."
-                    )
-                    break
-
-                # Defensive stop if the collector says
-                # there was nothing to request.
-                if batch_requested == 0:
-                    break
-
-            progress_bar.progress(1.0)
-
-            status_box.success(
-                "Pitcher collection run completed."
-            )
-
-            updated_missing_games = (
+            final_missing = (
                 get_missing_mlb_pitcher_log_games(
                     mlb_v2a_games,
                     working_logs,
                 )
             )
 
-            updated_coverage_games = (
-                len(mlb_v2a_games)
-                - len(updated_missing_games)
+            final_coverage_games = (
+                total_games
+                - len(final_missing)
             )
 
-            updated_coverage_pct = (
-                updated_coverage_games
-                / len(mlb_v2a_games)
-                if len(mlb_v2a_games)
+            final_coverage_pct = (
+                final_coverage_games
+                / total_games
+                if total_games
                 else 0.0
-            )
-
-            st.success(
-                "Pitcher collection completed — "
-                f"{total_requested:,} games requested, "
-                f"{total_new_rows:,} pitcher rows returned, "
-                f"{len(working_logs):,} pitcher rows cached, "
-                f"{len(updated_missing_games):,} games remaining, "
-                f"{updated_coverage_pct:.1%} complete."
             )
 
             st.session_state[
@@ -9723,19 +9770,38 @@ if (
                 "cached_pitcher_rows":
                     len(working_logs),
                 "remaining_games":
-                    len(updated_missing_games),
+                    len(final_missing),
                 "coverage":
-                    updated_coverage_pct,
+                    final_coverage_pct,
             }
 
-        except Exception as exc:
-            st.error(
-                "MLB V2A pitcher collection failed. "
-                "Any batches completed before the error "
-                "were preserved."
-            )
+            if final_missing.empty:
 
-            st.exception(exc)
+                progress_bar.progress(1.0)
+
+                status_box.success(
+                    "Historical MLB pitcher dataset "
+                    "build complete."
+                )
+
+                st.success(
+                    "V2A historical pitcher dataset is "
+                    f"complete — {len(working_logs):,} "
+                    "pitcher rows cached. "
+                    "We can now run the full leakage-safe "
+                    "V2A walk-forward validation."
+                )
+
+            else:
+
+                st.info(
+                    "Historical build checkpoint finished — "
+                    f"{total_requested:,} games processed "
+                    "during this run, "
+                    f"{total_new_rows:,} pitcher rows added, "
+                    f"{len(final_missing):,} games remain, "
+                    f"{final_coverage_pct:.1%} complete."
+                )
 
 
 # ==========================================
