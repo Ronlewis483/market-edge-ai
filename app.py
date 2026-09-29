@@ -9990,301 +9990,301 @@ else:
             st.exception(exc)
 
 
-# ==========================================
-# MLB V1 VS V2A MODEL COMPARISON
-# ==========================================
-
-v1_compare = st.session_state.get(
-"mlb_v1_comparison_results"
-)
-
-v2a_compare = st.session_state.get(
-"mlb_v2a_results"
-)
-
-if v1_compare and v2a_compare:
-
-st.divider()
-
-st.subheader(
-    "📊 MLB V1 vs V2A Model Comparison"
-)
-
-v1_accuracy = float(
-    v1_compare["accuracy"]
-)
-
-v2a_accuracy = float(
-    v2a_compare["accuracy"]
-)
-
-accuracy_change = (
-    v2a_accuracy
-    - v1_accuracy
-)
-
-v1_auc = v1_compare.get("auc")
-v2a_auc = v2a_compare.get("auc")
-
-v1_brier = float(
-    v1_compare["brier"]
-)
-
-v2a_brier = float(
-    v2a_compare["brier"]
-)
-
-v1_log_loss = float(
-    v1_compare["log_loss"]
-)
-
-v2a_log_loss = float(
-    v2a_compare["log_loss"]
-)
-
-comparison_data = pd.DataFrame(
-    {
-        "Metric": [
-            "Predictions",
-            "Accuracy",
-            "AUC",
-            "Brier Score",
-            "Log Loss",
-        ],
-        "V1": [
-            f"{v1_compare['prediction_count']:,}",
-            f"{v1_accuracy:.2%}",
-            (
-                f"{v1_auc:.3f}"
-                if v1_auc is not None
-                else "N/A"
-            ),
-            f"{v1_brier:.4f}",
-            f"{v1_log_loss:.4f}",
-        ],
-        "V2A": [
-            f"{v2a_compare['prediction_count']:,}",
-            f"{v2a_accuracy:.2%}",
-            (
-                f"{v2a_auc:.3f}"
-                if v2a_auc is not None
-                else "N/A"
-            ),
-            f"{v2a_brier:.4f}",
-            f"{v2a_log_loss:.4f}",
-        ],
-    }
-)
-
-st.dataframe(
-    comparison_data,
-    use_container_width=True,
-    hide_index=True,
-)
-
-# ======================================
-# ACCURACY IMPACT
-# ======================================
-
-st.markdown(
-    "### Starting-Pitcher Impact"
-)
-
-impact_col1, impact_col2, impact_col3 = (
-    st.columns(3)
-)
-
-impact_col1.metric(
-    "V1 Accuracy",
-    f"{v1_accuracy:.2%}",
-)
-
-impact_col2.metric(
-    "V2A Accuracy",
-    f"{v2a_accuracy:.2%}",
-)
-
-impact_col3.metric(
-    "Accuracy Change",
-    f"{accuracy_change:+.2%}",
-)
-
-# ======================================
-# MODEL QUALITY CHECK
-# ======================================
-
-accuracy_improved = (
-    v2a_accuracy > v1_accuracy
-)
-
-brier_improved = (
-    v2a_brier < v1_brier
-)
-
-log_loss_improved = (
-    v2a_log_loss < v1_log_loss
-)
-
-auc_improved = (
-    v1_auc is not None
-    and v2a_auc is not None
-    and v2a_auc > v1_auc
-)
-
-improvements = sum(
-    [
-        accuracy_improved,
-        brier_improved,
-        log_loss_improved,
-        auc_improved,
-    ]
-)
-
-if improvements == 4:
-
-    st.success(
-        "V2A improved all four major validation "
-        "metrics: accuracy, AUC, Brier score, "
-        "and log loss."
+    # ==========================================
+    # MLB V1 VS V2A MODEL COMPARISON
+    # ==========================================
+    
+    v1_compare = st.session_state.get(
+    "mlb_v1_comparison_results"
     )
-
-elif accuracy_improved:
-
-    st.info(
-        "V2A improved prediction accuracy, but "
-        "the probability-quality metrics are mixed. "
-        "Review the detailed results before deciding "
-        "whether V2A should replace V1."
+    
+    v2a_compare = st.session_state.get(
+    "mlb_v2a_results"
     )
-
-else:
-
-    st.warning(
-        "V2A did not improve overall prediction "
-        "accuracy. V1 remains the benchmark while "
-        "we investigate the pitcher features."
+    
+    if v1_compare and v2a_compare:
+    
+    st.divider()
+    
+    st.subheader(
+        "📊 MLB V1 vs V2A Model Comparison"
     )
-
-# ======================================
-# CONFIDENCE COMPARISON
-# ======================================
-
-st.markdown(
-    "### Accuracy by Confidence"
-)
-
-confidence_col1, confidence_col2 = (
-    st.columns(2)
-)
-
-with confidence_col1:
-
-    st.markdown("#### V1")
-
+    
+    v1_accuracy = float(
+        v1_compare["accuracy"]
+    )
+    
+    v2a_accuracy = float(
+        v2a_compare["accuracy"]
+    )
+    
+    accuracy_change = (
+        v2a_accuracy
+        - v1_accuracy
+    )
+    
+    v1_auc = v1_compare.get("auc")
+    v2a_auc = v2a_compare.get("auc")
+    
+    v1_brier = float(
+        v1_compare["brier"]
+    )
+    
+    v2a_brier = float(
+        v2a_compare["brier"]
+    )
+    
+    v1_log_loss = float(
+        v1_compare["log_loss"]
+    )
+    
+    v2a_log_loss = float(
+        v2a_compare["log_loss"]
+    )
+    
+    comparison_data = pd.DataFrame(
+        {
+            "Metric": [
+                "Predictions",
+                "Accuracy",
+                "AUC",
+                "Brier Score",
+                "Log Loss",
+            ],
+            "V1": [
+                f"{v1_compare['prediction_count']:,}",
+                f"{v1_accuracy:.2%}",
+                (
+                    f"{v1_auc:.3f}"
+                    if v1_auc is not None
+                    else "N/A"
+                ),
+                f"{v1_brier:.4f}",
+                f"{v1_log_loss:.4f}",
+            ],
+            "V2A": [
+                f"{v2a_compare['prediction_count']:,}",
+                f"{v2a_accuracy:.2%}",
+                (
+                    f"{v2a_auc:.3f}"
+                    if v2a_auc is not None
+                    else "N/A"
+                ),
+                f"{v2a_brier:.4f}",
+                f"{v2a_log_loss:.4f}",
+            ],
+        }
+    )
+    
     st.dataframe(
+        comparison_data,
+        use_container_width=True,
+        hide_index=True,
+    )
+    
+    # ======================================
+    # ACCURACY IMPACT
+    # ======================================
+    
+    st.markdown(
+        "### Starting-Pitcher Impact"
+    )
+    
+    impact_col1, impact_col2, impact_col3 = (
+        st.columns(3)
+    )
+    
+    impact_col1.metric(
+        "V1 Accuracy",
+        f"{v1_accuracy:.2%}",
+    )
+    
+    impact_col2.metric(
+        "V2A Accuracy",
+        f"{v2a_accuracy:.2%}",
+    )
+    
+    impact_col3.metric(
+        "Accuracy Change",
+        f"{accuracy_change:+.2%}",
+    )
+    
+    # ======================================
+    # MODEL QUALITY CHECK
+    # ======================================
+    
+    accuracy_improved = (
+        v2a_accuracy > v1_accuracy
+    )
+    
+    brier_improved = (
+        v2a_brier < v1_brier
+    )
+    
+    log_loss_improved = (
+        v2a_log_loss < v1_log_loss
+    )
+    
+    auc_improved = (
+        v1_auc is not None
+        and v2a_auc is not None
+        and v2a_auc > v1_auc
+    )
+    
+    improvements = sum(
+        [
+            accuracy_improved,
+            brier_improved,
+            log_loss_improved,
+            auc_improved,
+        ]
+    )
+    
+    if improvements == 4:
+    
+        st.success(
+            "V2A improved all four major validation "
+            "metrics: accuracy, AUC, Brier score, "
+            "and log loss."
+        )
+    
+    elif accuracy_improved:
+    
+        st.info(
+            "V2A improved prediction accuracy, but "
+            "the probability-quality metrics are mixed. "
+            "Review the detailed results before deciding "
+            "whether V2A should replace V1."
+        )
+    
+    else:
+    
+        st.warning(
+            "V2A did not improve overall prediction "
+            "accuracy. V1 remains the benchmark while "
+            "we investigate the pitcher features."
+        )
+    
+    # ======================================
+    # CONFIDENCE COMPARISON
+    # ======================================
+    
+    st.markdown(
+        "### Accuracy by Confidence"
+    )
+    
+    confidence_col1, confidence_col2 = (
+        st.columns(2)
+    )
+    
+    with confidence_col1:
+    
+        st.markdown("#### V1")
+    
+        st.dataframe(
+            v1_compare[
+                "confidence_summary"
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+    
+    with confidence_col2:
+    
+        st.markdown("#### V2A")
+    
+        st.dataframe(
+            v2a_compare[
+                "confidence_summary"
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+    
+    # ======================================
+    # SEASON COMPARISON
+    # ======================================
+    
+    st.markdown(
+        "### Season-by-Season Accuracy"
+    )
+    
+    v1_seasons = (
         v1_compare[
-            "confidence_summary"
-        ],
-        use_container_width=True,
-        hide_index=True,
-    )
-
-with confidence_col2:
-
-    st.markdown("#### V2A")
-
-    st.dataframe(
-        v2a_compare[
-            "confidence_summary"
-        ],
-        use_container_width=True,
-        hide_index=True,
-    )
-
-# ======================================
-# SEASON COMPARISON
-# ======================================
-
-st.markdown(
-    "### Season-by-Season Accuracy"
-)
-
-v1_seasons = (
-    v1_compare[
-        "season_summary"
-    ]
-    .rename(
-        columns={
-            "predictions":
-                "v1_predictions",
-            "accuracy":
-                "v1_accuracy",
-        }
-    )
-)
-
-v2a_seasons = (
-    v2a_compare[
-        "season_summary"
-    ]
-    .rename(
-        columns={
-            "predictions":
-                "v2a_predictions",
-            "accuracy":
-                "v2a_accuracy",
-        }
-    )
-)
-
-season_comparison = (
-    v1_seasons.merge(
-        v2a_seasons,
-        on="season_id",
-        how="outer",
-    )
-)
-
-season_comparison[
-    "accuracy_change"
-] = (
-    season_comparison[
-        "v2a_accuracy"
-    ]
-    - season_comparison[
-        "v1_accuracy"
-    ]
-)
-
-for column in [
-    "v1_accuracy",
-    "v2a_accuracy",
-    "accuracy_change",
-]:
-
-    season_comparison[column] = (
-        season_comparison[column]
-        .map(
-            lambda value:
-                f"{value:+.2%}"
-                if (
-                    column
-                    == "accuracy_change"
-                    and pd.notna(value)
-                )
-                else (
-                    f"{value:.2%}"
-                    if pd.notna(value)
-                    else "—"
-                )
+            "season_summary"
+        ]
+        .rename(
+            columns={
+                "predictions":
+                    "v1_predictions",
+                "accuracy":
+                    "v1_accuracy",
+            }
         )
     )
-
-st.dataframe(
-    season_comparison,
-    use_container_width=True,
-    hide_index=True,
-)
+    
+    v2a_seasons = (
+        v2a_compare[
+            "season_summary"
+        ]
+        .rename(
+            columns={
+                "predictions":
+                    "v2a_predictions",
+                "accuracy":
+                    "v2a_accuracy",
+            }
+        )
+    )
+    
+    season_comparison = (
+        v1_seasons.merge(
+            v2a_seasons,
+            on="season_id",
+            how="outer",
+        )
+    )
+    
+    season_comparison[
+        "accuracy_change"
+    ] = (
+        season_comparison[
+            "v2a_accuracy"
+        ]
+        - season_comparison[
+            "v1_accuracy"
+        ]
+    )
+    
+    for column in [
+        "v1_accuracy",
+        "v2a_accuracy",
+        "accuracy_change",
+    ]:
+    
+        season_comparison[column] = (
+            season_comparison[column]
+            .map(
+                lambda value:
+                    f"{value:+.2%}"
+                    if (
+                        column
+                        == "accuracy_change"
+                        and pd.notna(value)
+                    )
+                    else (
+                        f"{value:.2%}"
+                        if pd.notna(value)
+                        else "—"
+                    )
+            )
+        )
+    
+    st.dataframe(
+        season_comparison,
+        use_container_width=True,
+        hide_index=True,
+    )
 
 
 # ==========================================
