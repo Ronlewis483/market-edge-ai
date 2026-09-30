@@ -9568,6 +9568,48 @@ if (
         f"{coverage_pct:.1%}",
     )
 
+    # ==========================================
+    # PERMANENT PITCHER HISTORY BACKUP
+    # ==========================================
+    
+    if (
+        cached_pitcher_logs is not None
+        and not cached_pitcher_logs.empty
+    ):
+    
+        if st.button(
+            "💾 Save Pitcher History Permanently",
+            key="save_mlb_pitcher_history_permanently",
+        ):
+    
+            with st.spinner(
+                "Saving MLB pitcher history permanently..."
+            ):
+    
+                save_result = (
+                    save_mlb_pitcher_history(
+                        cached_pitcher_logs
+                    )
+                )
+    
+            if save_result.get(
+                "success",
+                False,
+            ):
+    
+                st.success(
+                    "MLB pitcher history permanently saved — "
+                    f"{save_result['rows_saved']:,} "
+                    "pitcher rows."
+                )
+    
+            else:
+    
+                st.error(
+                    "Permanent pitcher-history save failed: "
+                    f"{save_result.get('error')}"
+                )
+
     if missing_pitcher_games.empty:
 
         st.success(
