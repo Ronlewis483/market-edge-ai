@@ -10991,3 +10991,111 @@ if v3_history_ready:
         except Exception as exc:
             st.error("V3 feature checking/building stopped. Review the error before modeling.")
             st.exception(exc)
+
+
+# ==========================================
+# MLB V3 HISTORY-ONLY MODEL COMPARISON
+# ==========================================
+if v3_history_ready:
+    st.divider()
+    st.subheader("⚾ MLB V3 Model Comparison")
+    st.caption(
+        "All three V3 models and a V1-feature control use identical evaluation games and earlier-UTC-date training. "
+        "The frozen V1 benchmark remains 54.99%; this stricter control is a separate experiment. No automatic promotion."
+    )
+    v3_interval = st.selectbox("Retrain after approximately this many predictions", [500, 250, 100], key="v3_compare_interval")
+    if st.button("Run MLB V3 Model Comparison", key="run_v3_history_comparison", type="primary"):
+        try:
+            from dual_agent.mlb_research import run_mlb_v3_history_only_comparison
+            matrix = st.session_state.get("mlb_v3_historical_features")
+            if matrix is None or matrix.empty:
+                raise ValueError("Click Check Timing and Build MLB V3 Features first in this session.")
+            progress = st.progress(0.0)
+            status = st.empty()
+            def update_v3_comparison(value, model):
+                progress.progress(min(max(float(value), 0.0), 1.0))
+                status.info(f"Testing {model}. Larger retraining intervals finish faster.")
+            result = run_mlb_v3_history_only_comparison(matrix, min_train_games=500,
+                retrain_every=int(v3_interval), progress_callback=update_v3_comparison)
+            st.session_state["mlb_v3_history_comparison"] = result
+            status.success("Model comparison finished. V1 and V2A are unchanged.")
+        except Exception as exc:
+            st.error("V3 model comparison stopped.")
+            st.exception(exc)
+    result = st.session_state.get("mlb_v3_history_comparison")
+    if result is not None:
+        st.dataframe(result["comparison"], use_container_width=True, hide_index=True)
+        st.caption("Accuracy/AUC: higher is better. Brier/log loss: lower is better. Rates are shown as decimals (0.55 = 55%).")
+        with st.expander("Season results and calibration"):
+            st.dataframe(result["season_results"], use_container_width=True, hide_index=True)
+            st.dataframe(result["calibration"], use_container_width=True, hide_index=True)
+            st.dataframe(result["baseline"], use_container_width=True, hide_index=True)
+        st.caption(f"Settings used: minimum training games {result['min_train_games']}; retrain interval {result['retrain_every']}.")
+        combined_predictions = pd.concat(result["predictions"].values(), ignore_index=True)
+        st.download_button("Download V3 Comparison Predictions CSV", combined_predictions.to_csv(index=False).encode("utf-8"),
+            file_name="mlb_v3_comparison_predictions.csv", mime="text/csv", key="download_v3_comparison")
+        st.info("These results test historical proxies. Confirmed live lineups/starters require a separately validated feature/model path before use in predictions.")
+
+
+# ==========================================
+# MLB UPCOMING GAME INFORMATION CAPTURE
+# ==========================================
+st.divider()
+st.subheader("⚾ MLB Upcoming Game Information")
+st.caption(
+    "Capture raw MLB feeds, probable starters, available lineups, rosters, player season/recent stats, "
+    "venue and any weather reported by MLB. This is a manual capture with visible gaps and source errors."
+)
+mlb_capture_date = st.date_input("MLB game date", value=pd.Timestamp.now(tz="America/Chicago").date(), key="mlb_upcoming_capture_date")
+if st.button("Gather Upcoming MLB Game Information", key="gather_upcoming_mlb_information", type="primary"):
+    try:
+        from dual_agent.mlb_research import collect_mlb_upcoming_game_information, summarize_mlb_upcoming_information
+        with st.spinner("Gathering upcoming-game feeds and player context; a full slate can take several minutes..."):
+            package = collect_mlb_upcoming_game_information(str(mlb_capture_date),
+                historical_games=st.session_state.get("mlb_v3_games"),
+                pitcher_logs=st.session_state.get("mlb_v2a_pitcher_logs"))
+        st.session_state["mlb_upcoming_information"] = package
+        st.session_state["mlb_upcoming_information_summary"] = summarize_mlb_upcoming_information(package)
+    except Exception as exc:
+        st.error("Upcoming-game information collection stopped.")
+        st.exception(exc)
+package = st.session_state.get("mlb_upcoming_information")
+if package is not None:
+    st.caption(f"Captured date: {package['game_date']} | Package completed UTC: {package['snapshot_time']}")
+    summary = st.session_state["mlb_upcoming_information_summary"]
+    if summary.empty:
+        st.info("No eligible upcoming games were captured. Live/final games and games past scheduled first pitch are excluded.")
+    else:
+        st.dataframe(summary, use_container_width=True, hide_index=True)
+    st.warning("Not yet connected here: sportsbook odds/props, dedicated injury news, and external weather/roof confirmation. Probable starters and feed lineups may change.")
+    if package.get("errors"):
+        with st.expander("Collection errors"):
+            st.json(package["errors"])
+    if package.get("skipped"):
+        with st.expander("Excluded games"):
+            st.json(package["skipped"])
+    # Portable JSON retains raw feeds. Persistent writeback requires the current
+    # supabase_db implementation; do not guess its function names/signatures.
+    import json as mlb_capture_json
+    from datetime import datetime as mlb_capture_datetime
+    def _mlb_capture_json_safe(value):
+        if isinstance(value, pd.DataFrame):
+            return [_mlb_capture_json_safe(row) for row in value.to_dict("records")]
+        if isinstance(value, dict):
+            return {str(k): _mlb_capture_json_safe(v) for k,v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [_mlb_capture_json_safe(v) for v in value]
+        if value is None:
+            return None
+        if isinstance(value, (pd.Timestamp, mlb_capture_datetime)):
+            return value.isoformat()
+        if hasattr(value, "item"):
+            return _mlb_capture_json_safe(value.item())
+        if isinstance(value, float) and (pd.isna(value) or value in [float("inf"),float("-inf")]):
+            return None
+        return value
+    capture_text = mlb_capture_json.dumps(_mlb_capture_json_safe(package), ensure_ascii=False, allow_nan=False)
+    capture_stamp = pd.Timestamp(package["snapshot_time"]).strftime("%Y%m%dT%H%M%S%fZ")
+    st.download_button("Download Timestamped MLB Game Information JSON", capture_text.encode("utf-8"),
+        file_name=f"mlb_pregame_{capture_stamp}.json", mime="application/json", key="download_upcoming_mlb_information")
+    st.caption("This capture remains in the current session. Download it to retain it; automatic permanent snapshot saving still needs to be connected.")
