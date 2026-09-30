@@ -5290,4 +5290,3 @@ def summarize_mlb_v3_historical_readiness(features):
             "feature",
         ].tolist(),
     }
-
