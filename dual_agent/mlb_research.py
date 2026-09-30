@@ -5825,3 +5825,139 @@ def run_mlb_focused_model_test(features):
             "recommendation": "Candidate merits a prospective test; live model unchanged." if promising else "Keep the baseline; this experiment does not establish a stronger model.",
             "feature_names": MLB_COMPACT_HISTORY_FEATURES,
             "limitations": "Latest season was examined in earlier experiments. Historical features assume prior-date outcomes were available; this is not an untouched or prospective test."}
+
+MLB_SAVED_PLAYER_MODEL_VERSION = 1
+MLB_CAPTURE_TEAM_COLUMNS = ["season_hitting_ops_diff", "season_pitching_era_diff", "season_pitching_whip_diff"]
+MLB_CAPTURE_PLAYER_COLUMNS = [
+    "probable_starter_season_stats_era_diff", "probable_starter_season_stats_whip_diff",
+    "probable_starter_recent_stats_era_diff", "probable_starter_recent_stats_whip_diff",
+    "feed_lineup_season_stats_ops_diff", "feed_lineup_recent_stats_ops_diff",
+]
+
+
+def build_mlb_saved_player_matrix(dataset):
+    """Use actual saved pregame values, not historical boxscore identities."""
+    rows, excluded = [], []
+    for record in dataset.get("rows", []):
+        features = record.get("features", {}) or {}
+        start = pd.to_datetime(record.get("start_time"), utc=True, errors="coerce")
+        captured = pd.to_datetime(record.get("capture_finished_at"), utc=True, errors="coerce")
+        if pd.isna(start) or pd.isna(captured) or captured >= start:
+            excluded.append({"game_id": record.get("game_id"), "reason": "Capture timing invalid"})
+            continue
+        row = {"game_id": record["game_id"], "start_time": start, "capture_finished_at": captured,
+               "home_team": record.get("home_team"), "away_team": record.get("away_team")}
+        def value(key):
+            v = pd.to_numeric(features.get(key), errors="coerce")
+            return float(v) if pd.notna(v) and np.isfinite(v) else np.nan
+        valid = True
+        for side in ("home", "away"):
+            if (value(side + "_probable_starter_available") != 1 or
+                not value(side + "_feed_lineup_slots") >= 9 or
+                not value(side + "_feed_lineup_season_stats_ops_count") >= 8):
+                valid = False
+        for column in MLB_CAPTURE_TEAM_COLUMNS + MLB_CAPTURE_PLAYER_COLUMNS:
+            stem = column.removesuffix("_diff")
+            row[column] = value("home_" + stem) - value("away_" + stem)
+        mandatory = MLB_CAPTURE_TEAM_COLUMNS + ["probable_starter_season_stats_era_diff",
+            "probable_starter_season_stats_whip_diff", "feed_lineup_season_stats_ops_diff"]
+        if not valid or any(pd.isna(row[k]) for k in mandatory):
+            excluded.append({"game_id": record.get("game_id"), "reason": "Missing team stats, probable pitchers, or a sufficiently populated feed lineup"})
+            continue
+        outcome = record.get("outcome", {}) or {}
+        observed = pd.to_datetime(outcome.get("checked_at"), utc=True, errors="coerce")
+        label = outcome.get("home_win")
+        row["home_win"] = int(label) if outcome.get("final") and label in (0,1) and pd.notna(observed) and observed >= start else np.nan
+        row["result_observed_at"] = observed
+        rows.append(row)
+    if not rows:
+        return {"matrix": pd.DataFrame(), "excluded": excluded}
+    matrix = pd.DataFrame(rows).sort_values(["capture_finished_at", "game_id"]).drop_duplicates("game_id", keep="last")
+    return {"matrix": matrix.sort_values(["start_time", "game_id"]).reset_index(drop=True), "excluded": excluded}
+
+
+def _fit_mlb_saved_player_bundle(train, columns):
+    """Serializable numeric model; all preprocessing fitted to training rows."""
+    X = train[columns].astype(float)
+    median = X.median().fillna(0.0)
+    scaler = StandardScaler().fit(X.fillna(median))
+    model = LogisticRegression(C=0.25, max_iter=3000, random_state=42)
+    model.fit(scaler.transform(X.fillna(median)), train.home_win.astype(int))
+    return {"columns": list(columns), "median": median.tolist(), "mean": scaler.mean_.tolist(),
+            "scale": scaler.scale_.tolist(), "weights": model.coef_[0].tolist(),
+            "intercept": float(model.intercept_[0]), "training_games": len(train),
+            "latest_result_observed_at": train.result_observed_at.max().isoformat()}
+
+
+def predict_mlb_saved_player_bundle(bundle, matrix):
+    X = matrix[bundle["columns"]].astype(float).to_numpy()
+    X = np.where(np.isnan(X), np.asarray(bundle["median"]), X)
+    z = ((X - np.asarray(bundle["mean"]))/np.asarray(bundle["scale"])) @ np.asarray(bundle["weights"]) + bundle["intercept"]
+    return 1/(1+np.exp(-np.clip(z, -40, 40)))
+
+
+def run_mlb_saved_player_model(dataset, min_train_games=200, now=None):
+    """Connect saved player features, compare paired models, and fit a candidate.
+
+    This captured-data team control is distinct from frozen historical V1.
+    Models train only on final outcomes whose observation timestamp is earlier
+    than the prediction cutoff. No automatic promotion or accuracy promise.
+    """
+    from threadpoolctl import threadpool_limits
+    if min_train_games < 20:
+        raise ValueError("At least 20 training rows required, including for synthetic checks.")
+    now = pd.Timestamp(now) if now is not None else pd.Timestamp.now(tz="UTC")
+    if now.tzinfo is None:
+        now = now.tz_localize("UTC")
+    built = build_mlb_saved_player_matrix(dataset)
+    matrix = built["matrix"]
+    result = {"version": 1, "created_at": now.isoformat(), "excluded": built["excluded"],
+              "minimum_training_games": min_train_games, "live_model_changed": False,
+              "eligible_games": len(matrix), "completed_games": 0, "models": {}, "scores": [],
+              "evaluation_predictions": [], "upcoming_predictions": [], "status": "collecting"}
+    if matrix.empty:
+        result["message"] = "No captures have the required pitcher, lineup, team-stat, and timing coverage."
+        return result
+    completed = matrix[matrix.home_win.notna() & matrix.result_observed_at.le(now)].copy()
+    result["completed_games"] = len(completed)
+    configs = [("Saved team-stat control", MLB_CAPTURE_TEAM_COLUMNS),
+               ("Saved pitcher and lineup candidate", MLB_CAPTURE_TEAM_COLUMNS + MLB_CAPTURE_PLAYER_COLUMNS)]
+    with threadpool_limits(limits=2):
+        predictions = []
+        for date, current in completed.groupby(completed.start_time.dt.floor("D"), sort=True):
+            train = completed[completed.start_time.lt(date) & completed.result_observed_at.lt(date)]
+            if len(train) < min_train_games or train.home_win.nunique() != 2:
+                continue
+            for label, columns in configs:
+                bundle = _fit_mlb_saved_player_bundle(train, columns)
+                probs = predict_mlb_saved_player_bundle(bundle, current)
+                for (_, game), prob in zip(current.iterrows(), probs):
+                    predictions.append({"Model": label, "game_id": int(game.game_id), "start_time": game.start_time.isoformat(),
+                        "probability": float(prob), "actual_home_win": int(game.home_win),
+                        "correct": int(int(prob >= .5) == int(game.home_win)),
+                        "latest_training_result_observed_at": bundle["latest_result_observed_at"]})
+        result["evaluation_predictions"] = predictions
+        if predictions:
+            for label, group in pd.DataFrame(predictions).groupby("Model"):
+                y, prob = group.actual_home_win, group.probability
+                result["scores"].append({"Model": label, "Games": len(group), "Accuracy": float(group.correct.mean()),
+                    "Brier": float(brier_score_loss(y, prob)), "Log loss": float(log_loss(y, prob, labels=[0,1]))})
+        # Fit deployable research bundles using outcomes already observed now.
+        if len(completed) >= min_train_games and completed.home_win.nunique() == 2:
+            for label, columns in configs:
+                result["models"][label] = _fit_mlb_saved_player_bundle(completed, columns)
+            result["status"] = "candidate_fitted"
+            # Predictions must be made before first pitch and from recent captures.
+            upcoming = matrix[matrix.start_time.gt(now) & matrix.capture_finished_at.le(now)
+                              & matrix.capture_finished_at.ge(now-pd.Timedelta(minutes=15))]
+            for label, bundle in result["models"].items():
+                for (_, game), prob in zip(upcoming.iterrows(), predict_mlb_saved_player_bundle(bundle, upcoming)):
+                    result["upcoming_predictions"].append({"Model": label, "game_id": int(game.game_id),
+                        "Home": game.home_team, "Away": game.away_team, "Home win probability": float(prob),
+                        "Prediction created UTC": now.isoformat(), "Captured UTC": game.capture_finished_at.isoformat(),
+                        "research_only": True})
+            result["message"] = "Player-feature candidate fitted and saved for research. The live model remains unchanged."
+        else:
+            result["message"] = f"Player features are connected. {len(completed)} usable completed games; need {min_train_games} with both outcome classes to fit."
+    result["comparison_note"] = "The control uses saved team statistics on the same captured games; it is not the frozen V1 benchmark. Feed lineups and probable pitchers are observations, not confirmed identities."
+    return result
