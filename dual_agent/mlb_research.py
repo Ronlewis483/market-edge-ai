@@ -13,6 +13,7 @@ No live betting recommendations are generated here.
 """
 
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 from sklearn.pipeline import make_pipeline
@@ -4470,12 +4471,14 @@ def _mlb_boxscore_player_postgame_row(
 def fetch_mlb_historical_player_game_logs(
     games,
     timeout=30,
+    max_workers=10,
 ):
     """
     Collect compact postgame player lines from completed MLB boxscores.
 
-    One boxscore request supplies the players needed for both the historical
-    lineup reconstruction and bullpen/pitcher reconstruction.
+    Boxscores are fetched concurrently to speed up the one-time historical
+    warehouse build. Each request is independent; failed games are skipped
+    and remain eligible for a later resume pass.
     """
     if games is None or games.empty:
         return pd.DataFrame()
@@ -4504,46 +4507,59 @@ def fetch_mlb_historical_player_game_logs(
         .reset_index(drop=True)
     )
 
-    rows = []
-    session = requests.Session()
+    max_workers = max(1, min(int(max_workers), 16))
 
-    for _, game in df.iterrows():
-        game_id = int(game["game_id"])
+    def fetch_one(game_dict):
+        game_id = int(game_dict["game_id"])
         try:
             payload = _mlb_api_get_json(
                 MLB_BOXSCORE_URL.format(game_id=game_id),
                 timeout=timeout,
-                session=session,
             )
+            return game_dict, payload
         except (requests.RequestException, ValueError, TypeError):
-            continue
+            return game_dict, None
 
-        teams = payload.get("teams", {}) or {}
+    rows = []
+    game_records = df.to_dict("records")
 
-        for side in ("home", "away"):
-            side_box = teams.get(side, {}) or {}
-            batting_order = side_box.get("battingOrder", []) or []
-            batting_order_lookup = {
-                int(pid): index + 1
-                for index, pid in enumerate(batting_order)
-                if pid is not None
-            }
-            bullpen_ids = {
-                int(pid)
-                for pid in (side_box.get("bullpen", []) or [])
-                if pid is not None
-            }
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(fetch_one, game)
+            for game in game_records
+        ]
 
-            for player in (side_box.get("players", {}) or {}).values():
-                row = _mlb_boxscore_player_postgame_row(
-                    game,
-                    side,
-                    player,
-                    batting_order_lookup,
-                    bullpen_ids,
-                )
-                if row is not None:
-                    rows.append(row)
+        for future in as_completed(futures):
+            game, payload = future.result()
+            if not payload:
+                continue
+
+            teams = payload.get("teams", {}) or {}
+
+            for side in ("home", "away"):
+                side_box = teams.get(side, {}) or {}
+                batting_order = side_box.get("battingOrder", []) or []
+                batting_order_lookup = {
+                    int(pid): index + 1
+                    for index, pid in enumerate(batting_order)
+                    if pid is not None
+                }
+                bullpen_ids = {
+                    int(pid)
+                    for pid in (side_box.get("bullpen", []) or [])
+                    if pid is not None
+                }
+
+                for player in (side_box.get("players", {}) or {}).values():
+                    row = _mlb_boxscore_player_postgame_row(
+                        game,
+                        side,
+                        player,
+                        batting_order_lookup,
+                        bullpen_ids,
+                    )
+                    if row is not None:
+                        rows.append(row)
 
     if not rows:
         return pd.DataFrame()
@@ -4558,7 +4574,6 @@ def fetch_mlb_historical_player_game_logs(
         .sort_values(["start_time", "game_id", "side", "player_id"])
         .reset_index(drop=True)
     )
-
 
 def get_missing_mlb_player_log_games(
     games,
@@ -4608,6 +4623,7 @@ def collect_mlb_player_logs_batch(
     existing_logs=None,
     batch_size=250,
     timeout=30,
+    max_workers=10,
 ):
     """
     Collect one manageable historical player-log batch.
@@ -4641,6 +4657,7 @@ def collect_mlb_player_logs_batch(
     new_logs = fetch_mlb_historical_player_game_logs(
         batch,
         timeout=timeout,
+        max_workers=max_workers,
     )
 
     frames = []
