@@ -10777,3 +10777,136 @@ if v3_history_ready:
                     f"{final_player_coverage:.1%} complete."
                 )
 
+
+
+# ==========================================
+# MLB V3 WAREHOUSE AUDIT (READ ONLY)
+# ==========================================
+def _audit_mlb_v3_warehouse(games, player_logs):
+    """Screen stored history without modifying it or requesting boxscores."""
+    checks = []
+    details = {}
+
+    def check(name, count, note, warning=False):
+        checks.append({"Check": name, "Status": ("REVIEW" if warning else "FAIL") if count else "PASS",
+                       "Issues": int(count), "Meaning": note})
+
+    required_games = ["game_id", "season_id", "start_time", "home_team_id", "away_team_id"]
+    required_logs = ["game_id", "season_id", "start_time", "player_id", "side", "team_id",
+                     "opponent_team_id", "batting_order", "pitching_games"]
+    stats = ["batting_games", "plate_appearances", "at_bats", "hits", "doubles", "triples",
+             "batting_home_runs", "batting_runs", "rbi", "batting_walks", "batting_strikeouts",
+             "stolen_bases", "pitching_games", "games_started", "pitching_outs", "batters_faced",
+             "pitcher_strikeouts", "pitcher_walks", "pitcher_hits", "pitcher_home_runs",
+             "earned_runs", "pitches", "strikes"]
+    absent = ["games." + c for c in required_games if c not in games.columns]
+    absent += ["players." + c for c in dict.fromkeys(required_logs + stats) if c not in player_logs.columns]
+    check("Required columns", len(absent), ", ".join(absent) or "Expected warehouse fields exist.")
+    if absent:
+        return {"checks": pd.DataFrame(checks), "details": details, "passed": False}
+
+    g, p = games.copy(), player_logs.copy()
+    for frame, cols in [(g, ["game_id", "season_id", "home_team_id", "away_team_id"]),
+                        (p, ["game_id", "season_id", "player_id", "team_id", "opponent_team_id"])]:
+        invalid = pd.Series(False, index=frame.index)
+        for c in cols:
+            values = pd.to_numeric(frame[c], errors="coerce")
+            invalid |= values.isna() | values.le(0) | values.mod(1).ne(0)
+            frame[c] = values
+        frame["_invalid_id"] = invalid
+        frame["start_time"] = pd.to_datetime(frame["start_time"], utc=True, errors="coerce")
+    check("Historical game identifiers", g._invalid_id.sum(), "IDs and seasons must be positive whole numbers.")
+    check("Player identifiers", p._invalid_id.sum(), "IDs and seasons must be positive whole numbers.")
+    check("Historical game timestamps", g.start_time.isna().sum(), "Each scheduled game needs a valid timestamp.")
+    check("Player timestamps", p.start_time.isna().sum(), "Each history row needs a valid timestamp.")
+    check("Duplicate historical games", g.duplicated("game_id").sum(), "One schedule row per game.")
+    dup = p.duplicated(["game_id", "player_id"], keep=False)
+    check("Duplicate player-game rows", dup.sum(), "Every player-game key must be unique; all affected rows counted.")
+    details["Duplicate player-game rows"] = p.loc[dup].drop(columns="_invalid_id").head(250)
+    check("Invalid home/away labels", (~p.side.isin(["home", "away"])).sum(), "Every row must belong to home or away.")
+    expected = g.drop_duplicates("game_id")
+    known = p.game_id.isin(expected.game_id)
+    check("Rows outside historical schedule", (~known).sum(), "Review rows from games outside this collection window.", warning=True)
+    represented = set(p.loc[~p._invalid_id, "game_id"])
+    missing = expected.loc[~expected.game_id.isin(represented)]
+    check("Games without player history", len(missing), "Every expected completed game must have history.")
+    details["Games without player history"] = missing.drop(columns="_invalid_id").head(250)
+    joined = p.loc[known].merge(expected, on="game_id", suffixes=("_player", "_game"), how="left")
+    home = joined.side.eq("home")
+    team = joined.home_team_id.where(home, joined.away_team_id)
+    opponent = joined.away_team_id.where(home, joined.home_team_id)
+    mismatch = joined.team_id.ne(team) | joined.opponent_team_id.ne(opponent)
+    check("Team/opponent mismatches", mismatch.sum(), "Player teams must match the game's home/away teams.")
+    check("Season mismatches", joined.season_id_player.ne(joined.season_id_game).sum(), "Player and schedule seasons must match.")
+    check("Timestamp mismatches", joined.start_time_player.ne(joined.start_time_game).sum(),
+          "Different stored timestamps need review before chronological reconstruction.", warning=True)
+
+    numeric = p[stats].apply(pd.to_numeric, errors="coerce")
+    field_quality = pd.DataFrame({"Field": stats, "Missing or nonnumeric": numeric.isna().sum().values,
+                                  "Negative values": numeric.lt(0).sum().values})
+    check("Missing/nonnumeric statistics", numeric.isna().sum().sum(), "Zero is valid; missing and nonnumeric values require review.")
+    check("Negative count statistics", numeric.lt(0).sum().sum(), "Stored boxscore counts must be nonnegative.")
+    details["Statistic field quality"] = field_quality
+    # batting_order can legitimately be absent for pitchers or unused players.
+    # Minimum lineup/pitcher coverage is a screening rule, not proof of a full boxscore.
+    valid = p.loc[known & ~p._invalid_id & p.side.isin(["home", "away"])].drop_duplicates(["game_id", "player_id"]).copy()
+    order = pd.to_numeric(valid.batting_order, errors="coerce")
+    valid["_lineup"] = order.between(1, 9)
+    valid["_pitcher"] = pd.to_numeric(valid.pitching_games, errors="coerce").gt(0)
+    sides = valid.groupby(["game_id", "side"]).agg(
+        players=("player_id", "nunique"), lineup_players=("_lineup", "sum"), pitchers=("_pitcher", "sum"))
+    side_index = pd.MultiIndex.from_product([expected.game_id.dropna().unique(), ["home", "away"]], names=["game_id", "side"])
+    sides = sides.reindex(side_index, fill_value=0).reset_index()
+    suspect = sides.loc[sides.lineup_players.lt(9) | sides.pitchers.lt(1)]
+    check("Possible incomplete game sides", len(suspect), "Review sides with fewer than nine lineup players or no pitching line; unusual games may be legitimate.", warning=True)
+    details["Possible incomplete game sides"] = suspect
+    season = expected.groupby("season_id").agg(expected_games=("game_id", "nunique"),
+                                                   first_game=("start_time", "min"), last_game=("start_time", "max"))
+    covered = expected.loc[expected.game_id.isin(represented)].groupby("season_id").game_id.nunique()
+    season["covered_games"] = covered.reindex(season.index, fill_value=0)
+    season["missing_games"] = season.expected_games - season.covered_games
+    season["player_rows"] = p.groupby("season_id").size().reindex(season.index, fill_value=0)
+    season["unique_players"] = p.groupby("season_id").player_id.nunique().reindex(season.index, fill_value=0)
+    details["Season coverage"] = season.reset_index()
+    dates = expected.start_time.dt.strftime("%Y-%m")
+    months = expected.assign(month=dates).groupby("month").agg(expected_games=("game_id", "nunique"))
+    months["covered_games"] = expected.loc[expected.game_id.isin(represented)].assign(
+        month=lambda x: x.start_time.dt.strftime("%Y-%m")).groupby("month").game_id.nunique().reindex(months.index, fill_value=0)
+    months["missing_games"] = months.expected_games - months.covered_games
+    details["Monthly coverage"] = months.reset_index()
+    result = pd.DataFrame(checks)
+    return {"checks": result, "details": details, "passed": result.Status.eq("PASS").all()}
+
+
+if v3_history_ready:
+    st.divider()
+    st.subheader("⚾ MLB V3 Warehouse Audit")
+    st.caption(
+        "Check saved player history before building V3 features. This audit reads existing data "
+        "and makes no boxscore requests. Coverage is measured against the loaded historical schedule."
+    )
+    if st.button("Run MLB V3 Warehouse Audit", key="run_mlb_v3_warehouse_audit", type="primary"):
+        try:
+            with st.spinner("Auditing MLB player history..."):
+                audit = _audit_mlb_v3_warehouse(
+                    mlb_v3_games, st.session_state["mlb_v3_player_logs"]
+                )
+            # Do not keep stale audit results across changes to the warehouse.
+            st.session_state.pop("mlb_v3_warehouse_audit", None)
+            st.dataframe(audit["checks"], use_container_width=True, hide_index=True)
+            if audit["passed"]:
+                st.success("Warehouse screening passed. Next: verify historical feature timing before the V3 model comparison.")
+            else:
+                st.warning("The audit found issues to inspect before V3 modeling. Review the tables below.")
+            for title, table in audit["details"].items():
+                if not table.empty:
+                    with st.expander(title, expanded=title == "Season coverage"):
+                        st.dataframe(table, use_container_width=True, hide_index=True)
+            st.caption(
+                "Duplicate samples are limited to 250 rows. Missing batting order for non-lineup players is normal. "
+                "Stored zeroes may also represent source fields the collector did not receive; this audit cannot detect that. "
+                "Passing these checks does not prove every boxscore is complete or that model features avoid future information."
+            )
+        except Exception as exc:
+            st.error("The warehouse audit could not finish.")
+            st.exception(exc)
