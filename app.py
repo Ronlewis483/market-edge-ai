@@ -11074,19 +11074,41 @@ st.caption(
 mlb_capture_date = st.date_input("MLB game date", value=pd.Timestamp.now(tz="America/Chicago").date(), key="mlb_upcoming_capture_date")
 if st.button("Gather Upcoming MLB Game Information", key="gather_upcoming_mlb_information", type="primary"):
     try:
-        from dual_agent.mlb_research import collect_mlb_upcoming_game_information, summarize_mlb_upcoming_information
+        import importlib
+        import dual_agent.mlb_research as mlb_current_collector
+        required_capture_version = 2
+        # Streamlit reruns app.py while imported modules can remain in memory.
+        # Reload only an older collector, and only when the user requests capture.
+        if getattr(mlb_current_collector, "MLB_UPCOMING_INFORMATION_SCHEMA_VERSION", None) != required_capture_version:
+            importlib.invalidate_caches()
+            mlb_current_collector = importlib.reload(mlb_current_collector)
+        if getattr(mlb_current_collector, "MLB_UPCOMING_INFORMATION_SCHEMA_VERSION", None) != required_capture_version:
+            raise RuntimeError(
+                "The loaded MLB collector does not support capture version 2. "
+                "Deploy the matching dual_agent/mlb_research.py before gathering again."
+            )
+        # Discard the prior capture before fetching; never display it as the new result.
+        st.session_state.pop("mlb_upcoming_information", None)
+        st.session_state.pop("mlb_upcoming_information_summary", None)
         with st.spinner("Gathering upcoming-game feeds and player context; a full slate can take several minutes..."):
-            package = collect_mlb_upcoming_game_information(str(mlb_capture_date),
+            package = mlb_current_collector.collect_mlb_upcoming_game_information(str(mlb_capture_date),
                 historical_games=st.session_state.get("mlb_v3_games"),
                 pitcher_logs=st.session_state.get("mlb_v2a_pitcher_logs"))
+        if package.get("schema_version") != required_capture_version or any(
+            (game.get("current_information", {}) or {}).get("schema_version") != required_capture_version
+            for game in package.get("games", [])
+        ):
+            raise RuntimeError("The collector returned an older capture format; no new result was stored.")
         st.session_state["mlb_upcoming_information"] = package
-        st.session_state["mlb_upcoming_information_summary"] = summarize_mlb_upcoming_information(package)
+        st.session_state["mlb_upcoming_information_summary"] = mlb_current_collector.summarize_mlb_upcoming_information(package)
     except Exception as exc:
         st.error("Upcoming-game information collection stopped.")
         st.exception(exc)
 package = st.session_state.get("mlb_upcoming_information")
 if package is not None:
-    st.caption(f"Captured date: {package['game_date']} | Package completed UTC: {package['snapshot_time']}")
+    st.caption(f"Captured date: {package['game_date']} | Package completed UTC: {package['snapshot_time']} | Capture version: {package.get('schema_version', 'older/unversioned')}")
+    if package.get("schema_version") != 2:
+        st.warning("This is a previous capture. Click Gather Upcoming MLB Game Information to collect the updated sources.")
     summary = st.session_state["mlb_upcoming_information_summary"]
     if summary.empty:
         st.info("No eligible upcoming games were captured. Live/final games and games past scheduled first pitch are excluded.")
