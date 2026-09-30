@@ -536,3 +536,164 @@ def load_mlb_pitcher_history():
         )
 
         return pd.DataFrame()
+
+# ==========================================
+# MLB DAILY PREGAME INTELLIGENCE STORAGE
+# ==========================================
+# Current-day game context is stored separately from the
+# permanent historical pitcher cache. A latest snapshot is
+# convenient for live use, while timestamped snapshots let
+# Market Edge preserve exactly what was known before a game.
+
+import json
+from datetime import datetime, timezone
+
+MLB_PREGAME_STORAGE_PREFIX = "mlb/pregame"
+MLB_PREGAME_LATEST_FILE = f"{MLB_PREGAME_STORAGE_PREFIX}/latest.json"
+
+
+def _json_safe(value):
+    """Convert pandas/numpy/datetime values into JSON-safe values."""
+    if value is None:
+        return None
+
+    if isinstance(value, (datetime, pd.Timestamp)):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.isoformat()
+
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(v) for v in value]
+
+    if isinstance(value, np.generic):
+        return value.item()
+
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+
+    return value
+
+
+def save_mlb_pregame_intelligence(snapshot, snapshot_date=None):
+    """
+    Persist the MLB daily pregame intelligence package.
+
+    Saves two objects:
+      1. mlb/pregame/latest.json
+      2. mlb/pregame/YYYY-MM-DD/<timestamp>.json
+
+    The timestamped copy is immutable evidence of what Market
+    Edge knew at that point in time. The latest copy is used by
+    the live app and may be replaced as lineups/status change.
+    """
+    if snapshot is None:
+        return {"success": False, "message": "No MLB pregame snapshot supplied."}
+
+    client = get_supabase_client()
+    ensure_market_edge_storage_bucket()
+
+    now = datetime.now(timezone.utc)
+
+    if snapshot_date is None:
+        if isinstance(snapshot, dict):
+            snapshot_date = (
+                snapshot.get("date")
+                or snapshot.get("snapshot_date")
+                or snapshot.get("game_date")
+            )
+
+    if snapshot_date is None:
+        snapshot_date = now.date().isoformat()
+    else:
+        snapshot_date = str(snapshot_date)[:10]
+
+    payload = {
+        "snapshot_date": snapshot_date,
+        "saved_at": now.isoformat(),
+        "data": _json_safe(snapshot),
+    }
+
+    file_bytes = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    timestamp = now.strftime("%Y%m%dT%H%M%SZ")
+    archive_file = (
+        f"{MLB_PREGAME_STORAGE_PREFIX}/"
+        f"{snapshot_date}/{timestamp}.json"
+    )
+
+    try:
+        bucket = client.storage.from_(MLB_STORAGE_BUCKET)
+
+        bucket.upload(
+            MLB_PREGAME_LATEST_FILE,
+            file_bytes,
+            {"content-type": "application/json", "upsert": "true"},
+        )
+
+        bucket.upload(
+            archive_file,
+            file_bytes,
+            {"content-type": "application/json", "upsert": "false"},
+        )
+
+        return {
+            "success": True,
+            "latest_file": MLB_PREGAME_LATEST_FILE,
+            "archive_file": archive_file,
+            "snapshot_date": snapshot_date,
+            "saved_at": now.isoformat(),
+        }
+
+    except Exception as exc:
+        print("MLB pregame-intelligence save failed:", exc)
+        return {
+            "success": False,
+            "message": str(exc),
+            "snapshot_date": snapshot_date,
+        }
+
+
+def load_mlb_pregame_intelligence(snapshot_date=None, archive_file=None):
+    """
+    Load MLB pregame intelligence.
+
+    Default: load mlb/pregame/latest.json.
+    Pass archive_file to load a specific frozen historical snapshot.
+    """
+    client = get_supabase_client()
+
+    object_path = archive_file or MLB_PREGAME_LATEST_FILE
+
+    try:
+        file_bytes = (
+            client.storage
+            .from_(MLB_STORAGE_BUCKET)
+            .download(object_path)
+        )
+
+        if not file_bytes:
+            return None
+
+        payload = json.loads(file_bytes.decode("utf-8"))
+
+        if snapshot_date is not None:
+            wanted = str(snapshot_date)[:10]
+            actual = str(payload.get("snapshot_date", ""))[:10]
+            if actual != wanted:
+                return None
+
+        return payload
+
+    except Exception as exc:
+        print("MLB pregame-intelligence load failed:", exc)
+        return None
