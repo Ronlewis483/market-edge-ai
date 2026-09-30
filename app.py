@@ -11044,7 +11044,7 @@ st.divider()
 st.subheader("⚾ MLB Upcoming Game Information")
 st.caption(
     "Capture raw MLB feeds, probable starters, available lineups, rosters, player season/recent stats, "
-    "venue and any weather reported by MLB. This is a manual capture with visible gaps and source errors."
+    "stadium forecasts, roster status, recent transactions, and MLB injury-report mentions. This is a manual capture with visible gaps and source errors."
 )
 mlb_capture_date = st.date_input("MLB game date", value=pd.Timestamp.now(tz="America/Chicago").date(), key="mlb_upcoming_capture_date")
 if st.button("Gather Upcoming MLB Game Information", key="gather_upcoming_mlb_information", type="primary"):
@@ -11067,7 +11067,40 @@ if package is not None:
         st.info("No eligible upcoming games were captured. Live/final games and games past scheduled first pitch are excluded.")
     else:
         st.dataframe(summary, use_container_width=True, hide_index=True)
-    st.warning("Not yet connected here: sportsbook odds/props, dedicated injury news, and external weather/roof confirmation. Probable starters and feed lineups may change.")
+    from dual_agent.mlb_research import summarize_mlb_player_updates
+    captured_at = pd.Timestamp(package["snapshot_time"])
+    capture_age = max(0.0, (pd.Timestamp.now(tz="UTC") - captured_at).total_seconds() / 60)
+    st.caption(f"Capture age: {capture_age:.0f} minutes. Click Gather Upcoming MLB Game Information again to fetch current sources.")
+    if capture_age > 15:
+        st.warning("This capture is more than 15 minutes old. Refresh before relying on lineup or player availability information.")
+    st.warning("Still unverified: roof open/closed status, comprehensive breaking news, and sportsbook odds/props. Probable starters and feed lineups may change. No injury-report match does not establish that a player is healthy.")
+    player_updates = summarize_mlb_player_updates(package)
+    if not player_updates.empty:
+        with st.expander("Current player status and update coverage", expanded=True):
+            st.dataframe(player_updates, use_container_width=True, hide_index=True)
+    st.markdown("Weather source: [Open-Meteo](https://open-meteo.com/) · Player news source: [MLB injury report](https://www.mlb.com/injury-report)")
+    for captured_game in package.get("games", []):
+        current = captured_game.get("current_information", {}) or {}
+        scheduled = captured_game.get("schedule", {}) or {}
+        with st.expander(f"Sources and conditions: {scheduled.get('away_team', '?')} at {scheduled.get('home_team', '?')}"):
+            weather = current.get("stadium_forecast")
+            if weather:
+                st.json({k: v for k, v in weather.items() if k != "venue_metadata"})
+            else:
+                st.info("Stadium forecast unavailable for this capture. See collection errors.")
+            mentions = [x for x in current.get("player_news", []) if x.get("report_match")]
+            if mentions:
+                st.dataframe(pd.DataFrame(mentions), use_container_width=True, hide_index=True)
+            st.caption("News excerpts are unclassified source mentions, not a medical or availability determination. Source publication/update times are unknown unless supplied.")
+            for team_side, team_update in current.get("teams", {}).items():
+                transactions = team_update.get("transactions", [])
+                st.caption(f"{team_side.title()} transactions fetched: {team_update.get('transactions_fetched_at')}")
+                if transactions:
+                    st.dataframe(pd.DataFrame([{"Player": (t.get("person", {}) or {}).get("fullName"),
+                        "Date": t.get("date") or t.get("effectiveDate"), "Description": t.get("description")}
+                        for t in transactions]), use_container_width=True, hide_index=True)
+            if current.get("errors"):
+                st.json(current["errors"])
     if package.get("errors"):
         with st.expander("Collection errors"):
             st.json(package["errors"])
