@@ -11037,6 +11037,31 @@ if v3_history_ready:
         st.info("These results test historical proxies. Confirmed live lineups/starters require a separately validated feature/model path before use in predictions.")
 
 
+def _display_mlb_player_update_table(package):
+    rows = []
+    for game in package.get("games", []):
+        updates = game.get("current_information", {}) or {}
+        enriched = (game.get("enrichment", {}) or {}).get("players", {}) or {}
+        news = {str(x.get("player_id")): x for x in updates.get("player_news", [])}
+        context = game.get("team_context", {}) or {}
+        for side, team in updates.get("teams", {}).items():
+            lineup = set((context.get(side, {}) or {}).get("batting_order", []) or [])
+            transactions = team.get("transactions", [])
+            for entry in team.get("roster", []):
+                person = entry.get("person", {}) or {}; pid = person.get("id")
+                player = enriched.get(str(pid), {}) or {}
+                mentions = news.get(str(pid), {})
+                related = [t for t in transactions if (t.get("person", {}) or {}).get("id")==pid]
+                recent = player.get("recent_stats", {}) or {}
+                rows.append({"Game ID": game.get("game_id"), "Side": side, "Player": person.get("fullName"),
+                    "Roster status": (entry.get("status", {}) or {}).get("description") or "Unknown",
+                    "Listed in feed lineup": pid in lineup, "Recent transactions": len(related),
+                    "Latest transaction": max((str(t.get("date") or t.get("effectiveDate") or "") for t in related), default=None),
+                    "Recent stats available": bool(recent), "Profile available": bool(player.get("profile")),
+                    "Injury report": "Mention found — review" if mentions.get("report_match") else "Unverified",
+                    "Roster fetched UTC": team.get("roster_fetched_at"), "Stats collected in capture UTC": game.get("capture_finished_at") if recent else None})
+    return pd.DataFrame(rows)
+
 # ==========================================
 # MLB UPCOMING GAME INFORMATION CAPTURE
 # ==========================================
@@ -11067,14 +11092,24 @@ if package is not None:
         st.info("No eligible upcoming games were captured. Live/final games and games past scheduled first pitch are excluded.")
     else:
         st.dataframe(summary, use_container_width=True, hide_index=True)
-    from dual_agent.mlb_research import summarize_mlb_player_updates
     captured_at = pd.Timestamp(package["snapshot_time"])
     capture_age = max(0.0, (pd.Timestamp.now(tz="UTC") - captured_at).total_seconds() / 60)
     st.caption(f"Capture age: {capture_age:.0f} minutes. Click Gather Upcoming MLB Game Information again to fetch current sources.")
     if capture_age > 15:
         st.warning("This capture is more than 15 minutes old. Refresh before relying on lineup or player availability information.")
     st.warning("Still unverified: roof open/closed status, comprehensive breaking news, and sportsbook odds/props. Probable starters and feed lineups may change. No injury-report match does not establish that a player is healthy.")
-    player_updates = summarize_mlb_player_updates(package)
+    missing_current_information = [
+        game.get("game_id") for game in package.get("games", [])
+        if "current_information" not in game
+    ]
+    if missing_current_information:
+        st.warning(
+            "This capture lacks the updated stadium forecast and player-status fields for "
+            f"{len(missing_current_information)} game(s). Replace dual_agent/mlb_research.py "
+            "with the latest complete file, reboot, and gather again. Existing MLB feed "
+            "information and the JSON download remain available below."
+        )
+    player_updates = _display_mlb_player_update_table(package)
     if not player_updates.empty:
         with st.expander("Current player status and update coverage", expanded=True):
             st.dataframe(player_updates, use_container_width=True, hide_index=True)
