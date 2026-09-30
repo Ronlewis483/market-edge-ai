@@ -10095,7 +10095,6 @@ with st.expander("🔎 MLB V3 Deployment Diagnostic", expanded=True):
                         games=mlb_v2a_games,
                         existing_logs=working_player_logs,
                         batch_size=batch_target,
-                        max_workers=10,
                     )
 
                     batch_requested = int(
