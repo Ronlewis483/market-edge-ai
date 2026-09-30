@@ -11037,6 +11037,26 @@ if v3_history_ready:
         st.info("These results test historical proxies. Confirmed live lineups/starters require a separately validated feature/model path before use in predictions.")
 
 
+def _mlb_pregame_storage_module():
+    import importlib
+    import dual_agent.supabase_db as storage
+    if getattr(storage, "MLB_PREGAME_STORAGE_VERSION", None) != 2:
+        importlib.invalidate_caches()
+        storage = importlib.reload(storage)
+    if getattr(storage, "MLB_PREGAME_STORAGE_VERSION", None) != 2:
+        raise RuntimeError("Deploy the matching dual_agent/supabase_db.py before saving captures.")
+    return storage
+
+
+def _save_mlb_captured_information(package):
+    try:
+        return _mlb_pregame_storage_module().save_mlb_pregame_intelligence(
+            package, snapshot_date=package.get("game_date")
+        )
+    except Exception as exc:
+        return {"success": False, "archive_saved": False, "latest_saved": False, "message": str(exc)}
+
+
 def _display_mlb_player_update_table(package):
     rows = []
     for game in package.get("games", []):
@@ -11090,6 +11110,7 @@ if st.button("Gather Upcoming MLB Game Information", key="gather_upcoming_mlb_in
         # Discard the prior capture before fetching; never display it as the new result.
         st.session_state.pop("mlb_upcoming_information", None)
         st.session_state.pop("mlb_upcoming_information_summary", None)
+        st.session_state.pop("mlb_upcoming_save_result", None)
         with st.spinner("Gathering upcoming-game feeds and player context; a full slate can take several minutes..."):
             package = mlb_current_collector.collect_mlb_upcoming_game_information(str(mlb_capture_date),
                 historical_games=st.session_state.get("mlb_v3_games"),
@@ -11101,11 +11122,46 @@ if st.button("Gather Upcoming MLB Game Information", key="gather_upcoming_mlb_in
             raise RuntimeError("The collector returned an older capture format; no new result was stored.")
         st.session_state["mlb_upcoming_information"] = package
         st.session_state["mlb_upcoming_information_summary"] = mlb_current_collector.summarize_mlb_upcoming_information(package)
+        with st.spinner("Saving captured MLB game information permanently..."):
+            st.session_state["mlb_upcoming_save_result"] = _save_mlb_captured_information(package)
     except Exception as exc:
         st.error("Upcoming-game information collection stopped.")
         st.exception(exc)
+if st.button("Load Latest Saved MLB Game Information", key="load_latest_saved_mlb_capture"):
+    try:
+        with st.spinner("Loading saved MLB game information..."):
+            stored = _mlb_pregame_storage_module().load_mlb_pregame_intelligence()
+        if stored is None:
+            st.warning("No saved capture could be loaded. It may not exist yet, or storage may be unavailable.")
+        else:
+            loaded = stored.get("data")
+            if not isinstance(loaded, dict) or not isinstance(loaded.get("games"), list):
+                raise ValueError("Saved capture format is not recognized.")
+            from dual_agent.mlb_research import summarize_mlb_upcoming_information
+            st.session_state["mlb_upcoming_information"] = loaded
+            st.session_state["mlb_upcoming_information_summary"] = summarize_mlb_upcoming_information(loaded)
+            st.session_state["mlb_upcoming_save_result"] = {"success": True, "loaded": True, "saved_at": stored.get("saved_at")}
+    except Exception as exc:
+        st.error("Saved capture could not be loaded.")
+        st.exception(exc)
 package = st.session_state.get("mlb_upcoming_information")
 if package is not None:
+    save_result = st.session_state.get("mlb_upcoming_save_result", {})
+    if save_result.get("success"):
+        verb = "Loaded saved capture" if save_result.get("loaded") else "Capture permanently saved"
+        st.success(f"{verb}. Saved UTC: {save_result.get('saved_at', 'unknown')}")
+    elif save_result.get("archive_saved"):
+        st.warning("The permanent archive was saved, but the latest-copy update failed. The JSON download is still available.")
+        st.caption(f"Archive: {save_result.get('archive_file')}")
+        st.error(str(save_result.get("message", "Latest-copy update failed.")))
+    else:
+        st.warning("This capture has not been confirmed permanently saved. Download the JSON or retry saving below.")
+        if save_result.get("message"):
+            st.error(str(save_result["message"]))
+    if not save_result.get("success") and st.button("Retry Saving Captured MLB Information", key="retry_save_mlb_capture"):
+        with st.spinner("Saving captured MLB game information..."):
+            st.session_state["mlb_upcoming_save_result"] = _save_mlb_captured_information(package)
+        st.rerun()
     st.caption(f"Captured date: {package['game_date']} | Package completed UTC: {package['snapshot_time']} | Capture version: {package.get('schema_version', 'older/unversioned')}")
     if package.get("schema_version") != 2:
         st.warning("This is a previous capture. Click Gather Upcoming MLB Game Information to collect the updated sources.")
@@ -11188,4 +11244,4 @@ if package is not None:
     capture_stamp = pd.Timestamp(package["snapshot_time"]).strftime("%Y%m%dT%H%M%S%fZ")
     st.download_button("Download Timestamped MLB Game Information JSON", capture_text.encode("utf-8"),
         file_name=f"mlb_pregame_{capture_stamp}.json", mime="application/json", key="download_upcoming_mlb_information")
-    st.caption("This capture remains in the current session. Download it to retain it; automatic permanent snapshot saving still needs to be connected.")
+    st.caption("Gather automatically saves an archive and a latest copy. Save failures are shown above; JSON download remains available as a backup. Loading saved information does not refresh its source data.")
