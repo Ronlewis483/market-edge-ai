@@ -553,115 +553,65 @@ MLB_PREGAME_STORAGE_PREFIX = "mlb/pregame"
 MLB_PREGAME_LATEST_FILE = f"{MLB_PREGAME_STORAGE_PREFIX}/latest.json"
 
 
-def _json_safe(value):
-    """Convert pandas/numpy/datetime values into JSON-safe values."""
-    if value is None:
-        return None
+MLB_PREGAME_STORAGE_VERSION = 2
 
+
+def _json_safe(value):
+    """Convert captures including DataFrames and nested numpy values to strict JSON."""
+    if value is None or value is pd.NA or value is pd.NaT:
+        return None
+    if isinstance(value, pd.DataFrame):
+        return [_json_safe(row) for row in value.to_dict("records")]
+    if isinstance(value, pd.Series):
+        return [_json_safe(item) for item in value.tolist()]
     if isinstance(value, (datetime, pd.Timestamp)):
+        if pd.isna(value):
+            return None
         if value.tzinfo is None:
             value = value.replace(tzinfo=timezone.utc)
         return value.isoformat()
-
     if isinstance(value, dict):
         return {str(k): _json_safe(v) for k, v in value.items()}
-
     if isinstance(value, (list, tuple, set)):
         return [_json_safe(v) for v in value]
-
+    if isinstance(value, np.datetime64):
+        return _json_safe(pd.Timestamp(value))
     if isinstance(value, np.generic):
-        return value.item()
-
-    try:
-        if pd.isna(value):
-            return None
-    except (TypeError, ValueError):
-        pass
-
+        return _json_safe(value.item())
+    if isinstance(value, float) and not np.isfinite(value):
+        return None
     return value
 
 
 def save_mlb_pregame_intelligence(snapshot, snapshot_date=None):
-    """
-    Persist the MLB daily pregame intelligence package.
-
-    Saves two objects:
-      1. mlb/pregame/latest.json
-      2. mlb/pregame/YYYY-MM-DD/<timestamp>.json
-
-    The timestamped copy is immutable evidence of what Market
-    Edge knew at that point in time. The latest copy is used by
-    the live app and may be replaced as lineups/status change.
-    """
-    if snapshot is None:
-        return {"success": False, "message": "No MLB pregame snapshot supplied."}
-
-    client = get_supabase_client()
-    ensure_market_edge_storage_bucket()
-
-    now = datetime.now(timezone.utc)
-
-    if snapshot_date is None:
-        if isinstance(snapshot, dict):
-            snapshot_date = (
-                snapshot.get("date")
-                or snapshot.get("snapshot_date")
-                or snapshot.get("game_date")
-            )
-
-    if snapshot_date is None:
-        snapshot_date = now.date().isoformat()
-    else:
-        snapshot_date = str(snapshot_date)[:10]
-
-    payload = {
-        "snapshot_date": snapshot_date,
-        "saved_at": now.isoformat(),
-        "data": _json_safe(snapshot),
-    }
-
-    file_bytes = json.dumps(
-        payload,
-        ensure_ascii=False,
-        separators=(",", ":"),
-    ).encode("utf-8")
-
-    timestamp = now.strftime("%Y%m%dT%H%M%SZ")
-    archive_file = (
-        f"{MLB_PREGAME_STORAGE_PREFIX}/"
-        f"{snapshot_date}/{timestamp}.json"
-    )
-
+    """Archive first, then update latest. Report partial success explicitly."""
+    from uuid import uuid4
+    result = {"success": False, "archive_saved": False, "latest_saved": False}
+    if not isinstance(snapshot, dict):
+        return dict(result, message="No valid MLB pregame snapshot supplied.")
     try:
+        now = datetime.now(timezone.utc)
+        date_value = snapshot_date or snapshot.get("snapshot_date") or snapshot.get("game_date") or snapshot.get("date") or now.date()
+        snapshot_date = pd.Timestamp(date_value).date().isoformat()
+        archive_file = (f"{MLB_PREGAME_STORAGE_PREFIX}/{snapshot_date}/"
+                        f"{now.strftime('%Y%m%dT%H%M%S%fZ')}_{uuid4().hex}.json")
+        result.update(snapshot_date=snapshot_date, archive_file=archive_file,
+                      latest_file=MLB_PREGAME_LATEST_FILE, saved_at=now.isoformat())
+        payload = {"snapshot_date": snapshot_date, "saved_at": now.isoformat(),
+                   "archive_file": archive_file, "data": _json_safe(snapshot)}
+        file_bytes = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+        bucket_result = ensure_market_edge_storage_bucket()
+        if not bucket_result.get("success"):
+            raise RuntimeError(bucket_result.get("error") or "Storage bucket unavailable.")
+        client = get_supabase_client()
         bucket = client.storage.from_(MLB_STORAGE_BUCKET)
-
-        bucket.upload(
-            MLB_PREGAME_LATEST_FILE,
-            file_bytes,
-            {"content-type": "application/json", "upsert": "true"},
-        )
-
-        bucket.upload(
-            archive_file,
-            file_bytes,
-            {"content-type": "application/json", "upsert": "false"},
-        )
-
-        return {
-            "success": True,
-            "latest_file": MLB_PREGAME_LATEST_FILE,
-            "archive_file": archive_file,
-            "snapshot_date": snapshot_date,
-            "saved_at": now.isoformat(),
-        }
-
+        bucket.upload(archive_file, file_bytes, {"content-type": "application/json", "upsert": "false"})
+        result["archive_saved"] = True
+        bucket.upload(MLB_PREGAME_LATEST_FILE, file_bytes, {"content-type": "application/json", "upsert": "true"})
+        result.update(success=True, latest_saved=True)
     except Exception as exc:
-        print("MLB pregame-intelligence save failed:", exc)
-        return {
-            "success": False,
-            "message": str(exc),
-            "snapshot_date": snapshot_date,
-        }
+        result["message"] = str(exc)
+    return result
 
 
 def load_mlb_pregame_intelligence(snapshot_date=None, archive_file=None):
@@ -1435,4 +1385,3 @@ def get_mlb_player_history_status():
         ),
         "path": MLB_PLAYER_HISTORY_FILE,
     }
-
