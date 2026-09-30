@@ -5595,3 +5595,122 @@ def summarize_mlb_player_updates(package):
                     "Injury report": "Mention found — review" if mentions.get("report_match") else "Unverified",
                     "Roster fetched UTC": team.get("roster_fetched_at"), "Stats collected in capture UTC": game.get("capture_finished_at") if recent else None})
     return pd.DataFrame(rows)
+
+MLB_CAPTURE_LEARNING_VERSION = 1
+
+
+def build_mlb_capture_learning_rows(package, timeout=30, session=None):
+    """Frozen capture features plus separately fetched outcomes; never enrich again."""
+    import math
+    def number(value):
+        try:
+            result = float(value)
+            return result if math.isfinite(result) else None
+        except (TypeError, ValueError):
+            return None
+    rows, errors = [], []
+    client = session or requests.Session()
+    try:
+        for game in package.get("games", []):
+            start = pd.to_datetime(game.get("start_time"), utc=True, errors="coerce")
+            finished = pd.to_datetime(game.get("capture_finished_at"), utc=True, errors="coerce")
+            status = game.get("status", {}) or {}
+            if (not game.get("eligible_pregame_capture") or pd.isna(start) or pd.isna(finished)
+                    or finished >= start or status.get("abstractGameState") != "Preview"):
+                errors.append({"game_id": game.get("game_id"), "error": "Capture is not verified before scheduled first pitch."})
+                continue
+            gid = int(game["game_id"])
+            enrichment = game.get("enrichment", {}) or {}
+            players = enrichment.get("players", {}) or {}
+            teams = enrichment.get("teams", {}) or {}
+            contexts = game.get("team_context", {}) or {}
+            probable = game.get("probable_pitchers", {}) or {}
+            forecast = (game.get("current_information", {}) or {}).get("stadium_forecast", {}) or {}
+            features = {}
+            for key in ("temperature_2m", "wind_speed_10m", "wind_direction_10m", "precipitation_probability", "relative_humidity_2m"):
+                features["weather_" + key] = number(forecast.get(key))
+            features["weather_available"] = int(any(features[k] is not None for k in features))
+            for side in ("home", "away"):
+                context = contexts.get(side, {}) or {}
+                order = context.get("batting_order", []) or []
+                features[side + "_feed_lineup_slots"] = len(order)
+                features[side + "_active_roster_count"] = len((teams.get(side, {}) or {}).get("active_roster", []) or [])
+                for group, stats_keys in (("season_hitting", ("ops", "avg", "obp", "slg")), ("season_pitching", ("era", "whip"))):
+                    stats = (teams.get(side, {}) or {}).get(group, {}) or {}
+                    for key in stats_keys:
+                        features[f"{side}_{group}_{key}"] = number(stats.get(key))
+                pid = (probable.get(side, {}) or {}).get("id")
+                starter = players.get(str(pid), players.get(pid, {})) or {}
+                features[side + "_probable_starter_available"] = int(bool(pid))
+                for window in ("season_stats", "recent_stats"):
+                    stats = starter.get(window, {}) or {}
+                    for key in ("era", "whip", "strikeoutsPer9Inn", "walksPer9Inn"):
+                        features[f"{side}_probable_starter_{window}_{key}"] = number(stats.get(key))
+                for window in ("season_stats", "recent_stats"):
+                    values = [number((players.get(str(pid), players.get(pid, {})) or {}).get(window, {}).get("ops")) for pid in order]
+                    values = [v for v in values if v is not None]
+                    features[f"{side}_feed_lineup_{window}_ops"] = sum(values)/len(values) if values else None
+                    features[f"{side}_feed_lineup_{window}_ops_count"] = len(values)
+            row = {"capture_key": f"{gid}:{game['capture_finished_at']}", "game_id": gid,
+                   "start_time": start.isoformat(), "capture_finished_at": finished.isoformat(),
+                   "home_team": (game.get("home_team", {}) or {}).get("name"),
+                   "away_team": (game.get("away_team", {}) or {}).get("name"),
+                   "feature_version": 1, "features": features, "outcome": {"status": "Pending"}}
+            try:
+                response = client.get(MLB_LIVE_FEED_URL.format(game_id=gid), timeout=timeout)
+                response.raise_for_status()
+                feed = response.json()
+                current_status = (feed.get("gameData", {}) or {}).get("status", {}) or {}
+                outcome = {"status": current_status.get("detailedState") or "Unknown",
+                           "checked_at": datetime.now(timezone.utc).isoformat(), "source": "MLB Stats API"}
+                if current_status.get("abstractGameState") == "Final":
+                    scores = ((feed.get("liveData", {}) or {}).get("linescore", {}) or {}).get("teams", {}) or {}
+                    home, away = number((scores.get("home", {}) or {}).get("runs")), number((scores.get("away", {}) or {}).get("runs"))
+                    if home is not None and away is not None and home != away:
+                        outcome.update(home_runs=int(home), away_runs=int(away), home_win=int(home > away), final=True)
+                    else:
+                        errors.append({"game_id": gid, "error": "Final feed lacks a valid non-tied score; no training label."})
+                row["outcome"] = outcome
+            except Exception as exc:
+                errors.append({"game_id": gid, "error": f"Outcome fetch failed: {exc}"})
+            rows.append(row)
+    finally:
+        if session is None:
+            client.close()
+    return {"rows": rows, "errors": errors, "updated_at": datetime.now(timezone.utc).isoformat(), "feature_version": 1}
+
+
+
+def refresh_mlb_capture_learning_results(rows, timeout=30, session=None):
+    """Check pending games without changing any frozen feature or completed label."""
+    import copy
+    updated, errors, checked = copy.deepcopy(rows), [], {}
+    client = session or requests.Session()
+    try:
+        for row in updated:
+            if row.get("outcome", {}).get("final"):
+                continue
+            gid = int(row["game_id"])
+            try:
+                if gid not in checked:
+                    response = client.get(MLB_LIVE_FEED_URL.format(game_id=gid), timeout=timeout)
+                    response.raise_for_status()
+                    feed = response.json()
+                    status = (feed.get("gameData", {}) or {}).get("status", {}) or {}
+                    outcome = {"status": status.get("detailedState") or "Unknown", "source": "MLB Stats API",
+                               "checked_at": datetime.now(timezone.utc).isoformat()}
+                    if status.get("abstractGameState") == "Final":
+                        scores = ((feed.get("liveData", {}) or {}).get("linescore", {}) or {}).get("teams", {}) or {}
+                        home, away = (scores.get("home", {}) or {}).get("runs"), (scores.get("away", {}) or {}).get("runs")
+                        if isinstance(home, int) and isinstance(away, int) and home >= 0 and away >= 0 and home != away:
+                            outcome.update(home_runs=home, away_runs=away, home_win=int(home > away), final=True)
+                        else:
+                            errors.append({"game_id": gid, "error": "Final score invalid; label remains pending."})
+                    checked[gid] = outcome
+                row["outcome"] = copy.deepcopy(checked[gid])
+            except Exception as exc:
+                errors.append({"game_id": gid, "error": str(exc)})
+    finally:
+        if session is None:
+            client.close()
+    return {"rows": updated, "errors": errors}
