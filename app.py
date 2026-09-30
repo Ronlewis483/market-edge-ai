@@ -9287,14 +9287,38 @@ if st.button(
         )
 
 # ==========================================
-# MLB V2A RESEARCH CACHE
+# MLB V2A PERMANENT PITCHER HISTORY
 # ==========================================
 
 if "mlb_v2a_pitcher_logs" not in st.session_state:
-    st.session_state[
-        "mlb_v2a_pitcher_logs"
-    ] = pd.DataFrame()
 
+    with st.spinner(
+        "Loading permanent MLB pitcher history..."
+    ):
+
+        permanent_pitcher_logs = (
+            load_mlb_pitcher_history()
+        )
+
+        st.session_state[
+            "mlb_v2a_pitcher_logs"
+        ] = permanent_pitcher_logs
+
+        if (
+            permanent_pitcher_logs is not None
+            and not permanent_pitcher_logs.empty
+        ):
+
+            st.session_state[
+                "mlb_pitcher_history_loaded"
+            ] = True
+
+        else:
+
+            st.session_state[
+                "mlb_pitcher_history_loaded"
+            ] = False
+            
 # ==========================================
 # MLB V1 WALK-FORWARD BENCHMARK
 # ==========================================
