@@ -5353,13 +5353,15 @@ def run_mlb_v3_history_only_comparison(features, min_train_games=500,
             "frozen_v1_benchmark": .5499}
 
 
-def collect_mlb_upcoming_game_information(game_date, historical_games=None, pitcher_logs=None, timeout=30):
+def collect_mlb_upcoming_game_information(game_date, historical_games=None, pitcher_logs=None, timeout=30, game_ids=None):
     """Capture current upcoming-game evidence, keeping raw feeds and errors.
 
     No odds, injury-news or external weather source is invented. Those gaps
     remain explicit. This is a manual capture; no background schedule is implied.
     """
     slate = fetch_mlb_daily_slate(game_date, timeout=timeout)
+    if game_ids is not None and not slate.empty:
+        slate = slate[slate["game_id"].isin(set(game_ids))].copy()
     collected, errors, skipped = [], [], []
     capture_cache = {}
     session = requests.Session()
@@ -5714,3 +5716,112 @@ def refresh_mlb_capture_learning_results(rows, timeout=30, session=None):
         if session is None:
             client.close()
     return {"rows": updated, "errors": errors}
+
+MLB_MODEL_STRENGTHENING_VERSION = 1
+MLB_COMPACT_HISTORY_FEATURES = [
+    "win_pct_diff", "avg_runs_for_diff", "avg_runs_against_diff",
+    "recent_10_win_pct_diff", "recent_5_run_diff_diff",
+    "season_ops_diff", "season_era_diff", "season_whip_diff",
+]
+
+
+def run_mlb_focused_model_test(features):
+    """One fixed challenger, development-season selection, latest-season evaluation.
+
+    This is a new chronological experiment, not an untouched holdout: previous
+    experiments may already have reported results for these seasons. Feature
+    availability still depends on the historical builder's prior-date assumption.
+    """
+    from sklearn.impute import SimpleImputer
+    from threadpoolctl import threadpool_limits
+    required = list(dict.fromkeys(["game_id", "start_time", "home_win"] + MLB_MODEL_FEATURES + MLB_COMPACT_HISTORY_FEATURES))
+    absent = [c for c in required if c not in features.columns]
+    if absent:
+        raise ValueError(f"Build the MLB V3 historical feature matrix first. Missing fields: {absent}")
+    df = features.copy()
+    df["start_time"] = pd.to_datetime(df.start_time, utc=True, errors="coerce")
+    df["home_win"] = pd.to_numeric(df.home_win, errors="coerce")
+    if df.start_time.isna().any() or not df.home_win.isin([0, 1]).all() or df.game_id.duplicated().any():
+        raise ValueError("Invalid timestamps, labels, or duplicate game IDs.")
+    columns = list(dict.fromkeys(MLB_MODEL_FEATURES + MLB_COMPACT_HISTORY_FEATURES))
+    df[columns] = df[columns].apply(pd.to_numeric, errors="coerce")
+    if df[columns].isin([np.inf, -np.inf]).any().any():
+        raise ValueError("Infinite historical features.")
+    df = df.sort_values(["start_time", "game_id"]).reset_index(drop=True)
+    # Use MLB season metadata when present, and refuse ambiguous year mappings.
+    if "season_id" in df:
+        df["test_season"] = pd.to_numeric(df.season_id, errors="coerce")
+        if df.test_season.isna().any():
+            raise ValueError("Missing season identifiers.")
+    else:
+        df["test_season"] = df.start_time.dt.year
+    seasons = sorted(df.test_season.unique())
+    if len(seasons) < 3:
+        raise ValueError("At least three seasons are required for training, development, and evaluation.")
+    development_season, evaluation_season = seasons[-2:]
+    configs = [("V1 feature control", MLB_MODEL_FEATURES, 1.0),
+               ("Focused regularized candidate", MLB_COMPACT_HISTORY_FEATURES, 0.25)]
+    summaries, predictions, fitted = [], [], {}
+    coefficients = []
+    with threadpool_limits(limits=2):
+        for phase, season in (("Development", development_season), ("Latest-season evaluation", evaluation_season)):
+            current = df[df.test_season.eq(season)]
+            boundary = current.start_time.dt.floor("D").min()
+            train = df[df.test_season.lt(season) & df.start_time.lt(boundary)]
+            if len(train) < 500 or train.home_win.nunique() != 2 or len(current) < 100:
+                raise ValueError("Insufficient training or evaluation games.")
+            for name, fields, strength in configs:
+                X = train[fields]
+                if X.isna().all().any():
+                    raise ValueError(f"A training feature has no values for {name}.")
+                # Baseline reproduces its zero-fill; candidate imputes training medians.
+                model = make_pipeline(SimpleImputer(strategy="constant", fill_value=0) if strength == 1.0 else SimpleImputer(strategy="median"),
+                                      StandardScaler(), LogisticRegression(C=strength, max_iter=3000, random_state=42))
+                model.fit(X, train.home_win.astype(int))
+                prob = model.predict_proba(current[fields])[:, 1]
+                y = current.home_win.astype(int)
+                summaries.append({"Phase": phase, "Season": int(season), "Model": name,
+                    "Training games": len(train), "Evaluation games": len(current),
+                    "Accuracy": float(((prob >= .5).astype(int) == y).mean()),
+                    "AUC": float(roc_auc_score(y, prob)) if y.nunique() > 1 else np.nan,
+                    "Brier": float(brier_score_loss(y, prob)), "Log loss": float(log_loss(y, prob, labels=[0,1])),
+                    "Trained through UTC": train.start_time.max()})
+                if phase == "Latest-season evaluation":
+                    fitted[name] = model
+                    for field, coef in zip(fields, model.steps[-1][1].coef_[0]):
+                        coefficients.append({"Model": name, "Feature": field, "Standardized coefficient": float(coef)})
+                    for (_, game), p in zip(current.iterrows(), prob):
+                        predictions.append({"Model": name, "game_id": game.game_id, "start_time": game.start_time,
+                            "home_win_probability": float(p), "actual_home_win": int(game.home_win),
+                            "correct": int(int(p >= .5) == int(game.home_win)), "trained_through": train.start_time.max()})
+    scores = pd.DataFrame(summaries)
+    dev = scores[scores.Phase.eq("Development")].sort_values(["Log loss", "Brier", "Model"])
+    selected = str(dev.iloc[0].Model)
+    test = scores[scores.Phase.eq("Latest-season evaluation")].set_index("Model")
+    control = test.loc[configs[0][0]]
+    candidate = test.loc[configs[1][0]]
+    # Paired resampling of game dates shows uncertainty without treating same-day
+    # games as independent. It is descriptive; it is not automatic promotion.
+    pred = pd.DataFrame(predictions)
+    left = pred[pred.Model.eq(configs[0][0])].set_index("game_id")
+    right = pred[pred.Model.eq(configs[1][0])].set_index("game_id")
+    if left.index.tolist() != right.index.tolist():
+        raise RuntimeError("Evaluation game sets differ.")
+    paired = pd.DataFrame({"day": left.start_time.dt.floor("D"),
+                          "difference": right.correct - left.correct})
+    daily = paired.groupby("day").difference.agg(["sum", "count"])
+    rng = np.random.default_rng(42)
+    boot = []
+    for _ in range(1000):
+        sample = daily.iloc[rng.integers(0, len(daily), size=len(daily))]
+        boot.append(float(sample["sum"].sum()/sample["count"].sum()))
+    lower, upper = np.quantile(boot, [.025, .975])
+    promising = bool(selected == configs[1][0] and candidate.Accuracy > control.Accuracy
+                     and candidate.Brier < control.Brier and candidate["Log loss"] < control["Log loss"] and lower > 0)
+    return {"scores": scores, "predictions": pred, "coefficients": pd.DataFrame(coefficients),
+            "selected_on_development": selected, "development_season": int(development_season),
+            "evaluation_season": int(evaluation_season), "accuracy_change": float(candidate.Accuracy-control.Accuracy),
+            "accuracy_change_interval": [float(lower), float(upper)], "promising": promising,
+            "recommendation": "Candidate merits a prospective test; live model unchanged." if promising else "Keep the baseline; this experiment does not establish a stronger model.",
+            "feature_names": MLB_COMPACT_HISTORY_FEATURES,
+            "limitations": "Latest season was examined in earlier experiments. Historical features assume prior-date outcomes were available; this is not an untouched or prospective test."}
