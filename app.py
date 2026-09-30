@@ -9610,7 +9610,7 @@ if (
                     f"{save_result.get('error')}"
                 )
 
-        if missing_pitcher_games.empty:
+            if missing_pitcher_games.empty:
 
         st.success(
             "Historical MLB starting-pitcher "
