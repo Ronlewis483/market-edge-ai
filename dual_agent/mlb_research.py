@@ -3422,3 +3422,486 @@ def build_mlb_enriched_daily_pregame_intelligence(
     package["enrichment_time"] = datetime.now(timezone.utc).isoformat()
     return package
 
+
+# ==========================================
+# MLB SHARED PREGAME FEATURE ENGINE
+# ==========================================
+
+MLB_WINNER_LIVE_FEATURES = [
+    "games_played_diff",
+    "win_pct_diff",
+    "avg_runs_for_diff",
+    "avg_runs_against_diff",
+    "avg_run_diff_diff",
+    "recent_5_win_pct_diff",
+    "recent_10_win_pct_diff",
+    "recent_5_run_diff_diff",
+    "starter_prior_starts_diff",
+    "starter_prior_innings_diff",
+    "starter_era_diff",
+    "starter_whip_diff",
+    "starter_k_per_9_diff",
+    "starter_bb_per_9_diff",
+    "starter_hr_per_9_diff",
+    "starter_k_bb_ratio_diff",
+    "starter_recent_3_era_diff",
+    "starter_recent_3_whip_diff",
+    "starter_recent_3_k_per_9_diff",
+    "season_runs_per_game_diff",
+    "season_ops_diff",
+    "season_era_diff",
+    "season_whip_diff",
+    "lineup_ops_diff",
+    "lineup_recent_ops_diff",
+    "lineup_k_rate_diff",
+    "lineup_recent_k_rate_diff",
+    "bullpen_era_diff",
+    "bullpen_whip_diff",
+]
+
+MLB_PROP_BASE_FEATURES = [
+    "season_games",
+    "season_plate_appearances",
+    "season_at_bats",
+    "season_hits",
+    "season_home_runs",
+    "season_walks",
+    "season_strikeouts",
+    "season_avg",
+    "season_obp",
+    "season_slg",
+    "season_ops",
+    "recent_games",
+    "recent_plate_appearances",
+    "recent_at_bats",
+    "recent_hits",
+    "recent_home_runs",
+    "recent_walks",
+    "recent_strikeouts",
+    "recent_avg",
+    "recent_obp",
+    "recent_slg",
+    "recent_ops",
+    "season_innings",
+    "season_batters_faced",
+    "season_pitcher_strikeouts",
+    "season_pitcher_walks",
+    "season_pitcher_hits",
+    "season_pitcher_home_runs",
+    "season_era",
+    "season_whip",
+    "season_k_per_9",
+    "season_bb_per_9",
+    "recent_innings",
+    "recent_batters_faced",
+    "recent_pitcher_strikeouts",
+    "recent_pitcher_walks",
+    "recent_pitcher_hits",
+    "recent_pitcher_home_runs",
+    "recent_era",
+    "recent_whip",
+    "recent_k_per_9",
+    "recent_bb_per_9",
+    "batting_order",
+    "is_home",
+    "opponent_season_era",
+    "opponent_season_whip",
+    "opponent_season_ops",
+    "opponent_starter_era",
+    "opponent_starter_whip",
+    "opponent_starter_k_per_9",
+    "temperature_f",
+    "wind_speed_mph",
+]
+
+
+def _mlb_num(mapping, *keys, default=0.0):
+    """Read the first present numeric MLB stat from a mapping."""
+    mapping = mapping or {}
+    for key in keys:
+        value = mapping.get(key)
+        if value not in (None, "", "-.--"):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+    return float(default)
+
+
+def _mlb_rate(numerator, denominator, scale=1.0):
+    denominator = _safe_number(denominator, 0.0)
+    if denominator <= 0:
+        return 0.0
+    return float(_safe_number(numerator, 0.0) / denominator * scale)
+
+
+def _mlb_pitching_innings(stat):
+    return float(_innings_to_outs((stat or {}).get("inningsPitched")) / 3.0)
+
+
+def _mlb_team_rate_features(team_context):
+    team_context = team_context or {}
+    hitting = team_context.get("season_hitting", {}) or {}
+    pitching = team_context.get("season_pitching", {}) or {}
+
+    games = max(
+        _mlb_num(hitting, "gamesPlayed"),
+        _mlb_num(pitching, "gamesPlayed"),
+        0.0,
+    )
+    runs = _mlb_num(hitting, "runs")
+
+    return {
+        "season_games": games,
+        "season_runs_per_game": runs / games if games > 0 else 0.0,
+        "season_avg": _mlb_num(hitting, "avg"),
+        "season_obp": _mlb_num(hitting, "obp"),
+        "season_slg": _mlb_num(hitting, "slg"),
+        "season_ops": _mlb_num(hitting, "ops"),
+        "season_k_rate": _mlb_rate(
+            _mlb_num(hitting, "strikeOuts"),
+            _mlb_num(hitting, "plateAppearances", "atBats"),
+        ),
+        "season_bb_rate": _mlb_rate(
+            _mlb_num(hitting, "baseOnBalls", "walks"),
+            _mlb_num(hitting, "plateAppearances", "atBats"),
+        ),
+        "season_era": _mlb_num(pitching, "era", default=4.50),
+        "season_whip": _mlb_num(pitching, "whip", default=1.30),
+        "season_k_per_9": _mlb_num(
+            pitching, "strikeoutsPer9Inn", default=8.0
+        ),
+        "season_bb_per_9": _mlb_num(
+            pitching, "walksPer9Inn", default=3.0
+        ),
+    }
+
+
+def _mlb_player_hitting_features(stat, prefix):
+    stat = stat or {}
+    pa = _mlb_num(stat, "plateAppearances", "atBats")
+    return {
+        f"{prefix}_games": _mlb_num(stat, "gamesPlayed", "games"),
+        f"{prefix}_plate_appearances": pa,
+        f"{prefix}_at_bats": _mlb_num(stat, "atBats"),
+        f"{prefix}_hits": _mlb_num(stat, "hits"),
+        f"{prefix}_doubles": _mlb_num(stat, "doubles"),
+        f"{prefix}_triples": _mlb_num(stat, "triples"),
+        f"{prefix}_home_runs": _mlb_num(stat, "homeRuns"),
+        f"{prefix}_runs": _mlb_num(stat, "runs"),
+        f"{prefix}_rbi": _mlb_num(stat, "rbi"),
+        f"{prefix}_walks": _mlb_num(stat, "baseOnBalls", "walks"),
+        f"{prefix}_strikeouts": _mlb_num(stat, "strikeOuts"),
+        f"{prefix}_stolen_bases": _mlb_num(stat, "stolenBases"),
+        f"{prefix}_avg": _mlb_num(stat, "avg"),
+        f"{prefix}_obp": _mlb_num(stat, "obp"),
+        f"{prefix}_slg": _mlb_num(stat, "slg"),
+        f"{prefix}_ops": _mlb_num(stat, "ops"),
+        f"{prefix}_k_rate": _mlb_rate(_mlb_num(stat, "strikeOuts"), pa),
+        f"{prefix}_bb_rate": _mlb_rate(
+            _mlb_num(stat, "baseOnBalls", "walks"), pa
+        ),
+    }
+
+
+def _mlb_player_pitching_features(stat, prefix):
+    stat = stat or {}
+    innings = _mlb_pitching_innings(stat)
+    strikeouts = _mlb_num(stat, "strikeOuts")
+    walks = _mlb_num(stat, "baseOnBalls", "walks")
+    hits = _mlb_num(stat, "hits")
+    home_runs = _mlb_num(stat, "homeRuns")
+    batters_faced = _mlb_num(stat, "battersFaced")
+
+    return {
+        f"{prefix}_games": _mlb_num(stat, "gamesPlayed", "games"),
+        f"{prefix}_games_started": _mlb_num(stat, "gamesStarted"),
+        f"{prefix}_innings": innings,
+        f"{prefix}_batters_faced": batters_faced,
+        f"{prefix}_pitcher_strikeouts": strikeouts,
+        f"{prefix}_pitcher_walks": walks,
+        f"{prefix}_pitcher_hits": hits,
+        f"{prefix}_pitcher_home_runs": home_runs,
+        f"{prefix}_earned_runs": _mlb_num(stat, "earnedRuns"),
+        f"{prefix}_era": _mlb_num(stat, "era", default=4.50),
+        f"{prefix}_whip": _mlb_num(stat, "whip", default=1.30),
+        f"{prefix}_k_per_9": _mlb_num(
+            stat, "strikeoutsPer9Inn",
+            default=(strikeouts * 9.0 / innings if innings > 0 else 8.0),
+        ),
+        f"{prefix}_bb_per_9": _mlb_num(
+            stat, "walksPer9Inn",
+            default=(walks * 9.0 / innings if innings > 0 else 3.0),
+        ),
+        f"{prefix}_hr_per_9": (
+            home_runs * 9.0 / innings if innings > 0 else 1.20
+        ),
+    }
+
+
+def _mlb_lineup_aggregate(player_map, side):
+    hitters = []
+    for player in (player_map or {}).values():
+        if player.get("side") != side or player.get("stat_group") != "hitting":
+            continue
+        order = player.get("batting_order")
+        if order in (None, "", 0):
+            continue
+        hitters.append(player)
+
+    if not hitters:
+        return {
+            "lineup_size": 0.0,
+            "lineup_ops": 0.0,
+            "lineup_recent_ops": 0.0,
+            "lineup_k_rate": 0.0,
+            "lineup_recent_k_rate": 0.0,
+        }
+
+    season_ops = []
+    recent_ops = []
+    season_ks = season_pa = recent_ks = recent_pa = 0.0
+
+    for player in hitters:
+        season = player.get("season_stats", {}) or {}
+        recent = player.get("recent_stats", {}) or {}
+        season_ops.append(_mlb_num(season, "ops"))
+        recent_ops.append(_mlb_num(recent, "ops"))
+        season_ks += _mlb_num(season, "strikeOuts")
+        season_pa += _mlb_num(season, "plateAppearances", "atBats")
+        recent_ks += _mlb_num(recent, "strikeOuts")
+        recent_pa += _mlb_num(recent, "plateAppearances", "atBats")
+
+    return {
+        "lineup_size": float(len(hitters)),
+        "lineup_ops": float(np.mean(season_ops)) if season_ops else 0.0,
+        "lineup_recent_ops": float(np.mean(recent_ops)) if recent_ops else 0.0,
+        "lineup_k_rate": _mlb_rate(season_ks, season_pa),
+        "lineup_recent_k_rate": _mlb_rate(recent_ks, recent_pa),
+    }
+
+
+def _mlb_bullpen_aggregate(player_map, side):
+    relievers = []
+    for player in (player_map or {}).values():
+        if player.get("side") != side or not player.get("is_bullpen"):
+            continue
+        if player.get("stat_group") != "pitching":
+            continue
+        relievers.append(player)
+
+    innings = strikeouts = walks = hits = earned_runs = 0.0
+    for player in relievers:
+        stat = player.get("season_stats", {}) or {}
+        ip = _mlb_pitching_innings(stat)
+        innings += ip
+        strikeouts += _mlb_num(stat, "strikeOuts")
+        walks += _mlb_num(stat, "baseOnBalls", "walks")
+        hits += _mlb_num(stat, "hits")
+        earned_runs += _mlb_num(stat, "earnedRuns")
+
+    return {
+        "bullpen_size": float(len(relievers)),
+        "bullpen_innings": innings,
+        "bullpen_era": earned_runs * 9.0 / innings if innings > 0 else 4.50,
+        "bullpen_whip": (walks + hits) / innings if innings > 0 else 1.30,
+        "bullpen_k_per_9": strikeouts * 9.0 / innings if innings > 0 else 8.0,
+        "bullpen_bb_per_9": walks * 9.0 / innings if innings > 0 else 3.0,
+    }
+
+
+def _mlb_probable_pitcher_id(game, side):
+    probable = game.get("probable_pitchers", {}) or {}
+    pitcher = probable.get(side, {}) or {}
+    return pitcher.get("id") or pitcher.get("player_id")
+
+
+def _mlb_starter_features(player_map, game, side):
+    pitcher_id = _mlb_probable_pitcher_id(game, side)
+    player = (player_map or {}).get(str(pitcher_id), {}) if pitcher_id else {}
+    history = player.get("historical_pitching_features", {}) or {}
+
+    defaults = calculate_pitcher_features([])
+    return {
+        key: _safe_number(history.get(key), defaults[key])
+        for key in defaults
+    }
+
+
+def _mlb_weather_features(game):
+    weather = game.get("weather", {}) or {}
+    temp = weather.get("temp")
+    wind = str(weather.get("wind") or "")
+
+    wind_speed = 0.0
+    for token in wind.replace(",", " ").split():
+        try:
+            wind_speed = float(token)
+            break
+        except ValueError:
+            continue
+
+    return {
+        "temperature_f": _safe_number(temp, 0.0),
+        "wind_speed_mph": wind_speed,
+        "condition": weather.get("condition"),
+    }
+
+
+def build_mlb_winner_feature_row(enriched_game):
+    """Convert one enriched pregame snapshot into one game-winner feature row."""
+    enrichment = enriched_game.get("enrichment", {}) or {}
+    teams = enrichment.get("teams", {}) or {}
+    players = enrichment.get("players", {}) or {}
+
+    home_team = teams.get("home", {}) or {}
+    away_team = teams.get("away", {}) or {}
+    home_history = home_team.get("historical_features", {}) or {}
+    away_history = away_team.get("historical_features", {}) or {}
+
+    row = {
+        "game_id": enriched_game.get("game_id"),
+        "start_time": enriched_game.get("start_time"),
+        "home_team": home_team.get("team_name"),
+        "away_team": away_team.get("team_name"),
+        "home_team_id": home_team.get("team_id"),
+        "away_team_id": away_team.get("team_id"),
+    }
+
+    team_history_names = [
+        "games_played", "win_pct", "avg_runs_for", "avg_runs_against",
+        "avg_run_diff", "recent_5_win_pct", "recent_10_win_pct",
+        "recent_5_run_diff",
+    ]
+    for name in team_history_names:
+        home_value = _safe_number(home_history.get(name), 0.0)
+        away_value = _safe_number(away_history.get(name), 0.0)
+        row[f"home_{name}"] = home_value
+        row[f"away_{name}"] = away_value
+        row[f"{name}_diff"] = home_value - away_value
+
+    home_starter = _mlb_starter_features(players, enriched_game, "home")
+    away_starter = _mlb_starter_features(players, enriched_game, "away")
+    for name in home_starter:
+        home_value = _safe_number(home_starter[name], 0.0)
+        away_value = _safe_number(away_starter[name], 0.0)
+        row[f"home_{name}"] = home_value
+        row[f"away_{name}"] = away_value
+        row[f"{name}_diff"] = home_value - away_value
+
+    home_rates = _mlb_team_rate_features(home_team)
+    away_rates = _mlb_team_rate_features(away_team)
+    for name in home_rates:
+        row[f"home_{name}"] = home_rates[name]
+        row[f"away_{name}"] = away_rates[name]
+        row[f"{name}_diff"] = home_rates[name] - away_rates[name]
+
+    home_lineup = _mlb_lineup_aggregate(players, "home")
+    away_lineup = _mlb_lineup_aggregate(players, "away")
+    for name in home_lineup:
+        row[f"home_{name}"] = home_lineup[name]
+        row[f"away_{name}"] = away_lineup[name]
+        row[f"{name}_diff"] = home_lineup[name] - away_lineup[name]
+
+    home_bullpen = _mlb_bullpen_aggregate(players, "home")
+    away_bullpen = _mlb_bullpen_aggregate(players, "away")
+    for name in home_bullpen:
+        row[f"home_{name}"] = home_bullpen[name]
+        row[f"away_{name}"] = away_bullpen[name]
+        row[f"{name}_diff"] = home_bullpen[name] - away_bullpen[name]
+
+    row.update(_mlb_weather_features(enriched_game))
+    row["venue_id"] = (enriched_game.get("venue", {}) or {}).get("id")
+    row["venue_name"] = (enriched_game.get("venue", {}) or {}).get("name")
+    return row
+
+
+def build_mlb_winner_feature_matrix(enriched_package):
+    rows = [
+        build_mlb_winner_feature_row(game)
+        for game in (enriched_package or {}).get("games", []) or []
+        if game.get("enrichment")
+    ]
+    return pd.DataFrame(rows)
+
+
+def build_mlb_player_prop_feature_rows(enriched_game):
+    """Create one pregame row per active player for future prop-specific models."""
+    enrichment = enriched_game.get("enrichment", {}) or {}
+    teams = enrichment.get("teams", {}) or {}
+    players = enrichment.get("players", {}) or {}
+    weather = _mlb_weather_features(enriched_game)
+    rows = []
+
+    for player_id, player in players.items():
+        side = player.get("side")
+        if side not in ("home", "away"):
+            continue
+        opponent = "away" if side == "home" else "home"
+        opponent_rates = _mlb_team_rate_features(teams.get(opponent, {}))
+        opponent_starter = _mlb_starter_features(players, enriched_game, opponent)
+
+        row = {
+            "game_id": enriched_game.get("game_id"),
+            "start_time": enriched_game.get("start_time"),
+            "player_id": int(player_id),
+            "player_name": player.get("player_name"),
+            "side": side,
+            "is_home": float(side == "home"),
+            "position": player.get("position"),
+            "stat_group": player.get("stat_group"),
+            "batting_order": _safe_number(player.get("batting_order"), 0.0),
+            "opponent_team_id": (teams.get(opponent, {}) or {}).get("team_id"),
+            "opponent_team": (teams.get(opponent, {}) or {}).get("team_name"),
+            "opponent_season_era": opponent_rates.get("season_era", 4.50),
+            "opponent_season_whip": opponent_rates.get("season_whip", 1.30),
+            "opponent_season_ops": opponent_rates.get("season_ops", 0.0),
+            "opponent_starter_era": opponent_starter.get("starter_era", 4.50),
+            "opponent_starter_whip": opponent_starter.get("starter_whip", 1.30),
+            "opponent_starter_k_per_9": opponent_starter.get("starter_k_per_9", 8.0),
+            **weather,
+        }
+
+        group = player.get("stat_group")
+        season = player.get("season_stats", {}) or {}
+        recent = player.get("recent_stats", {}) or {}
+
+        if group == "hitting":
+            row.update(_mlb_player_hitting_features(season, "season"))
+            row.update(_mlb_player_hitting_features(recent, "recent"))
+        elif group == "pitching":
+            row.update(_mlb_player_pitching_features(season, "season"))
+            row.update(_mlb_player_pitching_features(recent, "recent"))
+            history = player.get("historical_pitching_features", {}) or {}
+            for key, value in history.items():
+                row[f"history_{key}"] = _safe_number(value, 0.0)
+
+        rows.append(row)
+
+    return rows
+
+
+def build_mlb_player_prop_feature_matrix(enriched_package):
+    rows = []
+    for game in (enriched_package or {}).get("games", []) or []:
+        if game.get("enrichment"):
+            rows.extend(build_mlb_player_prop_feature_rows(game))
+    return pd.DataFrame(rows)
+
+
+def build_mlb_shared_pregame_feature_package(enriched_package):
+    """One shared feature package for the winner engine and all prop engines."""
+    winner_features = build_mlb_winner_feature_matrix(enriched_package)
+    player_features = build_mlb_player_prop_feature_matrix(enriched_package)
+
+    return {
+        "snapshot_time": (enriched_package or {}).get("snapshot_time"),
+        "game_date": (enriched_package or {}).get("game_date"),
+        "winner_features": winner_features,
+        "player_features": player_features,
+        "winner_game_count": int(len(winner_features)),
+        "player_row_count": int(len(player_features)),
+        "winner_model_feature_names": list(MLB_WINNER_LIVE_FEATURES),
+        "prop_base_feature_names": list(MLB_PROP_BASE_FEATURES),
+    }
+
