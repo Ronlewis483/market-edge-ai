@@ -701,23 +701,282 @@ def load_mlb_pregame_intelligence(snapshot_date=None, archive_file=None):
 
 # ==========================================
 # MLB HISTORICAL PLAYER CACHE PERSISTENCE
+# CHUNKED STORAGE VERSION
 # ==========================================
 
-MLB_PLAYER_HISTORY_FILE = (
-    "mlb/mlb_player_history.csv"
+MLB_PLAYER_HISTORY_FILE = "mlb/mlb_player_history.csv"
+
+MLB_PLAYER_HISTORY_CHUNK_PREFIX = (
+    "mlb/player_history_chunks"
+)
+
+MLB_PLAYER_HISTORY_MANIFEST_FILE = (
+    f"{MLB_PLAYER_HISTORY_CHUNK_PREFIX}/manifest.json"
 )
 
 
-def save_mlb_player_history(
-    player_logs,
-):
+def _normalize_mlb_player_history(player_logs):
     """
-    Permanently save MLB historical player game logs
-    to Supabase Storage.
+    Normalize, deduplicate, and sort MLB player-game history.
+    """
 
-    The saved file is a checkpoint used by the V3 historical
-    reconstruction layer. Existing game/player rows are
-    deduplicated before the file is replaced.
+    if player_logs is None or player_logs.empty:
+        return pd.DataFrame()
+
+    clean_logs = player_logs.copy()
+
+    # ----------------------------------
+    # RESTORE / NORMALIZE START TIME
+    # ----------------------------------
+
+    if "start_time" in clean_logs.columns:
+        clean_logs["start_time"] = pd.to_datetime(
+            clean_logs["start_time"],
+            utc=True,
+            errors="coerce",
+        )
+
+    # ----------------------------------
+    # NUMERIC COLUMNS
+    # ----------------------------------
+
+    numeric_columns = [
+        "game_id",
+        "season_id",
+        "team_id",
+        "opponent_team_id",
+        "player_id",
+        "batting_order",
+        "batting_games",
+        "plate_appearances",
+        "at_bats",
+        "hits",
+        "doubles",
+        "triples",
+        "batting_home_runs",
+        "batting_runs",
+        "rbi",
+        "batting_walks",
+        "batting_strikeouts",
+        "stolen_bases",
+        "pitching_games",
+        "games_started",
+        "pitching_outs",
+        "batters_faced",
+        "pitcher_strikeouts",
+        "pitcher_walks",
+        "pitcher_hits",
+        "pitcher_home_runs",
+        "earned_runs",
+        "pitches",
+        "strikes",
+    ]
+
+    for column in numeric_columns:
+        if column in clean_logs.columns:
+            clean_logs[column] = pd.to_numeric(
+                clean_logs[column],
+                errors="coerce",
+            )
+
+    # ----------------------------------
+    # BOOLEAN BULLPEN FLAG
+    # ----------------------------------
+
+    if "is_bullpen" in clean_logs.columns:
+        clean_logs["is_bullpen"] = (
+            clean_logs["is_bullpen"]
+            .astype(str)
+            .str.strip()
+            .str.lower()
+            .isin([
+                "true",
+                "1",
+                "yes",
+            ])
+        )
+
+    # ----------------------------------
+    # DEDUPLICATE GAME / PLAYER
+    # ----------------------------------
+
+    dedupe_columns = [
+        column
+        for column in [
+            "game_id",
+            "player_id",
+        ]
+        if column in clean_logs.columns
+    ]
+
+    if dedupe_columns:
+        clean_logs = (
+            clean_logs
+            .drop_duplicates(
+                subset=dedupe_columns,
+                keep="last",
+            )
+            .reset_index(drop=True)
+        )
+
+    # ----------------------------------
+    # STABLE ORDER
+    # ----------------------------------
+
+    sort_columns = [
+        column
+        for column in [
+            "start_time",
+            "game_id",
+            "side",
+            "player_id",
+        ]
+        if column in clean_logs.columns
+    ]
+
+    if sort_columns:
+        clean_logs = (
+            clean_logs
+            .sort_values(sort_columns)
+            .reset_index(drop=True)
+        )
+
+    return clean_logs
+
+
+def _load_mlb_player_history_manifest():
+    """
+    Load the chunk manifest.
+
+    If no manifest exists yet, return an empty manifest.
+    """
+
+    try:
+        client = get_supabase_client()
+
+        file_bytes = (
+            client.storage
+            .from_(MLB_STORAGE_BUCKET)
+            .download(
+                MLB_PLAYER_HISTORY_MANIFEST_FILE
+            )
+        )
+
+        if not file_bytes:
+            raise FileNotFoundError
+
+        manifest = json.loads(
+            file_bytes.decode("utf-8")
+        )
+
+        if not isinstance(manifest, dict):
+            raise ValueError(
+                "Invalid MLB player-history manifest."
+            )
+
+        manifest.setdefault("version", 1)
+        manifest.setdefault("chunks", [])
+        manifest.setdefault("saved_game_ids", [])
+
+        return manifest
+
+    except Exception:
+        return {
+            "version": 1,
+            "chunks": [],
+            "saved_game_ids": [],
+            "updated_at": None,
+        }
+
+
+def _save_mlb_player_history_manifest(manifest):
+    """
+    Save the small chunk manifest.
+    """
+
+    try:
+        client = get_supabase_client()
+
+        payload = json.dumps(
+            manifest,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+        response = (
+            client.storage
+            .from_(MLB_STORAGE_BUCKET)
+            .upload(
+                path=MLB_PLAYER_HISTORY_MANIFEST_FILE,
+                file=payload,
+                file_options={
+                    "content-type": "application/json",
+                    "upsert": "true",
+                },
+            )
+        )
+
+        return {
+            "success": True,
+            "response": response,
+        }
+
+    except Exception as exc:
+        return {
+            "success": False,
+            "error": str(exc),
+        }
+
+
+def _load_mlb_player_history_base():
+    """
+    Load the original large MLB player-history CSV.
+
+    IMPORTANT:
+    This preserves the historical data already collected
+    before chunked storage was introduced.
+    """
+
+    try:
+        client = get_supabase_client()
+
+        file_bytes = (
+            client.storage
+            .from_(MLB_STORAGE_BUCKET)
+            .download(
+                MLB_PLAYER_HISTORY_FILE
+            )
+        )
+
+        if not file_bytes:
+            return pd.DataFrame()
+
+        player_logs = pd.read_csv(
+            io.BytesIO(file_bytes)
+        )
+
+        return _normalize_mlb_player_history(
+            player_logs
+        )
+
+    except Exception as exc:
+        print(
+            "MLB base player-history load failed:",
+            exc,
+        )
+
+        return pd.DataFrame()
+
+
+def save_mlb_player_history(player_logs):
+    """
+    Save only player-game rows that are not already
+    permanently stored.
+
+    The original mlb/mlb_player_history.csv remains the
+    permanent base dataset.
+
+    New data is stored in small append-only CSV chunks.
     """
 
     try:
@@ -746,127 +1005,219 @@ def save_mlb_player_history(
         ):
             return bucket_result
 
-        clean_logs = player_logs.copy()
+        clean_logs = _normalize_mlb_player_history(
+            player_logs
+        )
 
-        # ----------------------------------
-        # NORMALIZE IMPORTANT DATA TYPES
-        # ----------------------------------
+        # ==================================
+        # LOAD MANIFEST
+        # ==================================
 
-        if "start_time" in clean_logs.columns:
+        manifest = (
+            _load_mlb_player_history_manifest()
+        )
 
-            clean_logs["start_time"] = (
-                pd.to_datetime(
-                    clean_logs["start_time"],
-                    utc=True,
+        saved_game_ids = set()
+
+        for game_id in manifest.get(
+            "saved_game_ids",
+            [],
+        ):
+            try:
+                saved_game_ids.add(int(game_id))
+            except (TypeError, ValueError):
+                pass
+
+        # ==================================
+        # INCLUDE ORIGINAL BASE GAME IDS
+        # ==================================
+
+        base_logs = (
+            _load_mlb_player_history_base()
+        )
+
+        if (
+            base_logs is not None
+            and not base_logs.empty
+            and "game_id" in base_logs.columns
+        ):
+            base_game_ids = (
+                pd.to_numeric(
+                    base_logs["game_id"],
                     errors="coerce",
                 )
+                .dropna()
+                .astype(int)
+                .unique()
+                .tolist()
             )
 
-        for column in [
-            "game_id",
-            "season_id",
-            "team_id",
-            "opponent_team_id",
-            "player_id",
-        ]:
-
-            if column in clean_logs.columns:
-
-                clean_logs[column] = (
-                    pd.to_numeric(
-                        clean_logs[column],
-                        errors="coerce",
-                    )
-                )
-
-        # ----------------------------------
-        # REMOVE DUPLICATE GAME/PLAYER ROWS
-        # ----------------------------------
-
-        dedupe_columns = [
-            column
-            for column in [
-                "game_id",
-                "player_id",
-            ]
-            if column in clean_logs.columns
-        ]
-
-        if dedupe_columns:
-
-            clean_logs = (
-                clean_logs
-                .drop_duplicates(
-                    subset=dedupe_columns,
-                    keep="last",
-                )
-                .reset_index(drop=True)
+            saved_game_ids.update(
+                base_game_ids
             )
 
-        # ----------------------------------
-        # KEEP CHECKPOINT ORDER STABLE
-        # ----------------------------------
+        # ==================================
+        # FIND ONLY UNSAVED GAMES
+        # ==================================
 
-        sort_columns = [
-            column
-            for column in [
-                "start_time",
-                "game_id",
-                "side",
-                "player_id",
-            ]
-            if column in clean_logs.columns
-        ]
+        if "game_id" not in clean_logs.columns:
+            return {
+                "success": False,
+                "error": (
+                    "MLB player history does not "
+                    "contain game_id."
+                ),
+            }
 
-        if sort_columns:
+        clean_game_ids = pd.to_numeric(
+            clean_logs["game_id"],
+            errors="coerce",
+        )
 
-            clean_logs = (
-                clean_logs
-                .sort_values(
-                    sort_columns
-                )
-                .reset_index(drop=True)
+        new_mask = ~clean_game_ids.isin(
+            saved_game_ids
+        )
+
+        new_logs = (
+            clean_logs.loc[new_mask]
+            .copy()
+            .reset_index(drop=True)
+        )
+
+        # Nothing new means the checkpoint
+        # is already safely stored.
+        if new_logs.empty:
+            return {
+                "success": True,
+                "rows_saved": 0,
+                "games_saved": 0,
+                "players_saved": 0,
+                "path": None,
+                "message": (
+                    "No new MLB player-history "
+                    "games needed to be saved."
+                ),
+            }
+
+        # ==================================
+        # BUILD SMALL CHUNK
+        # ==================================
+
+        chunk_game_ids = (
+            pd.to_numeric(
+                new_logs["game_id"],
+                errors="coerce",
             )
+            .dropna()
+            .astype(int)
+            .unique()
+            .tolist()
+        )
 
-        # ----------------------------------
-        # CONVERT DATAFRAME TO CSV BYTES
-        # ----------------------------------
+        now = datetime.now(timezone.utc)
 
-        csv_bytes = clean_logs.to_csv(
+        timestamp = now.strftime(
+            "%Y%m%dT%H%M%S%fZ"
+        )
+
+        chunk_path = (
+            f"{MLB_PLAYER_HISTORY_CHUNK_PREFIX}/"
+            f"player_history_{timestamp}.csv"
+        )
+
+        csv_bytes = new_logs.to_csv(
             index=False
         ).encode("utf-8")
 
-        # ----------------------------------
-        # UPSERT PERMANENT CHECKPOINT
-        # ----------------------------------
+        # ==================================
+        # UPLOAD ONLY THIS NEW CHUNK
+        # ==================================
 
         response = (
             client.storage
             .from_(MLB_STORAGE_BUCKET)
             .upload(
-                path=MLB_PLAYER_HISTORY_FILE,
+                path=chunk_path,
                 file=csv_bytes,
                 file_options={
                     "content-type": "text/csv",
-                    "upsert": "true",
+                    "upsert": "false",
                 },
             )
         )
 
+        # ==================================
+        # UPDATE MANIFEST
+        # ==================================
+
+        chunk_record = {
+            "path": chunk_path,
+            "rows": int(len(new_logs)),
+            "games": int(
+                len(chunk_game_ids)
+            ),
+            "created_at": now.isoformat(),
+        }
+
+        manifest.setdefault(
+            "chunks",
+            [],
+        ).append(
+            chunk_record
+        )
+
+        saved_game_ids.update(
+            chunk_game_ids
+        )
+
+        manifest["saved_game_ids"] = sorted(
+            saved_game_ids
+        )
+
+        manifest["updated_at"] = (
+            now.isoformat()
+        )
+
+        manifest_result = (
+            _save_mlb_player_history_manifest(
+                manifest
+            )
+        )
+
+        if not manifest_result.get(
+            "success",
+            False,
+        ):
+            return {
+                "success": False,
+                "error": (
+                    "MLB player-history chunk was "
+                    "uploaded, but the manifest "
+                    "could not be updated: "
+                    f"{manifest_result.get('error')}"
+                ),
+                "chunk_path": chunk_path,
+            }
+
         return {
             "success": True,
-            "rows_saved": int(len(clean_logs)),
-            "games_saved": (
-                int(clean_logs["game_id"].nunique())
-                if "game_id" in clean_logs.columns
-                else None
+            "rows_saved": int(
+                len(new_logs)
+            ),
+            "games_saved": int(
+                len(chunk_game_ids)
             ),
             "players_saved": (
-                int(clean_logs["player_id"].nunique())
-                if "player_id" in clean_logs.columns
+                int(
+                    new_logs[
+                        "player_id"
+                    ].nunique()
+                )
+                if "player_id"
+                in new_logs.columns
                 else None
             ),
-            "path": MLB_PLAYER_HISTORY_FILE,
+            "path": chunk_path,
             "response": response,
         }
 
@@ -880,10 +1231,14 @@ def save_mlb_player_history(
 
 def load_mlb_player_history():
     """
-    Load the permanent MLB historical player-game cache
-    from Supabase Storage.
+    Load the complete MLB player-history warehouse.
 
-    Returns an empty DataFrame when no checkpoint exists.
+    Combines:
+        1. Original base CSV.
+        2. Every append-only player-history chunk.
+
+    Returns the same DataFrame format expected by
+    the rest of Market Edge.
     """
 
     try:
@@ -900,142 +1255,91 @@ def load_mlb_player_history():
         ):
             return pd.DataFrame()
 
-        file_bytes = (
-            client.storage
-            .from_(MLB_STORAGE_BUCKET)
-            .download(
-                MLB_PLAYER_HISTORY_FILE
-            )
+        history_frames = []
+
+        # ==================================
+        # ORIGINAL BASE HISTORY
+        # ==================================
+
+        base_logs = (
+            _load_mlb_player_history_base()
         )
 
-        if not file_bytes:
-            return pd.DataFrame()
-
-        player_logs = pd.read_csv(
-            io.BytesIO(file_bytes)
-        )
-
-        # ----------------------------------
-        # RESTORE IMPORTANT DATA TYPES
-        # ----------------------------------
-
-        if "start_time" in player_logs.columns:
-
-            player_logs["start_time"] = (
-                pd.to_datetime(
-                    player_logs["start_time"],
-                    utc=True,
-                    errors="coerce",
-                )
+        if (
+            base_logs is not None
+            and not base_logs.empty
+        ):
+            history_frames.append(
+                base_logs
             )
 
-        numeric_columns = [
-            "game_id",
-            "season_id",
-            "team_id",
-            "opponent_team_id",
-            "player_id",
-            "batting_order",
-            "batting_games",
-            "plate_appearances",
-            "at_bats",
-            "hits",
-            "doubles",
-            "triples",
-            "batting_home_runs",
-            "batting_runs",
-            "rbi",
-            "batting_walks",
-            "batting_strikeouts",
-            "stolen_bases",
-            "pitching_games",
-            "games_started",
-            "pitching_outs",
-            "batters_faced",
-            "pitcher_strikeouts",
-            "pitcher_walks",
-            "pitcher_hits",
-            "pitcher_home_runs",
-            "earned_runs",
-            "pitches",
-            "strikes",
-        ]
+        # ==================================
+        # CHUNK HISTORY
+        # ==================================
 
-        for column in numeric_columns:
+        manifest = (
+            _load_mlb_player_history_manifest()
+        )
 
-            if column in player_logs.columns:
+        for chunk in manifest.get(
+            "chunks",
+            [],
+        ):
 
-                player_logs[column] = (
-                    pd.to_numeric(
-                        player_logs[column],
-                        errors="coerce",
+            chunk_path = chunk.get(
+                "path"
+            )
+
+            if not chunk_path:
+                continue
+
+            try:
+
+                file_bytes = (
+                    client.storage
+                    .from_(MLB_STORAGE_BUCKET)
+                    .download(
+                        chunk_path
                     )
                 )
 
-        # ----------------------------------
-        # RESTORE BOOLEAN BULLPEN FLAG
-        # ----------------------------------
+                if not file_bytes:
+                    continue
 
-        if "is_bullpen" in player_logs.columns:
-
-            player_logs["is_bullpen"] = (
-                player_logs["is_bullpen"]
-                .astype(str)
-                .str.strip()
-                .str.lower()
-                .isin([
-                    "true",
-                    "1",
-                    "yes",
-                ])
-            )
-
-        # ----------------------------------
-        # REMOVE DUPLICATES AS SAFETY
-        # ----------------------------------
-
-        dedupe_columns = [
-            column
-            for column in [
-                "game_id",
-                "player_id",
-            ]
-            if column in player_logs.columns
-        ]
-
-        if dedupe_columns:
-
-            player_logs = (
-                player_logs
-                .drop_duplicates(
-                    subset=dedupe_columns,
-                    keep="last",
+                chunk_logs = pd.read_csv(
+                    io.BytesIO(file_bytes)
                 )
-                .reset_index(drop=True)
-            )
 
-        sort_columns = [
-            column
-            for column in [
-                "start_time",
-                "game_id",
-                "side",
-                "player_id",
-            ]
-            if column in player_logs.columns
-        ]
+                if not chunk_logs.empty:
+                    history_frames.append(
+                        chunk_logs
+                    )
 
-        if sort_columns:
+            except Exception as exc:
 
-            player_logs = (
-                player_logs
-                .sort_values(
-                    sort_columns
+                print(
+                    "MLB player-history "
+                    "chunk load failed:",
+                    chunk_path,
+                    exc,
                 )
-                .reset_index(drop=True)
-            )
 
-        return player_logs
+        if not history_frames:
+            return pd.DataFrame()
+
+        # ==================================
+        # COMBINE BASE + CHUNKS
+        # ==================================
+
+        player_logs = pd.concat(
+            history_frames,
+            ignore_index=True,
+            sort=False,
+        )
+
+        return _normalize_mlb_player_history(
+            player_logs
+        )
 
     except Exception as exc:
 
@@ -1049,14 +1353,22 @@ def load_mlb_player_history():
 
 def get_mlb_player_history_status():
     """
-    Return a small status summary for the permanent MLB
-    player-history checkpoint.
+    Return status for the complete MLB player-history
+    warehouse, including base + chunks.
     """
 
-    player_logs = load_mlb_player_history()
+    player_logs = (
+        load_mlb_player_history()
+    )
 
-    if player_logs is None or player_logs.empty:
+    manifest = (
+        _load_mlb_player_history_manifest()
+    )
 
+    if (
+        player_logs is None
+        or player_logs.empty
+    ):
         return {
             "exists": False,
             "rows": 0,
@@ -1064,6 +1376,7 @@ def get_mlb_player_history_status():
             "players": 0,
             "first_game": None,
             "last_game": None,
+            "chunks": 0,
             "path": MLB_PLAYER_HISTORY_FILE,
         }
 
@@ -1079,24 +1392,47 @@ def get_mlb_player_history_status():
         ).dropna()
 
         if not valid_times.empty:
-            first_game = str(valid_times.min())
-            last_game = str(valid_times.max())
+            first_game = str(
+                valid_times.min()
+            )
+
+            last_game = str(
+                valid_times.max()
+            )
 
     return {
         "exists": True,
-        "rows": int(len(player_logs)),
+        "rows": int(
+            len(player_logs)
+        ),
         "games": (
-            int(player_logs["game_id"].nunique())
-            if "game_id" in player_logs.columns
+            int(
+                player_logs[
+                    "game_id"
+                ].nunique()
+            )
+            if "game_id"
+            in player_logs.columns
             else 0
         ),
         "players": (
-            int(player_logs["player_id"].nunique())
-            if "player_id" in player_logs.columns
+            int(
+                player_logs[
+                    "player_id"
+                ].nunique()
+            )
+            if "player_id"
+            in player_logs.columns
             else 0
         ),
         "first_game": first_game,
         "last_game": last_game,
+        "chunks": len(
+            manifest.get(
+                "chunks",
+                [],
+            )
+        ),
         "path": MLB_PLAYER_HISTORY_FILE,
     }
 
