@@ -9924,6 +9924,40 @@ if (
         "⚾ MLB V3 Historical Player Research"
     )
 
+    # ==========================================
+# MLB V3 DEPLOYMENT DIAGNOSTIC
+# ==========================================
+
+import inspect
+import dual_agent.mlb_research as mlb_debug
+
+with st.expander("🔎 MLB V3 Deployment Diagnostic", expanded=True):
+
+    loaded_path = inspect.getsourcefile(
+        mlb_debug.collect_mlb_player_logs_batch
+    )
+
+    live_signature = inspect.signature(
+        mlb_debug.collect_mlb_player_logs_batch
+    )
+
+    st.write("**Loaded module path:**")
+    st.code(str(loaded_path))
+
+    st.write("**Live collector signature:**")
+    st.code(str(live_signature))
+
+    if "max_workers" in live_signature.parameters:
+        st.success(
+            "✅ Concurrent MLB collector is loaded. "
+            "max_workers is available."
+        )
+    else:
+        st.error(
+            "❌ OLD MLB collector is loaded. "
+            "max_workers is NOT available."
+        )
+
     st.caption(
         "Build the permanent player-game warehouse used by the V3 "
         "leakage-safe historical reconstruction. Each successful "
