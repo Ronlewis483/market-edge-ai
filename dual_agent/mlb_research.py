@@ -3905,3 +3905,474 @@ def build_mlb_shared_pregame_feature_package(enriched_package):
         "prop_base_feature_names": list(MLB_PROP_BASE_FEATURES),
     }
 
+# ==========================================
+# MLB V3 — RICH PREGAME CHALLENGER FRAMEWORK
+# ==========================================
+
+from sklearn.ensemble import (
+    HistGradientBoostingClassifier,
+    RandomForestClassifier,
+)
+
+
+MLB_V3_MODEL_FEATURES = list(MLB_WINNER_LIVE_FEATURES)
+
+MLB_V3_REQUIRED_COLUMNS = (
+    [
+        "game_id",
+        "start_time",
+        "home_win",
+    ]
+    + MLB_V3_MODEL_FEATURES
+)
+
+
+def validate_mlb_v3_historical_features(features):
+    """
+    Validate that V3 receives a true historical pregame feature table.
+
+    IMPORTANT:
+    The live feature engine creates rich features for today's slate.
+    That is not enough for a historical benchmark. Every historical row
+    passed here must represent information that was available before that
+    game's start_time.
+    """
+    if features is None or features.empty:
+        raise ValueError(
+            "MLB V3 requires a historical pregame feature dataset. "
+            "Today's live enriched slate cannot be used as a backtest."
+        )
+
+    missing = [
+        column
+        for column in MLB_V3_REQUIRED_COLUMNS
+        if column not in features.columns
+    ]
+
+    if missing:
+        raise ValueError(
+            "MLB V3 historical data is not ready. Missing columns: "
+            f"{missing}. Build these features historically at each game's "
+            "pregame timestamp before running V3."
+        )
+
+    df = features.copy()
+
+    df["start_time"] = pd.to_datetime(
+        df["start_time"],
+        utc=True,
+        errors="coerce",
+    )
+
+    df["home_win"] = pd.to_numeric(
+        df["home_win"],
+        errors="coerce",
+    )
+
+    df = (
+        df.dropna(
+            subset=[
+                "game_id",
+                "start_time",
+                "home_win",
+            ]
+        )
+        .drop_duplicates(
+            subset=["game_id"],
+            keep="first",
+        )
+        .sort_values(
+            ["start_time", "game_id"]
+        )
+        .reset_index(drop=True)
+    )
+
+    if df.empty:
+        raise ValueError(
+            "MLB V3 historical feature validation produced no usable games."
+        )
+
+    invalid_labels = set(
+        df["home_win"].dropna().unique()
+    ) - {0, 1, 0.0, 1.0}
+
+    if invalid_labels:
+        raise ValueError(
+            "MLB V3 home_win must contain only binary 0/1 labels."
+        )
+
+    numeric = (
+        df[MLB_V3_MODEL_FEATURES]
+        .apply(pd.to_numeric, errors="coerce")
+    )
+
+    completely_missing = [
+        column
+        for column in MLB_V3_MODEL_FEATURES
+        if numeric[column].notna().sum() == 0
+    ]
+
+    if completely_missing:
+        raise ValueError(
+            "MLB V3 contains feature columns with no historical values: "
+            f"{completely_missing}"
+        )
+
+    df[MLB_V3_MODEL_FEATURES] = numeric
+
+    return df
+
+
+def _make_mlb_v3_model(model_name):
+    """
+    Create one V3 challenger model.
+
+    Logistic remains the interpretable linear challenger.
+    Random forest and histogram gradient boosting allow nonlinear
+    interactions among starter, lineup, bullpen, team, and environment
+    variables without adding external ML dependencies.
+    """
+    name = str(model_name).strip().lower()
+
+    if name in {
+        "logistic",
+        "logistic_regression",
+        "lr",
+    }:
+        return make_pipeline(
+            StandardScaler(),
+            LogisticRegression(
+                max_iter=3000,
+                random_state=42,
+            ),
+        )
+
+    if name in {
+        "random_forest",
+        "rf",
+    }:
+        return RandomForestClassifier(
+            n_estimators=400,
+            max_depth=8,
+            min_samples_leaf=20,
+            max_features="sqrt",
+            class_weight=None,
+            random_state=42,
+            n_jobs=-1,
+        )
+
+    if name in {
+        "hist_gradient_boosting",
+        "hist_gb",
+        "hgb",
+    }:
+        return HistGradientBoostingClassifier(
+            loss="log_loss",
+            learning_rate=0.05,
+            max_iter=250,
+            max_leaf_nodes=15,
+            min_samples_leaf=30,
+            l2_regularization=1.0,
+            early_stopping=False,
+            random_state=42,
+        )
+
+    raise ValueError(
+        "Unknown MLB V3 model. Use logistic, random_forest, "
+        "or hist_gradient_boosting."
+    )
+
+
+def run_mlb_walkforward_v3(
+    features,
+    model_name="hist_gradient_boosting",
+    min_train_games=500,
+    retrain_every=100,
+):
+    """
+    Leakage-safe expanding-window V3 walk-forward test.
+
+    Each game is predicted only from rows with start_time earlier than
+    the game being scored. Games sharing a timestamp are predicted as
+    one batch, matching the V1/V2A leakage protection.
+
+    This function intentionally refuses today's live-only feature table.
+    It requires historical V3 features reconstructed as-of each game.
+    """
+    df = validate_mlb_v3_historical_features(features)
+
+    if len(df) <= int(min_train_games):
+        raise ValueError(
+            "Not enough historical MLB V3 games for walk-forward testing."
+        )
+
+    rows = []
+    model = None
+    trained_through_time = None
+    predictions_since_fit = int(retrain_every)
+
+    for game_time, current_group in df.groupby(
+        "start_time",
+        sort=True,
+    ):
+        train = df[
+            df["start_time"] < game_time
+        ].copy()
+
+        if len(train) < int(min_train_games):
+            continue
+
+        y_train = train["home_win"].astype(int)
+
+        if y_train.nunique() < 2:
+            continue
+
+        needs_retrain = (
+            model is None
+            or predictions_since_fit >= int(retrain_every)
+        )
+
+        if needs_retrain:
+            X_train = (
+                train[MLB_V3_MODEL_FEATURES]
+                .apply(pd.to_numeric, errors="coerce")
+            )
+
+            # Use training-only medians. This avoids looking forward
+            # when filling missing values.
+            train_medians = X_train.median(numeric_only=True)
+            X_train = X_train.fillna(train_medians).fillna(0.0)
+
+            model = _make_mlb_v3_model(model_name)
+            model.fit(X_train, y_train)
+
+            trained_through_time = train["start_time"].max()
+            predictions_since_fit = 0
+
+        X_current = (
+            current_group[MLB_V3_MODEL_FEATURES]
+            .apply(pd.to_numeric, errors="coerce")
+            .fillna(train_medians)
+            .fillna(0.0)
+        )
+
+        probabilities = model.predict_proba(
+            X_current
+        )[:, 1]
+
+        for position, (_, game) in enumerate(
+            current_group.iterrows()
+        ):
+            probability = float(probabilities[position])
+            actual = int(game["home_win"])
+            predicted = int(probability >= 0.50)
+            confidence = float(
+                max(probability, 1.0 - probability)
+            )
+
+            rows.append(
+                {
+                    "game_id": game["game_id"],
+                    "season_id": game.get("season_id"),
+                    "start_time": game_time,
+                    "home_team": game.get("home_team"),
+                    "away_team": game.get("away_team"),
+                    "actual_home_win": actual,
+                    "home_win_probability": probability,
+                    "predicted_home_win": predicted,
+                    "confidence": confidence,
+                    "correct": int(predicted == actual),
+                    "trained_through": trained_through_time,
+                    "model_version": (
+                        f"MLB_V3_{str(model_name).upper()}"
+                    ),
+                }
+            )
+
+        predictions_since_fit += len(current_group)
+
+    predictions = pd.DataFrame(rows)
+
+    if predictions.empty:
+        raise ValueError(
+            "MLB V3 walk-forward produced no predictions."
+        )
+
+    return (
+        predictions
+        .sort_values(["start_time", "game_id"])
+        .reset_index(drop=True)
+    )
+
+
+def summarize_mlb_walkforward_v3(predictions):
+    """
+    Score V3 with the exact core metrics used for V1:
+    accuracy, AUC, Brier score, log loss, confidence buckets,
+    and season-by-season accuracy.
+    """
+    results = summarize_mlb_walkforward_v1(predictions)
+
+    versions = (
+        predictions["model_version"]
+        .dropna()
+        .astype(str)
+        .unique()
+        .tolist()
+        if "model_version" in predictions.columns
+        else []
+    )
+
+    results["model_version"] = (
+        versions[0]
+        if len(versions) == 1
+        else "MLB_V3"
+    )
+
+    return results
+
+
+def run_mlb_v3_model_bakeoff(
+    features,
+    min_train_games=500,
+    retrain_every=100,
+    model_names=None,
+):
+    """
+    Run the same historical V3 rows through multiple model families.
+
+    No winner is automatically promoted. The returned comparison exposes
+    accuracy AND probability-quality metrics so a model cannot be promoted
+    merely because it became more confident.
+    """
+    if model_names is None:
+        model_names = [
+            "logistic",
+            "random_forest",
+            "hist_gradient_boosting",
+        ]
+
+    prediction_sets = {}
+    summary_rows = []
+
+    for model_name in model_names:
+        predictions = run_mlb_walkforward_v3(
+            features,
+            model_name=model_name,
+            min_train_games=min_train_games,
+            retrain_every=retrain_every,
+        )
+
+        summary = summarize_mlb_walkforward_v3(
+            predictions
+        )
+
+        prediction_sets[model_name] = predictions
+
+        summary_rows.append(
+            {
+                "model_name": model_name,
+                "prediction_count": summary["prediction_count"],
+                "accuracy": summary["accuracy"],
+                "auc": summary["auc"],
+                "brier": summary["brier"],
+                "log_loss": summary["log_loss"],
+                "baseline_accuracy": summary["baseline_accuracy"],
+                "baseline_brier": summary["baseline_brier"],
+                "baseline_log_loss": summary["baseline_log_loss"],
+            }
+        )
+
+    comparison = pd.DataFrame(summary_rows)
+
+    return {
+        "comparison": comparison,
+        "predictions": prediction_sets,
+        "feature_names": list(MLB_V3_MODEL_FEATURES),
+    }
+
+
+def compare_mlb_v3_to_v1(
+    v1_predictions,
+    v3_predictions,
+):
+    """
+    Compare V1 and one V3 challenger on their overlapping game IDs only.
+
+    This prevents a challenger from looking better simply because it was
+    evaluated on a different or easier subset of games.
+    """
+    if v1_predictions is None or v1_predictions.empty:
+        raise ValueError("V1 predictions are required.")
+
+    if v3_predictions is None or v3_predictions.empty:
+        raise ValueError("V3 predictions are required.")
+
+    v1 = v1_predictions.copy()
+    v3 = v3_predictions.copy()
+
+    common_ids = set(
+        pd.to_numeric(v1["game_id"], errors="coerce")
+        .dropna()
+        .astype(int)
+    ).intersection(
+        set(
+            pd.to_numeric(v3["game_id"], errors="coerce")
+            .dropna()
+            .astype(int)
+        )
+    )
+
+    if not common_ids:
+        raise ValueError(
+            "V1 and V3 have no overlapping game IDs."
+        )
+
+    v1_common = v1[
+        pd.to_numeric(v1["game_id"], errors="coerce")
+        .isin(common_ids)
+    ].copy()
+
+    v3_common = v3[
+        pd.to_numeric(v3["game_id"], errors="coerce")
+        .isin(common_ids)
+    ].copy()
+
+    v1_summary = summarize_mlb_walkforward_v1(
+        v1_common
+    )
+    v3_summary = summarize_mlb_walkforward_v3(
+        v3_common
+    )
+
+    comparison = pd.DataFrame(
+        [
+            {
+                "model": "MLB_V1",
+                "games": v1_summary["prediction_count"],
+                "accuracy": v1_summary["accuracy"],
+                "auc": v1_summary["auc"],
+                "brier": v1_summary["brier"],
+                "log_loss": v1_summary["log_loss"],
+            },
+            {
+                "model": v3_summary.get(
+                    "model_version",
+                    "MLB_V3",
+                ),
+                "games": v3_summary["prediction_count"],
+                "accuracy": v3_summary["accuracy"],
+                "auc": v3_summary["auc"],
+                "brier": v3_summary["brier"],
+                "log_loss": v3_summary["log_loss"],
+            },
+        ]
+    )
+
+    return {
+        "overlap_games": int(len(common_ids)),
+        "comparison": comparison,
+        "v1_summary": v1_summary,
+        "v3_summary": v3_summary,
+    }
+
