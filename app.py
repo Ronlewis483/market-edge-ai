@@ -9741,19 +9741,58 @@ if (
 
             except Exception as exc:
 
-                st.session_state[
-                    "mlb_v2a_pitcher_logs"
-                ] = working_logs
+                except Exception as exc:
 
-                status_box.error(
-                    "Historical pitcher build encountered "
-                    "an error. All completed checkpoints "
-                    "were preserved."
-                )
-
-                st.exception(exc)
-
-            final_missing = (
+                    st.session_state[
+                        "mlb_v2a_pitcher_logs"
+                    ] = working_logs
+                
+                    # Make one final attempt to preserve
+                    # everything collected before the error.
+                    if (
+                        working_logs is not None
+                        and not working_logs.empty
+                    ):
+                
+                        emergency_save = (
+                            save_mlb_pitcher_history(
+                                working_logs
+                            )
+                        )
+                
+                        if emergency_save.get(
+                            "success",
+                            False,
+                        ):
+                
+                            status_box.warning(
+                                "Historical pitcher build stopped, "
+                                "but all completed pitcher data was "
+                                "saved permanently."
+                            )
+                
+                        else:
+                
+                            status_box.error(
+                                "Historical pitcher build stopped "
+                                "and the permanent backup also "
+                                "failed."
+                            )
+                
+                            st.error(
+                                "Permanent-save error: "
+                                f"{emergency_save.get('error')}"
+                            )
+                
+                    else:
+                
+                        status_box.error(
+                            "Historical pitcher build encountered "
+                            "an error."
+                        )
+                
+                    st.exception(exc)
+                            final_missing = (
                 get_missing_mlb_pitcher_log_games(
                     mlb_v2a_games,
                     working_logs,
