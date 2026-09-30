@@ -5228,3 +5228,190 @@ def summarize_mlb_v3_historical_readiness(features):
             "feature",
         ].tolist(),
     }
+
+# History-only comparison schema. Keep live V3 and frozen V1/V2A untouched.
+MLB_V3_HISTORY_ONLY_FEATURES = [
+    name for name in MLB_V3_MODEL_FEATURES if not name.startswith("starter_")
+]
+
+
+def run_mlb_v3_history_only_comparison(features, min_train_games=500,
+                                       retrain_every=500, progress_callback=None):
+    """Evaluate all challengers and a V1-feature control on identical UTC dates.
+
+    The V1 control uses the original V1 feature list/model parameters, with the
+    stricter prior-date cutoff. It is a new control, not a replacement for the
+    frozen 54.99% benchmark. No model is promoted or trained for live use here.
+    """
+    from threadpoolctl import threadpool_limits
+    if min_train_games < 2 or retrain_every < 1:
+        raise ValueError("Training minimum and retraining interval must be positive.")
+    required = ["game_id", "start_time", "home_win"] + list(dict.fromkeys(
+        MLB_MODEL_FEATURES + MLB_V3_HISTORY_ONLY_FEATURES))
+    absent = [c for c in required if c not in features.columns]
+    if absent:
+        raise ValueError(f"Historical comparison fields missing: {absent}")
+    df = features.copy()
+    df["start_time"] = pd.to_datetime(df.start_time, utc=True, errors="coerce")
+    df["home_win"] = pd.to_numeric(df.home_win, errors="coerce")
+    if df.start_time.isna().any() or not df.home_win.isin([0, 1]).all() or df.game_id.duplicated().any():
+        raise ValueError("Invalid timestamps, labels, or duplicate games in feature table.")
+    df = df.sort_values(["start_time", "game_id"]).reset_index(drop=True)
+    numeric = df[list(dict.fromkeys(MLB_MODEL_FEATURES + MLB_V3_HISTORY_ONLY_FEATURES))].apply(pd.to_numeric, errors="coerce")
+    if numeric.isin([np.inf, -np.inf]).any().any():
+        raise ValueError("Feature matrix contains infinite values.")
+    if numeric.isna().all().any():
+        raise ValueError("A required history-only feature has no values.")
+    df[numeric.columns] = numeric
+    dates = df.start_time.dt.floor("D")
+    groups = list(df.groupby(dates, sort=True))
+    models = [("V1 feature control", "v1_control", MLB_MODEL_FEATURES),
+              ("V3 Logistic Regression", "logistic", MLB_V3_HISTORY_ONLY_FEATURES),
+              ("V3 Random Forest", "random_forest", MLB_V3_HISTORY_ONLY_FEATURES),
+              ("V3 HistGradientBoosting", "hist_gradient_boosting", MLB_V3_HISTORY_ONLY_FEATURES)]
+    outputs, summaries, season_rows = {}, [], []
+    for model_index, (label, family, columns) in enumerate(models):
+        model, median, trained_through, since_fit = None, None, None, retrain_every
+        records = []
+        with threadpool_limits(limits=2):
+            for date_index, (date, current) in enumerate(groups):
+                train = df.loc[dates.lt(date)]
+                if len(train) < min_train_games or train.home_win.nunique() < 2:
+                    continue
+                if model is None or since_fit >= retrain_every:
+                    X = train[columns]
+                    median = X.median()
+                    if family == "v1_control":
+                        model = make_pipeline(StandardScaler(), LogisticRegression(max_iter=2000, random_state=42))
+                        X = X.fillna(0.0)
+                    else:
+                        model = _make_mlb_v3_model(family)
+                        if family == "random_forest":
+                            model.set_params(n_jobs=2)
+                        X = X.fillna(median).fillna(0.0)
+                    model.fit(X, train.home_win.astype(int))
+                    trained_through = train.start_time.max()
+                    since_fit = 0
+                X = current[columns].fillna(0.0) if family == "v1_control" else current[columns].fillna(median).fillna(0.0)
+                probs = model.predict_proba(X)[:, 1]
+                for (_, game), prob in zip(current.iterrows(), probs):
+                    actual, predicted = int(game.home_win), int(prob >= .5)
+                    records.append({"game_id": game.game_id, "season_id": game.get("season_id"),
+                                    "start_time": game.start_time, "actual_home_win": actual,
+                                    "home_win_probability": float(prob), "predicted_home_win": predicted,
+                                    "confidence": max(float(prob), 1-float(prob)), "correct": int(actual==predicted),
+                                    "trained_through": trained_through, "model_version": label,
+                                    "baseline_home_probability": float(train.home_win.mean())})
+                since_fit += len(current)
+                if progress_callback:
+                    progress_callback((model_index + (date_index+1)/len(groups))/len(models), label)
+        prediction = pd.DataFrame(records)
+        if prediction.empty:
+            raise ValueError("Not enough eligible training data for comparison.")
+        outputs[label] = prediction
+        actual, prob = prediction.actual_home_win, prediction.home_win_probability
+        summaries.append({"Model": label, "Games": len(prediction), "Accuracy": float(prediction.correct.mean()),
+                          "AUC": float(roc_auc_score(actual, prob)) if actual.nunique()>1 else np.nan,
+                          "Brier": float(brier_score_loss(actual, prob)),
+                          "Log loss": float(log_loss(actual, prob, labels=[0,1]))})
+        for season, part in prediction.groupby("season_id"):
+            season_rows.append({"Model": label, "Season": season, "Games": len(part),
+                                "Accuracy": float(part.correct.mean()),
+                                "Brier": float(brier_score_loss(part.actual_home_win, part.home_win_probability))})
+    control = outputs[models[0][0]]
+    control_ids = control.game_id.tolist()
+    for prediction in outputs.values():
+        if prediction.game_id.tolist() != control_ids:
+            raise RuntimeError("Model evaluation games do not match.")
+        if not (pd.to_datetime(prediction.trained_through, utc=True)
+                < pd.to_datetime(prediction.start_time, utc=True).dt.floor("D")).all():
+            raise RuntimeError("Training-date cutoff violated.")
+    comparison = pd.DataFrame(summaries)
+    comparison["Accuracy change vs control"] = comparison.Accuracy - comparison.iloc[0].Accuracy
+    comparison["Brier change vs control"] = comparison.Brier - comparison.iloc[0].Brier
+    calibration = []
+    for label, prediction in outputs.items():
+        bucket = pd.cut(prediction.home_win_probability, bins=np.linspace(0,1,11), include_lowest=True)
+        for interval, part in prediction.groupby(bucket, observed=True):
+            calibration.append({"Model": label, "Probability band": str(interval), "Games": len(part),
+                                "Mean predicted home probability": float(part.home_win_probability.mean()),
+                                "Actual home win rate": float(part.actual_home_win.mean())})
+    baseline = pd.DataFrame([{"Model": "Training-only home-rate baseline", "Games": len(control),
+                             "Accuracy": float(((control.baseline_home_probability>=.5).astype(int)==control.actual_home_win).mean()),
+                             "Brier": float(brier_score_loss(control.actual_home_win, control.baseline_home_probability)),
+                             "Log loss": float(log_loss(control.actual_home_win, control.baseline_home_probability, labels=[0,1]))}])
+    if progress_callback:
+        progress_callback(1.0, "Comparison complete")
+    return {"comparison": comparison, "predictions": outputs, "season_results": pd.DataFrame(season_rows),
+            "calibration": pd.DataFrame(calibration), "baseline": baseline,
+            "feature_names": MLB_V3_HISTORY_ONLY_FEATURES,
+            "min_train_games": min_train_games, "retrain_every": retrain_every,
+            "cutoff_rule": "Earlier UTC dates only; result availability timestamps absent",
+            "frozen_v1_benchmark": .5499}
+
+
+def collect_mlb_upcoming_game_information(game_date, historical_games=None, pitcher_logs=None, timeout=30):
+    """Capture current upcoming-game evidence, keeping raw feeds and errors.
+
+    No odds, injury-news or external weather source is invented. Those gaps
+    remain explicit. This is a manual capture; no background schedule is implied.
+    """
+    slate = fetch_mlb_daily_slate(game_date, timeout=timeout)
+    collected, errors, skipped = [], [], []
+    session = requests.Session()
+    try:
+        for _, scheduled in slate.iterrows():
+            now = pd.Timestamp.now(tz="UTC")
+            start = pd.to_datetime(scheduled.get("start_time"), utc=True, errors="coerce")
+            if scheduled.get("abstract_status") != "Preview" or pd.isna(start) or start <= now:
+                skipped.append({"game_id": scheduled.get("game_id"), "reason": "Not an upcoming pregame game"})
+                continue
+            try:
+                snapshot = fetch_mlb_pregame_game_snapshot(int(scheduled.game_id), timeout=timeout)
+                snapshot["schedule"] = scheduled.to_dict()
+                status = snapshot.get("status", {})
+                if status.get("abstractGameState") != "Preview" or start <= pd.Timestamp.now(tz="UTC"):
+                    skipped.append({"game_id": scheduled.game_id, "reason": "Game began or status changed during capture"})
+                    continue
+                snapshot = enrich_mlb_pregame_game_snapshot(snapshot, historical_games=historical_games,
+                    pitcher_logs=pitcher_logs, timeout=timeout, session=session)
+                snapshot["capture_finished_at"] = datetime.now(timezone.utc).isoformat()
+                snapshot["eligible_pregame_capture"] = bool(
+                    pd.Timestamp(snapshot["capture_finished_at"]) < start
+                )
+                if not snapshot["eligible_pregame_capture"]:
+                    errors.append({"game_id": scheduled.game_id, "error": "Enrichment crossed scheduled first pitch; exclude from pregame evaluation"})
+                collected.append(snapshot)
+                errors.extend((snapshot.get("enrichment", {}) or {}).get("errors", []) or [])
+            except (requests.RequestException, ValueError, TypeError) as exc:
+                errors.append({"game_id": scheduled.get("game_id"), "error": str(exc)})
+    finally:
+        session.close()
+    return {"game_date": str(game_date), "snapshot_time": datetime.now(timezone.utc).isoformat(),
+            "slate": slate, "games": collected, "errors": errors, "skipped": skipped,
+            "source": "MLB Stats API", "capture_mode": "manual",
+            "unconnected_sources": ["Sportsbook odds and prop lines", "Dedicated injury/news feed", "External weather/roof confirmation"],
+            "availability_note": "Fields are observations at capture time. Probable starters are not confirmed starters; feed lineups may change."}
+
+
+def summarize_mlb_upcoming_information(package):
+    rows = []
+    for game in package.get("games", []):
+        schedule = game.get("schedule", {}) or {}
+        context = game.get("team_context", {}) or {}
+        probable = game.get("probable_pitchers", {}) or {}
+        enrichment = game.get("enrichment", {}) or {}
+        weather = game.get("weather", {}) or {}
+        row = {"Game": f"{schedule.get('away_team', '?')} at {schedule.get('home_team', '?')}",
+               "Game ID": game.get("game_id"), "Start UTC": game.get("start_time"),
+               "Captured UTC": game.get("snapshot_time"), "Capture finished UTC": game.get("capture_finished_at"),
+               "Pregame capture": game.get("eligible_pregame_capture", False),
+               "Venue": (game.get("venue", {}) or {}).get("name"),
+               "Weather reported": bool(weather), "Players enriched": len(enrichment.get("players", {}) or {}),
+               "Source errors": len(enrichment.get("errors", []) or [])}
+        for side in ["home", "away"]:
+            row[f"{side.title()} probable starter"] = (probable.get(side, {}) or {}).get("fullName") or "Unknown"
+            row[f"{side.title()} lineup slots"] = len((context.get(side, {}) or {}).get("batting_order", []) or [])
+            row[f"{side.title()} roster players"] = len(((enrichment.get("teams", {}) or {}).get(side, {}) or {}).get("active_roster", []) or [])
+        rows.append(row)
+    return pd.DataFrame(rows)
