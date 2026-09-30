@@ -9705,53 +9705,49 @@ if (
                         working_logs,
                     )
 
-                    # ------------------------------
+                                        # ------------------------------
                     # CHECKPOINT SUCCESSFUL WORK
                     # ------------------------------
-                    
+
                     working_logs = (
                         updated_logs.copy()
                     )
-                    
-                    # Keep the active Streamlit session updated.
+
+                    # Keep current session updated.
                     st.session_state[
                         "mlb_v2a_pitcher_logs"
                     ] = working_logs
-                    
-                    # Permanently save every successful
-                    # checkpoint to Supabase Storage.
+
+                    # Permanently save this checkpoint.
                     if (
                         working_logs is not None
                         and not working_logs.empty
                     ):
-                    
+
                         save_result = (
                             save_mlb_pitcher_history(
                                 working_logs
                             )
                         )
-                    
+
                         if not save_result.get(
                             "success",
                             False,
                         ):
-                    
+
                             raise RuntimeError(
                                 "Pitcher checkpoint was collected "
                                 "but could not be permanently saved: "
                                 f"{save_result.get('error')}"
                             )
-                    
+
                     total_requested += (
                         batch_requested
                     )
-                    
+
                     total_new_rows += (
                         batch_new_rows
                     )
-                    # ------------------------------
-                    # COMPLETE
-                    # ------------------------------
 
                     if remaining_after.empty:
                         break
