@@ -9706,168 +9706,168 @@ if (
                     )
 
                     # ------------------------------
-                                            # CHECKPOINT SUCCESSFUL WORK
-                        # ------------------------------
+                    # CHECKPOINT SUCCESSFUL WORK
+                    # ------------------------------
 
-                        working_logs = (
-                            updated_logs.copy()
-                        )
+                    working_logs = (
+                        updated_logs.copy()
+                    )
 
-                        # Keep current session updated.
-                        st.session_state[
-                            "mlb_v2a_pitcher_logs"
-                        ] = working_logs
-
-                        # Permanently save this checkpoint.
-                        if (
-                            working_logs is not None
-                            and not working_logs.empty
-                        ):
-
-                            save_result = (
-                                save_mlb_pitcher_history(
-                                    working_logs
-                                )
-                            )
-
-                            if not save_result.get(
-                                "success",
-                                False,
-                            ):
-
-                                raise RuntimeError(
-                                    "Pitcher checkpoint was collected "
-                                    "but could not be permanently saved: "
-                                    f"{save_result.get('error')}"
-                                )
-
-                        total_requested += (
-                            batch_requested
-                        )
-
-                        total_new_rows += (
-                            batch_new_rows
-                        )
-
-                        remaining_after = (
-                            get_missing_mlb_pitcher_log_games(
-                                mlb_v2a_games,
-                                working_logs,
-                            )
-                        )
-
-                        completed_games = (
-                            total_games
-                            - len(remaining_after)
-                        )
-
-                        current_progress = (
-                            completed_games
-                            / total_games
-                            if total_games
-                            else 0.0
-                        )
-
-                        progress_bar.progress(
-                            min(
-                                max(
-                                    current_progress,
-                                    0.0,
-                                ),
-                                1.0,
-                            )
-                        )
-
-                        status_box.info(
-                            "Building historical pitcher data — "
-                            f"{len(working_logs):,} pitcher rows "
-                            f"cached | "
-                            f"{len(remaining_after):,} games "
-                            "remaining | "
-                            f"{current_progress:.1%} complete"
-                        )
-
-                        # ------------------------------
-                        # COMPLETE
-                        # ------------------------------
-
-                        if remaining_after.empty:
-                            break
-
-                        if collection.get(
-                            "complete",
-                            False,
-                        ):
-                            break
-
-                        # ------------------------------
-                        # SAFETY: NO PROGRESS
-                        # ------------------------------
-
-                        if (
-                            len(remaining_after)
-                            >= len(remaining_before)
-                        ):
-                            st.warning(
-                                "Historical pitcher build stopped "
-                                "because the latest checkpoint made "
-                                "no additional progress. Completed "
-                                "data was preserved."
-                            )
-                            break
-
-                        if batch_requested == 0:
-                            break
-
-                except Exception as exc:
-
+                    # Keep current session updated.
                     st.session_state[
                         "mlb_v2a_pitcher_logs"
                     ] = working_logs
 
-                    # Make one final attempt to preserve
-                    # everything collected before the error.
+                    # Permanently save this checkpoint.
                     if (
                         working_logs is not None
                         and not working_logs.empty
                     ):
 
-                        emergency_save = (
+                        save_result = (
                             save_mlb_pitcher_history(
                                 working_logs
                             )
                         )
 
-                        if emergency_save.get(
+                        if not save_result.get(
                             "success",
                             False,
                         ):
 
-                            status_box.warning(
-                                "Historical pitcher build stopped, "
-                                "but all completed pitcher data was "
-                                "saved permanently."
+                            raise RuntimeError(
+                                "Pitcher checkpoint was collected "
+                                "but could not be permanently saved: "
+                                f"{save_result.get('error')}"
                             )
 
-                        else:
+                    total_requested += (
+                        batch_requested
+                    )
 
-                            status_box.error(
-                                "Historical pitcher build stopped "
-                                "and the permanent backup also "
-                                "failed."
-                            )
+                    total_new_rows += (
+                        batch_new_rows
+                    )
 
-                            st.error(
-                                "Permanent-save error: "
-                                f"{emergency_save.get('error')}"
-                            )
+                    remaining_after = (
+                        get_missing_mlb_pitcher_log_games(
+                            mlb_v2a_games,
+                            working_logs,
+                        )
+                    )
+
+                    completed_games = (
+                        total_games
+                        - len(remaining_after)
+                    )
+
+                    current_progress = (
+                        completed_games
+                        / total_games
+                        if total_games
+                        else 0.0
+                    )
+
+                    progress_bar.progress(
+                        min(
+                            max(
+                                current_progress,
+                                0.0,
+                            ),
+                            1.0,
+                        )
+                    )
+
+                    status_box.info(
+                        "Building historical pitcher data — "
+                        f"{len(working_logs):,} pitcher rows "
+                        f"cached | "
+                        f"{len(remaining_after):,} games "
+                        "remaining | "
+                        f"{current_progress:.1%} complete"
+                    )
+
+                    # ------------------------------
+                    # COMPLETE
+                    # ------------------------------
+
+                    if remaining_after.empty:
+                        break
+
+                    if collection.get(
+                        "complete",
+                        False,
+                    ):
+                        break
+
+                    # ------------------------------
+                    # SAFETY: NO PROGRESS
+                    # ------------------------------
+
+                    if (
+                        len(remaining_after)
+                        >= len(remaining_before)
+                    ):
+                        st.warning(
+                            "Historical pitcher build stopped "
+                            "because the latest checkpoint made "
+                            "no additional progress. Completed "
+                            "data was preserved."
+                        )
+                        break
+
+                    if batch_requested == 0:
+                        break
+
+            except Exception as exc:
+
+                st.session_state[
+                    "mlb_v2a_pitcher_logs"
+                ] = working_logs
+
+                # Make one final attempt to preserve
+                # everything collected before the error.
+                if (
+                    working_logs is not None
+                    and not working_logs.empty
+                ):
+
+                    emergency_save = (
+                        save_mlb_pitcher_history(
+                            working_logs
+                        )
+                    )
+
+                    if emergency_save.get(
+                        "success",
+                        False,
+                    ):
+
+                        status_box.warning(
+                            "Historical pitcher build stopped, "
+                            "but all completed pitcher data was "
+                            "saved permanently."
+                        )
 
                     else:
 
                         status_box.error(
-                            "Historical pitcher build encountered "
-                            "an error."
+                            "Historical pitcher build stopped "
+                            "and the permanent backup also "
+                            "failed."
                         )
+
+                        st.error(
+                            "Permanent-save error: "
+                            f"{emergency_save.get('error')}"
+                        )
+
+                else:
+
+                    status_box.error(
+                        "Historical pitcher build encountered "
+                        "an error."
+                    )
 
                     st.exception(exc)
 
