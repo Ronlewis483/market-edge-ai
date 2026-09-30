@@ -7,8 +7,9 @@ from datetime import datetime, timezone
 def get_supabase_client():
     """Connect Market Edge AI to Supabase."""
 
-    url = st.secrets["SUPABASE_URL"]
-    key = st.secrets["SUPABASE_KEY"]
+    import os
+    url = os.environ.get("SUPABASE_URL") or st.secrets["SUPABASE_URL"]
+    key = os.environ.get("SUPABASE_KEY") or st.secrets["SUPABASE_KEY"]
 
     return create_client(url, key)
 
@@ -1433,3 +1434,38 @@ def load_mlb_capture_learning_dataset():
     if not isinstance(data.get("rows"), list):
         raise ValueError("Stored learning dataset is invalid.")
     return data
+
+
+MLB_SCANNER_STORAGE_VERSION = 1
+MLB_SCANNER_STATUS_FILE = "mlb/scanner/status.json"
+
+
+def save_mlb_scanner_status(status):
+    bucket = get_supabase_client().storage.from_(MLB_STORAGE_BUCKET)
+    bucket.upload(MLB_SCANNER_STATUS_FILE, json.dumps(_json_safe(status), allow_nan=False).encode("utf-8"),
+                  {"content-type": "application/json", "upsert": "true"})
+
+
+def load_mlb_scanner_status():
+    bucket = get_supabase_client().storage.from_(MLB_STORAGE_BUCKET)
+    entries = bucket.list("mlb/scanner", {"search": "status.json"})
+    if not any(item.get("name") == "status.json" for item in entries):
+        return None
+    return json.loads(bucket.download(MLB_SCANNER_STATUS_FILE).decode("utf-8"))
+
+MLB_SAVED_PLAYER_MODEL_STORAGE_VERSION = 1
+
+
+def save_mlb_saved_player_model(result):
+    """Persist research model weights and timestamped comparison/prediction evidence."""
+    from uuid import uuid4
+    try:
+        now = datetime.now(timezone.utc)
+        bucket = get_supabase_client().storage.from_(MLB_STORAGE_BUCKET)
+        content = json.dumps(_json_safe(result), allow_nan=False).encode("utf-8")
+        path = f"mlb/player_model/{now.strftime('%Y%m%dT%H%M%S%fZ')}_{uuid4().hex}.json"
+        bucket.upload(path, content, {"content-type": "application/json", "upsert": "false"})
+        bucket.upload("mlb/player_model/latest.json", content, {"content-type": "application/json", "upsert": "true"})
+        return {"success": True, "archive_file": path}
+    except Exception as exc:
+        return {"success": False, "message": str(exc)}
