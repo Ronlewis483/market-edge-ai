@@ -9915,374 +9915,6 @@ if (
                 )
 
     # ==========================================
-    # MLB V3 HISTORICAL PLAYER RESEARCH
-    # ==========================================
-
-    st.divider()
-
-    st.subheader(
-        "⚾ MLB V3 Historical Player Research"
-    )
-
-    # ==========================================
-    # MLB V3 DEPLOYMENT DIAGNOSTIC
-    # ==========================================
-    
-    import inspect
-    import dual_agent.mlb_research as mlb_debug
-    
-    with st.expander("🔎 MLB V3 Deployment Diagnostic", expanded=True):
-    
-        loaded_path = inspect.getsourcefile(
-            mlb_debug.collect_mlb_player_logs_batch
-        )
-    
-        live_signature = inspect.signature(
-            mlb_debug.collect_mlb_player_logs_batch
-        )
-    
-        st.write("**Loaded module path:**")
-        st.code(str(loaded_path))
-    
-        st.write("**Live collector signature:**")
-        st.code(str(live_signature))
-    
-        if "max_workers" in live_signature.parameters:
-            st.success(
-                "✅ Concurrent MLB collector is loaded. "
-                "max_workers is available."
-            )
-        else:
-            st.error(
-                "❌ OLD MLB collector is loaded. "
-                "max_workers is NOT available."
-            )
-    
-        st.caption(
-            "Build the permanent player-game warehouse used by the V3 "
-            "leakage-safe historical reconstruction. Each successful "
-            "250-game checkpoint is saved permanently to Supabase."
-        )
-    
-        if "mlb_v3_player_logs" not in st.session_state:
-    
-            with st.spinner(
-                "Loading permanent MLB player history..."
-            ):
-    
-                st.session_state[
-                    "mlb_v3_player_logs"
-                ] = load_mlb_player_history()
-    
-        cached_player_logs = st.session_state.get(
-            "mlb_v3_player_logs",
-            pd.DataFrame(),
-        )
-    
-        missing_player_games = (
-            get_missing_mlb_player_log_games(
-                mlb_v2a_games,
-                existing_logs=cached_player_logs,
-            )
-        )
-    
-            # ==========================================
-        # GUARANTEE MLB HISTORICAL GAMES FOR V3
-        # ==========================================
-    
-        mlb_v2a_games = st.session_state.get(
-            "mlb_v2a_games"
-        )
-    
-        if (
-            mlb_v2a_games is None
-            or (
-                hasattr(mlb_v2a_games, "empty")
-                and mlb_v2a_games.empty
-            )
-        ):
-            with st.spinner(
-                "Loading MLB historical games for V3..."
-            ):
-                mlb_v2a_games = fetch_mlb_games(
-                    start_date="2023-03-01",
-                    end_date="2026-09-30",
-                )
-    
-                st.session_state[
-                    "mlb_v2a_games"
-                ] = mlb_v2a_games
-
-    player_total_games = len(mlb_v2a_games)
-    player_completed_games = (
-        player_total_games
-        - len(missing_player_games)
-    )
-    player_coverage_pct = (
-        player_completed_games / player_total_games
-        if player_total_games
-        else 0.0
-    )
-
-    player_count = (
-        int(cached_player_logs["player_id"].nunique())
-        if (
-            cached_player_logs is not None
-            and not cached_player_logs.empty
-            and "player_id" in cached_player_logs.columns
-        )
-        else 0
-    )
-
-    player_col1, player_col2, player_col3, player_col4 = (
-        st.columns(4)
-    )
-
-    player_col1.metric(
-        "Player Rows Collected",
-        f"{len(cached_player_logs):,}",
-    )
-    player_col2.metric(
-        "Unique Players",
-        f"{player_count:,}",
-    )
-    player_col3.metric(
-        "Games Remaining",
-        f"{len(missing_player_games):,}",
-    )
-    player_col4.metric(
-        "V3 Data Progress",
-        f"{player_coverage_pct:.1%}",
-    )
-
-    st.progress(
-        min(max(player_coverage_pct, 0.0), 1.0)
-    )
-
-    if missing_player_games.empty:
-
-        st.success(
-            "Historical MLB player-game warehouse is 100% complete. "
-            "The permanent V3 cache is ready for historical feature "
-            "reconstruction and challenger-model validation."
-        )
-
-    else:
-
-        st.caption(
-            "The builder resumes from the permanent Supabase checkpoint, "
-            "fetches up to 10 MLB boxscores concurrently, skips games "
-            "already collected, and saves after every successful "
-            "250-game checkpoint."
-        )
-
-        if st.button(
-            "Build Remaining MLB Player History",
-            key="build_remaining_mlb_player_history",
-            type="primary",
-        ):
-
-            working_player_logs = cached_player_logs.copy()
-            total_player_requested = 0
-            total_player_new_rows = 0
-            player_batches = 0
-
-            player_progress_bar = st.progress(
-                player_coverage_pct
-            )
-            player_status_box = st.empty()
-
-            try:
-
-                while True:
-
-                    remaining_before = (
-                        get_missing_mlb_player_log_games(
-                            mlb_v2a_games,
-                            existing_logs=working_player_logs,
-                        )
-                    )
-
-                    if remaining_before.empty:
-                        break
-
-                    player_batches += 1
-                    batch_target = min(
-                        250,
-                        len(remaining_before),
-                    )
-
-                    player_status_box.info(
-                        "Building MLB V3 player history — "
-                        f"checkpoint {player_batches:,} | "
-                        f"{len(remaining_before):,} games remaining..."
-                    )
-
-                    collection = collect_mlb_player_logs_batch(
-                        games=mlb_v2a_games,
-                        existing_logs=working_player_logs,
-                        batch_size=batch_target,
-                    )
-
-                    batch_requested = int(
-                        collection.get("games_requested", 0)
-                    )
-                    new_logs = collection.get(
-                        "new_logs",
-                        pd.DataFrame(),
-                    )
-                    updated_logs = collection.get(
-                        "combined_logs",
-                        working_player_logs,
-                    )
-
-                    working_player_logs = updated_logs.copy()
-                    st.session_state[
-                        "mlb_v3_player_logs"
-                    ] = working_player_logs
-
-                    if (
-                        working_player_logs is not None
-                        and not working_player_logs.empty
-                    ):
-
-                        save_result = save_mlb_player_history(
-                            working_player_logs
-                        )
-
-                        if not save_result.get("success", False):
-                            raise RuntimeError(
-                                "Player checkpoint was collected but could "
-                                "not be permanently saved: "
-                                f"{save_result.get('error')}"
-                            )
-
-                    batch_new_rows = (
-                        len(new_logs)
-                        if new_logs is not None
-                        else 0
-                    )
-                    total_player_requested += batch_requested
-                    total_player_new_rows += batch_new_rows
-
-                    remaining_after = (
-                        get_missing_mlb_player_log_games(
-                            mlb_v2a_games,
-                            existing_logs=working_player_logs,
-                        )
-                    )
-
-                    completed_games = (
-                        player_total_games
-                        - len(remaining_after)
-                    )
-                    current_progress = (
-                        completed_games / player_total_games
-                        if player_total_games
-                        else 0.0
-                    )
-
-                    current_players = (
-                        int(working_player_logs["player_id"].nunique())
-                        if (
-                            not working_player_logs.empty
-                            and "player_id" in working_player_logs.columns
-                        )
-                        else 0
-                    )
-
-                    player_progress_bar.progress(
-                        min(max(current_progress, 0.0), 1.0)
-                    )
-                    player_status_box.info(
-                        "Building MLB V3 player history — "
-                        f"{len(working_player_logs):,} rows | "
-                        f"{current_players:,} players | "
-                        f"{len(remaining_after):,} games remaining | "
-                        f"{current_progress:.1%} complete"
-                    )
-
-                    if remaining_after.empty:
-                        break
-
-                    if collection.get("complete", False):
-                        break
-
-                    if len(remaining_after) >= len(remaining_before):
-                        st.warning(
-                            "Player-history build stopped because the latest "
-                            "checkpoint made no additional progress. All "
-                            "completed data was preserved in Supabase."
-                        )
-                        break
-
-                    if batch_requested == 0:
-                        break
-
-            except Exception as exc:
-
-                st.session_state[
-                    "mlb_v3_player_logs"
-                ] = working_player_logs
-
-                player_status_box.error(
-                    "MLB V3 player-history build encountered an error. "
-                    "All successfully saved checkpoints were preserved."
-                )
-                st.exception(exc)
-
-            final_missing_players = (
-                get_missing_mlb_player_log_games(
-                    mlb_v2a_games,
-                    existing_logs=working_player_logs,
-                )
-            )
-            final_player_coverage = (
-                (player_total_games - len(final_missing_players))
-                / player_total_games
-                if player_total_games
-                else 0.0
-            )
-            final_unique_players = (
-                int(working_player_logs["player_id"].nunique())
-                if (
-                    not working_player_logs.empty
-                    and "player_id" in working_player_logs.columns
-                )
-                else 0
-            )
-
-            st.session_state[
-                "mlb_v3_last_player_collection"
-            ] = {
-                "requested_games": total_player_requested,
-                "new_player_rows": total_player_new_rows,
-                "cached_player_rows": len(working_player_logs),
-                "unique_players": final_unique_players,
-                "remaining_games": len(final_missing_players),
-                "coverage": final_player_coverage,
-            }
-
-            if final_missing_players.empty:
-                player_progress_bar.progress(1.0)
-                player_status_box.success(
-                    "MLB V3 historical player warehouse is 100% complete."
-                )
-                st.success(
-                    f"V3 player history complete — "
-                    f"{len(working_player_logs):,} player-game rows across "
-                    f"{final_unique_players:,} players are permanently saved."
-                )
-            else:
-                st.info(
-                    "Player-history checkpoint finished — "
-                    f"{total_player_requested:,} games processed this run, "
-                    f"{total_player_new_rows:,} player rows added, "
-                    f"{len(final_missing_players):,} games remain, "
-                    f"{final_player_coverage:.1%} complete."
-                )
-
-    # ==========================================
     # MLB V2A WALK-FORWARD VALIDATION
     # ==========================================
 
@@ -10824,3 +10456,324 @@ if (
 
         st.subheader("Historical Training Summary")
         st.json(mlb_metrics)
+
+# ==========================================
+# MLB V3 HISTORICAL PLAYER RESEARCH
+# ==========================================
+
+st.divider()
+st.subheader("⚾ MLB V3 Historical Player Research")
+st.caption(
+    "Build the permanent player-game warehouse used by the V3 "
+    "leakage-safe historical reconstruction. Each successful "
+    "250-game checkpoint is saved permanently to Supabase."
+)
+
+# V3 must also work before any V1 benchmark or V2A action has run.
+mlb_v3_games = st.session_state.get("mlb_v3_games")
+if mlb_v3_games is None or mlb_v3_games.empty:
+    mlb_v3_games = st.session_state.get("mlb_v2a_games")
+
+v3_history_ready = False
+try:
+    if mlb_v3_games is None or mlb_v3_games.empty:
+        with st.spinner("Loading MLB historical games for V3..."):
+            mlb_v3_games = fetch_mlb_games(
+                start_date="2023-03-01",
+                end_date="2026-09-30",
+            )
+
+    if mlb_v3_games is None or mlb_v3_games.empty:
+        st.warning(
+            "No completed MLB historical games were loaded. "
+            "Reload the page to retry before building V3 player history."
+        )
+    else:
+        st.session_state["mlb_v3_games"] = mlb_v3_games
+        if st.session_state.get("mlb_v3_player_logs") is None:
+            with st.spinner("Loading permanent MLB player history..."):
+                st.session_state["mlb_v3_player_logs"] = load_mlb_player_history()
+
+        cached_player_logs = st.session_state.get("mlb_v3_player_logs")
+        if cached_player_logs is None:
+            raise RuntimeError("Permanent MLB player history did not load. Reload the page to retry.")
+
+        missing_player_games = get_missing_mlb_player_log_games(
+            mlb_v3_games,
+            existing_logs=cached_player_logs,
+        )
+        v3_history_ready = True
+except Exception as exc:
+    st.error("MLB V3 history could not be initialized. Reload the page to retry.")
+    st.exception(exc)
+
+if v3_history_ready:
+    player_total_games = len(mlb_v3_games)
+    player_completed_games = (
+        player_total_games
+        - len(missing_player_games)
+    )
+    player_coverage_pct = (
+        player_completed_games / player_total_games
+        if player_total_games
+        else 0.0
+    )
+
+    player_count = (
+        int(cached_player_logs["player_id"].nunique())
+        if (
+            cached_player_logs is not None
+            and not cached_player_logs.empty
+            and "player_id" in cached_player_logs.columns
+        )
+        else 0
+    )
+
+    player_col1, player_col2, player_col3, player_col4 = (
+        st.columns(4)
+    )
+
+    player_col1.metric(
+        "Player Rows Collected",
+        f"{len(cached_player_logs):,}",
+    )
+    player_col2.metric(
+        "Unique Players",
+        f"{player_count:,}",
+    )
+    player_col3.metric(
+        "Games Remaining",
+        f"{len(missing_player_games):,}",
+    )
+    player_col4.metric(
+        "V3 Data Progress",
+        f"{player_coverage_pct:.1%}",
+    )
+
+    st.progress(
+        min(max(player_coverage_pct, 0.0), 1.0)
+    )
+
+    if missing_player_games.empty:
+
+        st.success(
+            "Historical MLB player-game warehouse is 100% complete. "
+            "The permanent V3 cache is ready for historical feature "
+            "reconstruction and challenger-model validation."
+        )
+
+    else:
+
+        st.caption(
+            "The builder resumes from the permanent Supabase checkpoint, "
+            "fetches up to 10 MLB boxscores concurrently, skips games "
+            "already collected, and saves after every successful "
+            "250-game checkpoint."
+        )
+
+        if st.button(
+            "Build Remaining MLB Player History",
+            key="build_remaining_mlb_player_history",
+            type="primary",
+        ):
+
+            working_player_logs = cached_player_logs.copy()
+            total_player_requested = 0
+            total_player_new_rows = 0
+            player_batches = 0
+
+            player_progress_bar = st.progress(
+                player_coverage_pct
+            )
+            player_status_box = st.empty()
+
+            try:
+
+                while True:
+
+                    remaining_before = (
+                        get_missing_mlb_player_log_games(
+                            mlb_v3_games,
+                            existing_logs=working_player_logs,
+                        )
+                    )
+
+                    if remaining_before.empty:
+                        break
+
+                    player_batches += 1
+                    batch_target = min(
+                        250,
+                        len(remaining_before),
+                    )
+
+                    player_status_box.info(
+                        "Building MLB V3 player history — "
+                        f"checkpoint {player_batches:,} | "
+                        f"{len(remaining_before):,} games remaining..."
+                    )
+
+                    collection = collect_mlb_player_logs_batch(
+                        games=mlb_v3_games,
+                        existing_logs=working_player_logs,
+                        batch_size=batch_target,
+                    )
+
+                    batch_requested = int(
+                        collection.get("games_requested", 0)
+                    )
+                    new_logs = collection.get(
+                        "new_logs",
+                        pd.DataFrame(),
+                    )
+                    updated_logs = collection.get(
+                        "combined_logs",
+                        working_player_logs,
+                    )
+
+                    working_player_logs = updated_logs.copy()
+                    st.session_state[
+                        "mlb_v3_player_logs"
+                    ] = working_player_logs
+
+                    if (
+                        working_player_logs is not None
+                        and not working_player_logs.empty
+                    ):
+
+                        save_result = save_mlb_player_history(
+                            working_player_logs
+                        )
+
+                        if not save_result.get("success", False):
+                            raise RuntimeError(
+                                "Player checkpoint was collected but could "
+                                "not be permanently saved: "
+                                f"{save_result.get('error')}"
+                            )
+
+                    batch_new_rows = (
+                        len(new_logs)
+                        if new_logs is not None
+                        else 0
+                    )
+                    total_player_requested += batch_requested
+                    total_player_new_rows += batch_new_rows
+
+                    remaining_after = (
+                        get_missing_mlb_player_log_games(
+                            mlb_v3_games,
+                            existing_logs=working_player_logs,
+                        )
+                    )
+
+                    completed_games = (
+                        player_total_games
+                        - len(remaining_after)
+                    )
+                    current_progress = (
+                        completed_games / player_total_games
+                        if player_total_games
+                        else 0.0
+                    )
+
+                    current_players = (
+                        int(working_player_logs["player_id"].nunique())
+                        if (
+                            not working_player_logs.empty
+                            and "player_id" in working_player_logs.columns
+                        )
+                        else 0
+                    )
+
+                    player_progress_bar.progress(
+                        min(max(current_progress, 0.0), 1.0)
+                    )
+                    player_status_box.info(
+                        "Building MLB V3 player history — "
+                        f"{len(working_player_logs):,} rows | "
+                        f"{current_players:,} players | "
+                        f"{len(remaining_after):,} games remaining | "
+                        f"{current_progress:.1%} complete"
+                    )
+
+                    if remaining_after.empty:
+                        break
+
+                    if collection.get("complete", False):
+                        break
+
+                    if len(remaining_after) >= len(remaining_before):
+                        st.warning(
+                            "Player-history build stopped because the latest "
+                            "checkpoint made no additional progress. All "
+                            "completed data was preserved in Supabase."
+                        )
+                        break
+
+                    if batch_requested == 0:
+                        break
+
+            except Exception as exc:
+
+                st.session_state[
+                    "mlb_v3_player_logs"
+                ] = working_player_logs
+
+                player_status_box.error(
+                    "MLB V3 player-history build encountered an error. "
+                    "All successfully saved checkpoints were preserved."
+                )
+                st.exception(exc)
+
+            final_missing_players = (
+                get_missing_mlb_player_log_games(
+                    mlb_v3_games,
+                    existing_logs=working_player_logs,
+                )
+            )
+            final_player_coverage = (
+                (player_total_games - len(final_missing_players))
+                / player_total_games
+                if player_total_games
+                else 0.0
+            )
+            final_unique_players = (
+                int(working_player_logs["player_id"].nunique())
+                if (
+                    not working_player_logs.empty
+                    and "player_id" in working_player_logs.columns
+                )
+                else 0
+            )
+
+            st.session_state[
+                "mlb_v3_last_player_collection"
+            ] = {
+                "requested_games": total_player_requested,
+                "new_player_rows": total_player_new_rows,
+                "cached_player_rows": len(working_player_logs),
+                "unique_players": final_unique_players,
+                "remaining_games": len(final_missing_players),
+                "coverage": final_player_coverage,
+            }
+
+            if final_missing_players.empty:
+                player_progress_bar.progress(1.0)
+                player_status_box.success(
+                    "MLB V3 historical player warehouse is 100% complete."
+                )
+                st.success(
+                    f"V3 player history complete — "
+                    f"{len(working_player_logs):,} player-game rows across "
+                    f"{final_unique_players:,} players are permanently saved."
+                )
+            else:
+                st.info(
+                    "Player-history checkpoint finished — "
+                    f"{total_player_requested:,} games processed this run, "
+                    f"{total_player_new_rows:,} player rows added, "
+                    f"{len(final_missing_players):,} games remain, "
+                    f"{final_player_coverage:.1%} complete."
+                )
+
