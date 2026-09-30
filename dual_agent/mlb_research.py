@@ -31,6 +31,9 @@ import pandas as pd
 import requests
 
 
+MLB_UPCOMING_INFORMATION_SCHEMA_VERSION = 2
+
+
 MLB_API_URL = (
     "https://statsapi.mlb.com/api/v1/schedule"
 )
@@ -5398,7 +5401,8 @@ def collect_mlb_upcoming_game_information(game_date, historical_games=None, pitc
                 errors.append({"game_id": scheduled.get("game_id"), "error": str(exc)})
     finally:
         session.close()
-    return {"game_date": str(game_date), "snapshot_time": datetime.now(timezone.utc).isoformat(),
+    return {"schema_version": MLB_UPCOMING_INFORMATION_SCHEMA_VERSION,
+            "game_date": str(game_date), "snapshot_time": datetime.now(timezone.utc).isoformat(),
             "slate": slate, "games": collected, "errors": errors, "skipped": skipped,
             "source": "MLB Stats API", "capture_mode": "manual",
             "unconnected_sources": ["Sportsbook odds and prop lines", "Comprehensive breaking-news coverage", "Verified roof open/closed status"],
@@ -5517,7 +5521,8 @@ def fetch_mlb_stadium_forecast(snapshot, timeout=20, session=None):
 
 def _attach_mlb_current_information(snapshot, session, capture_cache, timeout=20):
     """Attach observations and explicit source failures; do not alter model inputs."""
-    updates = {"teams": {}, "errors": [], "sources": [], "player_news": []}
+    updates = {"schema_version": MLB_UPCOMING_INFORMATION_SCHEMA_VERSION,
+               "teams": {}, "errors": [], "sources": [], "player_news": []}
     def failed(scope, exc):
         updates["errors"].append({"game_id": snapshot.get("game_id"), "scope": scope, "error": str(exc)})
     for side in ["home", "away"]:
