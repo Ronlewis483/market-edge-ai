@@ -4871,16 +4871,17 @@ def build_mlb_v3_historical_features(
     pitcher_logs=None,
 ):
     """
-    Reconstruct V3 features chronologically.
+    Build history-only V3 proxies using records from earlier UTC dates.
 
-    Critical leakage rule:
-    Features for a timestamp are calculated first. Only after every game at
-    that timestamp has been converted into a feature row are the completed
-    game/player records added to history.
-
-    The historical boxscore identifies the lineup/bullpen participants for
-    that game, but their SAME-GAME statistics are not used in that row.
-    Only their earlier accumulated history is used.
+    Current-game boxscore participants and statistics are never feature inputs.
+    Lineup is the last observed prior-day lineup, not a confirmed pregame lineup.
+    Bullpen uses prior 30-day relief appearances, not current-game relievers.
+    Starter identity is unavailable without archived pregame evidence, so starter
+    features remain missing. Weather is also unavailable from this warehouse.
+    All games on a UTC date are featurized before that date enters history.
+    The cache has no finish/availability timestamps: this conservative date rule
+    still assumes earlier-date results were available (suspended games require
+    additional source evidence). It is not proof of real-time availability.
     """
     if games is None or games.empty:
         raise ValueError("No MLB historical games supplied for V3.")
@@ -4923,35 +4924,24 @@ def build_mlb_v3_historical_features(
 
     team_history = defaultdict(list)
     player_history = defaultdict(list)
-    pitcher_history = defaultdict(list)
-
-    # If the permanent starter cache is supplied, use it as an independent
-    # starter-history source. It is rolled forward chronologically below.
-    pitcher_logs_by_game = defaultdict(list)
-    if pitcher_logs is not None and not pitcher_logs.empty:
-        p_logs = pitcher_logs.copy()
-        p_logs["start_time"] = pd.to_datetime(
-            p_logs["start_time"], utc=True, errors="coerce"
-        )
-        p_logs = p_logs.dropna(
-            subset=["game_id", "start_time", "pitcher_id"]
-        )
-        for _, log in p_logs.iterrows():
-            pitcher_logs_by_game[int(log["game_id"])].append(
-                log.to_dict()
-            )
+    team_season_history = defaultdict(list)
+    team_season_player_history = defaultdict(list)
+    last_lineup = {}
+    relief_appearances = defaultdict(list)
 
     rows = []
 
-    for game_time, group in game_df.groupby(
-        "start_time",
+    for history_date, group in game_df.groupby(
+        game_df["start_time"].dt.floor("D"),
         sort=True,
     ):
         pending_team = []
         pending_player = []
-        pending_pitcher = []
+        pending_rosters = []
 
         for _, game in group.iterrows():
+            game_time = game["start_time"]
+            season_id = int(game["season_id"])
             game_id = int(game["game_id"])
             home_id = int(game["home_team_id"])
             away_id = int(game["away_team_id"])
@@ -5009,44 +4999,16 @@ def build_mlb_v3_historical_features(
 
             side_lineups = {}
             side_bullpens = {}
-
-            for side in ("home", "away"):
-                side_lineups[side] = [
-                    int(r["player_id"])
-                    for r in sorted(
-                        side_logs[side],
-                        key=lambda x: (
-                            999 if x.get("batting_order") in (None, "")
-                            else _safe_number(x.get("batting_order"), 999)
-                        ),
-                    )
-                    if x.get("batting_order") not in (None, "", 0)
-                ]
-
-                side_bullpens[side] = [
-                    int(r["player_id"])
-                    for r in side_logs[side]
-                    if bool(r.get("is_bullpen"))
-                ]
-
-            # Starting-pitcher history.
-            for side in ("home", "away"):
-                pitcher_id = game.get(
-                    f"{side}_starting_pitcher_id"
-                )
-                if pd.isna(pitcher_id):
-                    pitcher_id = None
-                else:
-                    pitcher_id = int(pitcher_id)
-
-                starter = calculate_pitcher_features(
-                    pitcher_history[pitcher_id]
-                    if pitcher_id is not None
-                    else []
-                )
-
-                for name, value in starter.items():
-                    row[f"{side}_{name}"] = value
+            for side, team_id in (("home", home_id), ("away", away_id)):
+                key = (season_id, team_id)
+                side_lineups[side] = last_lineup.get(key, [])
+                cutoff = history_date - pd.Timedelta(days=30)
+                side_bullpens[side] = sorted({
+                    pid for date, pid in relief_appearances[key] if date >= cutoff
+                })
+                # Do not treat final schedule starter IDs as archived pregame knowledge.
+                for name in calculate_pitcher_features([]):
+                    row[f"{side}_{name}"] = np.nan
 
             starter_names = [
                 name.replace("_diff", "")
@@ -5055,14 +5017,14 @@ def build_mlb_v3_historical_features(
             for name in starter_names:
                 hv = _safe_number(row.get(f"home_{name}"))
                 av = _safe_number(row.get(f"away_{name}"))
-                row[f"{name}_diff"] = hv - av
+                row[f"{name}_diff"] = np.nan
 
             # Team season run-rate context reconstructed from prior games.
             home_team_season = _mlb_historical_team_season_features(
-                team_history[home_id]
+                team_season_history[(season_id, home_id)]
             )
             away_team_season = _mlb_historical_team_season_features(
-                team_history[away_id]
+                team_season_history[(season_id, away_id)]
             )
             row["home_season_runs_per_game"] = (
                 home_team_season["season_runs_per_game"]
@@ -5075,28 +5037,11 @@ def build_mlb_v3_historical_features(
                 - row["away_season_runs_per_game"]
             )
 
-            # Reconstruct team season hitting/pitching from all players who
-            # have appeared for that team before this game.
-            team_player_ids = {}
-            for side, team_id in (
-                ("home", home_id),
-                ("away", away_id),
-            ):
-                ids = set()
-                for pid, history in player_history.items():
-                    if any(
-                        int(h.get("team_id", -1)) == team_id
-                        for h in history
-                    ):
-                        ids.add(int(pid))
-                team_player_ids[side] = ids
-
+            # Season/team keyed rows prevent traded players' other-team statistics
+            # and previous seasons from contaminating team season rates.
             team_rates = {}
-            for side in ("home", "away"):
-                team_rows = []
-                for pid in team_player_ids[side]:
-                    team_rows.extend(player_history.get(pid, []))
-
+            for side, team_id in (("home", home_id), ("away", away_id)):
+                team_rows = team_season_player_history[(season_id, team_id)]
                 hit = _mlb_historical_hitting_features(team_rows)
                 pitch = _mlb_historical_pitching_features(team_rows)
 
@@ -5117,12 +5062,17 @@ def build_mlb_v3_historical_features(
                 row[f"away_{name}"] = av
                 row[f"{name}_diff"] = hv - av
 
+            lineup_history = {
+                pid: [r for r in player_history.get(pid, [])
+                      if int(r.get("season_id", -1)) == season_id]
+                for pid in set(side_lineups["home"] + side_lineups["away"])
+            }
             home_lineup = _mlb_historical_lineup_features(
-                player_history,
+                lineup_history,
                 side_lineups["home"],
             )
             away_lineup = _mlb_historical_lineup_features(
-                player_history,
+                lineup_history,
                 side_lineups["away"],
             )
             for name in (
@@ -5137,14 +5087,18 @@ def build_mlb_v3_historical_features(
                 row[f"away_{name}"] = av
                 row[f"{name}_diff"] = hv - av
 
-            home_bullpen = _mlb_historical_bullpen_features(
-                player_history,
-                side_bullpens["home"],
-            )
-            away_bullpen = _mlb_historical_bullpen_features(
-                player_history,
-                side_bullpens["away"],
-            )
+            bullpen_features = {}
+            for side, team_id in (("home", home_id), ("away", away_id)):
+                relief_history = defaultdict(list)
+                for record in team_season_player_history[(season_id, team_id)]:
+                    if (_safe_number(record.get("pitching_games")) > 0
+                            and _safe_number(record.get("games_started")) == 0):
+                        relief_history[int(record["player_id"])].append(record)
+                bullpen_features[side] = _mlb_historical_bullpen_features(
+                    relief_history, side_bullpens[side]
+                )
+            home_bullpen = bullpen_features["home"]
+            away_bullpen = bullpen_features["away"]
             for name in (
                 "bullpen_era",
                 "bullpen_whip",
@@ -5164,6 +5118,7 @@ def build_mlb_v3_historical_features(
                 (
                     home_id,
                     {
+                        "season_id": season_id,
                         "win": 1.0 if home_score > away_score else 0.0,
                         "runs_for": home_score,
                         "runs_against": away_score,
@@ -5173,6 +5128,7 @@ def build_mlb_v3_historical_features(
                 (
                     away_id,
                     {
+                        "season_id": season_id,
                         "win": 1.0 if away_score > home_score else 0.0,
                         "runs_for": away_score,
                         "runs_against": home_score,
@@ -5182,65 +5138,30 @@ def build_mlb_v3_historical_features(
             ])
 
             pending_player.extend(game_player_logs)
-
-            if pitcher_logs_by_game:
-                pending_pitcher.extend(
-                    pitcher_logs_by_game.get(game_id, [])
+            for side, team_id in (("home", home_id), ("away", away_id)):
+                lineup = sorted(
+                    [r for r in side_logs[side]
+                     if 1 <= _safe_number(r.get("batting_order"), 999) <= 9],
+                    key=lambda r: _safe_number(r.get("batting_order"), 999),
                 )
-            else:
-                # Fall back to the richer player boxscore cache for starters.
-                starter_ids = {
-                    int(pid)
-                    for pid in (
-                        game.get("home_starting_pitcher_id"),
-                        game.get("away_starting_pitcher_id"),
-                    )
-                    if not pd.isna(pid)
-                }
-                for record in game_player_logs:
-                    if int(record["player_id"]) not in starter_ids:
-                        continue
-                    pending_pitcher.append({
-                        "pitcher_id": int(record["player_id"]),
-                        "outs": record.get("pitching_outs", 0.0),
-                        "hits": record.get("pitcher_hits", 0.0),
-                        "earned_runs": record.get("earned_runs", 0.0),
-                        "walks": record.get("pitcher_walks", 0.0),
-                        "strikeouts": record.get("pitcher_strikeouts", 0.0),
-                        "home_runs": record.get("pitcher_home_runs", 0.0),
-                    })
+                pending_rosters.append(((season_id, team_id), [int(r["player_id"]) for r in lineup]))
 
-        # Only now may this timestamp's results enter future histories.
+        # Only now may this UTC date's records enter later dates' histories.
         for team_id, result in pending_team:
             team_history[int(team_id)].append(result)
+            team_season_history[(result["season_id"], int(team_id))].append(result)
 
         for record in pending_player:
             player_history[int(record["player_id"])].append(record)
+            key = (int(record["season_id"]), int(record["team_id"]))
+            team_season_player_history[key].append(record)
+            if (_safe_number(record.get("pitching_games")) > 0
+                    and _safe_number(record.get("games_started")) == 0):
+                relief_appearances[key].append((history_date, int(record["player_id"])))
 
-        for record in pending_pitcher:
-            pitcher_history[int(record["pitcher_id"])].append({
-                "outs": _safe_number(
-                    record.get("outs"),
-                    _safe_number(record.get("pitching_outs")),
-                ),
-                "hits": _safe_number(
-                    record.get("hits"),
-                    _safe_number(record.get("pitcher_hits")),
-                ),
-                "earned_runs": _safe_number(record.get("earned_runs")),
-                "walks": _safe_number(
-                    record.get("walks"),
-                    _safe_number(record.get("pitcher_walks")),
-                ),
-                "strikeouts": _safe_number(
-                    record.get("strikeouts"),
-                    _safe_number(record.get("pitcher_strikeouts")),
-                ),
-                "home_runs": _safe_number(
-                    record.get("home_runs"),
-                    _safe_number(record.get("pitcher_home_runs")),
-                ),
-            })
+        for key, lineup in pending_rosters:
+            if lineup:
+                last_lineup[key] = lineup
 
     result = pd.DataFrame(rows)
 
