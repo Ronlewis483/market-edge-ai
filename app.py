@@ -11245,3 +11245,57 @@ if package is not None:
     st.download_button("Download Timestamped MLB Game Information JSON", capture_text.encode("utf-8"),
         file_name=f"mlb_pregame_{capture_stamp}.json", mime="application/json", key="download_upcoming_mlb_information")
     st.caption("Gather automatically saves an archive and a latest copy. Save failures are shown above; JSON download remains available as a backup. Loading saved information does not refresh its source data.")
+
+
+    st.subheader("Saved Pregame Features and Final Results")
+    st.caption("Build features from this frozen capture and check final results. Unfinished games remain pending. The live prediction model is unchanged.")
+    if st.button("Build Saved Features and Check Results", key="mlb_capture_learning_update"):
+        try:
+            import importlib
+            import dual_agent.mlb_research as research
+            storage = _mlb_pregame_storage_module()
+            if getattr(research, "MLB_CAPTURE_LEARNING_VERSION", None) != 1:
+                importlib.invalidate_caches()
+                research = importlib.reload(research)
+            if getattr(storage, "MLB_CAPTURE_LEARNING_STORAGE_VERSION", None) != 1:
+                storage = importlib.reload(storage)
+            if getattr(research, "MLB_CAPTURE_LEARNING_VERSION", None) != 1 or getattr(storage, "MLB_CAPTURE_LEARNING_STORAGE_VERSION", None) != 1:
+                raise RuntimeError("Deploy all three matching files: app.py, mlb_research.py, and supabase_db.py.")
+            with st.spinner("Building frozen pregame features and checking game results..."):
+                batch = research.build_mlb_capture_learning_rows(package)
+                previous = storage.load_mlb_capture_learning_dataset()
+                current_keys = {row["capture_key"] for row in batch["rows"]}
+                older = [row for row in previous["rows"] if row["capture_key"] not in current_keys]
+                refreshed = research.refresh_mlb_capture_learning_results(older)
+                batch["rows"] = refreshed["rows"] + batch["rows"]
+                batch["errors"].extend(refreshed["errors"])
+                saved = storage.update_mlb_capture_learning_dataset(batch)
+            st.session_state["mlb_capture_learning_result"] = saved
+            st.session_state["mlb_capture_learning_errors"] = batch.get("errors", [])
+        except Exception as exc:
+            st.session_state["mlb_capture_learning_result"] = {"success": False, "message": str(exc)}
+    learning = st.session_state.get("mlb_capture_learning_result")
+    if learning:
+        if not learning.get("success"):
+            st.error("Learning dataset was not saved: " + learning.get("message", "Unknown error"))
+        else:
+            records = learning["data"]["rows"]
+            ready = [r for r in records if r.get("outcome", {}).get("final")]
+            st.success(f"Feature dataset saved: {len(records)} captures; {len(ready)} have final results.")
+            st.dataframe(pd.DataFrame([{"Game ID": r["game_id"], "Captured UTC": r["capture_finished_at"],
+                "Home": r.get("home_team"), "Away": r.get("away_team"),
+                "Status": r["outcome"].get("status"), "Home runs": r["outcome"].get("home_runs"),
+                "Away runs": r["outcome"].get("away_runs")} for r in records]), use_container_width=True)
+            # One row per game for model evaluation; use its latest eligible capture.
+            by_game = {}
+            for row in sorted(ready, key=lambda r: r["capture_finished_at"]):
+                by_game[row["game_id"]] = row
+            training = pd.DataFrame([dict(game_id=r["game_id"], start_time=r["start_time"],
+                capture_finished_at=r["capture_finished_at"], **r["features"], home_win=r["outcome"]["home_win"])
+                for r in by_game.values()])
+            st.download_button("Download Completed Game Features CSV", training.to_csv(index=False).encode("utf-8"),
+                file_name="mlb_completed_capture_features.csv", mime="text/csv", key="mlb_learning_csv")
+            st.info("These rows prepare a future test. A small number of completed games cannot establish an accuracy improvement. Unknown fields remain missing; no model has been retrained.")
+        if st.session_state.get("mlb_capture_learning_errors"):
+            with st.expander("Feature and result checks"):
+                st.json(st.session_state["mlb_capture_learning_errors"])
