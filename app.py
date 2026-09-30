@@ -90,8 +90,6 @@ from dual_agent.supabase_db import (
     get_all_bets,
     update_bet_result,
     save_prediction_snapshot,
-    load_mlb_pitcher_history,
-    save_mlb_pitcher_history,
 )
 
 from dual_agent.bet_settlement import (
@@ -9287,38 +9285,14 @@ if st.button(
         )
 
 # ==========================================
-# MLB V2A PERMANENT PITCHER HISTORY
+# MLB V2A RESEARCH CACHE
 # ==========================================
 
 if "mlb_v2a_pitcher_logs" not in st.session_state:
+    st.session_state[
+        "mlb_v2a_pitcher_logs"
+    ] = pd.DataFrame()
 
-    with st.spinner(
-        "Loading permanent MLB pitcher history..."
-    ):
-
-        permanent_pitcher_logs = (
-            load_mlb_pitcher_history()
-        )
-
-        st.session_state[
-            "mlb_v2a_pitcher_logs"
-        ] = permanent_pitcher_logs
-
-        if (
-            permanent_pitcher_logs is not None
-            and not permanent_pitcher_logs.empty
-        ):
-
-            st.session_state[
-                "mlb_pitcher_history_loaded"
-            ] = True
-
-        else:
-
-            st.session_state[
-                "mlb_pitcher_history_loaded"
-            ] = False
-            
 # ==========================================
 # MLB V1 WALK-FORWARD BENCHMARK
 # ==========================================
@@ -9523,6 +9497,7 @@ if (
     mlb_v2a_games is not None
     and not mlb_v2a_games.empty
 ):
+
     st.divider()
 
     st.subheader(
@@ -9536,16 +9511,14 @@ if (
         )
     )
 
-    total_games = len(mlb_v2a_games)
-
     coverage_games = (
-        total_games
+        len(mlb_v2a_games)
         - len(missing_pitcher_games)
     )
 
     coverage_pct = (
-        coverage_games / total_games
-        if total_games
+        coverage_games / len(mlb_v2a_games)
+        if len(mlb_v2a_games)
         else 0.0
     )
 
@@ -9568,886 +9541,117 @@ if (
         f"{coverage_pct:.1%}",
     )
 
-    # ==========================================
-    # PERMANENT PITCHER HISTORY BACKUP
-    # ==========================================
-
-    if (
-        cached_pitcher_logs is not None
-        and not cached_pitcher_logs.empty
+    if st.button(
+        "Collect Next 250 MLB Pitcher Games",
+        key="collect_mlb_v2a_pitchers",
     ):
 
-        if st.button(
-            "💾 Save Pitcher History Permanently",
-            key="save_mlb_pitcher_history_permanently",
-        ):
+        try:
 
             with st.spinner(
-                "Saving MLB pitcher history permanently..."
+                "Collecting the next 250 MLB "
+                "pitcher games..."
             ):
 
-                save_result = (
-                    save_mlb_pitcher_history(
-                        cached_pitcher_logs
+                collection = (
+                    collect_mlb_pitcher_logs_batch(
+                        games=mlb_v2a_games,
+                        existing_logs=cached_pitcher_logs,
+                        batch_size=250,
                     )
                 )
-
-            if save_result.get(
-                "success",
-                False,
-            ):
-
-                st.success(
-                    "MLB pitcher history permanently saved — "
-                    f"{save_result['rows_saved']:,} "
-                    "pitcher rows."
-                )
-
-            else:
-
-                st.error(
-                    "Permanent pitcher-history save failed: "
-                    f"{save_result.get('error')}"
-                )
-
-    # ==========================================
-    # HISTORICAL PITCHER DATA STATUS
-    # ==========================================
-
-    if missing_pitcher_games.empty:
-
-        st.success(
-            "Historical MLB starting-pitcher "
-            "dataset is complete."
-        )
-
-    else:
-
-        st.caption(
-            "Historical pitcher data only needs to be "
-            "built once. The automated builder works "
-            "in 250-game checkpoints and permanently "
-            "saves each successful checkpoint."
-        )
-
-        if st.button(
-            "Build Remaining MLB Pitcher History",
-            key="build_remaining_mlb_pitcher_history",
-            type="primary",
-        ):
-
-            working_logs = (
-                cached_pitcher_logs.copy()
-            )
-
-            total_requested = 0
-            total_new_rows = 0
-            completed_batches = 0
-
-            progress_bar = st.progress(
-                coverage_pct
-            )
-
-            status_box = st.empty()
-
-            try:
-
-                while True:
-
-                    remaining_before = (
-                        get_missing_mlb_pitcher_log_games(
-                            mlb_v2a_games,
-                            working_logs,
-                        )
-                    )
-
-                    if remaining_before.empty:
-                        break
-
-                    completed_batches += 1
-
-                    batch_target = min(
-                        250,
-                        len(remaining_before),
-                    )
-
-                    status_box.info(
-                        "Building historical pitcher data — "
-                        f"checkpoint {completed_batches:,} | "
-                        f"{len(remaining_before):,} games "
-                        "remaining..."
-                    )
-
-                    collection = (
-                        collect_mlb_pitcher_logs_batch(
-                            games=mlb_v2a_games,
-                            existing_logs=working_logs,
-                            batch_size=batch_target,
-                        )
-                    )
-
-                    batch_requested = int(
-                        collection.get(
-                            "requested_games",
-                            0,
-                        )
-                    )
-
-                    batch_new_rows = int(
-                        collection.get(
-                            "new_pitcher_rows",
-                            0,
-                        )
-                    )
-
-                    updated_logs = collection.get(
-                        "logs",
-                        working_logs,
-                    )
-
-                    # ------------------------------
-                    # CHECKPOINT SUCCESSFUL WORK
-                    # ------------------------------
-
-                    working_logs = (
-                        updated_logs.copy()
-                    )
-
-                    # Keep the current Streamlit
-                    # session updated.
-                    st.session_state[
-                        "mlb_v2a_pitcher_logs"
-                    ] = working_logs
-
-                    # Permanently save every
-                    # successful checkpoint.
-                    if (
-                        working_logs is not None
-                        and not working_logs.empty
-                    ):
-
-                        save_result = (
-                            save_mlb_pitcher_history(
-                                working_logs
-                            )
-                        )
-
-                        if not save_result.get(
-                            "success",
-                            False,
-                        ):
-
-                            raise RuntimeError(
-                                "Pitcher checkpoint was "
-                                "collected but could not be "
-                                "permanently saved: "
-                                f"{save_result.get('error')}"
-                            )
-
-                    total_requested += (
-                        batch_requested
-                    )
-
-                    total_new_rows += (
-                        batch_new_rows
-                    )
-
-                    # ------------------------------
-                    # RECALCULATE REMAINING GAMES
-                    # ------------------------------
-
-                    remaining_after = (
-                        get_missing_mlb_pitcher_log_games(
-                            mlb_v2a_games,
-                            working_logs,
-                        )
-                    )
-
-                    completed_games = (
-                        total_games
-                        - len(remaining_after)
-                    )
-
-                    current_progress = (
-                        completed_games
-                        / total_games
-                        if total_games
-                        else 0.0
-                    )
-
-                    progress_bar.progress(
-                        min(
-                            max(
-                                current_progress,
-                                0.0,
-                            ),
-                            1.0,
-                        )
-                    )
-
-                    status_box.info(
-                        "Building historical pitcher data — "
-                        f"{len(working_logs):,} pitcher rows "
-                        f"cached | "
-                        f"{len(remaining_after):,} games "
-                        "remaining | "
-                        f"{current_progress:.1%} complete"
-                    )
-
-                    # ------------------------------
-                    # COMPLETE
-                    # ------------------------------
-
-                    if remaining_after.empty:
-                        break
-
-                    if collection.get(
-                        "complete",
-                        False,
-                    ):
-                        break
-
-                    # ------------------------------
-                    # SAFETY: NO PROGRESS
-                    # ------------------------------
-
-                    if (
-                        len(remaining_after)
-                        >= len(remaining_before)
-                    ):
-
-                        st.warning(
-                            "Historical pitcher build stopped "
-                            "because the latest checkpoint made "
-                            "no additional progress. Completed "
-                            "data was preserved."
-                        )
-
-                        break
-
-                    if batch_requested == 0:
-                        break
-
-            except Exception as exc:
 
                 st.session_state[
                     "mlb_v2a_pitcher_logs"
-                ] = working_logs
+                ] = collection["logs"]
 
-                status_box.error(
-                    "Historical pitcher build encountered "
-                    "an error. All completed checkpoints "
-                    "were preserved."
-                )
-
-                st.exception(exc)
-
-            # ======================================
-            # FINAL COLLECTION STATUS
-            # ======================================
-
-            final_missing = (
-                get_missing_mlb_pitcher_log_games(
-                    mlb_v2a_games,
-                    working_logs,
-                )
+            st.success(
+                "Pitcher batch completed — "
+                f"{collection['requested_games']:,} "
+                "games requested, "
+                f"{collection['new_pitcher_rows']:,} "
+                "pitcher rows returned, "
+                f"{collection['remaining_games']:,} "
+                "games remaining."
             )
 
-            final_coverage_games = (
-                total_games
-                - len(final_missing)
+        except Exception as exc:
+
+            st.error(
+                f"MLB V2A pitcher collection failed: "
+                f"{exc}"
             )
 
-            final_coverage_pct = (
-                final_coverage_games
-                / total_games
-                if total_games
-                else 0.0
-            )
+            st.exception(exc)
 
-            st.session_state[
-                "mlb_v2a_last_collection"
-            ] = {
-                "requested_games":
-                    total_requested,
-                "new_pitcher_rows":
-                    total_new_rows,
-                "cached_pitcher_rows":
-                    len(working_logs),
-                "remaining_games":
-                    len(final_missing),
-                "coverage":
-                    final_coverage_pct,
-            }
 
-            if final_missing.empty:
+# ==========================================
+# DISPLAY MLB VALIDATION RESULTS
+# ==========================================
 
-                progress_bar.progress(1.0)
+mlb_metrics = st.session_state.get(
+    "mlb_training_metrics"
+)
 
-                status_box.success(
-                    "Historical MLB pitcher dataset "
-                    "build complete."
-                )
+if mlb_metrics:
 
-                st.success(
-                    "V2A historical pitcher dataset is "
-                    f"complete — {len(working_logs):,} "
-                    "pitcher rows cached and permanently "
-                    "saved. We can now run the full "
-                    "leakage-safe V2A walk-forward "
-                    "validation."
-                )
+    st.subheader("MLB Model Validation Results")
 
-            else:
+    if mlb_metrics["passes_benchmarks"]:
 
-                st.info(
-                    "Historical build checkpoint finished — "
-                    f"{total_requested:,} games processed "
-                    "during this run, "
-                    f"{total_new_rows:,} pitcher rows added, "
-                    f"{len(final_missing):,} games remain, "
-                    f"{final_coverage_pct:.1%} complete."
-                )
-
-    # ==========================================
-    # MLB V2A WALK-FORWARD VALIDATION
-    # ==========================================
-
-    st.divider()
-
-    st.subheader(
-        "⚾ MLB V2A Walk-Forward Validation"
-    )
-
-    st.caption(
-        "Tests the MLB model with starting-pitcher "
-        "intelligence and compares it directly with "
-        "the original V1 model."
-    )
-
-    mlb_v2a_games = st.session_state.get(
-        "mlb_v2a_games"
-    )
-
-    mlb_v2a_pitcher_logs = st.session_state.get(
-        "mlb_v2a_pitcher_logs",
-        pd.DataFrame(),
-    )
-
-    v2a_ready = (
-        mlb_v2a_games is not None
-        and not mlb_v2a_games.empty
-        and mlb_v2a_pitcher_logs is not None
-        and not mlb_v2a_pitcher_logs.empty
-    )
-
-    if not v2a_ready:
-
-        st.info(
-            "V2A validation will become available after "
-            "the MLB historical games and pitcher history "
-            "have been collected."
+        st.success(
+            "Historical validation benchmarks passed."
         )
 
     else:
 
-        remaining_v2a_games = (
-            get_missing_mlb_pitcher_log_games(
-                mlb_v2a_games,
-                mlb_v2a_pitcher_logs,
-            )
+        st.warning(
+            "Historical validation benchmarks not passed. "
+            "Further model evaluation is required."
         )
 
-        validation_col1, validation_col2 = (
-            st.columns(2)
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+
+        st.metric(
+            "Model Accuracy",
+            f"{mlb_metrics['model_accuracy']:.2%}",
         )
 
-        validation_col1.metric(
-            "Historical Games",
-            f"{len(mlb_v2a_games):,}",
+        st.metric(
+            "Baseline Accuracy",
+            f"{mlb_metrics['baseline_accuracy']:.2%}",
         )
 
-        validation_col2.metric(
-            "Pitcher Rows",
-            f"{len(mlb_v2a_pitcher_logs):,}",
+    with col2:
+
+        st.metric(
+            "Model Brier Score",
+            f"{mlb_metrics['model_brier']:.4f}",
         )
 
-        if len(remaining_v2a_games) > 0:
-
-            st.caption(
-                f"{len(remaining_v2a_games):,} historical "
-                "games do not have complete pitcher records. "
-                "They will not prevent V2A validation."
-            )
-
-        if st.button(
-            "Run MLB V2A Walk-Forward Validation",
-            key="run_mlb_v2a_walkforward_validation",
-            type="primary",
-        ):
-
-            try:
-
-                with st.spinner(
-                    "Building leakage-safe pitcher features "
-                    "and running V1 vs V2A walk-forward "
-                    "validation..."
-                ):
-
-                    # ======================================
-                    # BUILD ORIGINAL V1 TEAM FEATURES
-                    # ======================================
-
-                    mlb_v1_features = (
-                        build_mlb_pregame_features(
-                            mlb_v2a_games
-                        )
-                    )
-
-                    if mlb_v1_features.empty:
-
-                        raise ValueError(
-                            "MLB V1 feature generation "
-                            "returned no data."
-                        )
-
-                    # ======================================
-                    # BUILD V2A PITCHER FEATURES
-                    # ======================================
-
-                    mlb_v2a_features = (
-                        build_mlb_v2a_features(
-                            games=mlb_v2a_games,
-                            team_features=mlb_v1_features,
-                            pitcher_logs=mlb_v2a_pitcher_logs,
-                        )
-                    )
-
-                    if mlb_v2a_features.empty:
-
-                        raise ValueError(
-                            "MLB V2A feature generation "
-                            "returned no data."
-                        )
-
-                    # ======================================
-                    # RUN V1 ON SAME DATASET
-                    # ======================================
-
-                    mlb_v1_comparison_predictions = (
-                        run_mlb_walkforward_v1(
-                            mlb_v1_features,
-                            min_train_games=500,
-                            retrain_every=100,
-                        )
-                    )
-
-                    mlb_v1_comparison_results = (
-                        summarize_mlb_walkforward_v1(
-                            mlb_v1_comparison_predictions
-                        )
-                    )
-
-                    # ======================================
-                    # RUN V2A
-                    # ======================================
-
-                    mlb_v2a_predictions = (
-                        run_mlb_walkforward_v2a(
-                            mlb_v2a_features,
-                            min_train_games=500,
-                            retrain_every=100,
-                        )
-                    )
-
-                    mlb_v2a_results = (
-                        summarize_mlb_walkforward_v2a(
-                            mlb_v2a_predictions
-                        )
-                    )
-
-                    # ======================================
-                    # STORE RESULTS
-                    # ======================================
-
-                    st.session_state[
-                        "mlb_v1_comparison_results"
-                    ] = mlb_v1_comparison_results
-
-                    st.session_state[
-                        "mlb_v2a_results"
-                    ] = mlb_v2a_results
-
-                    st.session_state[
-                        "mlb_v2a_features"
-                    ] = mlb_v2a_features
-
-                st.success(
-                    "MLB V2A walk-forward validation "
-                    "completed."
-                )
-
-            except Exception as exc:
-
-                st.error(
-                    "MLB V2A walk-forward validation failed."
-                )
-
-                st.exception(exc)
-
-
-    # ==========================================
-    # MLB V1 VS V2A MODEL COMPARISON
-    # ==========================================
-
-    v1_compare = st.session_state.get(
-        "mlb_v1_comparison_results"
-    )
-
-    v2a_compare = st.session_state.get(
-        "mlb_v2a_results"
-    )
-
-    if v1_compare and v2a_compare:
-
-        st.divider()
-
-        st.subheader(
-            "📊 MLB V1 vs V2A Model Comparison"
+        st.metric(
+            "Baseline Brier Score",
+            f"{mlb_metrics['baseline_brier']:.4f}",
         )
 
-        v1_accuracy = float(
-            v1_compare["accuracy"]
+    with col3:
+
+        st.metric(
+            "Model Log Loss",
+            f"{mlb_metrics['model_log_loss']:.4f}",
         )
 
-        v2a_accuracy = float(
-            v2a_compare["accuracy"]
+        st.metric(
+            "AUC Score",
+            (
+                f"{mlb_metrics['auc']:.3f}"
+                if mlb_metrics["auc"] is not None
+                else "N/A"
+            ),
         )
 
-        accuracy_change = (
-            v2a_accuracy
-            - v1_accuracy
-        )
+    st.subheader("Historical Training Summary")
 
-        v1_auc = v1_compare.get("auc")
-        v2a_auc = v2a_compare.get("auc")
-
-        v1_brier = float(
-            v1_compare["brier"]
-        )
-
-        v2a_brier = float(
-            v2a_compare["brier"]
-        )
-
-        v1_log_loss = float(
-            v1_compare["log_loss"]
-        )
-
-        v2a_log_loss = float(
-            v2a_compare["log_loss"]
-        )
-
-        comparison_data = pd.DataFrame(
-            {
-                "Metric": [
-                    "Predictions",
-                    "Accuracy",
-                    "AUC",
-                    "Brier Score",
-                    "Log Loss",
-                ],
-                "V1": [
-                    f"{v1_compare['prediction_count']:,}",
-                    f"{v1_accuracy:.2%}",
-                    (
-                        f"{v1_auc:.3f}"
-                        if v1_auc is not None
-                        else "N/A"
-                    ),
-                    f"{v1_brier:.4f}",
-                    f"{v1_log_loss:.4f}",
-                ],
-                "V2A": [
-                    f"{v2a_compare['prediction_count']:,}",
-                    f"{v2a_accuracy:.2%}",
-                    (
-                        f"{v2a_auc:.3f}"
-                        if v2a_auc is not None
-                        else "N/A"
-                    ),
-                    f"{v2a_brier:.4f}",
-                    f"{v2a_log_loss:.4f}",
-                ],
-            }
-        )
-
-        st.dataframe(
-            comparison_data,
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        # ======================================
-        # ACCURACY IMPACT
-        # ======================================
-
-        st.markdown(
-            "### Starting-Pitcher Impact"
-        )
-
-        impact_col1, impact_col2, impact_col3 = (
-            st.columns(3)
-        )
-
-        impact_col1.metric(
-            "V1 Accuracy",
-            f"{v1_accuracy:.2%}",
-        )
-
-        impact_col2.metric(
-            "V2A Accuracy",
-            f"{v2a_accuracy:.2%}",
-        )
-
-        impact_col3.metric(
-            "Accuracy Change",
-            f"{accuracy_change:+.2%}",
-        )
-
-        # ======================================
-        # MODEL QUALITY CHECK
-        # ======================================
-
-        accuracy_improved = (
-            v2a_accuracy > v1_accuracy
-        )
-
-        brier_improved = (
-            v2a_brier < v1_brier
-        )
-
-        log_loss_improved = (
-            v2a_log_loss < v1_log_loss
-        )
-
-        auc_improved = (
-            v1_auc is not None
-            and v2a_auc is not None
-            and v2a_auc > v1_auc
-        )
-
-        improvements = sum(
-            [
-                accuracy_improved,
-                brier_improved,
-                log_loss_improved,
-                auc_improved,
-            ]
-        )
-
-        if improvements == 4:
-
-            st.success(
-                "V2A improved all four major validation "
-                "metrics: accuracy, AUC, Brier score, "
-                "and log loss."
-            )
-
-        elif accuracy_improved:
-
-            st.info(
-                "V2A improved prediction accuracy, but "
-                "the probability-quality metrics are mixed. "
-                "Review the detailed results before deciding "
-                "whether V2A should replace V1."
-            )
-
-        else:
-
-            st.warning(
-                "V2A did not improve overall prediction "
-                "accuracy. V1 remains the benchmark while "
-                "we investigate the pitcher features."
-            )
-
-        # ======================================
-        # CONFIDENCE COMPARISON
-        # ======================================
-
-        st.markdown(
-            "### Accuracy by Confidence"
-        )
-
-        confidence_col1, confidence_col2 = (
-            st.columns(2)
-        )
-
-        with confidence_col1:
-
-            st.markdown("#### V1")
-
-            st.dataframe(
-                v1_compare[
-                    "confidence_summary"
-                ],
-                use_container_width=True,
-                hide_index=True,
-            )
-
-        with confidence_col2:
-
-            st.markdown("#### V2A")
-
-            st.dataframe(
-                v2a_compare[
-                    "confidence_summary"
-                ],
-                use_container_width=True,
-                hide_index=True,
-            )
-
-        # ======================================
-        # SEASON COMPARISON
-        # ======================================
-
-        st.markdown(
-            "### Season-by-Season Accuracy"
-        )
-
-        v1_seasons = (
-            v1_compare[
-                "season_summary"
-            ]
-            .rename(
-                columns={
-                    "predictions":
-                        "v1_predictions",
-                    "accuracy":
-                        "v1_accuracy",
-                }
-            )
-        )
-
-        v2a_seasons = (
-            v2a_compare[
-                "season_summary"
-            ]
-            .rename(
-                columns={
-                    "predictions":
-                        "v2a_predictions",
-                    "accuracy":
-                        "v2a_accuracy",
-                }
-            )
-        )
-
-        season_comparison = (
-            v1_seasons.merge(
-                v2a_seasons,
-                on="season_id",
-                how="outer",
-            )
-        )
-
-        season_comparison[
-            "accuracy_change"
-        ] = (
-            season_comparison[
-                "v2a_accuracy"
-            ]
-            - season_comparison[
-                "v1_accuracy"
-            ]
-        )
-
-        for column in [
-            "v1_accuracy",
-            "v2a_accuracy",
-            "accuracy_change",
-        ]:
-
-            season_comparison[column] = (
-                season_comparison[column]
-                .map(
-                    lambda value:
-                        f"{value:+.2%}"
-                        if (
-                            column
-                            == "accuracy_change"
-                            and pd.notna(value)
-                        )
-                        else (
-                            f"{value:.2%}"
-                            if pd.notna(value)
-                            else "—"
-                        )
-                )
-            )
-
-        st.dataframe(
-            season_comparison,
-            use_container_width=True,
-            hide_index=True,
-        )
-
-    # ==========================================
-    # DISPLAY MLB VALIDATION RESULTS
-    # ==========================================
-
-    mlb_metrics = st.session_state.get(
-        "mlb_training_metrics"
-    )
-
-    if mlb_metrics:
-        st.subheader("MLB Model Validation Results")
-
-        if mlb_metrics["passes_benchmarks"]:
-            st.success(
-                "Historical validation benchmarks passed."
-            )
-        else:
-            st.warning(
-                "Historical validation benchmarks not passed. "
-                "Further model evaluation is required."
-            )
-
-        col1, col2, col3 = st.columns(3)
-
-        with col1:
-            st.metric(
-                "Model Accuracy",
-                f"{mlb_metrics['model_accuracy']:.2%}",
-            )
-            st.metric(
-                "Baseline Accuracy",
-                f"{mlb_metrics['baseline_accuracy']:.2%}",
-            )
-
-        with col2:
-            st.metric(
-                "Model Brier Score",
-                f"{mlb_metrics['model_brier']:.4f}",
-            )
-            st.metric(
-                "Baseline Brier Score",
-                f"{mlb_metrics['baseline_brier']:.4f}",
-            )
-
-        with col3:
-            st.metric(
-                "Model Log Loss",
-                f"{mlb_metrics['model_log_loss']:.4f}",
-            )
-            st.metric(
-                "AUC Score",
-                (
-                    f"{mlb_metrics['auc']:.3f}"
-                    if mlb_metrics["auc"] is not None
-                    else "N/A"
-                ),
-            )
-
-        st.subheader("Historical Training Summary")
-        st.json(mlb_metrics)
+    st.json(mlb_metrics)
