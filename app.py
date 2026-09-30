@@ -9610,7 +9610,7 @@ if (
                     f"{save_result.get('error')}"
                 )
 
-    if missing_pitcher_games.empty:
+        if missing_pitcher_games.empty:
 
         st.success(
             "Historical MLB starting-pitcher "
@@ -9622,8 +9622,8 @@ if (
         st.caption(
             "Historical pitcher data only needs to be "
             "built once. The automated builder works "
-            "in 250-game checkpoints and preserves "
-            "each successful checkpoint."
+            "in 250-game checkpoints and permanently "
+            "saves each successful checkpoint."
         )
 
         if st.button(
