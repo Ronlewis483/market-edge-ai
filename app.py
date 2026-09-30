@@ -10910,3 +10910,84 @@ if v3_history_ready:
         except Exception as exc:
             st.error("The warehouse audit could not finish.")
             st.exception(exc)
+
+
+# ==========================================
+# MLB V3 HISTORICAL FEATURE TIMING CHECK
+# ==========================================
+if v3_history_ready:
+    st.divider()
+    st.subheader("⚾ MLB V3 Historical Feature Check")
+    st.caption(
+        "Build history-only features after the warehouse audit passes. Lineup uses the last "
+        "observed lineup from an earlier UTC date; bullpen uses prior relief appearances. "
+        "Current-game participants, starter identities and weather are not reconstructed as pregame facts."
+    )
+    if st.button("Check Timing and Build MLB V3 Features", key="check_build_mlb_v3_features", type="primary"):
+        try:
+            from dual_agent.mlb_research import (
+                build_mlb_v3_historical_features,
+                summarize_mlb_v3_historical_readiness,
+            )
+            with st.spinner("Checking warehouse and feature timing..."):
+                current_logs = st.session_state["mlb_v3_player_logs"]
+                current_audit = _audit_mlb_v3_warehouse(mlb_v3_games, current_logs)
+                if not current_audit["passed"]:
+                    raise ValueError("Warehouse audit has unresolved issues. Run the audit and review its tables first.")
+                sample_games = mlb_v3_games.copy()
+                sample_games["start_time"] = pd.to_datetime(sample_games.start_time, utc=True)
+                sample_games = sample_games.sort_values(["start_time", "game_id"])
+                sample_dates = sample_games.start_time.dt.floor("D").drop_duplicates().head(6)
+                if len(sample_dates) < 3:
+                    raise ValueError("At least three historical UTC dates are needed for the timing check.")
+                sample_games = sample_games.loc[sample_games.start_time.dt.floor("D").isin(sample_dates)].copy()
+                sample_logs = current_logs.loc[current_logs.game_id.isin(sample_games.game_id)].copy()
+                baseline = build_mlb_v3_historical_features(sample_games, sample_logs)
+                cutoff = sample_dates.iloc[-2]
+                altered_games = sample_games.copy()
+                altered_logs = sample_logs.copy()
+                affected = altered_games.start_time.dt.floor("D").ge(cutoff)
+                altered_games.loc[affected, "home_score"] = 0
+                altered_games.loc[affected, "away_score"] = 99
+                affected_logs = altered_logs.game_id.isin(altered_games.loc[affected, "game_id"])
+                for field in ["hits", "earned_runs", "pitcher_hits", "batting_order"]:
+                    altered_logs.loc[affected_logs, field] = 99
+                altered_logs.loc[affected_logs, "player_id"] = 999999999
+                altered_logs.loc[affected_logs, "is_bullpen"] = False
+                altered = build_mlb_v3_historical_features(altered_games, altered_logs)
+                columns = [c for c in baseline.columns if c != "home_win"]
+                ids = sample_games.loc[sample_games.start_time.dt.floor("D").le(cutoff), "game_id"]
+                def same_features(left, right, game_ids):
+                    pd.testing.assert_frame_equal(
+                        left.loc[left.game_id.isin(game_ids), columns].reset_index(drop=True),
+                        right.loc[right.game_id.isin(game_ids), columns].reset_index(drop=True),
+                    )
+                same_features(baseline, altered, ids)
+                prefix = sample_games.loc[sample_games.start_time.dt.floor("D").le(cutoff)]
+                truncated = build_mlb_v3_historical_features(
+                    prefix, sample_logs.loc[sample_logs.game_id.isin(prefix.game_id)]
+                )
+                same_features(baseline, truncated, ids)
+                st.success("Sample timing checks passed: current/future results and participants did not change earlier or same-day features.")
+            with st.spinner("Building the full MLB V3 historical feature matrix. This may take several minutes..."):
+                features = build_mlb_v3_historical_features(mlb_v3_games, current_logs)
+                readiness = summarize_mlb_v3_historical_readiness(features)
+                st.session_state["mlb_v3_historical_features"] = features
+                st.session_state["mlb_v3_historical_feature_readiness"] = readiness
+            st.success(f"Built {len(features):,} MLB V3 historical feature rows. No model has been trained or promoted.")
+            st.dataframe(readiness["feature_coverage"], use_container_width=True, hide_index=True)
+            st.download_button(
+                "Download MLB V3 Historical Features CSV",
+                data=features.to_csv(index=False).encode("utf-8"),
+                file_name="mlb_v3_historical_features.csv",
+                mime="text/csv",
+                key="download_mlb_v3_historical_features",
+            )
+            st.info(
+                "Unavailable starter and weather fields remain missing. Next, define a historical model feature set "
+                "that excludes unavailable fields and evaluate V1/V3 on matching dates. "
+                "The date rule assumes earlier-date results were available; suspended-game timing needs separate evidence."
+            )
+        except Exception as exc:
+            st.error("V3 feature checking/building stopped. Review the error before modeling.")
+            st.exception(exc)
