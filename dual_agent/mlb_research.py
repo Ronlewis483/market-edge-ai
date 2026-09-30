@@ -2786,3 +2786,182 @@ def collect_mlb_pitcher_logs_batch(
         "complete":
             bool(remaining.empty),
     }
+
+# ==========================================
+# MLB DAILY PREGAME INTELLIGENCE LAYER
+# ==========================================
+
+MLB_LIVE_FEED_URL = (
+    "https://statsapi.mlb.com/api/v1.1/game/{game_id}/feed/live"
+)
+
+
+def fetch_mlb_daily_slate(game_date=None, timeout=30):
+    """Return every MLB game scheduled for a calendar date.
+
+    Unlike fetch_mlb_games(), this includes pregame/live/final games because
+    production predictions begin with the complete daily slate.
+    """
+    target = pd.Timestamp(game_date or datetime.now(timezone.utc).date())
+    date_text = target.strftime("%Y-%m-%d")
+    response = requests.get(
+        MLB_API_URL,
+        params={
+            "sportId": 1,
+            "date": date_text,
+            "hydrate": "probablePitcher,venue",
+        },
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    rows = []
+    for date_entry in payload.get("dates", []):
+        for game in date_entry.get("games", []):
+            teams = game.get("teams", {})
+            home = teams.get("home", {})
+            away = teams.get("away", {})
+            home_team = home.get("team", {})
+            away_team = away.get("team", {})
+            venue = game.get("venue", {})
+            status = game.get("status", {})
+            rows.append({
+                "game_id": game.get("gamePk"),
+                "season_id": game.get("season"),
+                "game_date": date_text,
+                "start_time": game.get("gameDate"),
+                "game_type": game.get("gameType"),
+                "status": status.get("detailedState"),
+                "abstract_status": status.get("abstractGameState"),
+                "home_team_id": home_team.get("id"),
+                "home_team": home_team.get("name"),
+                "away_team_id": away_team.get("id"),
+                "away_team": away_team.get("name"),
+                "home_starting_pitcher_id": (home.get("probablePitcher") or {}).get("id"),
+                "home_starting_pitcher": (home.get("probablePitcher") or {}).get("fullName"),
+                "away_starting_pitcher_id": (away.get("probablePitcher") or {}).get("id"),
+                "away_starting_pitcher": (away.get("probablePitcher") or {}).get("fullName"),
+                "venue_id": venue.get("id"),
+                "venue_name": venue.get("name"),
+            })
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    df["start_time"] = pd.to_datetime(df["start_time"], utc=True, errors="coerce")
+    return df.drop_duplicates(subset=["game_id"]).sort_values(["start_time", "game_id"]).reset_index(drop=True)
+
+
+def _mlb_player_snapshot(player, side, batting_order_lookup, bullpen_ids):
+    person = player.get("person", {}) or {}
+    position = player.get("position", {}) or {}
+    batting = (player.get("stats", {}) or {}).get("batting", {}) or {}
+    pitching = (player.get("stats", {}) or {}).get("pitching", {}) or {}
+    season = player.get("seasonStats", {}) or {}
+    season_batting = season.get("batting", {}) or {}
+    season_pitching = season.get("pitching", {}) or {}
+    player_id = person.get("id")
+    return {
+        "side": side,
+        "player_id": player_id,
+        "player_name": person.get("fullName"),
+        "position": position.get("abbreviation") or position.get("name"),
+        "batting_order": batting_order_lookup.get(player_id),
+        "is_bullpen": player_id in bullpen_ids,
+        "game_batting": batting,
+        "game_pitching": pitching,
+        "season_batting": season_batting,
+        "season_pitching": season_pitching,
+        "person": person,
+    }
+
+
+def fetch_mlb_pregame_game_snapshot(game_id, timeout=30):
+    """Build the current information snapshot for one scheduled MLB game.
+
+    The raw feed is retained so future feature engineering can use fields that
+    are not flattened today. No postgame result is converted into a feature here.
+    """
+    url = MLB_LIVE_FEED_URL.format(game_id=int(game_id))
+    response = requests.get(url, timeout=timeout)
+    response.raise_for_status()
+    feed = response.json()
+
+    game_data = feed.get("gameData", {}) or {}
+    live_data = feed.get("liveData", {}) or {}
+    boxscore = live_data.get("boxscore", {}) or {}
+    teams = boxscore.get("teams", {}) or {}
+    gd_teams = game_data.get("teams", {}) or {}
+    venue = game_data.get("venue", {}) or {}
+    weather = game_data.get("weather", {}) or {}
+    datetime_data = game_data.get("datetime", {}) or {}
+    status = game_data.get("status", {}) or {}
+    probable = game_data.get("probablePitchers", {}) or {}
+
+    player_rows = []
+    team_context = {}
+    for side in ("home", "away"):
+        side_box = teams.get(side, {}) or {}
+        batting_order = side_box.get("battingOrder", []) or []
+        batting_order_lookup = {pid: index + 1 for index, pid in enumerate(batting_order)}
+        bullpen_ids = set(side_box.get("bullpen", []) or [])
+        side_players = side_box.get("players", {}) or {}
+        for player in side_players.values():
+            player_rows.append(_mlb_player_snapshot(player, side, batting_order_lookup, bullpen_ids))
+        team_context[side] = {
+            "team": gd_teams.get(side, {}),
+            "team_stats": side_box.get("teamStats", {}) or {},
+            "batting_order": batting_order,
+            "bullpen": list(bullpen_ids),
+            "bench": side_box.get("bench", []) or [],
+            "pitchers": side_box.get("pitchers", []) or [],
+        }
+
+    return {
+        "game_id": int(game_id),
+        "snapshot_time": datetime.now(timezone.utc).isoformat(),
+        "start_time": datetime_data.get("dateTime"),
+        "status": status,
+        "home_team": gd_teams.get("home", {}),
+        "away_team": gd_teams.get("away", {}),
+        "probable_pitchers": probable,
+        "venue": venue,
+        "weather": weather,
+        "game_info": game_data.get("gameInfo", {}) or {},
+        "officials": boxscore.get("officials", []) or [],
+        "team_context": team_context,
+        "players": player_rows,
+        "raw_feed": feed,
+    }
+
+
+def build_mlb_daily_pregame_intelligence(game_date=None, timeout=30):
+    """Build one current pregame intelligence package for the day's MLB slate.
+
+    This is the shared upstream data object for future winner and player-prop
+    models. It intentionally gathers game context before deciding which model
+    features to calculate.
+    """
+    slate = fetch_mlb_daily_slate(game_date=game_date, timeout=timeout)
+    snapshots = []
+    errors = []
+    if slate.empty:
+        return {"slate": slate, "games": [], "errors": []}
+
+    for _, game in slate.iterrows():
+        game_id = int(game["game_id"])
+        try:
+            snapshot = fetch_mlb_pregame_game_snapshot(game_id, timeout=timeout)
+            snapshot["schedule"] = game.to_dict()
+            snapshots.append(snapshot)
+        except (requests.RequestException, ValueError, TypeError) as exc:
+            errors.append({"game_id": game_id, "error": str(exc)})
+
+    return {
+        "snapshot_date": str(pd.Timestamp(game_date or datetime.now(timezone.utc).date()).date()),
+        "snapshot_time": datetime.now(timezone.utc).isoformat(),
+        "slate": slate,
+        "games": snapshots,
+        "game_count": int(len(slate)),
+        "snapshots_built": int(len(snapshots)),
+        "errors": errors,
+    }
