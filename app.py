@@ -9925,66 +9925,93 @@ if (
     )
 
     # ==========================================
-# MLB V3 DEPLOYMENT DIAGNOSTIC
-# ==========================================
-
-import inspect
-import dual_agent.mlb_research as mlb_debug
-
-with st.expander("🔎 MLB V3 Deployment Diagnostic", expanded=True):
-
-    loaded_path = inspect.getsourcefile(
-        mlb_debug.collect_mlb_player_logs_batch
-    )
-
-    live_signature = inspect.signature(
-        mlb_debug.collect_mlb_player_logs_batch
-    )
-
-    st.write("**Loaded module path:**")
-    st.code(str(loaded_path))
-
-    st.write("**Live collector signature:**")
-    st.code(str(live_signature))
-
-    if "max_workers" in live_signature.parameters:
-        st.success(
-            "✅ Concurrent MLB collector is loaded. "
-            "max_workers is available."
+    # MLB V3 DEPLOYMENT DIAGNOSTIC
+    # ==========================================
+    
+    import inspect
+    import dual_agent.mlb_research as mlb_debug
+    
+    with st.expander("🔎 MLB V3 Deployment Diagnostic", expanded=True):
+    
+        loaded_path = inspect.getsourcefile(
+            mlb_debug.collect_mlb_player_logs_batch
         )
-    else:
-        st.error(
-            "❌ OLD MLB collector is loaded. "
-            "max_workers is NOT available."
+    
+        live_signature = inspect.signature(
+            mlb_debug.collect_mlb_player_logs_batch
         )
-
-    st.caption(
-        "Build the permanent player-game warehouse used by the V3 "
-        "leakage-safe historical reconstruction. Each successful "
-        "250-game checkpoint is saved permanently to Supabase."
-    )
-
-    if "mlb_v3_player_logs" not in st.session_state:
-
-        with st.spinner(
-            "Loading permanent MLB player history..."
+    
+        st.write("**Loaded module path:**")
+        st.code(str(loaded_path))
+    
+        st.write("**Live collector signature:**")
+        st.code(str(live_signature))
+    
+        if "max_workers" in live_signature.parameters:
+            st.success(
+                "✅ Concurrent MLB collector is loaded. "
+                "max_workers is available."
+            )
+        else:
+            st.error(
+                "❌ OLD MLB collector is loaded. "
+                "max_workers is NOT available."
+            )
+    
+        st.caption(
+            "Build the permanent player-game warehouse used by the V3 "
+            "leakage-safe historical reconstruction. Each successful "
+            "250-game checkpoint is saved permanently to Supabase."
+        )
+    
+        if "mlb_v3_player_logs" not in st.session_state:
+    
+            with st.spinner(
+                "Loading permanent MLB player history..."
+            ):
+    
+                st.session_state[
+                    "mlb_v3_player_logs"
+                ] = load_mlb_player_history()
+    
+        cached_player_logs = st.session_state.get(
+            "mlb_v3_player_logs",
+            pd.DataFrame(),
+        )
+    
+        missing_player_games = (
+            get_missing_mlb_player_log_games(
+                mlb_v2a_games,
+                existing_logs=cached_player_logs,
+            )
+        )
+    
+            # ==========================================
+        # GUARANTEE MLB HISTORICAL GAMES FOR V3
+        # ==========================================
+    
+        mlb_v2a_games = st.session_state.get(
+            "mlb_v2a_games"
+        )
+    
+        if (
+            mlb_v2a_games is None
+            or (
+                hasattr(mlb_v2a_games, "empty")
+                and mlb_v2a_games.empty
+            )
         ):
-
-            st.session_state[
-                "mlb_v3_player_logs"
-            ] = load_mlb_player_history()
-
-    cached_player_logs = st.session_state.get(
-        "mlb_v3_player_logs",
-        pd.DataFrame(),
-    )
-
-    missing_player_games = (
-        get_missing_mlb_player_log_games(
-            mlb_v2a_games,
-            existing_logs=cached_player_logs,
-        )
-    )
+            with st.spinner(
+                "Loading MLB historical games for V3..."
+            ):
+                mlb_v2a_games = fetch_mlb_games(
+                    start_date="2023-03-01",
+                    end_date="2026-09-30",
+                )
+    
+                st.session_state[
+                    "mlb_v2a_games"
+                ] = mlb_v2a_games
 
     player_total_games = len(mlb_v2a_games)
     player_completed_games = (
