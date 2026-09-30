@@ -11186,3 +11186,54 @@ if hasattr(st, "fragment"):
     st.fragment(run_every="60s")(_render_mlb_scanner_dashboard)()
 else:
     _render_mlb_scanner_dashboard()
+
+st.divider()
+st.subheader("⚾ Model With Saved Pitcher and Lineup Information")
+st.caption("Connect real saved pregame player features to a research model. Compare team statistics alone with team statistics plus probable pitchers and feed lineup strength, using identical games.")
+if st.button("Build Player-Information Candidate", key="mlb_saved_player_candidate", type="primary"):
+    try:
+        import importlib
+        import dual_agent.mlb_research as research
+        storage = _mlb_pregame_storage_module()
+        if getattr(research, "MLB_SAVED_PLAYER_MODEL_VERSION", None) != 1:
+            research = importlib.reload(research)
+        if getattr(storage, "MLB_SAVED_PLAYER_MODEL_STORAGE_VERSION", None) != 1:
+            storage = importlib.reload(storage)
+        if getattr(research, "MLB_SAVED_PLAYER_MODEL_VERSION", None) != 1 or getattr(storage, "MLB_SAVED_PLAYER_MODEL_STORAGE_VERSION", None) != 1:
+            raise RuntimeError("Deploy all three matching app.py, mlb_research.py, and supabase_db.py files.")
+        with st.spinner("Checking saved game results and connecting player features..."):
+            dataset = storage.load_mlb_capture_learning_dataset()
+            archived = storage.load_mlb_pregame_intelligence()
+            batch = research.build_mlb_capture_learning_rows(archived["data"]) if archived and isinstance(archived.get("data"), dict) else {"rows": [], "errors": []}
+            keys = {row["capture_key"] for row in batch["rows"]}
+            pending = research.refresh_mlb_capture_learning_results([row for row in dataset["rows"] if row["capture_key"] not in keys])
+            batch["rows"] = pending["rows"] + batch["rows"]
+            checks = batch.get("errors", []) + pending.get("errors", [])
+            merged = storage.update_mlb_capture_learning_dataset(batch)
+            if not merged.get("success"):
+                raise RuntimeError("Unable to update saved results: " + merged.get("message", "Unknown error"))
+            result = research.run_mlb_saved_player_model(merged["data"])
+            result["result_checks"] = checks
+            saved = storage.save_mlb_saved_player_model(result)
+        st.session_state["mlb_saved_player_candidate_result"] = result
+        st.session_state["mlb_saved_player_candidate_save"] = saved
+    except Exception as exc:
+        st.error("Player-information model stopped: " + str(exc))
+player_model = st.session_state.get("mlb_saved_player_candidate_result")
+if player_model:
+    st.info(player_model["message"])
+    st.write(f"Eligible games: {player_model['eligible_games']} | Usable completed games: {player_model['completed_games']}")
+    save_status = st.session_state.get("mlb_saved_player_candidate_save", {})
+    if save_status.get("success"):
+        st.success("Player-model research record permanently saved.")
+    else:
+        st.error("Research record could not be saved: " + save_status.get("message", "Unknown error"))
+    if player_model["scores"]:
+        st.dataframe(pd.DataFrame(player_model["scores"]), use_container_width=True, hide_index=True)
+        st.caption("Accuracy: higher is better. Brier/log loss: lower is better. These are captured-data research comparisons, not a live model promotion.")
+    if player_model["upcoming_predictions"]:
+        st.dataframe(pd.DataFrame(player_model["upcoming_predictions"]), use_container_width=True, hide_index=True)
+    if player_model.get("comparison_note"):
+        st.caption(player_model["comparison_note"])
+    with st.expander("Player model coverage and saved weights"):
+        st.json({"excluded": player_model["excluded"], "result_checks": player_model.get("result_checks", []), "models": player_model["models"]})
