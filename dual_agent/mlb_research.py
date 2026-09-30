@@ -5358,6 +5358,7 @@ def collect_mlb_upcoming_game_information(game_date, historical_games=None, pitc
     """
     slate = fetch_mlb_daily_slate(game_date, timeout=timeout)
     collected, errors, skipped = [], [], []
+    capture_cache = {}
     session = requests.Session()
     try:
         for _, scheduled in slate.iterrows():
@@ -5373,8 +5374,18 @@ def collect_mlb_upcoming_game_information(game_date, historical_games=None, pitc
                 if status.get("abstractGameState") != "Preview" or start <= pd.Timestamp.now(tz="UTC"):
                     skipped.append({"game_id": scheduled.game_id, "reason": "Game began or status changed during capture"})
                     continue
+                # Ensure announced probable pitchers are enriched even before boxscore rosters populate.
+                existing_ids = {p.get("player_id") for p in snapshot.get("players", [])}
+                for side, probable in (snapshot.get("probable_pitchers", {}) or {}).items():
+                    pid = (probable or {}).get("id")
+                    if pid and pid not in existing_ids:
+                        snapshot.setdefault("players", []).append({"player_id": pid, "player_name": probable.get("fullName"),
+                            "side": side, "position": "P", "batting_order": None, "is_bullpen": False})
+                        existing_ids.add(pid)
                 snapshot = enrich_mlb_pregame_game_snapshot(snapshot, historical_games=historical_games,
                     pitcher_logs=pitcher_logs, timeout=timeout, session=session)
+                snapshot = _attach_mlb_current_information(snapshot, session, capture_cache, timeout=min(timeout, 20))
+                errors.extend((snapshot.get("current_information", {}) or {}).get("errors", []))
                 snapshot["capture_finished_at"] = datetime.now(timezone.utc).isoformat()
                 snapshot["eligible_pregame_capture"] = bool(
                     pd.Timestamp(snapshot["capture_finished_at"]) < start
@@ -5390,7 +5401,7 @@ def collect_mlb_upcoming_game_information(game_date, historical_games=None, pitc
     return {"game_date": str(game_date), "snapshot_time": datetime.now(timezone.utc).isoformat(),
             "slate": slate, "games": collected, "errors": errors, "skipped": skipped,
             "source": "MLB Stats API", "capture_mode": "manual",
-            "unconnected_sources": ["Sportsbook odds and prop lines", "Dedicated injury/news feed", "External weather/roof confirmation"],
+            "unconnected_sources": ["Sportsbook odds and prop lines", "Comprehensive breaking-news coverage", "Verified roof open/closed status"],
             "availability_note": "Fields are observations at capture time. Probable starters are not confirmed starters; feed lineups may change."}
 
 
@@ -5409,9 +5420,173 @@ def summarize_mlb_upcoming_information(package):
                "Venue": (game.get("venue", {}) or {}).get("name"),
                "Weather reported": bool(weather), "Players enriched": len(enrichment.get("players", {}) or {}),
                "Source errors": len(enrichment.get("errors", []) or [])}
+        forecast = (game.get("current_information", {}) or {}).get("stadium_forecast") or {}
+        row.update({"Forecast °F": forecast.get("temperature_2m"), "Wind mph": forecast.get("wind_speed_10m"),
+                    "Wind from degrees": forecast.get("wind_direction_10m"),
+                    "Precipitation probability %": forecast.get("precipitation_probability"),
+                    "Forecast valid UTC": forecast.get("forecast_valid_at"),
+                    "Weather fetched UTC": forecast.get("fetched_at"),
+                    "Roof type": forecast.get("roof_type"), "Roof status": forecast.get("roof_status", "Unknown")})
         for side in ["home", "away"]:
             row[f"{side.title()} probable starter"] = (probable.get(side, {}) or {}).get("fullName") or "Unknown"
             row[f"{side.title()} lineup slots"] = len((context.get(side, {}) or {}).get("batting_order", []) or [])
             row[f"{side.title()} roster players"] = len(((enrichment.get("teams", {}) or {}).get(side, {}) or {}).get("active_roster", []) or [])
         rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _mlb_injury_report_text(html):
+    """Extract visible article text; ignore embedded scripts and styling."""
+    from html.parser import HTMLParser
+    class VisibleText(HTMLParser):
+        def __init__(self):
+            super().__init__(); self.hidden = 0; self.parts = []
+        def handle_starttag(self, tag, attrs):
+            if tag in {"script", "style", "noscript"}: self.hidden += 1
+        def handle_endtag(self, tag):
+            if tag in {"script", "style", "noscript"}: self.hidden = max(0, self.hidden-1)
+        def handle_data(self, text):
+            if not self.hidden and text.strip(): self.parts.append(text.strip())
+    parser = VisibleText(); parser.feed(html)
+    return " ".join(parser.parts)
+
+
+def fetch_mlb_current_team_updates(team_id, timeout=20, session=None):
+    """Observe current 40-man status plus recent official transactions."""
+    now = pd.Timestamp.now(tz="UTC")
+    roster_url = MLB_ROSTER_URL.format(team_id=int(team_id))
+    roster = _mlb_api_get_json(roster_url, params={"rosterType": "40Man"}, timeout=timeout, session=session)
+    roster_at = datetime.now(timezone.utc).isoformat()
+    transaction_url = "https://statsapi.mlb.com/api/v1/transactions"
+    transactions = _mlb_api_get_json(transaction_url, params={"teamId": int(team_id),
+        "startDate": (now - pd.Timedelta(days=7)).strftime("%Y-%m-%d"),
+        "endDate": now.strftime("%Y-%m-%d")}, timeout=timeout, session=session)
+    return {"team_id": int(team_id), "roster": roster.get("roster", []) or [],
+            "transactions": transactions.get("transactions", []) or [],
+            "roster_fetched_at": roster_at, "transactions_fetched_at": datetime.now(timezone.utc).isoformat(),
+            "roster_source": roster_url, "transaction_source": transaction_url}
+
+
+def fetch_mlb_stadium_forecast(snapshot, timeout=20, session=None):
+    """Get the nearest first-pitch hourly outdoor forecast, without roof assumptions."""
+    venue = snapshot.get("venue", {}) or {}
+    schedule = snapshot.get("schedule", {}) or {}
+    venue_id = venue.get("id") or schedule.get("venue_id")
+    if venue_id is None: raise ValueError("Venue ID missing; stadium weather cannot be located.")
+    venue_url = f"https://statsapi.mlb.com/api/v1/venues/{int(venue_id)}"
+    payload = _mlb_api_get_json(venue_url, params={"hydrate": "location,fieldInfo"}, timeout=timeout, session=session)
+    venues = payload.get("venues", []) or []
+    if not venues: raise ValueError("Venue metadata unavailable.")
+    venue_data = venues[0]
+    location = venue_data.get("location", {}) or {}
+    coords = location.get("defaultCoordinates", {}) or {}
+    lat, lon = coords.get("latitude"), coords.get("longitude")
+    if lat is None or lon is None: raise ValueError("Stadium coordinates unavailable; no city-level guess used.")
+    lat, lon = float(lat), float(lon)
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180): raise ValueError("Invalid stadium coordinates.")
+    start = pd.to_datetime(snapshot.get("start_time") or schedule.get("start_time"), utc=True, errors="coerce")
+    if pd.isna(start): raise ValueError("First-pitch time unavailable.")
+    fields = ["temperature_2m", "relative_humidity_2m", "precipitation_probability", "precipitation",
+              "wind_speed_10m", "wind_direction_10m", "wind_gusts_10m"]
+    weather_url = "https://api.open-meteo.com/v1/forecast"
+    forecast = _mlb_api_get_json(weather_url, params={"latitude": lat, "longitude": lon,
+        "hourly": ",".join(fields), "temperature_unit": "fahrenheit", "wind_speed_unit": "mph",
+        "precipitation_unit": "inch", "timezone": "UTC", "forecast_days": 16}, timeout=timeout, session=session)
+    hourly = forecast.get("hourly", {}) or {}
+    times = pd.to_datetime(hourly.get("time", []), utc=True, errors="coerce")
+    if len(times)==0: raise ValueError("Forecast hours unavailable.")
+    distances = pd.Series(times-start).abs()
+    index = distances.idxmin()
+    if pd.isna(distances.loc[index]) or distances.loc[index] > pd.Timedelta(hours=1):
+        raise ValueError("Game time is outside the available forecast hours.")
+    roof_type = (venue_data.get("fieldInfo", {}) or {}).get("roofType")
+    result = {"source": "Open-Meteo", "source_url": weather_url,
+              "fetched_at": datetime.now(timezone.utc).isoformat(), "forecast_valid_at": times[index].isoformat(),
+              "provider_issue_time": None, "latitude": lat, "longitude": lon,
+              "roof_type": roof_type, "roof_status": "Unknown — no current open/closed confirmation",
+              "wind_relative_to_field": "Unknown — field orientation not verified",
+              "units": forecast.get("hourly_units", {}), "venue_metadata": venue_data,
+              "note": "Outdoor forecast near stadium coordinates; indoor/closed-roof conditions may differ. Fetch time is not provider issue time."}
+    for field in fields:
+        values = hourly.get(field, [])
+        result[field] = values[index] if index < len(values) else None
+    if not any(result[field] is not None for field in fields):
+        raise ValueError("Forecast returned no populated weather fields.")
+    return result
+
+
+def _attach_mlb_current_information(snapshot, session, capture_cache, timeout=20):
+    """Attach observations and explicit source failures; do not alter model inputs."""
+    updates = {"teams": {}, "errors": [], "sources": [], "player_news": []}
+    def failed(scope, exc):
+        updates["errors"].append({"game_id": snapshot.get("game_id"), "scope": scope, "error": str(exc)})
+    for side in ["home", "away"]:
+        team = snapshot.get(f"{side}_team", {}) or {}
+        team_id = team.get("id") or (snapshot.get("schedule", {}) or {}).get(f"{side}_team_id")
+        if team_id is None:
+            failed(f"{side}_current_roster", ValueError("Team ID missing")); continue
+        try:
+            key = ("team_updates", int(team_id))
+            if key not in capture_cache:
+                capture_cache[key] = fetch_mlb_current_team_updates(team_id, timeout=timeout, session=session)
+            updates["teams"][side] = capture_cache[key]
+        except (requests.RequestException, ValueError, TypeError, KeyError) as exc: failed(f"{side}_team_updates", exc)
+    try:
+        updates["stadium_forecast"] = fetch_mlb_stadium_forecast(snapshot, timeout=timeout, session=session)
+    except (requests.RequestException, ValueError, TypeError, KeyError) as exc:
+        updates["stadium_forecast"] = None; failed("stadium_forecast", exc)
+    report_url = "https://www.mlb.com/injury-report"
+    try:
+        if "injury_report" not in capture_cache:
+            response = session.get(report_url, timeout=timeout)
+            response.raise_for_status()
+            capture_cache["injury_report"] = {"text": _mlb_injury_report_text(response.text),
+                "fetched_at": datetime.now(timezone.utc).isoformat(), "source": report_url}
+        report = capture_cache["injury_report"]
+        if len(report["text"]) < 200: raise ValueError("Injury report did not provide usable visible text.")
+        updates["sources"].append({"source": report_url, "fetched_at": report["fetched_at"],
+                                    "source_update_time": None, "coverage": "Visible MLB injury-report text; no full-web search"})
+        candidates = {}
+        for side, data in updates["teams"].items():
+            for entry in data.get("roster", []):
+                person = entry.get("person", {}) or {}
+                if person.get("id") and person.get("fullName"):
+                    candidates[person["id"]] = (side, person["fullName"])
+        for player in snapshot.get("players", []) or []:
+            if player.get("player_id") and player.get("player_name"):
+                candidates[player["player_id"]] = (player.get("side"), player["player_name"])
+        for pid, (side, name) in candidates.items():
+            offset = report["text"].casefold().find(name.casefold())
+            updates["player_news"].append({"player_id": pid, "player_name": name, "side": side,
+                "report_match": offset >= 0, "excerpt": report["text"][max(0,offset-60):offset+len(name)+180] if offset>=0 else None,
+                "source": report_url, "fetched_at": report["fetched_at"], "source_update_time": None,
+                "interpretation": "Report mention; verify linked source" if offset>=0 else "No full-name match; availability remains unverified"})
+    except (requests.RequestException, ValueError, TypeError) as exc: failed("injury_report", exc)
+    snapshot["current_information"] = updates
+    return snapshot
+
+
+def summarize_mlb_player_updates(package):
+    rows = []
+    for game in package.get("games", []):
+        updates = game.get("current_information", {}) or {}
+        enriched = (game.get("enrichment", {}) or {}).get("players", {}) or {}
+        news = {str(x.get("player_id")): x for x in updates.get("player_news", [])}
+        context = game.get("team_context", {}) or {}
+        for side, team in updates.get("teams", {}).items():
+            lineup = set((context.get(side, {}) or {}).get("batting_order", []) or [])
+            transactions = team.get("transactions", [])
+            for entry in team.get("roster", []):
+                person = entry.get("person", {}) or {}; pid = person.get("id")
+                player = enriched.get(str(pid), {}) or {}
+                mentions = news.get(str(pid), {})
+                related = [t for t in transactions if (t.get("person", {}) or {}).get("id")==pid]
+                recent = player.get("recent_stats", {}) or {}
+                rows.append({"Game ID": game.get("game_id"), "Side": side, "Player": person.get("fullName"),
+                    "Roster status": (entry.get("status", {}) or {}).get("description") or "Unknown",
+                    "Listed in feed lineup": pid in lineup, "Recent transactions": len(related),
+                    "Latest transaction": max((str(t.get("date") or t.get("effectiveDate") or "") for t in related), default=None),
+                    "Recent stats available": bool(recent), "Profile available": bool(player.get("profile")),
+                    "Injury report": "Mention found — review" if mentions.get("report_match") else "Unverified",
+                    "Roster fetched UTC": team.get("roster_fetched_at"), "Stats collected in capture UTC": game.get("capture_finished_at") if recent else None})
     return pd.DataFrame(rows)
