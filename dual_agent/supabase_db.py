@@ -1385,3 +1385,51 @@ def get_mlb_player_history_status():
         ),
         "path": MLB_PLAYER_HISTORY_FILE,
     }
+
+
+MLB_CAPTURE_LEARNING_STORAGE_VERSION = 1
+MLB_CAPTURE_LEARNING_FILE = "mlb/capture_learning/latest.json"
+
+
+def update_mlb_capture_learning_dataset(batch):
+    """Merge by capture key; fail closed on read errors to protect existing rows.
+
+    Intended for one writer. Multiple concurrent writers require a database table.
+    """
+    try:
+        client = get_supabase_client()
+        bucket = client.storage.from_(MLB_STORAGE_BUCKET)
+        # Listing distinguishes an absent first-run object from a download error.
+        entries = bucket.list("mlb/capture_learning", {"search": "latest.json"})
+        exists = any(x.get("name") == "latest.json" for x in entries)
+        previous = json.loads(bucket.download(MLB_CAPTURE_LEARNING_FILE).decode("utf-8")) if exists else {"rows": []}
+        if not isinstance(previous.get("rows"), list):
+            raise ValueError("Stored learning dataset is invalid; refusing to overwrite it.")
+        merged = {r["capture_key"]: r for r in previous["rows"]}
+        for row in batch.get("rows", []):
+            old = merged.get(row["capture_key"])
+            if old and old.get("features") != row.get("features"):
+                raise ValueError("Frozen features changed for an existing capture; refusing to save.")
+            if old and old.get("outcome", {}).get("final") and not row.get("outcome", {}).get("final"):
+                continue
+            merged[row["capture_key"]] = row
+        data = {"feature_version": 1, "updated_at": datetime.now(timezone.utc).isoformat(),
+                "rows": sorted(merged.values(), key=lambda r: (r["start_time"], r["capture_key"]))}
+        content = json.dumps(_json_safe(data), allow_nan=False).encode("utf-8")
+        bucket.upload(MLB_CAPTURE_LEARNING_FILE, content, {"content-type": "application/json", "upsert": "true"})
+        return {"success": True, "data": data}
+    except Exception as exc:
+        return {"success": False, "message": str(exc)}
+
+
+
+def load_mlb_capture_learning_dataset():
+    """Distinguish first use from a failed read; never silently erase history."""
+    bucket = get_supabase_client().storage.from_(MLB_STORAGE_BUCKET)
+    entries = bucket.list("mlb/capture_learning", {"search": "latest.json"})
+    if not any(x.get("name") == "latest.json" for x in entries):
+        return {"rows": []}
+    data = json.loads(bucket.download(MLB_CAPTURE_LEARNING_FILE).decode("utf-8"))
+    if not isinstance(data.get("rows"), list):
+        raise ValueError("Stored learning dataset is invalid.")
+    return data
