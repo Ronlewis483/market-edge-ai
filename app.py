@@ -11037,6 +11037,44 @@ if v3_history_ready:
         st.info("These results test historical proxies. Confirmed live lineups/starters require a separately validated feature/model path before use in predictions.")
 
 
+
+# ==========================================
+# FOCUSED MLB MODEL IMPROVEMENT EXPERIMENT
+# ==========================================
+if v3_history_ready:
+    st.divider()
+    st.subheader("⚾ Focused MLB Model Improvement Test")
+    st.caption("One smaller candidate versus the baseline. Uses your existing historical feature matrix, selects on an earlier season, and evaluates on the latest season. No new API calls.")
+    if st.button("Test Focused MLB Candidate", key="mlb_focused_model_test", type="primary"):
+        try:
+            import importlib
+            import dual_agent.mlb_research as research
+            if getattr(research, "MLB_MODEL_STRENGTHENING_VERSION", None) != 1:
+                importlib.invalidate_caches()
+                research = importlib.reload(research)
+            if getattr(research, "MLB_MODEL_STRENGTHENING_VERSION", None) != 1:
+                raise RuntimeError("Deploy the matching mlb_research.py model update.")
+            matrix = st.session_state.get("mlb_v3_historical_features")
+            if matrix is None or matrix.empty:
+                raise ValueError("Click Check Timing and Build MLB V3 Features first in this session.")
+            with st.spinner("Training the focused candidate and evaluating both models..."):
+                st.session_state["mlb_focused_model_result"] = research.run_mlb_focused_model_test(matrix)
+        except Exception as exc:
+            st.error("Focused model test stopped: " + str(exc))
+    focused = st.session_state.get("mlb_focused_model_result")
+    if focused:
+        st.write(f"Selected on {focused['development_season']}: {focused['selected_on_development']}. Evaluation season: {focused['evaluation_season']}.")
+        st.dataframe(focused["scores"], use_container_width=True, hide_index=True)
+        low, high = focused["accuracy_change_interval"]
+        st.write(f"Candidate accuracy change versus control: {100*focused['accuracy_change']:+.2f} percentage points. Paired date-bootstrap 95% interval: {100*low:+.2f} to {100*high:+.2f}.")
+        st.info(focused["recommendation"])
+        st.caption("Accuracy/AUC: higher is better. Brier/log loss: lower is better. Live models remain unchanged. " + focused["limitations"])
+        with st.expander("Candidate features and learned weights"):
+            st.dataframe(focused["coefficients"], use_container_width=True, hide_index=True)
+        st.download_button("Download Focused Model Predictions CSV", focused["predictions"].to_csv(index=False).encode("utf-8"),
+            file_name="mlb_focused_model_predictions.csv", mime="text/csv", key="mlb_focused_predictions_csv")
+
+
 def _mlb_pregame_storage_module():
     import importlib
     import dual_agent.supabase_db as storage
@@ -11083,219 +11121,68 @@ def _display_mlb_player_update_table(package):
     return pd.DataFrame(rows)
 
 # ==========================================
-# MLB UPCOMING GAME INFORMATION CAPTURE
+# AUTOMATIC MLB SCANNER DASHBOARD
 # ==========================================
 st.divider()
-st.subheader("⚾ MLB Upcoming Game Information")
-st.caption(
-    "Capture raw MLB feeds, probable starters, available lineups, rosters, player season/recent stats, "
-    "stadium forecasts, roster status, recent transactions, and MLB injury-report mentions. This is a manual capture with visible gaps and source errors."
-)
-mlb_capture_date = st.date_input("MLB game date", value=pd.Timestamp.now(tz="America/Chicago").date(), key="mlb_upcoming_capture_date")
-if st.button("Gather Upcoming MLB Game Information", key="gather_upcoming_mlb_information", type="primary"):
+st.subheader("⚾ Automatic MLB Information Scanner")
+st.caption("The background worker collects pregame information, saves features, and checks final results. This page reads saved data; it does not start the worker.")
+
+
+def _render_mlb_scanner_dashboard():
     try:
         import importlib
-        import dual_agent.mlb_research as mlb_current_collector
-        required_capture_version = 2
-        # Streamlit reruns app.py while imported modules can remain in memory.
-        # Reload only an older collector, and only when the user requests capture.
-        if getattr(mlb_current_collector, "MLB_UPCOMING_INFORMATION_SCHEMA_VERSION", None) != required_capture_version:
+        storage = _mlb_pregame_storage_module()
+        if getattr(storage, "MLB_SCANNER_STORAGE_VERSION", None) != 1:
             importlib.invalidate_caches()
-            mlb_current_collector = importlib.reload(mlb_current_collector)
-        if getattr(mlb_current_collector, "MLB_UPCOMING_INFORMATION_SCHEMA_VERSION", None) != required_capture_version:
-            raise RuntimeError(
-                "The loaded MLB collector does not support capture version 2. "
-                "Deploy the matching dual_agent/mlb_research.py before gathering again."
-            )
-        # Discard the prior capture before fetching; never display it as the new result.
-        st.session_state.pop("mlb_upcoming_information", None)
-        st.session_state.pop("mlb_upcoming_information_summary", None)
-        st.session_state.pop("mlb_upcoming_save_result", None)
-        with st.spinner("Gathering upcoming-game feeds and player context; a full slate can take several minutes..."):
-            package = mlb_current_collector.collect_mlb_upcoming_game_information(str(mlb_capture_date),
-                historical_games=st.session_state.get("mlb_v3_games"),
-                pitcher_logs=st.session_state.get("mlb_v2a_pitcher_logs"))
-        if package.get("schema_version") != required_capture_version or any(
-            (game.get("current_information", {}) or {}).get("schema_version") != required_capture_version
-            for game in package.get("games", [])
-        ):
-            raise RuntimeError("The collector returned an older capture format; no new result was stored.")
-        st.session_state["mlb_upcoming_information"] = package
-        st.session_state["mlb_upcoming_information_summary"] = mlb_current_collector.summarize_mlb_upcoming_information(package)
-        with st.spinner("Saving captured MLB game information permanently..."):
-            st.session_state["mlb_upcoming_save_result"] = _save_mlb_captured_information(package)
-    except Exception as exc:
-        st.error("Upcoming-game information collection stopped.")
-        st.exception(exc)
-if st.button("Load Latest Saved MLB Game Information", key="load_latest_saved_mlb_capture"):
-    try:
-        with st.spinner("Loading saved MLB game information..."):
-            stored = _mlb_pregame_storage_module().load_mlb_pregame_intelligence()
-        if stored is None:
-            st.warning("No saved capture could be loaded. It may not exist yet, or storage may be unavailable.")
+            storage = importlib.reload(storage)
+        if getattr(storage, "MLB_SCANNER_STORAGE_VERSION", None) != 1:
+            raise RuntimeError("Deploy the matching supabase_db.py scanner update.")
+        status = storage.load_mlb_scanner_status()
+        if not status:
+            st.info("No automatic scan has been recorded yet. Deploy the always-on scanner worker with its Supabase environment variables to enable it.")
         else:
-            loaded = stored.get("data")
-            if not isinstance(loaded, dict) or not isinstance(loaded.get("games"), list):
-                raise ValueError("Saved capture format is not recognized.")
-            from dual_agent.mlb_research import summarize_mlb_upcoming_information
-            st.session_state["mlb_upcoming_information"] = loaded
-            st.session_state["mlb_upcoming_information_summary"] = summarize_mlb_upcoming_information(loaded)
-            st.session_state["mlb_upcoming_save_result"] = {"success": True, "loaded": True, "saved_at": stored.get("saved_at")}
-    except Exception as exc:
-        st.error("Saved capture could not be loaded.")
-        st.exception(exc)
-package = st.session_state.get("mlb_upcoming_information")
-if package is not None:
-    save_result = st.session_state.get("mlb_upcoming_save_result", {})
-    if save_result.get("success"):
-        verb = "Loaded saved capture" if save_result.get("loaded") else "Capture permanently saved"
-        st.success(f"{verb}. Saved UTC: {save_result.get('saved_at', 'unknown')}")
-    elif save_result.get("archive_saved"):
-        st.warning("The permanent archive was saved, but the latest-copy update failed. The JSON download is still available.")
-        st.caption(f"Archive: {save_result.get('archive_file')}")
-        st.error(str(save_result.get("message", "Latest-copy update failed.")))
-    else:
-        st.warning("This capture has not been confirmed permanently saved. Download the JSON or retry saving below.")
-        if save_result.get("message"):
-            st.error(str(save_result["message"]))
-    if not save_result.get("success") and st.button("Retry Saving Captured MLB Information", key="retry_save_mlb_capture"):
-        with st.spinner("Saving captured MLB game information..."):
-            st.session_state["mlb_upcoming_save_result"] = _save_mlb_captured_information(package)
-        st.rerun()
-    st.caption(f"Captured date: {package['game_date']} | Package completed UTC: {package['snapshot_time']} | Capture version: {package.get('schema_version', 'older/unversioned')}")
-    if package.get("schema_version") != 2:
-        st.warning("This is a previous capture. Click Gather Upcoming MLB Game Information to collect the updated sources.")
-    summary = st.session_state["mlb_upcoming_information_summary"]
-    if summary.empty:
-        st.info("No eligible upcoming games were captured. Live/final games and games past scheduled first pitch are excluded.")
-    else:
-        st.dataframe(summary, use_container_width=True, hide_index=True)
-    captured_at = pd.Timestamp(package["snapshot_time"])
-    capture_age = max(0.0, (pd.Timestamp.now(tz="UTC") - captured_at).total_seconds() / 60)
-    st.caption(f"Capture age: {capture_age:.0f} minutes. Click Gather Upcoming MLB Game Information again to fetch current sources.")
-    if capture_age > 15:
-        st.warning("This capture is more than 15 minutes old. Refresh before relying on lineup or player availability information.")
-    st.warning("Still unverified: roof open/closed status, comprehensive breaking news, and sportsbook odds/props. Probable starters and feed lineups may change. No injury-report match does not establish that a player is healthy.")
-    missing_current_information = [
-        game.get("game_id") for game in package.get("games", [])
-        if "current_information" not in game
-    ]
-    if missing_current_information:
-        st.warning(
-            "This capture lacks the updated stadium forecast and player-status fields for "
-            f"{len(missing_current_information)} game(s). Replace dual_agent/mlb_research.py "
-            "with the latest complete file, reboot, and gather again. Existing MLB feed "
-            "information and the JSON download remain available below."
-        )
-    player_updates = _display_mlb_player_update_table(package)
-    if not player_updates.empty:
-        with st.expander("Current player status and update coverage", expanded=True):
-            st.dataframe(player_updates, use_container_width=True, hide_index=True)
-    st.markdown("Weather source: [Open-Meteo](https://open-meteo.com/) · Player news source: [MLB injury report](https://www.mlb.com/injury-report)")
-    for captured_game in package.get("games", []):
-        current = captured_game.get("current_information", {}) or {}
-        scheduled = captured_game.get("schedule", {}) or {}
-        with st.expander(f"Sources and conditions: {scheduled.get('away_team', '?')} at {scheduled.get('home_team', '?')}"):
-            weather = current.get("stadium_forecast")
-            if weather:
-                st.json({k: v for k, v in weather.items() if k != "venue_metadata"})
+            stamp = status.get("finished_at") or status.get("started_at")
+            st.write(f"Last scanner status: {status.get('state')} | UTC: {stamp}")
+            age = (pd.Timestamp.now(tz="UTC") - pd.Timestamp(stamp)).total_seconds()/60
+            if age > 10:
+                st.warning(f"Last scanner update was {age:.0f} minutes ago. Check the always-on scanner worker.")
+            if status.get("interval_exceeded"):
+                st.warning("The last scan took longer than three minutes. The worker avoids overlapping writes; this scan cadence needs tuning.")
+            if status.get("state") == "failed":
+                st.error("The last automatic scan failed. See details below.")
+            elif status.get("state") == "running":
+                st.info("A scan is running. The page will refresh its saved status automatically.")
             else:
-                st.info("Stadium forecast unavailable for this capture. See collection errors.")
-            mentions = [x for x in current.get("player_news", []) if x.get("report_match")]
-            if mentions:
-                st.dataframe(pd.DataFrame(mentions), use_container_width=True, hide_index=True)
-            st.caption("News excerpts are unclassified source mentions, not a medical or availability determination. Source publication/update times are unknown unless supplied.")
-            for team_side, team_update in current.get("teams", {}).items():
-                transactions = team_update.get("transactions", [])
-                st.caption(f"{team_side.title()} transactions fetched: {team_update.get('transactions_fetched_at')}")
-                if transactions:
-                    st.dataframe(pd.DataFrame([{"Player": (t.get("person", {}) or {}).get("fullName"),
-                        "Date": t.get("date") or t.get("effectiveDate"), "Description": t.get("description")}
-                        for t in transactions]), use_container_width=True, hide_index=True)
-            if current.get("errors"):
-                st.json(current["errors"])
-    if package.get("errors"):
-        with st.expander("Collection errors"):
-            st.json(package["errors"])
-    if package.get("skipped"):
-        with st.expander("Excluded games"):
-            st.json(package["skipped"])
-    # Portable JSON retains raw feeds. Persistent writeback requires the current
-    # supabase_db implementation; do not guess its function names/signatures.
-    import json as mlb_capture_json
-    from datetime import datetime as mlb_capture_datetime
-    def _mlb_capture_json_safe(value):
-        if isinstance(value, pd.DataFrame):
-            return [_mlb_capture_json_safe(row) for row in value.to_dict("records")]
-        if isinstance(value, dict):
-            return {str(k): _mlb_capture_json_safe(v) for k,v in value.items()}
-        if isinstance(value, (list, tuple)):
-            return [_mlb_capture_json_safe(v) for v in value]
-        if value is None:
-            return None
-        if isinstance(value, (pd.Timestamp, mlb_capture_datetime)):
-            return value.isoformat()
-        if hasattr(value, "item"):
-            return _mlb_capture_json_safe(value.item())
-        if isinstance(value, float) and (pd.isna(value) or value in [float("inf"),float("-inf")]):
-            return None
-        return value
-    capture_text = mlb_capture_json.dumps(_mlb_capture_json_safe(package), ensure_ascii=False, allow_nan=False)
-    capture_stamp = pd.Timestamp(package["snapshot_time"]).strftime("%Y%m%dT%H%M%S%fZ")
-    st.download_button("Download Timestamped MLB Game Information JSON", capture_text.encode("utf-8"),
-        file_name=f"mlb_pregame_{capture_stamp}.json", mime="application/json", key="download_upcoming_mlb_information")
-    st.caption("Gather automatically saves an archive and a latest copy. Save failures are shown above; JSON download remains available as a backup. Loading saved information does not refresh its source data.")
-
-
-    st.subheader("Saved Pregame Features and Final Results")
-    st.caption("Build features from this frozen capture and check final results. Unfinished games remain pending. The live prediction model is unchanged.")
-    if st.button("Build Saved Features and Check Results", key="mlb_capture_learning_update"):
-        try:
-            import importlib
+                st.success(f"Last scan captured {status.get('captured_games', 0)} games. Completed games stored: {status.get('completed_games', 0)}.")
+            if status.get("errors"):
+                with st.expander("Scanner source errors"):
+                    st.json(status["errors"])
+        stored = storage.load_mlb_pregame_intelligence()
+        if stored and isinstance(stored.get("data"), dict):
+            package = stored["data"]
             import dual_agent.mlb_research as research
-            storage = _mlb_pregame_storage_module()
-            if getattr(research, "MLB_CAPTURE_LEARNING_VERSION", None) != 1:
-                importlib.invalidate_caches()
-                research = importlib.reload(research)
-            if getattr(storage, "MLB_CAPTURE_LEARNING_STORAGE_VERSION", None) != 1:
-                storage = importlib.reload(storage)
-            if getattr(research, "MLB_CAPTURE_LEARNING_VERSION", None) != 1 or getattr(storage, "MLB_CAPTURE_LEARNING_STORAGE_VERSION", None) != 1:
-                raise RuntimeError("Deploy all three matching files: app.py, mlb_research.py, and supabase_db.py.")
-            with st.spinner("Building frozen pregame features and checking game results..."):
-                batch = research.build_mlb_capture_learning_rows(package)
-                previous = storage.load_mlb_capture_learning_dataset()
-                current_keys = {row["capture_key"] for row in batch["rows"]}
-                older = [row for row in previous["rows"] if row["capture_key"] not in current_keys]
-                refreshed = research.refresh_mlb_capture_learning_results(older)
-                batch["rows"] = refreshed["rows"] + batch["rows"]
-                batch["errors"].extend(refreshed["errors"])
-                saved = storage.update_mlb_capture_learning_dataset(batch)
-            st.session_state["mlb_capture_learning_result"] = saved
-            st.session_state["mlb_capture_learning_errors"] = batch.get("errors", [])
-        except Exception as exc:
-            st.session_state["mlb_capture_learning_result"] = {"success": False, "message": str(exc)}
-    learning = st.session_state.get("mlb_capture_learning_result")
-    if learning:
-        if not learning.get("success"):
-            st.error("Learning dataset was not saved: " + learning.get("message", "Unknown error"))
-        else:
-            records = learning["data"]["rows"]
-            ready = [r for r in records if r.get("outcome", {}).get("final")]
-            st.success(f"Feature dataset saved: {len(records)} captures; {len(ready)} have final results.")
+            st.caption(f"Latest archived slate: {package.get('game_date')} | Captured UTC: {package.get('snapshot_time')}")
+            st.dataframe(research.summarize_mlb_upcoming_information(package), use_container_width=True)
+            with st.expander("Player information from latest capture"):
+                st.dataframe(_display_mlb_player_update_table(package), use_container_width=True)
+        data = storage.load_mlb_capture_learning_dataset()
+        records = data["rows"]
+        latest = {}
+        for row in sorted(records, key=lambda r: r["capture_finished_at"]):
+            latest[row["game_id"]] = row
+        st.write(f"Saved pregame captures: {len(records)} | Unique games: {len(latest)}")
+        if latest:
             st.dataframe(pd.DataFrame([{"Game ID": r["game_id"], "Captured UTC": r["capture_finished_at"],
                 "Home": r.get("home_team"), "Away": r.get("away_team"),
                 "Status": r["outcome"].get("status"), "Home runs": r["outcome"].get("home_runs"),
-                "Away runs": r["outcome"].get("away_runs")} for r in records]), use_container_width=True)
-            # One row per game for model evaluation; use its latest eligible capture.
-            by_game = {}
-            for row in sorted(ready, key=lambda r: r["capture_finished_at"]):
-                by_game[row["game_id"]] = row
-            training = pd.DataFrame([dict(game_id=r["game_id"], start_time=r["start_time"],
-                capture_finished_at=r["capture_finished_at"], **r["features"], home_win=r["outcome"]["home_win"])
-                for r in by_game.values()])
-            st.download_button("Download Completed Game Features CSV", training.to_csv(index=False).encode("utf-8"),
-                file_name="mlb_completed_capture_features.csv", mime="text/csv", key="mlb_learning_csv")
-            st.info("These rows prepare a future test. A small number of completed games cannot establish an accuracy improvement. Unknown fields remain missing; no model has been retrained.")
-        if st.session_state.get("mlb_capture_learning_errors"):
-            with st.expander("Feature and result checks"):
-                st.json(st.session_state["mlb_capture_learning_errors"])
+                "Away runs": r["outcome"].get("away_runs")} for r in latest.values()]), use_container_width=True)
+        st.caption("The always-on worker targets a new scan every three minutes. Slow scans are reported and never overlap. Upcoming games are enriched within six hours of scheduled first pitch. Saved timestamps show source age. The live model has not been retrained.")
+    except Exception as exc:
+        st.error("Unable to load automatic scanner data: " + str(exc))
+
+
+# Refresh the read-only dashboard while open; collection runs independently.
+if hasattr(st, "fragment"):
+    st.fragment(run_every="60s")(_render_mlb_scanner_dashboard)()
+else:
+    _render_mlb_scanner_dashboard()
