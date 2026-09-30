@@ -9938,62 +9938,62 @@ if (
 # ==========================================
 
 mlb_v2a_games = st.session_state.get(
-"mlb_v2a_games"
+    "mlb_v2a_games"
 )
 
 cached_pitcher_logs = st.session_state.get(
-"mlb_v2a_pitcher_logs",
-pd.DataFrame(),
+    "mlb_v2a_pitcher_logs",
+    pd.DataFrame(),
 )
 
 if (
-mlb_v2a_games is not None
-and not mlb_v2a_games.empty
+    mlb_v2a_games is not None
+    and not mlb_v2a_games.empty
 ):
-st.divider()
+    st.divider()
 
-st.subheader(
-    "⚾ MLB V2A Pitcher Research"
-)
-
-missing_pitcher_games = (
-    get_missing_mlb_pitcher_log_games(
-        mlb_v2a_games,
-        cached_pitcher_logs,
+    st.subheader(
+        "⚾ MLB V2A Pitcher Research"
     )
-)
 
-total_games = len(mlb_v2a_games)
+    missing_pitcher_games = (
+        get_missing_mlb_pitcher_log_games(
+            mlb_v2a_games,
+            cached_pitcher_logs,
+        )
+    )
 
-coverage_games = (
-    total_games
-    - len(missing_pitcher_games)
-)
+    total_games = len(mlb_v2a_games)
 
-coverage_pct = (
-    coverage_games / total_games
-    if total_games
-    else 0.0
-)
+    coverage_games = (
+        total_games
+        - len(missing_pitcher_games)
+    )
 
-cache_col1, cache_col2, cache_col3 = (
-    st.columns(3)
-)
+    coverage_pct = (
+        coverage_games / total_games
+        if total_games
+        else 0.0
+    )
 
-cache_col1.metric(
-    "Pitcher Rows Collected",
-    f"{len(cached_pitcher_logs):,}",
-)
+    cache_col1, cache_col2, cache_col3 = (
+        st.columns(3)
+    )
 
-cache_col2.metric(
-    "Games Remaining",
-    f"{len(missing_pitcher_games):,}",
-)
+    cache_col1.metric(
+        "Pitcher Rows Collected",
+        f"{len(cached_pitcher_logs):,}",
+    )
 
-cache_col3.metric(
-    "V2A Data Progress",
-    f"{coverage_pct:.1%}",
-)
+    cache_col2.metric(
+        "Games Remaining",
+        f"{len(missing_pitcher_games):,}",
+    )
+
+    cache_col3.metric(
+        "V2A Data Progress",
+        f"{coverage_pct:.1%}",
+    )
 
 # ==========================================
 # PERMANENT PITCHER HISTORY BACKUP
