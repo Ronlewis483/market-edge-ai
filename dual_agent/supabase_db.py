@@ -263,3 +263,276 @@ def get_prediction_history(
             exc,
         )
         return []
+
+# ==========================================
+# MLB PITCHER HISTORY PERSISTENCE
+# ==========================================
+
+import io
+import pandas as pd
+
+
+MLB_STORAGE_BUCKET = "market-edge-data"
+
+MLB_PITCHER_HISTORY_FILE = (
+    "mlb/mlb_pitcher_history.csv"
+)
+
+
+def ensure_market_edge_storage_bucket():
+    """
+    Make sure the permanent Market Edge storage
+    bucket exists.
+
+    This is handled entirely through Python.
+    """
+
+    try:
+        client = get_supabase_client()
+
+        buckets = client.storage.list_buckets()
+
+        bucket_names = []
+
+        for bucket in buckets:
+
+            if isinstance(bucket, dict):
+                bucket_name = bucket.get("name")
+
+            else:
+                bucket_name = getattr(
+                    bucket,
+                    "name",
+                    None,
+                )
+
+            if bucket_name:
+                bucket_names.append(bucket_name)
+
+        if MLB_STORAGE_BUCKET not in bucket_names:
+
+            client.storage.create_bucket(
+                MLB_STORAGE_BUCKET,
+                options={
+                    "public": False,
+                },
+            )
+
+        return {
+            "success": True,
+        }
+
+    except Exception as exc:
+
+        return {
+            "success": False,
+            "error": str(exc),
+        }
+
+
+def save_mlb_pitcher_history(
+    pitcher_logs,
+):
+    """
+    Permanently save MLB historical pitcher logs
+    to Supabase Storage.
+
+    Existing records are deduplicated before saving.
+
+    This replaces the previous saved file so the
+    stored dataset always represents the newest
+    complete checkpoint.
+    """
+
+    try:
+
+        if (
+            pitcher_logs is None
+            or pitcher_logs.empty
+        ):
+            return {
+                "success": False,
+                "error": (
+                    "Pitcher history is empty. "
+                    "Nothing was saved."
+                ),
+            }
+
+        client = get_supabase_client()
+
+        bucket_result = (
+            ensure_market_edge_storage_bucket()
+        )
+
+        if not bucket_result.get(
+            "success",
+            False,
+        ):
+            return bucket_result
+
+        clean_logs = pitcher_logs.copy()
+
+        # ----------------------------------
+        # REMOVE DUPLICATE PITCHER/GAME ROWS
+        # ----------------------------------
+
+        dedupe_columns = [
+            column
+            for column in [
+                "game_id",
+                "pitcher_id",
+            ]
+            if column in clean_logs.columns
+        ]
+
+        if dedupe_columns:
+
+            clean_logs = (
+                clean_logs
+                .drop_duplicates(
+                    subset=dedupe_columns,
+                    keep="last",
+                )
+                .reset_index(drop=True)
+            )
+
+        # ----------------------------------
+        # CONVERT DATAFRAME TO CSV BYTES
+        # ----------------------------------
+
+        csv_bytes = clean_logs.to_csv(
+            index=False
+        ).encode("utf-8")
+
+        # ----------------------------------
+        # UPSERT PERMANENT FILE
+        # ----------------------------------
+
+        response = (
+            client.storage
+            .from_(MLB_STORAGE_BUCKET)
+            .upload(
+                path=MLB_PITCHER_HISTORY_FILE,
+                file=csv_bytes,
+                file_options={
+                    "content-type": "text/csv",
+                    "upsert": "true",
+                },
+            )
+        )
+
+        return {
+            "success": True,
+            "rows_saved": len(clean_logs),
+            "path": MLB_PITCHER_HISTORY_FILE,
+            "response": response,
+        }
+
+    except Exception as exc:
+
+        return {
+            "success": False,
+            "error": str(exc),
+        }
+
+
+def load_mlb_pitcher_history():
+    """
+    Load the permanently saved MLB pitcher-history
+    dataset from Supabase Storage.
+
+    Returns an empty DataFrame if no permanent
+    dataset exists yet.
+    """
+
+    try:
+
+        client = get_supabase_client()
+
+        bucket_result = (
+            ensure_market_edge_storage_bucket()
+        )
+
+        if not bucket_result.get(
+            "success",
+            False,
+        ):
+            return pd.DataFrame()
+
+        file_bytes = (
+            client.storage
+            .from_(MLB_STORAGE_BUCKET)
+            .download(
+                MLB_PITCHER_HISTORY_FILE
+            )
+        )
+
+        if not file_bytes:
+            return pd.DataFrame()
+
+        pitcher_logs = pd.read_csv(
+            io.BytesIO(file_bytes)
+        )
+
+        # ----------------------------------
+        # RESTORE IMPORTANT DATA TYPES
+        # ----------------------------------
+
+        if "start_time" in pitcher_logs.columns:
+
+            pitcher_logs["start_time"] = (
+                pd.to_datetime(
+                    pitcher_logs["start_time"],
+                    utc=True,
+                    errors="coerce",
+                )
+            )
+
+        for column in [
+            "game_id",
+            "pitcher_id",
+        ]:
+
+            if column in pitcher_logs.columns:
+
+                pitcher_logs[column] = (
+                    pd.to_numeric(
+                        pitcher_logs[column],
+                        errors="coerce",
+                    )
+                )
+
+        # ----------------------------------
+        # REMOVE DUPLICATES AS SAFETY
+        # ----------------------------------
+
+        dedupe_columns = [
+            column
+            for column in [
+                "game_id",
+                "pitcher_id",
+            ]
+            if column in pitcher_logs.columns
+        ]
+
+        if dedupe_columns:
+
+            pitcher_logs = (
+                pitcher_logs
+                .drop_duplicates(
+                    subset=dedupe_columns,
+                    keep="last",
+                )
+                .reset_index(drop=True)
+            )
+
+        return pitcher_logs
+
+    except Exception as exc:
+
+        print(
+            "MLB pitcher-history load failed:",
+            exc,
+        )
+
+        return pd.DataFrame()
