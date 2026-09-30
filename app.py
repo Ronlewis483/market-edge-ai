@@ -9705,7 +9705,7 @@ if (
                         working_logs,
                     )
 
-                                        # ------------------------------
+                    # ------------------------------
                     # CHECKPOINT SUCCESSFUL WORK
                     # ------------------------------
 
@@ -9730,16 +9730,16 @@ if (
                             )
                         )
 
-                        if not save_result.get(
-                            "success",
-                            False,
-                        ):
+                    if not save_result.get(
+                        "success",
+                        False,
+                    ):
 
-                            raise RuntimeError(
-                                "Pitcher checkpoint was collected "
-                                "but could not be permanently saved: "
-                                f"{save_result.get('error')}"
-                            )
+                    raise RuntimeError(
+                        "Pitcher checkpoint was collected "
+                        "but could not be permanently saved: "
+                        f"{save_result.get('error')}"
+                    )
 
                     total_requested += (
                         batch_requested
@@ -9776,8 +9776,6 @@ if (
 
                     if batch_requested == 0:
                         break
-
-            except Exception as exc:
 
                 except Exception as exc:
 
