@@ -2965,3 +2965,460 @@ def build_mlb_daily_pregame_intelligence(game_date=None, timeout=30):
         "snapshots_built": int(len(snapshots)),
         "errors": errors,
     }
+
+# ==========================================
+# MLB DAILY PREGAME ENRICHMENT LAYER
+# ==========================================
+
+MLB_PEOPLE_URL = "https://statsapi.mlb.com/api/v1/people/{player_id}"
+MLB_PERSON_STATS_URL = "https://statsapi.mlb.com/api/v1/people/{player_id}/stats"
+MLB_TEAM_STATS_URL = "https://statsapi.mlb.com/api/v1/teams/{team_id}/stats"
+MLB_ROSTER_URL = "https://statsapi.mlb.com/api/v1/teams/{team_id}/roster"
+
+
+def _mlb_api_get_json(url, params=None, timeout=30, session=None):
+    """Small shared MLB request helper used by the enrichment layer."""
+    client = session or requests
+    response = client.get(url, params=params, timeout=timeout)
+    response.raise_for_status()
+    return response.json()
+
+
+def _mlb_first_split(payload):
+    """Return the first MLB Stats API stat split, or an empty dict."""
+    stats = (payload or {}).get("stats", []) or []
+    for block in stats:
+        splits = block.get("splits", []) or []
+        if splits:
+            return splits[0].get("stat", {}) or {}
+    return {}
+
+
+def fetch_mlb_player_profile(player_id, timeout=30, session=None):
+    """Public MLB player profile facts useful to pregame modeling."""
+    if player_id is None:
+        return {}
+
+    payload = _mlb_api_get_json(
+        MLB_PEOPLE_URL.format(player_id=int(player_id)),
+        params={"hydrate": "currentTeam"},
+        timeout=timeout,
+        session=session,
+    )
+
+    people = payload.get("people", []) or []
+    if not people:
+        return {}
+
+    person = people[0] or {}
+
+    return {
+        "player_id": person.get("id"),
+        "full_name": person.get("fullName"),
+        "birth_date": person.get("birthDate"),
+        "current_age": person.get("currentAge"),
+        "height": person.get("height"),
+        "weight": person.get("weight"),
+        "active": person.get("active"),
+        "primary_position": person.get("primaryPosition", {}) or {},
+        "bat_side": person.get("batSide", {}) or {},
+        "pitch_hand": person.get("pitchHand", {}) or {},
+        "mlb_debut_date": person.get("mlbDebutDate"),
+        "current_team": person.get("currentTeam", {}) or {},
+    }
+
+
+def fetch_mlb_player_season_stats(
+    player_id, season, group, timeout=30, session=None,
+):
+    if player_id is None or season is None:
+        return {}
+
+    payload = _mlb_api_get_json(
+        MLB_PERSON_STATS_URL.format(player_id=int(player_id)),
+        params={
+            "stats": "season",
+            "group": str(group),
+            "season": int(season),
+        },
+        timeout=timeout,
+        session=session,
+    )
+    return _mlb_first_split(payload)
+
+
+def fetch_mlb_player_recent_stats(
+    player_id, group, end_date, days=14, timeout=30, session=None,
+):
+    """Rolling stats ending the day before the game to avoid same-game leakage."""
+    if player_id is None or end_date is None:
+        return {}
+
+    end_ts = pd.Timestamp(end_date)
+    if end_ts.tzinfo is not None:
+        end_ts = end_ts.tz_convert("UTC").tz_localize(None)
+
+    safe_end = end_ts.normalize() - pd.Timedelta(days=1)
+    safe_start = safe_end - pd.Timedelta(days=max(int(days) - 1, 0))
+
+    payload = _mlb_api_get_json(
+        MLB_PERSON_STATS_URL.format(player_id=int(player_id)),
+        params={
+            "stats": "byDateRange",
+            "group": str(group),
+            "startDate": safe_start.strftime("%m/%d/%Y"),
+            "endDate": safe_end.strftime("%m/%d/%Y"),
+        },
+        timeout=timeout,
+        session=session,
+    )
+    return _mlb_first_split(payload)
+
+
+def fetch_mlb_team_season_stats(
+    team_id, season, group, timeout=30, session=None,
+):
+    if team_id is None or season is None:
+        return {}
+
+    payload = _mlb_api_get_json(
+        MLB_TEAM_STATS_URL.format(team_id=int(team_id)),
+        params={
+            "stats": "season",
+            "group": str(group),
+            "season": int(season),
+        },
+        timeout=timeout,
+        session=session,
+    )
+    return _mlb_first_split(payload)
+
+
+def fetch_mlb_active_roster(team_id, roster_date, timeout=30, session=None):
+    if team_id is None:
+        return []
+
+    payload = _mlb_api_get_json(
+        MLB_ROSTER_URL.format(team_id=int(team_id)),
+        params={
+            "rosterType": "active",
+            "date": pd.Timestamp(roster_date).strftime("%Y-%m-%d"),
+        },
+        timeout=timeout,
+        session=session,
+    )
+
+    rows = []
+    for entry in payload.get("roster", []) or []:
+        person = entry.get("person", {}) or {}
+        rows.append({
+            "player_id": person.get("id"),
+            "player_name": person.get("fullName"),
+            "jersey_number": entry.get("jerseyNumber"),
+            "status": entry.get("status", {}) or {},
+            "position": entry.get("position", {}) or {},
+        })
+    return rows
+
+
+def _mlb_pitcher_history_before_game(pitcher_logs, pitcher_id, game_time):
+    if (
+        pitcher_logs is None
+        or pitcher_logs.empty
+        or pitcher_id is None
+        or game_time is None
+    ):
+        return []
+
+    logs = pitcher_logs.copy()
+    if "pitcher_id" not in logs.columns or "start_time" not in logs.columns:
+        return []
+
+    logs["pitcher_id"] = pd.to_numeric(logs["pitcher_id"], errors="coerce")
+    logs["start_time"] = pd.to_datetime(
+        logs["start_time"], utc=True, errors="coerce"
+    )
+    cutoff = pd.to_datetime(game_time, utc=True, errors="coerce")
+
+    if pd.isna(cutoff):
+        return []
+
+    selected = logs[
+        (logs["pitcher_id"] == int(pitcher_id))
+        & (logs["start_time"] < cutoff)
+    ].sort_values("start_time")
+
+    columns = [
+        c for c in (
+            "outs", "hits", "earned_runs", "walks", "strikeouts", "home_runs"
+        )
+        if c in selected.columns
+    ]
+    return selected[columns].to_dict("records") if not selected.empty else []
+
+
+def _mlb_team_history_before_game(historical_games, team_id, game_time):
+    if (
+        historical_games is None
+        or historical_games.empty
+        or team_id is None
+        or game_time is None
+    ):
+        return []
+
+    games = historical_games.copy()
+    required = {
+        "start_time", "home_team_id", "away_team_id",
+        "home_score", "away_score",
+    }
+    if not required.issubset(games.columns):
+        return []
+
+    games["start_time"] = pd.to_datetime(
+        games["start_time"], utc=True, errors="coerce"
+    )
+    cutoff = pd.to_datetime(game_time, utc=True, errors="coerce")
+    if pd.isna(cutoff):
+        return []
+
+    team_id = int(team_id)
+    home_ids = pd.to_numeric(games["home_team_id"], errors="coerce")
+    away_ids = pd.to_numeric(games["away_team_id"], errors="coerce")
+
+    prior = games[
+        (games["start_time"] < cutoff)
+        & ((home_ids == team_id) | (away_ids == team_id))
+    ].sort_values(["start_time", "game_id"])
+
+    history = []
+    for _, game in prior.iterrows():
+        home_id = int(game["home_team_id"])
+        home_score = _safe_number(game["home_score"])
+        away_score = _safe_number(game["away_score"])
+
+        if home_id == team_id:
+            runs_for, runs_against = home_score, away_score
+        else:
+            runs_for, runs_against = away_score, home_score
+
+        win = 1.0 if runs_for > runs_against else 0.0 if runs_for < runs_against else 0.5
+        history.append({
+            "win": win,
+            "runs_for": runs_for,
+            "runs_against": runs_against,
+            "run_diff": runs_for - runs_against,
+        })
+    return history
+
+
+def enrich_mlb_pregame_game_snapshot(
+    snapshot,
+    historical_games=None,
+    pitcher_logs=None,
+    timeout=30,
+    recent_days=14,
+    session=None,
+):
+    """Create the shared game/player knowledge object for winner + prop models."""
+    if not snapshot:
+        return {}
+
+    enriched = dict(snapshot)
+    schedule = snapshot.get("schedule", {}) or {}
+    game_time = snapshot.get("start_time") or schedule.get("start_time")
+    season = schedule.get("season_id")
+
+    if season is None and game_time is not None:
+        season = pd.Timestamp(game_time).year
+
+    game_date = schedule.get("game_date")
+    if game_date is None and game_time is not None:
+        game_date = pd.Timestamp(game_time).date()
+
+    team_enrichment = {}
+    player_enrichment = {}
+    errors = []
+    client = session or requests.Session()
+
+    for side in ("home", "away"):
+        team = snapshot.get(f"{side}_team", {}) or {}
+        team_id = team.get("id") or schedule.get(f"{side}_team_id")
+
+        history = _mlb_team_history_before_game(
+            historical_games, team_id, game_time
+        )
+
+        context = {
+            "team_id": team_id,
+            "team_name": team.get("name") or schedule.get(f"{side}_team"),
+            "historical_features": calculate_team_features(history),
+            "active_roster": [],
+            "season_hitting": {},
+            "season_pitching": {},
+        }
+
+        try:
+            context["active_roster"] = fetch_mlb_active_roster(
+                team_id, game_date, timeout=timeout, session=client
+            )
+        except (requests.RequestException, ValueError, TypeError) as exc:
+            errors.append({
+                "scope": "team_roster", "side": side,
+                "team_id": team_id, "error": str(exc),
+            })
+
+        for group, key in (
+            ("hitting", "season_hitting"),
+            ("pitching", "season_pitching"),
+        ):
+            try:
+                context[key] = fetch_mlb_team_season_stats(
+                    team_id, season, group, timeout=timeout, session=client
+                )
+            except (requests.RequestException, ValueError, TypeError) as exc:
+                errors.append({
+                    "scope": f"team_{group}", "side": side,
+                    "team_id": team_id, "error": str(exc),
+                })
+
+        team_enrichment[side] = context
+
+    seen_players = set()
+
+    for player in snapshot.get("players", []) or []:
+        player_id = player.get("player_id")
+        if player_id is None or player_id in seen_players:
+            continue
+        seen_players.add(player_id)
+
+        position = str(player.get("position") or "").upper()
+        probable = snapshot.get("probable_pitchers", {}) or {}
+        probable_ids = {
+            (probable.get("home", {}) or {}).get("id"),
+            (probable.get("away", {}) or {}).get("id"),
+        }
+
+        is_pitcher = (
+            position == "P"
+            or player.get("is_bullpen")
+            or player_id in probable_ids
+        )
+        group = "pitching" if is_pitcher else "hitting"
+
+        item = {
+            "player_id": player_id,
+            "player_name": player.get("player_name"),
+            "side": player.get("side"),
+            "position": player.get("position"),
+            "batting_order": player.get("batting_order"),
+            "is_bullpen": bool(player.get("is_bullpen")),
+            "stat_group": group,
+            "profile": {},
+            "season_stats": {},
+            "recent_stats": {},
+        }
+
+        try:
+            item["profile"] = fetch_mlb_player_profile(
+                player_id, timeout=timeout, session=client
+            )
+        except (requests.RequestException, ValueError, TypeError) as exc:
+            errors.append({
+                "scope": "player_profile",
+                "player_id": player_id, "error": str(exc),
+            })
+
+        try:
+            item["season_stats"] = fetch_mlb_player_season_stats(
+                player_id, season, group, timeout=timeout, session=client
+            )
+        except (requests.RequestException, ValueError, TypeError) as exc:
+            errors.append({
+                "scope": "player_season",
+                "player_id": player_id, "error": str(exc),
+            })
+
+        try:
+            item["recent_stats"] = fetch_mlb_player_recent_stats(
+                player_id, group, game_date, days=recent_days,
+                timeout=timeout, session=client
+            )
+        except (requests.RequestException, ValueError, TypeError) as exc:
+            errors.append({
+                "scope": "player_recent",
+                "player_id": player_id, "error": str(exc),
+            })
+
+        if is_pitcher:
+            history = _mlb_pitcher_history_before_game(
+                pitcher_logs, player_id, game_time
+            )
+            item["historical_pitching_features"] = (
+                calculate_pitcher_features(history)
+            )
+
+        player_enrichment[str(player_id)] = item
+
+    enriched["enrichment"] = {
+        "season": season,
+        "game_date": str(game_date) if game_date is not None else None,
+        "recent_window_days": int(recent_days),
+        "teams": team_enrichment,
+        "players": player_enrichment,
+        "errors": errors,
+    }
+    return enriched
+
+
+def build_mlb_enriched_daily_pregame_intelligence(
+    game_date=None,
+    historical_games=None,
+    pitcher_logs=None,
+    timeout=30,
+    recent_days=14,
+):
+    """Build one enriched daily package shared by winner and player-prop models."""
+    package = build_mlb_daily_pregame_intelligence(
+        game_date=game_date,
+        timeout=timeout,
+    )
+
+    games = package.get("games", []) or []
+    if not games:
+        package["enriched"] = True
+        package["enrichment_errors"] = []
+        return package
+
+    session = requests.Session()
+    enriched_games = []
+    all_errors = list(package.get("errors", []) or [])
+
+    for snapshot in games:
+        try:
+            enriched = enrich_mlb_pregame_game_snapshot(
+                snapshot,
+                historical_games=historical_games,
+                pitcher_logs=pitcher_logs,
+                timeout=timeout,
+                recent_days=recent_days,
+                session=session,
+            )
+            enriched_games.append(enriched)
+            all_errors.extend(
+                (enriched.get("enrichment", {}) or {}).get("errors", []) or []
+            )
+        except (requests.RequestException, ValueError, TypeError) as exc:
+            all_errors.append({
+                "scope": "game_enrichment",
+                "game_id": snapshot.get("game_id"),
+                "error": str(exc),
+            })
+            enriched_games.append(snapshot)
+
+    package["games"] = enriched_games
+    package["enriched"] = True
+    package["enriched_games"] = int(len(enriched_games))
+    package["enrichment_errors"] = all_errors
+    package["enrichment_time"] = datetime.now(timezone.utc).isoformat()
+    return package
+
