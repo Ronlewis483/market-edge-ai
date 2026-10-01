@@ -2,17 +2,28 @@
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
+import os
+import tempfile
+import time
 import urllib.request
 import pandas as pd
 
 
-def completion_time(payload):
+def completion_time(payload,return_details=False):
     plays=payload.get('allPlays',[])
-    if not plays or not all(p.get('about',{}).get('isComplete') for p in plays):
-        raise ValueError('Incomplete play history')
+    if not plays:raise ValueError('Empty play history')
+    incomplete=[p for p in plays if not p.get('about',{}).get('isComplete')]
+    if any(p.get('result',{}).get('eventType')!='game_advisory' for p in incomplete):
+        raise ValueError('Incomplete baseball play history')
     ended=[pd.to_datetime(p['about']['endTime'],utc=True) for p in plays if p.get('about',{}).get('endTime')]
-    if len(ended)!=len(plays): raise ValueError('Missing completed-play timestamps')
-    return max(ended).isoformat()
+    if len(ended)!=len(plays) or any(pd.isna(t) for t in ended):raise ValueError('Missing completed-play timestamps')
+    if not any(p.get('about',{}).get('isComplete') for p in plays):raise ValueError('No completed baseball plays')
+    # A rain-delay advisory is not proof of when the game was declared final.
+    # The caller requests only final, non-resumed games. Use a conservative
+    # availability buffer rather than inventing an exact completion time.
+    kind='advisory_48h_buffer' if incomplete else 'completed_plays'
+    stamp=max(ended)+(pd.Timedelta(hours=48) if incomplete else pd.Timedelta(0))
+    return (stamp.isoformat(),kind) if return_details else stamp.isoformat()
 
 
 def collect_bullpen_completion_times(games,schedules,cache_root,progress=None):
@@ -37,19 +48,37 @@ def collect_bullpen_completion_times(games,schedules,cache_root,progress=None):
     def fetch(gid):
         path=root/f'{gid}_v1.json'
         if path.exists():
-            value=json.loads(path.read_text());pd.to_datetime(value['ended'],utc=True)
-            return value['ended']
-        with urllib.request.urlopen(f'https://statsapi.mlb.com/api/v1/game/{gid}/playByPlay',timeout=25) as response:
-            ended=completion_time(json.load(response))
-        path.write_text(json.dumps({'game_id':gid,'ended':ended,'source':'MLB completed play history'}))
-        return ended
-    records={};errors=[]
+            try:
+                value=json.loads(path.read_text());stamp=pd.to_datetime(value['ended'],utc=True)
+                if pd.isna(stamp):raise ValueError('Invalid cached timestamp')
+                return value['ended'],value.get('eligibility_kind','completed_plays')
+            except (ValueError,KeyError,TypeError,OSError):pass
+        error=None
+        for attempt in range(3):
+            temporary=None
+            try:
+                with urllib.request.urlopen(f'https://statsapi.mlb.com/api/v1/game/{gid}/playByPlay',timeout=25) as response:
+                    ended,kind=completion_time(json.load(response),return_details=True)
+                value={'game_id':gid,'ended':ended,'eligibility_kind':kind,'source':'MLB completed play history'}
+                with tempfile.NamedTemporaryFile(mode='w',dir=root,prefix=f'{gid}_',suffix='.tmp',delete=False) as handle:
+                    temporary=Path(handle.name);json.dump(value,handle);handle.flush();os.fsync(handle.fileno())
+                os.replace(temporary,path)
+                return ended,kind
+            except Exception as exc:
+                error=exc
+                if attempt<2:time.sleep(.5*(attempt+1))
+            finally:
+                if temporary is not None:temporary.unlink(missing_ok=True)
+        raise ValueError(f'Game {gid} failed after 3 attempts: {error}') from error
+    records={};errors=[];conservative=[]
     with ThreadPoolExecutor(max_workers=6) as pool:
         pending={pool.submit(fetch,gid):gid for gid in requested}
         for index,future in enumerate(as_completed(pending),1):
             gid=pending[future]
-            try:records[gid]=future.result()
+            try:
+                ended,kind=future.result();records[gid]=ended
+                if kind=='advisory_48h_buffer':conservative.append(gid)
             except Exception as exc:errors.append({'game_id':gid,'error':str(exc)})
             if progress and (index%10==0 or index==len(pending)):progress(index,len(pending))
     if errors:raise ValueError(f'Recent bullpen completion history incomplete: {len(errors)} failures; cached successes retained. First: {errors[0]}')
-    return records,{'requested_games':len(requested),'verified_games':len(records),'window_days':3,'source':'MLB completed play history','suspended_resumed_games':'excluded'}
+    return records,{'requested_games':len(requested),'verified_games':len(records)-len(conservative),'conservative_game_ids':sorted(conservative),'advisory_note':'Final rain-advisory games use last recorded event plus 48 hours; before that point, affected recent workload remains unknown.','window_days':3,'source':'MLB completed play history','suspended_resumed_games':'excluded'}
