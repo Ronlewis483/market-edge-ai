@@ -5542,6 +5542,25 @@ def _attach_mlb_current_information(snapshot, session, capture_cache, timeout=20
         updates["stadium_forecast"] = fetch_mlb_stadium_forecast(snapshot, timeout=timeout, session=session)
     except (requests.RequestException, ValueError, TypeError, KeyError) as exc:
         updates["stadium_forecast"] = None; failed("stadium_forecast", exc)
+    # Stadium metadata remains collectible even if the weather provider fails.
+    forecast = updates.get("stadium_forecast") or {}
+    if forecast.get("venue_metadata"):
+        updates["stadium_metadata"] = {"data": forecast["venue_metadata"],
+            "fetched_at": forecast["fetched_at"], "source": "MLB Stats API"}
+    else:
+        try:
+            venue_id = (snapshot.get("venue", {}) or {}).get("id")
+            if venue_id is None:
+                raise ValueError("Venue ID missing")
+            payload = _mlb_api_get_json(f"https://statsapi.mlb.com/api/v1/venues/{int(venue_id)}",
+                params={"hydrate": "location,fieldInfo"}, timeout=timeout, session=session)
+            venues = payload.get("venues", []) or []
+            if not venues:
+                raise ValueError("Venue metadata unavailable")
+            updates["stadium_metadata"] = {"data": venues[0],
+                "fetched_at": datetime.now(timezone.utc).isoformat(), "source": "MLB Stats API"}
+        except (requests.RequestException, ValueError, TypeError) as exc:
+            failed("stadium_metadata", exc)
     report_url = "https://www.mlb.com/injury-report"
     try:
         if "injury_report" not in capture_cache:
@@ -5675,6 +5694,8 @@ def build_mlb_capture_learning_rows(package, timeout=30, session=None):
                 row["outcome"] = outcome
             except Exception as exc:
                 errors.append({"game_id": gid, "error": f"Outcome fetch failed: {exc}"})
+            row["context_version"] = MLB_COMPLETE_CONTEXT_VERSION
+            row["context_features"] = build_mlb_complete_context_features(game)
             rows.append(row)
     finally:
         if session is None:
@@ -5826,7 +5847,7 @@ def run_mlb_focused_model_test(features):
             "feature_names": MLB_COMPACT_HISTORY_FEATURES,
             "limitations": "Latest season was examined in earlier experiments. Historical features assume prior-date outcomes were available; this is not an untouched or prospective test."}
 
-MLB_SAVED_PLAYER_MODEL_VERSION = 1
+MLB_SAVED_PLAYER_MODEL_VERSION = 2
 MLB_CAPTURE_TEAM_COLUMNS = ["season_hitting_ops_diff", "season_pitching_era_diff", "season_pitching_whip_diff"]
 MLB_CAPTURE_PLAYER_COLUMNS = [
     "probable_starter_season_stats_era_diff", "probable_starter_season_stats_whip_diff",
@@ -5869,6 +5890,10 @@ def build_mlb_saved_player_matrix(dataset):
         label = outcome.get("home_win")
         row["home_win"] = int(label) if outcome.get("final") and label in (0,1) and pd.notna(observed) and observed >= start else np.nan
         row["result_observed_at"] = observed
+        extras = record.get("context_features", {}) or {}
+        for key in MLB_COMPLETE_CONTEXT_COLUMNS:
+            v = pd.to_numeric(extras.get(key), errors="coerce")
+            row[key] = float(v) if pd.notna(v) and np.isfinite(v) else np.nan
         rows.append(row)
     if not rows:
         return {"matrix": pd.DataFrame(), "excluded": excluded}
@@ -5878,12 +5903,15 @@ def build_mlb_saved_player_matrix(dataset):
 
 def _fit_mlb_saved_player_bundle(train, columns):
     """Serializable numeric model; all preprocessing fitted to training rows."""
+    available = [key for key in columns if train[key].notna().any()]
+    unavailable = [key for key in columns if key not in available]
+    columns = available
     X = train[columns].astype(float)
     median = X.median().fillna(0.0)
     scaler = StandardScaler().fit(X.fillna(median))
     model = LogisticRegression(C=0.25, max_iter=3000, random_state=42)
     model.fit(scaler.transform(X.fillna(median)), train.home_win.astype(int))
-    return {"columns": list(columns), "median": median.tolist(), "mean": scaler.mean_.tolist(),
+    return {"columns": list(columns), "unavailable_columns": unavailable, "median": median.tolist(), "mean": scaler.mean_.tolist(),
             "scale": scaler.scale_.tolist(), "weights": model.coef_[0].tolist(),
             "intercept": float(model.intercept_[0]), "training_games": len(train),
             "latest_result_observed_at": train.result_observed_at.max().isoformat()}
@@ -5920,8 +5948,16 @@ def run_mlb_saved_player_model(dataset, min_train_games=200, now=None):
         return result
     completed = matrix[matrix.home_win.notna() & matrix.result_observed_at.le(now)].copy()
     result["completed_games"] = len(completed)
+    base_player = MLB_CAPTURE_TEAM_COLUMNS + MLB_CAPTURE_PLAYER_COLUMNS
     configs = [("Saved team-stat control", MLB_CAPTURE_TEAM_COLUMNS),
-               ("Saved pitcher and lineup candidate", MLB_CAPTURE_TEAM_COLUMNS + MLB_CAPTURE_PLAYER_COLUMNS)]
+               ("Saved pitcher and lineup candidate", base_player),
+               ("Players plus availability and workload", base_player + MLB_AVAILABILITY_WORKLOAD_COLUMNS),
+               ("Players plus weather and stadium", base_player + MLB_WEATHER_COLUMNS + MLB_STADIUM_COLUMNS),
+               ("Complete pregame candidate", base_player + MLB_COMPLETE_CONTEXT_COLUMNS)]
+    result["feature_coverage"] = [{"Feature": column, "Games with values": int(matrix[column].notna().sum()),
+                                  "Eligible games": len(matrix)} for column in MLB_COMPLETE_CONTEXT_COLUMNS]
+    result["equation"] = "P(home win) = 1 / (1 + exp(-(intercept + sum(weight_j * (feature_j - training_mean_j) / training_scale_j))))"
+    result["context_note"] = "Coefficients are learned from training outcomes. Missing values use training medians; features with no training observations are omitted. Outdoor weather is suppressed for known closed roofs. No injury-report mention is treated as a confirmed injury. Stadium updates require dated pregame observations."
     with threadpool_limits(limits=2):
         predictions = []
         for date, current in completed.groupby(completed.start_time.dt.floor("D"), sort=True):
@@ -5960,4 +5996,133 @@ def run_mlb_saved_player_model(dataset, min_train_games=200, now=None):
         else:
             result["message"] = f"Player features are connected. {len(completed)} usable completed games; need {min_train_games} with both outcome classes to fit."
     result["comparison_note"] = "The control uses saved team statistics on the same captured games; it is not the frozen V1 benchmark. Feed lineups and probable pitchers are observations, not confirmed identities."
+    return result
+
+# Complete captured-context schema. Values must come from frozen pregame sources.
+MLB_COMPLETE_CONTEXT_VERSION = 1
+MLB_AVAILABILITY_WORKLOAD_COLUMNS = [
+    "lineup_injured_roster_count_diff", "recent_transactions_count_diff",
+    "starter_recent_window_outs_diff", "bullpen_recent_window_outs_diff",
+]
+MLB_WEATHER_COLUMNS = ["forecast_temperature_f", "forecast_wind_mph", "forecast_humidity_pct",
+    "forecast_precipitation_probability_pct", "wind_out_to_center_mph", "wind_cross_field_mph",
+    "temperature_x_lineup_ops_diff", "wind_out_x_lineup_ops_diff"]
+MLB_STADIUM_COLUMNS = ["stadium_left_line_ft", "stadium_center_field_ft", "stadium_right_line_ft",
+    "stadium_elevation_ft", "roof_closed", "outdoor_exposure", "turf_surface",
+    "stadium_update_count", "stadium_center_x_lineup_ops_diff"]
+MLB_COMPLETE_CONTEXT_COLUMNS = MLB_AVAILABILITY_WORKLOAD_COLUMNS + MLB_WEATHER_COLUMNS + MLB_STADIUM_COLUMNS
+
+
+def build_mlb_complete_context_features(game):
+    """Derive numerical context only from evidence frozen before first pitch.
+
+    stadium_observations is an optional provider-neutral input: each record needs
+    venue_id, observed_at, effective_at, and explicit measured fields. No inferred
+    roof status, field orientation, or unverified news becomes a known condition.
+    """
+    import math
+    result = {key: None for key in MLB_COMPLETE_CONTEXT_COLUMNS}
+    def number(v):
+        try:
+            v = float(v)
+            return v if math.isfinite(v) else None
+        except (ValueError, TypeError):
+            return None
+    finished = pd.to_datetime(game.get("capture_finished_at"), utc=True, errors="coerce")
+    start = pd.to_datetime(game.get("start_time"), utc=True, errors="coerce")
+    if pd.isna(finished) or pd.isna(start) or finished >= start:
+        return result
+    def before(v):
+        t = pd.to_datetime(v, utc=True, errors="coerce")
+        return pd.notna(t) and t <= finished and t < start
+    updates = game.get("current_information", {}) or {}
+    enrichment = game.get("enrichment", {}) or {}
+    players = enrichment.get("players", {}) or {}
+    context = game.get("team_context", {}) or {}
+    probable = game.get("probable_pitchers", {}) or {}
+    side_values = {}
+    for side in ("home", "away"):
+        values = {}
+        team = (updates.get("teams", {}) or {}).get(side, {}) or {}
+        order = {str(pid) for pid in (context.get(side, {}) or {}).get("batting_order", []) or []}
+        if before(team.get("roster_fetched_at")):
+            statuses = [(entry.get("status", {}) or {}).get("description", "")
+                        for entry in team.get("roster", []) if str((entry.get("person", {}) or {}).get("id")) in order]
+            if len(statuses) == len(order) and order and all(statuses):
+                values["lineup_injured_roster_count"] = sum("injur" in s.lower() or "disabled" in s.lower() for s in statuses)
+        if before(team.get("transactions_fetched_at")):
+            values["recent_transactions_count"] = len(team.get("transactions", []))
+        pid = (probable.get(side, {}) or {}).get("id")
+        starter = players.get(str(pid), players.get(pid, {})) or {}
+        innings = (starter.get("recent_stats", {}) or {}).get("inningsPitched")
+        if innings is not None:
+            try: values["starter_recent_window_outs"] = _innings_to_outs(innings)
+            except (ValueError, TypeError): pass
+        bullpen = [p for p in players.values() if p.get("side") == side and p.get("is_bullpen")]
+        innings = [(p.get("recent_stats", {}) or {}).get("inningsPitched") for p in bullpen]
+        if bullpen and all(v is not None for v in innings):
+            try: values["bullpen_recent_window_outs"] = sum(_innings_to_outs(v) for v in innings)
+            except (ValueError, TypeError): pass
+        ops = [number((players.get(pid, {}) or {}).get("season_stats", {}).get("ops")) for pid in order]
+        ops = [v for v in ops if v is not None]
+        values["lineup_ops"] = sum(ops)/len(ops) if len(ops) >= 8 else None
+        side_values[side] = values
+    for key in MLB_AVAILABILITY_WORKLOAD_COLUMNS:
+        stem = key.removesuffix("_diff")
+        h, a = side_values["home"].get(stem), side_values["away"].get(stem)
+        if h is not None and a is not None: result[key] = h-a
+    forecast = updates.get("stadium_forecast", {}) or {}
+    valid_at = pd.to_datetime(forecast.get("forecast_valid_at"), utc=True, errors="coerce")
+    verified_forecast = before(forecast.get("fetched_at")) and pd.notna(valid_at) and abs(valid_at-start) <= pd.Timedelta(hours=1)
+    metadata = updates.get("stadium_metadata", {}) or {}
+    if metadata.get("source") and before(metadata.get("fetched_at")):
+        venue = metadata.get("data", {}) or {}
+    else:
+        venue = forecast.get("venue_metadata", {}) if verified_forecast else {}
+    field = (venue or {}).get("fieldInfo", {}) or {}
+    dimensions = {"stadium_left_line_ft": "leftLine", "stadium_center_field_ft": "center", "stadium_right_line_ft": "rightLine"}
+    for key, source in dimensions.items(): result[key] = number(field.get(source))
+    surface = str(field.get("turfType") or "").lower()
+    if surface:
+        if "grass" in surface: result["turf_surface"] = 0
+        elif "turf" in surface or "artific" in surface: result["turf_surface"] = 1
+    roof_type = str(field.get("roofType") or (forecast.get("roof_type") if verified_forecast else None) or "").lower()
+    if roof_type == "open": result["outdoor_exposure"], result["roof_closed"] = 1, 0
+    elif roof_type in ("dome", "domed", "closed"): result["outdoor_exposure"], result["roof_closed"] = 0, 1
+    bearing = None
+    venue_id = (game.get("venue", {}) or {}).get("id")
+    observations = []
+    for record in game.get("stadium_observations", []) or []:
+        effective = pd.to_datetime(record.get("effective_at"), utc=True, errors="coerce")
+        if (record.get("source") and record.get("venue_id") == venue_id and before(record.get("observed_at"))
+                and pd.notna(effective) and effective <= start):
+            observations.append(record)
+    for record in sorted(observations, key=lambda r: r["effective_at"]):
+        for key in dimensions:
+            if key in record: result[key] = number(record[key])
+        if "stadium_elevation_ft" in record: result["stadium_elevation_ft"] = number(record["stadium_elevation_ft"])
+        if "center_field_bearing_degrees" in record:
+            candidate_bearing = number(record["center_field_bearing_degrees"])
+            bearing = candidate_bearing if candidate_bearing is not None and 0 <= candidate_bearing < 360 else None
+        roof = str(record.get("roof_status") or "").lower()
+        if roof in ("open", "closed"):
+            result["roof_closed"] = int(roof == "closed")
+            result["outdoor_exposure"] = int(roof == "open")
+    if observations: result["stadium_update_count"] = len(observations)
+    if verified_forecast and result["outdoor_exposure"] != 0:
+        for key, source in (("forecast_temperature_f", "temperature_2m"), ("forecast_wind_mph", "wind_speed_10m"),
+                            ("forecast_humidity_pct", "relative_humidity_2m"), ("forecast_precipitation_probability_pct", "precipitation_probability")):
+            result[key] = number(forecast.get(source))
+        wind, direction = number(forecast.get("wind_speed_10m")), number(forecast.get("wind_direction_10m"))
+        if bearing is not None and wind is not None and direction is not None and result["outdoor_exposure"] == 1:
+            # Meteorological direction is where wind comes FROM; convert to TO.
+            angle = math.radians((direction+180-bearing) % 360)
+            result["wind_out_to_center_mph"] = wind*math.cos(angle)
+            result["wind_cross_field_mph"] = abs(wind*math.sin(angle))
+    h, a = side_values["home"].get("lineup_ops"), side_values["away"].get("lineup_ops")
+    if h is not None and a is not None:
+        for key, source in (("temperature_x_lineup_ops_diff", "forecast_temperature_f"),
+                            ("wind_out_x_lineup_ops_diff", "wind_out_to_center_mph"),
+                            ("stadium_center_x_lineup_ops_diff", "stadium_center_field_ft")):
+            if result[source] is not None: result[key] = result[source]*(h-a)
     return result
