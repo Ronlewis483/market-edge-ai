@@ -11467,13 +11467,13 @@ if matchup:
         st.write("Recommendation model chosen using 2025: " + ("Matchup + Elo + logistic layer" if matchup["win_layer_selected"] else "Matchup runs — the Elo layer did not improve development log loss"))
     with st.expander("Trace saved MLB predictions — no retraining", expanded=True):
         st.caption("Reconstruct the scoring and Elo layers from archived weights and inputs. Outcomes are used only to grade the reconstructed predictions.")
-        if st.button("Audit saved prediction engine", key="mlb_saved_engine_audit"):
+        if st.button("Audit saved prediction engine", key="mlb_saved_engine_audit_run"):
             try:
-                st.session_state["mlb_saved_engine_audit"] = audit_saved_mlb_engine(matchup)
+                st.session_state["mlb_saved_engine_audit_result"] = audit_saved_mlb_engine(matchup)
             except Exception as exc:
-                st.session_state.pop("mlb_saved_engine_audit", None)
+                st.session_state.pop("mlb_saved_engine_audit_result", None)
                 st.error("Saved engine audit stopped: " + str(exc))
-        saved_audit = st.session_state.get("mlb_saved_engine_audit")
+        saved_audit = st.session_state.get("mlb_saved_engine_audit_result")
         if saved_audit and saved_audit["archive_id"] == str(matchup.get("created_at", "")):
             st.json(saved_audit["verification"])
             st.dataframe(pd.DataFrame(saved_audit["layer_scores"]), use_container_width=True, hide_index=True)
