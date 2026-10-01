@@ -11243,14 +11243,20 @@ if report:
 
 st.divider()
 st.subheader("MLB matchup run model")
-st.caption("Estimate each team's scoring from its lineup and the opposing starter, then calculate win probability. Select regularization and a confidence threshold on 2025, then evaluate on 2026. Handedness splits, bullpen availability, and weather are not yet included.")
+st.caption("Estimate each team's scoring from its lineup and the opposing starter, then calculate win probability. Select regularization and a confidence threshold on 2025, then evaluate on 2026. Bullpen membership comes from frozen feeds; prior relief workload and quality come from the saved warehouse with a 48-hour delay. Confirmed availability, handedness splits, and weather remain incomplete.")
 matchup_scope = st.selectbox("Matchup test coverage", ["Cached June pilot — verify model", "May–September — up to 1,800 games"], key="mlb_matchup_scope")
 if st.button("Build and evaluate MLB matchup model", key="mlb_matchup_run", type="primary"):
     try:
         from dual_agent.mlb_matchup_model import run_mlb_matchup_model
         progress_bar = st.progress(0, text="Checking pregame archives...")
         with st.spinner("Learning expected runs and checking matchup predictions..."):
-            result = run_mlb_matchup_model(cohort="june_pilot" if matchup_scope.startswith("Cached") else "seasonwide", progress=lambda done,total: progress_bar.progress(done/total, text=f"Checked {done} of {total} games"))
+            bullpen_logs = st.session_state.get("mlb_v3_player_logs")
+            if bullpen_logs is None or bullpen_logs.empty:
+                from dual_agent.supabase_db import load_mlb_player_history
+                bullpen_logs = load_mlb_player_history()
+            if bullpen_logs is None or bullpen_logs.empty:
+                raise ValueError("Historical player warehouse is empty; load it before bullpen modeling")
+            result = run_mlb_matchup_model(player_logs=bullpen_logs, cohort="june_pilot" if matchup_scope.startswith("Cached") else "seasonwide", progress=lambda done,total: progress_bar.progress(done/total, text=f"Checked {done} of {total} games"))
         st.session_state["mlb_matchup_result"] = result
         progress_bar.empty()
     except Exception as exc:
@@ -11262,6 +11268,9 @@ if matchup:
     low,high = matchup["accuracy_change_95_interval"]
     st.write(f"Accuracy change: {matchup['accuracy_change']*100:+.2f} percentage points; 95% interval {low*100:+.2f} to {high*100:+.2f}. Average run error: {matchup['run_MAE']:.2f} runs per team.")
     st.info("Experimental matchup model. A result here does not replace the live model.")
+    st.caption(matchup.get("bullpen_note", ""))
+    if "bullpen_selected" in matchup:
+        st.write("Bullpen feature group selected on 2025: " + ("Yes" if matchup["bullpen_selected"] else "No — the simpler matchup scored better on development games"))
     confidence = matchup["confidence_selection"]
     if confidence["threshold"] is not None:
         st.write(f"Confidence cutoff chosen on 2025: {confidence['threshold']:.0%}. Selected 2026 games: {confidence['test_games']}.")
@@ -11272,4 +11281,4 @@ if matchup:
     with st.expander("Game predictions and misses"):
         st.dataframe(pd.DataFrame(matchup["predictions"]), use_container_width=True, hide_index=True)
     with st.expander("Learned weights, development results, and missing inputs"):
-        st.json({key:matchup[key] for key in ["selected_alpha","development_scores","coefficients","missing_inputs","limitations","confidence_selection"]})
+        st.json({key:matchup.get(key) for key in ["selected_alpha","development_scores","coefficients","missing_inputs","limitations","confidence_selection","bullpen_selected","bullpen_note","bullpen_coverage_by_season"]})
