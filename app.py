@@ -11121,22 +11121,22 @@ def _display_mlb_player_update_table(package):
     return pd.DataFrame(rows)
 
 st.divider()
-st.subheader("⚾ Model With Saved Pitcher and Lineup Information")
-st.caption("Connect real saved pregame player features to a research model. Compare team statistics alone with team statistics plus probable pitchers and feed lineup strength, using identical games.")
+st.subheader("⚾ Complete Pregame Prediction Model")
+st.caption("Connect team performance, probable pitchers, feed lineups, roster availability, recent workload, weather, and dated stadium observations to learned model coefficients. Compare feature groups on identical games.")
 if st.button("Build Player-Information Candidate", key="mlb_saved_player_candidate", type="primary"):
     try:
         import importlib
         import dual_agent.mlb_research as research
         storage = _mlb_pregame_storage_module()
-        if getattr(research, "MLB_SAVED_PLAYER_MODEL_VERSION", None) != 1:
+        if getattr(research, "MLB_SAVED_PLAYER_MODEL_VERSION", None) != 2:
             research = importlib.reload(research)
-        if getattr(storage, "MLB_SAVED_PLAYER_MODEL_STORAGE_VERSION", None) != 1:
+        if getattr(storage, "MLB_SAVED_PLAYER_MODEL_STORAGE_VERSION", None) != 2:
             storage = importlib.reload(storage)
         missing_modules = []
-        if getattr(research, "MLB_SAVED_PLAYER_MODEL_VERSION", None) != 1:
-            missing_modules.append("dual_agent/mlb_research.py (player-model version 1)")
-        if getattr(storage, "MLB_SAVED_PLAYER_MODEL_STORAGE_VERSION", None) != 1:
-            missing_modules.append("dual_agent/supabase_db.py (player-model storage version 1)")
+        if getattr(research, "MLB_SAVED_PLAYER_MODEL_VERSION", None) != 2:
+            missing_modules.append("dual_agent/mlb_research.py (player-model version 2)")
+        if getattr(storage, "MLB_SAVED_PLAYER_MODEL_STORAGE_VERSION", None) != 2:
+            missing_modules.append("dual_agent/supabase_db.py (player-model storage version 2)")
         if missing_modules:
             raise RuntimeError("The loaded code is missing: " + "; ".join(missing_modules) + ". Replace those exact repository files and reboot Streamlit.")
         with st.spinner("Checking saved game results and connecting player features..."):
@@ -11173,5 +11173,11 @@ if player_model:
         st.dataframe(pd.DataFrame(player_model["upcoming_predictions"]), use_container_width=True, hide_index=True)
     if player_model.get("comparison_note"):
         st.caption(player_model["comparison_note"])
+    if player_model.get("feature_coverage"):
+        with st.expander("Weather, stadium, availability, and workload coverage"):
+            st.dataframe(pd.DataFrame(player_model["feature_coverage"]), use_container_width=True, hide_index=True)
+    if player_model.get("equation"):
+        st.code(player_model["equation"], language="text")
+        st.caption(player_model.get("context_note", ""))
     with st.expander("Player model coverage and saved weights"):
         st.json({"excluded": player_model["excluded"], "result_checks": player_model.get("result_checks", []), "models": player_model["models"]})
