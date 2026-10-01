@@ -11219,12 +11219,12 @@ if player_model:
 
 st.divider()
 st.subheader("MLB historical accuracy comparison")
-st.caption("Train on 2024–2025; test both models on identical 2026 games. This archive pilot tests pitcher and lineup additions. Weather, injuries, workload, and stadium updates require separately verified historical captures.")
+st.caption("Select the player candidate on 2025, refit on 2024–2025, and compare on identical 2026 games sampled across May–September. Tests ERA, WHIP, strikeout/walk rates, and lineup OPS, OBP, and SLG. Weather, injuries, workload, and stadium updates require separately verified historical captures.")
 if st.button("Run historical MLB accuracy test", key="mlb_integrated_accuracy"):
     try:
         from dual_agent.mlb_historical_accuracy_test import run_historical_accuracy_test
         progress_bar = st.progress(0, text="Loading historical pregame archives...")
-        with st.spinner("Running paired accuracy test; the first run downloads 450 archived games..."):
+        with st.spinner("Running paired accuracy test; the first run checks up to 1,800 archived games..."):
             report = run_historical_accuracy_test(progress=lambda done, total: progress_bar.progress(done / total, text=f"Checked {done} of {total} games"))
         st.session_state["mlb_integrated_accuracy_report"] = report
         progress_bar.empty()
@@ -11239,4 +11239,37 @@ if report:
         st.warning("This test does not establish improved accuracy. Keep the candidate experimental.")
     st.caption(report["scope"])
     with st.expander("Test coverage and limitations"):
-        st.json({"usable_games": report["usable_games"], "seasons": report["counts_by_season"], "excluded": report["excluded_reasons"], "limitations": report["limitations"]})
+        st.json({"usable_games": report["usable_games"], "seasons": report["counts_by_season"], "excluded": report["excluded_reasons"], "limitations": report["limitations"], "selected_candidate": report.get("selected_candidate"), "development_scores": report.get("development_scores"), "feature_coverage": report.get("feature_coverage")})
+
+st.divider()
+st.subheader("MLB matchup run model")
+st.caption("Estimate each team's scoring from its lineup and the opposing starter, then calculate win probability. Select regularization and a confidence threshold on 2025, then evaluate on 2026. Handedness splits, bullpen availability, and weather are not yet included.")
+matchup_scope = st.selectbox("Matchup test coverage", ["Cached June pilot — verify model", "May–September — up to 1,800 games"], key="mlb_matchup_scope")
+if st.button("Build and evaluate MLB matchup model", key="mlb_matchup_run", type="primary"):
+    try:
+        from dual_agent.mlb_matchup_model import run_mlb_matchup_model
+        progress_bar = st.progress(0, text="Checking pregame archives...")
+        with st.spinner("Learning expected runs and checking matchup predictions..."):
+            result = run_mlb_matchup_model(cohort="june_pilot" if matchup_scope.startswith("Cached") else "seasonwide", progress=lambda done,total: progress_bar.progress(done/total, text=f"Checked {done} of {total} games"))
+        st.session_state["mlb_matchup_result"] = result
+        progress_bar.empty()
+    except Exception as exc:
+        st.error("Matchup model stopped: " + str(exc))
+matchup = st.session_state.get("mlb_matchup_result")
+if matchup:
+    st.caption("Displayed result cohort: " + matchup["cohort"])
+    st.dataframe(pd.DataFrame(matchup["scores"]), use_container_width=True, hide_index=True)
+    low,high = matchup["accuracy_change_95_interval"]
+    st.write(f"Accuracy change: {matchup['accuracy_change']*100:+.2f} percentage points; 95% interval {low*100:+.2f} to {high*100:+.2f}. Average run error: {matchup['run_MAE']:.2f} runs per team.")
+    st.info("Experimental matchup model. A result here does not replace the live model.")
+    confidence = matchup["confidence_selection"]
+    if confidence["threshold"] is not None:
+        st.write(f"Confidence cutoff chosen on 2025: {confidence['threshold']:.0%}. Selected 2026 games: {confidence['test_games']}.")
+        if confidence["test_accuracy"] is not None:
+            st.write(f"Selected-game accuracy: {confidence['test_accuracy']:.2%}.")
+    else:
+        st.caption("Not enough development games above the confidence cutoffs to select a subgroup.")
+    with st.expander("Game predictions and misses"):
+        st.dataframe(pd.DataFrame(matchup["predictions"]), use_container_width=True, hide_index=True)
+    with st.expander("Learned weights, development results, and missing inputs"):
+        st.json({key:matchup[key] for key in ["selected_alpha","development_scores","coefficients","missing_inputs","limitations","confidence_selection"]})
