@@ -129,13 +129,13 @@ def shrunk_rates(split,overall):
             (split['tb']+100*overall['tb']/overall['ab'])/(split['ab']+100))
 
 
-def attach_handedness(games,records):
+def attach_handedness(games,records,progress=None):
     batters=defaultdict(list);pitchers=defaultdict(list)
     for row in records:
         batters[(row['season'],row['batter'])].append(row)
         pitchers[(row['season'],row['pitcher'])].append(row)
     coverage=[]
-    for game in games:
+    for index,game in enumerate(games,1):
         cutoff=datetime.strptime(game['timecode'],'%Y%m%d_%H%M%S').replace(tzinfo=timezone.utc)-timedelta(hours=48)
         def eligible(rows):
             return [r for r in rows if r['game_id']!=game['game_id'] and timestamp(r['start_time'])<cutoff and timestamp(r['ended'])<cutoff]
@@ -164,4 +164,5 @@ def attach_handedness(games,records):
                                       float(np.mean(slgs)) if count>=8 else None,
                                       float(np.mean(allowed)) if len(allowed)>=8 else None,count/9]
             coverage.append({'game_id':game['game_id'],'season':game['season'],'side':side,'starter_hand':hand,'lineup_players_with_splits':count,'pitcher_split_players':len(allowed)})
+        if progress and (index%10==0 or index==len(games)):progress(index,len(games))
     return coverage
