@@ -1411,6 +1411,8 @@ def update_mlb_capture_learning_dataset(batch):
             old = merged.get(row["capture_key"])
             if old and old.get("features") != row.get("features"):
                 raise ValueError("Frozen features changed for an existing capture; refusing to save.")
+            if old and old.get("context_features") and old["context_features"] != row.get("context_features"):
+                raise ValueError("Frozen stadium/weather/player context changed; refusing to save.")
             if old and old.get("outcome", {}).get("final") and not row.get("outcome", {}).get("final"):
                 continue
             merged[row["capture_key"]] = row
@@ -1453,7 +1455,7 @@ def load_mlb_scanner_status():
         return None
     return json.loads(bucket.download(MLB_SCANNER_STATUS_FILE).decode("utf-8"))
 
-MLB_SAVED_PLAYER_MODEL_STORAGE_VERSION = 1
+MLB_SAVED_PLAYER_MODEL_STORAGE_VERSION = 2
 
 
 def save_mlb_saved_player_model(result):
