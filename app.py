@@ -11245,7 +11245,7 @@ st.divider()
 st.subheader("MLB matchup run model")
 st.caption("Estimate each team's scoring from its lineup and the opposing starter, then calculate win probability. Select regularization and a confidence threshold on 2025, then evaluate on 2026. Bullpen membership comes from frozen feeds; prior relief workload and quality come from the saved warehouse with a 48-hour delay. Handedness splits use prior completed plate appearances; confirmed bullpen availability and weather remain incomplete.")
 handedness_enabled = st.checkbox("Include prior plate-appearance handedness splits", value=True, key="mlb_matchup_handedness")
-st.caption("First handedness build downloads prior play histories; successful downloads are cached. No new accuracy gain is assumed.")
+st.caption("Starter rest, recent workload/form, and prior park scoring are connected to this matchup model. Weather and roof inputs use dated saved captures when available. First handedness build downloads prior play histories; successful downloads are cached.")
 matchup_scope = st.selectbox("Matchup test coverage", ["Cached June pilot — verify model", "May–September — up to 1,800 games"], key="mlb_matchup_scope")
 if st.button("Build and evaluate MLB matchup model", key="mlb_matchup_run", type="primary"):
     try:
@@ -11258,8 +11258,8 @@ if st.button("Build and evaluate MLB matchup model", key="mlb_matchup_run", type
         matchup_archive_module = importlib.reload(matchup_archive_module)
         matchup_module = importlib.reload(matchup_module)
         run_mlb_matchup_model = matchup_module.run_mlb_matchup_model
-        if not {"player_logs", "include_handedness"}.issubset(inspect.signature(run_mlb_matchup_model).parameters):
-            raise RuntimeError("The deployed matchup module is outdated: " + str(matchup_module.__file__) + ". Its run_mlb_matchup_model function must accept player_logs and include_handedness. Check the repository branch used by this deployment.")
+        if not {"player_logs", "include_handedness", "include_context"}.issubset(inspect.signature(run_mlb_matchup_model).parameters):
+            raise RuntimeError("The deployed matchup module is outdated: " + str(matchup_module.__file__) + ". Its run_mlb_matchup_model function must accept player_logs, include_handedness, and include_context. Check the repository branch used by this deployment.")
         progress_bar = st.progress(0, text="Checking pregame archives...")
         with st.spinner("Learning expected runs and checking matchup predictions..."):
             bullpen_logs = st.session_state.get("mlb_v3_player_logs")
@@ -11268,7 +11268,10 @@ if st.button("Build and evaluate MLB matchup model", key="mlb_matchup_run", type
                 bullpen_logs = load_mlb_player_history()
             if bullpen_logs is None or bullpen_logs.empty:
                 raise ValueError("Historical player warehouse is empty; load it before bullpen modeling")
-            result = run_mlb_matchup_model(include_handedness=handedness_enabled, player_logs=bullpen_logs, cohort="june_pilot" if matchup_scope.startswith("Cached") else "seasonwide", progress=lambda done,total: progress_bar.progress(done/total, text=f"Checked {done} of {total} games"))
+            from dual_agent.supabase_db import load_mlb_capture_learning_dataset
+            matchup_context = load_mlb_capture_learning_dataset()
+            result = run_mlb_matchup_model(include_context=True, context_dataset=matchup_context, include_handedness=handedness_enabled, player_logs=bullpen_logs, cohort="june_pilot" if matchup_scope.startswith("Cached") else "seasonwide", progress=lambda done,total: progress_bar.progress(done/total, text=f"Checked {done} of {total} games"))
+        result["archive_status"] = matchup_module.save_mlb_matchup_record(result)
         st.session_state["mlb_matchup_result"] = result
         progress_bar.empty()
     except Exception as exc:
@@ -11276,6 +11279,10 @@ if st.button("Build and evaluate MLB matchup model", key="mlb_matchup_run", type
 matchup = st.session_state.get("mlb_matchup_result")
 if matchup:
     st.caption("Displayed result cohort: " + matchup["cohort"])
+    if matchup.get("archive_status", {}).get("success"):
+        st.success("Matchup model, weights, and collected feature inputs permanently archived.")
+    elif matchup.get("archive_status"):
+        st.warning("Model built, but permanent archive failed: " + matchup["archive_status"].get("message", "Unknown error"))
     st.dataframe(pd.DataFrame(matchup["scores"]), use_container_width=True, hide_index=True)
     low,high = matchup["accuracy_change_95_interval"]
     st.write(f"Accuracy change: {matchup['accuracy_change']*100:+.2f} percentage points; 95% interval {low*100:+.2f} to {high*100:+.2f}. Average run error: {matchup['run_MAE']:.2f} runs per team.")
@@ -11293,4 +11300,4 @@ if matchup:
     with st.expander("Game predictions and misses"):
         st.dataframe(pd.DataFrame(matchup["predictions"]), use_container_width=True, hide_index=True)
     with st.expander("Learned weights, development results, and missing inputs"):
-        st.json({key:matchup.get(key) for key in ["selected_alpha","development_scores","coefficients","missing_inputs","limitations","confidence_selection","bullpen_selected","bullpen_note","bullpen_coverage_by_season","handedness_connected","handedness_source","handedness_note"]})
+        st.json({key:matchup.get(key) for key in ["selected_alpha","development_scores","coefficients","missing_inputs","limitations","confidence_selection","bullpen_selected","bullpen_note","bullpen_coverage_by_season","handedness_connected","handedness_source","handedness_note","context_connected","context_note","context_coverage","unlearned_features"]})
