@@ -11242,8 +11242,8 @@ if report:
         st.json({"usable_games": report["usable_games"], "seasons": report["counts_by_season"], "excluded": report["excluded_reasons"], "limitations": report["limitations"], "selected_candidate": report.get("selected_candidate"), "development_scores": report.get("development_scores"), "feature_coverage": report.get("feature_coverage")})
 
 st.divider()
-st.subheader("MLB matchup run model")
-st.caption("Estimate each team's scoring from its lineup and the opposing starter, then calculate win probability. Select regularization and a confidence threshold on 2025, then evaluate on 2026. Bullpen membership comes from frozen feeds; prior relief workload and quality come from the saved warehouse with a 48-hour delay. Handedness splits use prior completed plate appearances; confirmed bullpen availability and weather remain incomplete.")
+st.subheader("MLB matchup + Elo — goal: 7 correct out of 10 recommended games")
+st.caption("Estimate each team's scoring from its lineup and the opposing starter, then calculate win probability. Add pregame Elo and learn a logistic win layer from earlier-block forecasts. Choose a recommendation cutoff on 2025 targeting 70% with at least 50 picks, then report 2026 results. If no development cutoff qualifies, no recommendation rule is issued. Bullpen membership comes from frozen feeds; prior relief workload and quality come from the saved warehouse with a 48-hour delay. Handedness splits use prior completed plate appearances; confirmed bullpen availability and weather remain incomplete.")
 handedness_enabled = st.checkbox("Include prior plate-appearance handedness splits", value=True, key="mlb_matchup_handedness")
 st.caption("Starter rest, recent workload/form, and prior park scoring are connected to this matchup model. Weather and roof inputs use dated saved captures when available. First handedness build downloads prior play histories; successful downloads are cached.")
 matchup_scope = st.selectbox("Matchup test coverage", ["Cached June pilot — verify model", "May–September — up to 1,800 games"], key="mlb_matchup_scope")
@@ -11256,6 +11256,8 @@ if st.button("Build and evaluate MLB matchup model", key="mlb_matchup_run", type
         # Streamlit reruns app.py while imported modules may retain earlier code.
         importlib.invalidate_caches()
         matchup_archive_module = importlib.reload(matchup_archive_module)
+        import dual_agent.mlb_matchup_elo as matchup_elo_module
+        importlib.reload(matchup_elo_module)
         matchup_module = importlib.reload(matchup_module)
         run_mlb_matchup_model = matchup_module.run_mlb_matchup_model
         if not {"player_logs", "include_handedness", "include_context"}.issubset(inspect.signature(run_mlb_matchup_model).parameters):
@@ -11290,14 +11292,26 @@ if matchup:
     st.caption(matchup.get("bullpen_note", ""))
     if "bullpen_selected" in matchup:
         st.write("Bullpen feature group selected on 2025: " + ("Yes" if matchup["bullpen_selected"] else "No — the simpler matchup scored better on development games"))
+    metrics=matchup.get("recommendation_metrics")
+    if metrics:
+        c1,c2,c3=st.columns(3)
+        c1.metric("Recommended-pick accuracy", f"{metrics['accuracy']:.1%}" if metrics['accuracy'] is not None else "No qualifying picks")
+        c2.metric("Correct / recommended", f"{metrics['correct']} / {metrics['games']}")
+        c3.metric("Games recommended", f"{metrics['coverage']:.1%}")
+        st.caption("Goal: 70% across every recommended game. These are historical results, not a future recommendation ledger.")
+        if metrics.get("wilson_95_interval"):
+            lo,hi=metrics["wilson_95_interval"]
+            st.caption(f"Selected-pick 95% Wilson interval: {lo:.1%}–{hi:.1%}. This interval treats picks as independent; shared game dates can add uncertainty.")
+        if not metrics.get("target_demonstrated"):
+            st.info("Sustained 70% accuracy has not been established. Keep gathering future evidence before live promotion.")
     confidence = matchup["confidence_selection"]
     if confidence["threshold"] is not None:
         st.write(f"Confidence cutoff chosen on 2025: {confidence['threshold']:.0%}. Selected 2026 games: {confidence['test_games']}.")
         if confidence["test_accuracy"] is not None:
             st.write(f"Selected-game accuracy: {confidence['test_accuracy']:.2%}.")
     else:
-        st.caption("Not enough development games above the confidence cutoffs to select a subgroup.")
+        st.caption("No development cutoff met 70% accuracy with at least 50 picks. No recommendation rule was issued; see development results below.")
     with st.expander("Game predictions and misses"):
         st.dataframe(pd.DataFrame(matchup["predictions"]), use_container_width=True, hide_index=True)
     with st.expander("Learned weights, development results, and missing inputs"):
-        st.json({key:matchup.get(key) for key in ["selected_alpha","development_scores","coefficients","missing_inputs","limitations","confidence_selection","bullpen_selected","bullpen_note","bullpen_coverage_by_season","handedness_connected","handedness_source","handedness_note","context_connected","context_note","context_coverage","unlearned_features"]})
+        st.json({key:matchup.get(key) for key in ["elo_source","win_layer_bundle","win_layer_development","recommendation_policy","recommendation_metrics","selected_alpha","development_scores","coefficients","missing_inputs","limitations","confidence_selection","bullpen_selected","bullpen_note","bullpen_coverage_by_season","handedness_connected","handedness_source","handedness_note","context_connected","context_note","context_coverage","unlearned_features"]})
