@@ -22,13 +22,14 @@ BULLPEN_FEATURES = ['opponent_listed_relief_count', 'opponent_relief_pitches_pri
                     'opponent_relief_era_prior_30d', 'opponent_relief_whip_prior_30d']
 
 
-def attach_bullpen_history(games, player_logs, completion_times):
+def attach_bullpen_history(games, player_logs, completion_times, uncertain_game_ids=None):
     """Frozen bullpen membership plus strictly prior warehouse appearances.
 
     Recent workload requires verified completed-game play timestamps.
     Season quality still uses start+48h as conservative eligibility assumption.
     No same-game observations or present-day roster statuses are admitted.
     """
+    uncertain_game_ids=set(uncertain_game_ids or [])
     required={'game_id','player_id','team_id','start_time','games_started',
               'pitching_outs','pitching_games','pitches','earned_runs','pitcher_hits','pitcher_walks'}
     if player_logs is None or player_logs.empty or not required.issubset(player_logs.columns):
@@ -55,6 +56,7 @@ def attach_bullpen_history(games, player_logs, completion_times):
             if history is not None and listed:
                 prior=history[(history.start_time<cutoff) & (history.start_time>=cutoff-pd.Timedelta(days=30)) & (pd.to_numeric(history.player_id,errors='coerce').isin(listed)) & (pd.to_numeric(history.game_id,errors='coerce')!=game['game_id'])]
                 recent=history[(history.start_time>=capture-pd.Timedelta(days=3)) & (history.start_time<capture) & (history.verified_end<capture) & pd.to_numeric(history.player_id,errors='coerce').isin(listed) & (pd.to_numeric(history.game_id,errors='coerce')!=game['game_id'])]
+                uncertain=history[(history.start_time>=capture-pd.Timedelta(days=3)) & (history.start_time<capture) & (history.verified_end>=capture) & history.game_id.isin(uncertain_game_ids) & pd.to_numeric(history.player_id,errors='coerce').isin(listed)]
                 if not prior.empty or not recent.empty:
                     cohort=set(int(pid) for pid in prior.player_id.unique()) | set(int(pid) for pid in recent.player_id.unique())
                     counts=recent.groupby('player_id').size()
@@ -65,6 +67,7 @@ def attach_bullpen_history(games, player_logs, completion_times):
                     values=[len(cohort),total(recent,'pitches'),total(recent,'pitching_outs'),float((counts>=2).sum()/len(cohort)),
                             er*27/outs if outs and er is not None else None,
                             (hits+walks)*3/outs if outs and hits is not None and walks is not None else None]
+                if not uncertain.empty:values[1:4]=[None,None,None]
             game['bullpen_sides'][side]=values
             coverage.append({'game_id':game['game_id'],'season':game['season'],'side':side,'prior_relief_history':values[0] is not None})
     return coverage
@@ -142,7 +145,7 @@ def run_mlb_matchup_model(cache_root='mlb_accuracy_results', progress=None, coho
         missing_games=set(completion_times)-set(pd.to_numeric(player_logs.game_id,errors='coerce').dropna().astype(int))
         if missing_games:raise ValueError(f'Recent bullpen warehouse incomplete: {len(missing_games)} verified games have no player logs. Refresh the warehouse before building.')
     stage('Calculating prior bullpen workload and quality')
-    bullpen_coverage=attach_bullpen_history(games, player_logs,completion_times) if player_logs is not None else []
+    bullpen_coverage=attach_bullpen_history(games, player_logs,completion_times,bullpen_source.get('conservative_game_ids',[])) if player_logs is not None else []
     if player_logs is not None and not any(row['prior_relief_history'] for row in bullpen_coverage):
         raise ValueError('No eligible prior relief history matched the archived bullpen identities')
     handedness_coverage=[];handedness_source={}
@@ -247,7 +250,7 @@ def run_mlb_matchup_model(cache_root='mlb_accuracy_results', progress=None, coho
               'bullpen_selected':chosen_config['bullpen'], 'bullpen_coverage':bullpen_coverage, 'bullpen_coverage_by_season':pd.DataFrame(bullpen_coverage).groupby('season').prior_relief_history.agg(['sum','count']).reset_index().to_dict('records') if bullpen_coverage else [], 'coefficients': dict(zip(retained, fitted.coef_.tolist())), 'predictions': predictions,
               'missing_inputs': [* ([] if include_handedness else ['Verified historical pitcher/hitter handedness splits']), 'Confirmed bullpen health/rest availability; completion time does not establish health', 'Historical weather and roof status'],
               'limitations': ['2026 has been inspected in earlier experiments; it is not an untouched holdout.', 'Archive provider reconstruction/corrections remain possible; prior score availability uses a conservative 48-hour delay.', 'Independent Poisson scoring is an approximation; regulation ties are split equally.', 'The logistic win layer uses earlier-block run forecasts. Hyperparameters still share 2025 development data; a new future record is required.', 'Historical recommendations are evaluations, not timestamped live picks. The live engine remains unpromoted.', 'Confidence subgroup results must include their sample size. Small subgroups do not establish reliability.'],
-              'bullpen_note':'Archived bullpen list is a feed observation, not confirmed availability. Relief counts use listed pitchers with prior relief appearances. Workload covers the immediate three days before capture and requires verified prior-game completion. Quality retains a 48-hour buffer over its prior 30-day window. Missing history stays unknown. Stored zero values cannot establish source completeness.', 'retained_feature_rows':games, 'created_at':pd.Timestamp.now(tz='UTC').isoformat(), 'model_bundle':{'columns':retained,'median':model.steps[0][1].statistics_[np.isfinite(model.steps[0][1].statistics_)].tolist(),'mean':model.steps[1][1].mean_.tolist(),'scale':model.steps[1][1].scale_.tolist(),'weights':fitted.coef_.tolist(),'intercept':float(fitted.intercept_)}, 'live_model_changed': False}
+              'bullpen_note':'Archived bullpen list is a feed observation, not confirmed availability. Relief counts use listed pitchers with prior relief appearances. Workload covers the immediate three days before capture and requires verified prior-game completion. Quality retains a 48-hour buffer over its prior 30-day window. Rain-advisory finals with uncertain completion use a 48-hour delay; affected recent workload stays unknown until eligible. Missing history stays unknown. Stored zero values cannot establish source completeness.', 'retained_feature_rows':games, 'created_at':pd.Timestamp.now(tz='UTC').isoformat(), 'model_bundle':{'columns':retained,'median':model.steps[0][1].statistics_[np.isfinite(model.steps[0][1].statistics_)].tolist(),'mean':model.steps[1][1].mean_.tolist(),'scale':model.steps[1][1].scale_.tolist(),'weights':fitted.coef_.tolist(),'intercept':float(fitted.intercept_)}, 'live_model_changed': False}
     stage('Writing completed model results')
     (Path(cache_root)/'mlb_matchup_model_result.json').write_text(json.dumps(result, indent=2))
     return result
