@@ -11483,6 +11483,32 @@ if matchup:
             st.caption("Imputation counts describe availability, not source freshness. Layer comparisons diagnose this archive; they do not authorize choosing the best layer on evaluation outcomes. All-missing training features were not learned.")
     with st.expander("Strengthen MLB probability layers from saved features", expanded=True):
         st.caption("Fits a consistent frozen-base comparison from saved features only. Selects runs settings on 2024, fits probability layers on early 2025, chooses the layer and cutoff on late 2025, then grades 2026. No historical downloads. The live engine is unchanged.")
+        odds_batch_limit = st.number_input("Maximum new historical odds requests per batch", min_value=1, max_value=200, value=10, step=1, key="mlb_historical_odds_limit")
+        st.caption(f"This batch can use up to {int(odds_batch_limit)*10:,} Odds API credits for US moneylines. Cached snapshots are reused. The first uncached request checks historical access; an access error stops the batch.")
+        if st.button("Collect historical odds for this saved model", key="mlb_historical_odds_collect"):
+            try:
+                import os as mlb_odds_os
+                import importlib as mlb_odds_importlib
+                import dual_agent.mlb_historical_odds as mlb_odds_module
+                mlb_odds_module = mlb_odds_importlib.reload(mlb_odds_module)
+                odds_key = mlb_odds_os.environ.get("ODDS_API_KEY") or mlb_odds_os.environ.get("THE_ODDS_API_KEY")
+                if not odds_key:
+                    odds_key = st.secrets.get("ODDS_API_KEY") or st.secrets.get("THE_ODDS_API_KEY")
+                odds_progress = st.progress(0, text="Collecting historical moneyline snapshots...")
+                odds_result = mlb_odds_module.collect_historical_odds(matchup, odds_key, max_requests=int(odds_batch_limit), progress=lambda done,total: odds_progress.progress(done/total, text=f"Checked {done} of {total} snapshots"))
+                odds_result["source_archive"] = matchup.get("created_at")
+                st.session_state["mlb_historical_odds_dataset"] = odds_result
+                odds_progress.empty()
+            except Exception as exc:
+                st.error("Historical odds collection stopped: " + str(exc))
+        collected_odds = st.session_state.get("mlb_historical_odds_dataset")
+        if collected_odds and collected_odds.get("source_archive") == matchup.get("created_at"):
+            st.json({key:collected_odds.get(key) for key in ["requests_used","credits_used_reported","credits_remaining","cached_snapshots","pending_snapshots","historical_access_verified","errors"]})
+            odds_coverage = pd.DataFrame(collected_odds.get("coverage", []))
+            if not odds_coverage.empty:
+                st.dataframe(odds_coverage.groupby("season").agg(games=("game_id","count"),games_with_consensus=("eligible_books",lambda counts:int((counts>=2).sum()))).reset_index(), use_container_width=True, hide_index=True)
+            st.caption("Collected quotes will feed the probability comparison below automatically. Repeat collection to resume pending snapshots. The comparison needs at least 80 eligible early-2025 games and 40 late-2025 games; limited batches may not reach these yet.")
+            st.download_button("Download collected historical odds", data=__import__("json").dumps(collected_odds), file_name="mlb_historical_odds.json", mime="application/json", key="mlb_historical_odds_download")
         probability_odds_upload = st.file_uploader("Optional historical sportsbook consensus JSON", type=["json"], key="mlb_probability_odds_upload")
         st.caption('Odds format: {"rows": [{"game_id": 123, "captured_at": "2025-06-01T18:00:00Z", "bookmaker": "book-name", "home_decimal": 1.5, "away_decimal": 2.8}]}. At least two distinct books per game; quotes must be at or before the saved prediction and no more than 30 minutes old. No API requests or purchases are made.')
         if st.button("Build consistent MLB probability comparison", key="mlb_probability_upgrade_run"):
@@ -11491,7 +11517,7 @@ if matchup:
                 import importlib as mlb_upgrade_importlib
                 import dual_agent.mlb_probability_upgrade as mlb_upgrade_module
                 mlb_upgrade_module = mlb_upgrade_importlib.reload(mlb_upgrade_module)
-                odds_payload = mlb_upgrade_json.load(probability_odds_upload) if probability_odds_upload is not None else None
+                odds_payload = mlb_upgrade_json.load(probability_odds_upload) if probability_odds_upload is not None else (collected_odds if collected_odds and collected_odds.get("source_archive") == matchup.get("created_at") else None)
                 with st.spinner("Fitting probability layers from saved features..."):
                     upgraded = mlb_upgrade_module.run_saved_probability_upgrade(matchup, odds_payload)
                 from dual_agent.mlb_matchup_model import save_mlb_matchup_record
