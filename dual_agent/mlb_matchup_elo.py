@@ -1,4 +1,5 @@
-"""Elo, chronological win layer and immutable prospective recommendation records."""
+"""Version 7: Elo, fixed small-slate selection and pregame recommendation records."""
+MODULE_VERSION = 7
 import json
 import hashlib
 from pathlib import Path
@@ -93,7 +94,8 @@ def chronological_win_layer(train24,dev25,test26,alpha,flags,fit_runs,predict_ru
     return probabilities,development,bundle,candidates
 
 def select_recommendations(probabilities,outcomes):
-    """Choose a fixed cutoff on development data, targeting 70% with >=50 picks."""
+    """Choose on development only; show research picks even below the target."""
+    probabilities=np.asarray(probabilities,dtype=float)
     rows=[]
     for cutoff in [.55,.60,.65,.70,.75,.80]:
         mask=np.maximum(probabilities,1-probabilities)>=cutoff
@@ -102,8 +104,8 @@ def select_recommendations(probabilities,outcomes):
             correct=int(((probabilities[mask]>=.5)==np.asarray(outcomes)[mask]).sum())
             rows.append({'threshold':cutoff,'games':n,'correct':correct,'accuracy':correct/n})
     meets=[r for r in rows if r['accuracy']>=.70]
-    chosen=max(meets,key=lambda r:r['games']) if meets else None
-    return (chosen['threshold'] if chosen else None),rows
+    chosen=max(meets,key=lambda r:r['games']) if meets else (max(rows,key=lambda r:(r['accuracy'],r['games'])) if rows else {'threshold':.5})
+    return chosen['threshold'],rows
 
 def recommendation_metrics(probabilities,outcomes,threshold):
     mask=np.maximum(probabilities,1-probabilities)>=threshold if threshold is not None else np.zeros(len(probabilities),dtype=bool)
@@ -182,3 +184,94 @@ def settle_recommendation(game_id):
     path=f'mlb/matchup_recommendations/results/{int(game_id)}.json'
     bucket.upload(path,json.dumps(grade).encode(),{'content-type':'application/json','upsert':'false'})
     return grade
+
+
+def confidence_diagnostics(probabilities,outcomes):
+    """Report ranking quality without choosing a rule on evaluated outcomes."""
+    p=np.asarray(probabilities);y=np.asarray(outcomes);confidence=np.maximum(p,1-p)
+    correct=(p>=.5)==y
+    bands=[]
+    for low,high in [(.5,.55),(.55,.6),(.6,.65),(.65,.7),(.7,.8),(.8,1.00001)]:
+        mask=(confidence>=low)&(confidence<high);n=int(mask.sum())
+        bands.append({'Confidence band':f'{low:.0%}–{min(high,1):.0%}','Games':n,
+                      'Correct':int(correct[mask].sum()),'Accuracy':float(correct[mask].mean()) if n else None,
+                      'Mean confidence':float(confidence[mask].mean()) if n else None})
+    order=np.argsort(-confidence,kind='stable');ranked=[]
+    for count in [10,25,50,100]:
+        if len(order)<count:continue
+        chosen=order[:count]
+        ranked.append({'Top ranked games':count,'Correct':int(correct[chosen].sum()),
+                       'Accuracy':float(correct[chosen].mean()),'Mean confidence':float(confidence[chosen].mean())})
+    return {'bands':bands,'ranked_groups':ranked,'note':'Diagnostic groups only. Never select a cutoff from these evaluation outcomes; top groups are across the whole evaluated period, not a daily quota.'}
+
+SMALL_SLATE_POLICY = {'version':1,'timezone':'America/Chicago','minimum_confidence':.55,
+                      'maximum_picks_per_day':3,'maximum_picks_per_start_window':1,
+                      'start_window_minutes':60,'decision_lead_seconds':1,
+                      'tie_break':'lowest game_id','frozen_before_evaluation':True}
+
+
+def select_small_slates(games, probabilities, schedule_games=None):
+    """Fixed chronological selection; never inspect outcomes or later snapshots.
+
+    Lock each hourly start window just before its first scheduled start. Rank
+    only captures already available then. Select at most one per window and
+    three per local day. Incomplete historical slates are explicitly reported.
+    """
+    p=np.asarray(probabilities,dtype=float)
+    if len(p)!=len(games) or not np.isfinite(p).all() or ((p<0)|(p>1)).any():
+        raise ValueError('One finite probability per game is required')
+    if len({int(g['game_id']) for g in games})!=len(games):raise ValueError('Duplicate slate game IDs')
+    policy=dict(SMALL_SLATE_POLICY);tz=policy['timezone']
+    starts=[pd.to_datetime(g['start_time'],utc=True) for g in games]
+    def window(start):return start.tz_convert(tz).floor('h',ambiguous=False,nonexistent='shift_forward')
+    windows={};locks={};scheduled_counts={}
+    for i,start in enumerate(starts):
+        key=window(start);windows.setdefault(key,[]).append(i)
+        locks[key]=min(locks.get(key,start),start)
+    for g in schedule_games or []:
+        if g.get('gameType')!='R':continue
+        start=pd.to_datetime(g['gameDate'],utc=True);key=window(start)
+        if key in windows:
+            locks[key]=min(locks[key],start);scheduled_counts.setdefault(key,set()).add(int(g['gamePk']))
+    mask=np.zeros(len(games),dtype=bool);day_counts={};decisions=[];reasons={}
+    confidence=np.maximum(p,1-p)
+    for key in sorted(windows):
+        indices=windows[key];lock=locks[key]-pd.Timedelta(seconds=policy['decision_lead_seconds'])
+        day=str(key.date());eligible=[]
+        for i in indices:
+            capture=pd.to_datetime(games[i]['timecode'],format='%Y%m%d_%H%M%S',utc=True)
+            if capture>lock or capture>=starts[i]:reasons[i]='Capture unavailable at window lock'
+            elif confidence[i]<policy['minimum_confidence']:reasons[i]='Below fixed 55% research confidence'
+            else:eligible.append(i)
+        selected=None
+        if eligible and day_counts.get(day,0)<policy['maximum_picks_per_day']:
+            selected=min(eligible,key=lambda i:(-confidence[i],int(games[i]['game_id'])))
+            mask[selected]=True;day_counts[day]=day_counts.get(day,0)+1
+        for i in eligible:
+            if i!=selected:reasons[i]='Daily cap reached' if day_counts.get(day,0)>=3 and selected is None else 'Another game ranked higher at this lock'
+        decisions.append({'Local date':day,'Start window':key.isoformat(),'Decision UTC':lock.isoformat(),
+                          'Scheduled games':len(scheduled_counts.get(key,set())) if schedule_games is not None else None,
+                          'Archived games':len(indices),'Eligible captures':len(eligible),
+                          'Selected game_id':int(games[selected]['game_id']) if selected is not None else None})
+    return mask,{'policy':policy,'decisions':decisions,'exclusion_reasons':{str(games[i]['game_id']):reason for i,reason in reasons.items()},
+                 'scope':'Ranks only archived eligible games. Missing snapshots can omit stronger candidates; this is not a complete live-slate backtest.'}
+
+
+def summarize_small_slates(games,probabilities,mask):
+    """Score every selected game only after selection is fixed."""
+    p=np.asarray(probabilities);y=np.asarray([g['home_win'] for g in games]);correct=(p>=.5)==y
+    indices=sorted(np.flatnonzero(mask),key=lambda i:(games[i]['start_time'],int(games[i]['game_id'])))
+    n=len(indices);wins=int(correct[indices].sum());rate=wins/n if n else None
+    weeks={};blocks=[]
+    for i in indices:
+        date=pd.to_datetime(games[i]['start_time'],utc=True).tz_convert(SMALL_SLATE_POLICY['timezone']).date()
+        monday=date-pd.Timedelta(days=date.weekday())
+        row=weeks.setdefault(str(monday),{'Week starting':str(monday),'Picks':0,'Correct':0})
+        row['Picks']+=1;row['Correct']+=int(correct[i])
+    for row in weeks.values():row['Accuracy']=row['Correct']/row['Picks']
+    for start in range(0,n,10):
+        chosen=indices[start:start+10];count=len(chosen);hits=int(correct[chosen].sum())
+        blocks.append({'Block':start//10+1,'Picks':count,'Correct':hits,'Accuracy':hits/count,'Complete ten-pick block':count==10})
+    return {'games':n,'correct':wins,'accuracy':rate,'coverage':n/len(games) if games else 0,
+            'target':.70,'weeks':list(weeks.values()),'ten_pick_blocks':blocks,
+            'selected_game_ids':[int(games[i]['game_id']) for i in indices]}
