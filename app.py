@@ -11243,12 +11243,33 @@ if report:
 
 st.divider()
 st.subheader("MLB matchup + Elo — goal: 7 correct out of 10 recommended games")
-st.caption("Estimate each team's scoring from its lineup and the opposing starter, then calculate win probability. Add pregame Elo and learn a logistic win layer from earlier-block forecasts. Choose a recommendation cutoff on 2025 targeting 70% with at least 50 picks, then report 2026 results. If no development cutoff qualifies, no recommendation rule is issued. Bullpen membership comes from frozen feeds; prior relief workload and quality come from the saved warehouse with a 48-hour delay. Handedness splits use prior completed plate appearances; confirmed bullpen availability and weather remain incomplete.")
+st.caption("Estimate each team's scoring from its lineup and the opposing starter, then calculate win probability. Add pregame Elo and learn a logistic win layer from earlier-block forecasts. Choose a recommendation cutoff on 2025 targeting 70% with at least 50 picks, then report 2026 results. If no cutoff meets 70%, display the strongest supported development group as research picks and show its actual accuracy. Bullpen membership comes from frozen feeds; immediate three-day relief workload uses saved player logs with verified completed-game timestamps; quality retains a 48-hour delay. Handedness splits use prior completed plate appearances; confirmed bullpen availability and weather remain incomplete.")
 handedness_enabled = st.checkbox("Include prior plate-appearance handedness splits", value=True, key="mlb_matchup_handedness")
 st.caption("Starter rest, recent workload/form, and prior park scoring are connected to this matchup model. Weather and roof inputs use dated saved captures when available. First handedness build downloads prior play histories; successful downloads are cached.")
-matchup_scope = st.selectbox("Matchup test coverage", ["Cached June pilot — verify model", "May–September — up to 1,800 games"], key="mlb_matchup_scope")
+matchup_scope = st.selectbox("Matchup test coverage", ["Cached June pilot — verify model", "May–September — up to 1,800 games"], index=1, key="mlb_matchup_scope_v7")
 if st.button("Build and evaluate MLB matchup model", key="mlb_matchup_run", type="primary"):
+    # A failed new build must not display an earlier run as its result.
+    st.session_state.pop("mlb_matchup_result", None)
     try:
+        import ast
+        from pathlib import Path
+        required_matchup_files = {
+            "mlb_historical_accuracy_test.py": {"run_historical_accuracy_test"},
+            "mlb_matchup_model.py": {"run_mlb_matchup_model", "save_mlb_matchup_record"},
+            "mlb_matchup_elo.py": {"attach_elo", "select_small_slates", "summarize_small_slates"},
+            "mlb_bullpen_freshness.py": {"collect_bullpen_completion_times"},
+            "mlb_handedness.py": {"collect_prior_appearances", "attach_handedness"},
+            "mlb_matchup_context.py": {"attach_matchup_context"},
+        }
+        for filename, expected_functions in required_matchup_files.items():
+            module_path = Path(__file__).resolve().parent / "dual_agent" / filename
+            if not module_path.is_file():
+                raise RuntimeError("Missing dual_agent/" + filename + ". Upload the exact .py file to that folder.")
+            source = module_path.read_text(encoding="utf-8")
+            tree = ast.parse(source, filename=str(module_path))
+            actual_functions = {node.name for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+            if "test_alpaca_connection" in source or not expected_functions.issubset(actual_functions):
+                raise RuntimeError("Wrong or outdated content in dual_agent/" + filename + ". Replace it with the matching downloaded file; app.py belongs only in the repository root.")
         import importlib
         import inspect
         import dual_agent.mlb_historical_accuracy_test as matchup_archive_module
@@ -11256,6 +11277,8 @@ if st.button("Build and evaluate MLB matchup model", key="mlb_matchup_run", type
         # Streamlit reruns app.py while imported modules may retain earlier code.
         importlib.invalidate_caches()
         matchup_archive_module = importlib.reload(matchup_archive_module)
+        import dual_agent.mlb_bullpen_freshness as matchup_freshness_module
+        importlib.reload(matchup_freshness_module)
         import dual_agent.mlb_matchup_elo as matchup_elo_module
         importlib.reload(matchup_elo_module)
         matchup_module = importlib.reload(matchup_module)
@@ -11292,6 +11315,24 @@ if matchup:
     st.caption(matchup.get("bullpen_note", ""))
     if "bullpen_selected" in matchup:
         st.write("Bullpen feature group selected on 2025: " + ("Yes" if matchup["bullpen_selected"] else "No — the simpler matchup scored better on development games"))
+    slates=matchup.get("small_slates")
+    if slates:
+        st.subheader("Fixed small-slate results — goal: 7 out of 10")
+        slate=slates["evaluation"]
+        s1,s2,s3=st.columns(3)
+        s1.metric("Small-slate accuracy",f"{slate['accuracy']:.1%}" if slate['accuracy'] is not None else "No eligible picks")
+        s2.metric("Correct / selected",f"{slate['correct']} / {slate['games']}")
+        s3.metric("Available games selected",f"{slate['coverage']:.1%}")
+        st.caption("Fixed rule: at least 55% model confidence; one pick per hourly start window, up to three per Chicago calendar day. Rank only captures available before the window's first scheduled start. No daily quota is forced.")
+        st.warning("Historical slates are incomplete: missing or late archived captures can exclude candidates. These results do not establish sustained live accuracy.")
+        with st.expander("Every week and every ten-pick block",expanded=True):
+            st.dataframe(pd.DataFrame(slate["weeks"]),use_container_width=True,hide_index=True)
+            st.dataframe(pd.DataFrame(slate["ten_pick_blocks"]),use_container_width=True,hide_index=True)
+            st.caption("A final block with fewer than ten picks is partial. Count all selected losses; never remove a weak week.")
+        with st.expander("Frozen slate policy and decision-time coverage"):
+            st.json(slates["details"]["policy"])
+            st.dataframe(pd.DataFrame(slates["details"]["decisions"]),use_container_width=True,hide_index=True)
+            st.json(slates["details"]["exclusion_reasons"])
     metrics=matchup.get("recommendation_metrics")
     if metrics:
         c1,c2,c3=st.columns(3)
@@ -11304,14 +11345,25 @@ if matchup:
             st.caption(f"Selected-pick 95% Wilson interval: {lo:.1%}–{hi:.1%}. This interval treats picks as independent; shared game dates can add uncertainty.")
         if not metrics.get("target_demonstrated"):
             st.info("Sustained 70% accuracy has not been established. Keep gathering future evidence before live promotion.")
+    if "win_layer_selected" in matchup:
+        st.write("Recommendation model chosen using 2025: " + ("Matchup + Elo + logistic layer" if matchup["win_layer_selected"] else "Matchup runs — the Elo layer did not improve development log loss"))
+    diagnostics=matchup.get("confidence_diagnostics",{})
+    with st.expander("Confidence ranking — where strong picks succeed or fail", expanded=True):
+        for label,key in [("Development games — used to choose the rule","development"),("Evaluation games — diagnostic only","evaluation")]:
+            report=diagnostics.get(key)
+            if report:
+                st.write(label)
+                st.dataframe(pd.DataFrame(report["bands"]),use_container_width=True,hide_index=True)
+                st.dataframe(pd.DataFrame(report["ranked_groups"]),use_container_width=True,hide_index=True)
+        st.caption("Top groups rank games across the entire period. Their outcomes do not set the cutoff and do not guarantee ten daily recommendations.")
     confidence = matchup["confidence_selection"]
     if confidence["threshold"] is not None:
         st.write(f"Confidence cutoff chosen on 2025: {confidence['threshold']:.0%}. Selected 2026 games: {confidence['test_games']}.")
         if confidence["test_accuracy"] is not None:
             st.write(f"Selected-game accuracy: {confidence['test_accuracy']:.2%}.")
     else:
-        st.caption("No development cutoff met 70% accuracy with at least 50 picks. No recommendation rule was issued; see development results below.")
+        st.caption("No research recommendation rule is available in this older result. Rebuild using the updated module.")
     with st.expander("Game predictions and misses"):
         st.dataframe(pd.DataFrame(matchup["predictions"]), use_container_width=True, hide_index=True)
     with st.expander("Learned weights, development results, and missing inputs"):
-        st.json({key:matchup.get(key) for key in ["elo_source","win_layer_bundle","win_layer_development","recommendation_policy","recommendation_metrics","selected_alpha","development_scores","coefficients","missing_inputs","limitations","confidence_selection","bullpen_selected","bullpen_note","bullpen_coverage_by_season","handedness_connected","handedness_source","handedness_note","context_connected","context_note","context_coverage","unlearned_features"]})
+        st.json({key:matchup.get(key) for key in ["small_slates","bullpen_freshness_source","win_layer_selected","confidence_diagnostics","elo_source","win_layer_bundle","win_layer_development","recommendation_policy","recommendation_metrics","selected_alpha","development_scores","coefficients","missing_inputs","limitations","confidence_selection","bullpen_selected","bullpen_note","bullpen_coverage_by_season","handedness_connected","handedness_source","handedness_note","context_connected","context_note","context_coverage","unlearned_features"]})
