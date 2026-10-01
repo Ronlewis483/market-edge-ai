@@ -1552,15 +1552,49 @@ if page == "🏀 Sports Center":
             "⚾ MLB Prediction Center"
         )
 
-        st.caption(
-            "MLB will use the same prediction-center "
-            "interface as NFL and NBA."
-        )
-
-        st.info(
-            "⚾ MLB live prediction pipeline is the "
-            "next engine being connected."
-        )
+        st.caption("Saved pregame data → timing and coverage checks → learned complete-context candidate → predictions. This candidate is experimental until its accuracy is established.")
+        prediction_date = st.date_input("MLB game date", value=pd.Timestamp.now(tz="America/Chicago").date(), key="mlb_connected_date")
+        if st.button("Generate MLB predictions from collected data", key="mlb_connected_generate", type="primary"):
+            try:
+                import dual_agent.mlb_research as research
+                import dual_agent.supabase_db as storage
+                with st.spinner("Checking saved outcomes and generating predictions..."):
+                    dataset = storage.load_mlb_capture_learning_dataset()
+                    archived = storage.load_mlb_pregame_intelligence()
+                    batch = research.build_mlb_capture_learning_rows(archived["data"]) if archived and isinstance(archived.get("data"), dict) else {"rows": [], "errors": []}
+                    keys = {row["capture_key"] for row in batch["rows"]}
+                    refreshed = research.refresh_mlb_capture_learning_results([row for row in dataset["rows"] if row["capture_key"] not in keys])
+                    batch["rows"] = refreshed["rows"] + batch["rows"]
+                    merged = storage.update_mlb_capture_learning_dataset(batch)
+                    if not merged.get("success"):
+                        raise RuntimeError(merged.get("message", "Unable to save result checks"))
+                    result = research.run_mlb_saved_player_model(merged["data"])
+                    saved = storage.save_mlb_saved_player_model(result)
+                    if not saved.get("success"):
+                        raise RuntimeError(saved.get("message", "Unable to save model record"))
+                    st.session_state["mlb_connected_result"] = result
+                    st.session_state["mlb_connected_dates"] = {int(row["game_id"]): pd.Timestamp(row["start_time"]).tz_convert("America/Chicago").date() for row in merged["data"]["rows"]}
+            except Exception as exc:
+                st.error("MLB prediction pipeline stopped: " + str(exc))
+        connected = st.session_state.get("mlb_connected_result")
+        if connected:
+            st.info(connected["message"])
+            picks = [r for r in connected.get("upcoming_predictions", []) if r["Model"] == "Complete pregame candidate" and st.session_state.get("mlb_connected_dates", {}).get(r["game_id"]) == prediction_date]
+            now_utc = pd.Timestamp.now(tz="UTC")
+            picks = [r for r in picks if now_utc - pd.Timestamp(r["Captured UTC"]) <= pd.Timedelta(minutes=15)]
+            if picks:
+                for pick in picks:
+                    probability = pick["Home win probability"]
+                    pick["Predicted winner"] = pick["Home"] if probability >= .5 else pick["Away"]
+                    pick["Winner probability"] = max(probability, 1-probability)
+                st.dataframe(pd.DataFrame(picks), use_container_width=True, hide_index=True)
+                st.caption("Experimental candidate predictions. Weather and other context affect the equation only when training observations exist.")
+            else:
+                st.warning("No usable candidate predictions for this date. The engine requires 200 completed captures to fit, plus eligible upcoming captures collected within 15 minutes. The scanner remains deferred.")
+            if connected.get("scores"):
+                st.dataframe(pd.DataFrame(connected["scores"]), use_container_width=True, hide_index=True)
+            with st.expander("Data coverage and model controllers"):
+                st.json({"completed_games": connected["completed_games"], "minimum_training_games": connected["minimum_training_games"], "excluded": connected["excluded"], "models": connected["models"], "coverage": connected.get("feature_coverage", [])})
 
 
 # ============================================
@@ -11181,3 +11215,28 @@ if player_model:
         st.caption(player_model.get("context_note", ""))
     with st.expander("Player model coverage and saved weights"):
         st.json({"excluded": player_model["excluded"], "result_checks": player_model.get("result_checks", []), "models": player_model["models"]})
+
+
+st.divider()
+st.subheader("MLB historical accuracy comparison")
+st.caption("Train on 2024–2025; test both models on identical 2026 games. This archive pilot tests pitcher and lineup additions. Weather, injuries, workload, and stadium updates require separately verified historical captures.")
+if st.button("Run historical MLB accuracy test", key="mlb_integrated_accuracy"):
+    try:
+        from dual_agent.mlb_historical_accuracy_test import run_historical_accuracy_test
+        progress_bar = st.progress(0, text="Loading historical pregame archives...")
+        with st.spinner("Running paired accuracy test; the first run downloads 450 archived games..."):
+            report = run_historical_accuracy_test(progress=lambda done, total: progress_bar.progress(done / total, text=f"Checked {done} of {total} games"))
+        st.session_state["mlb_integrated_accuracy_report"] = report
+        progress_bar.empty()
+    except Exception as exc:
+        st.error("Historical accuracy test stopped: " + str(exc))
+report = st.session_state.get("mlb_integrated_accuracy_report")
+if report:
+    st.dataframe(pd.DataFrame(report["scores"]), use_container_width=True, hide_index=True)
+    low, high = report["accuracy_change_95_interval"]
+    st.write(f"Accuracy change: {report['accuracy_change'] * 100:+.2f} percentage points. 95% interval: {low * 100:+.2f} to {high * 100:+.2f}.")
+    if low <= 0:
+        st.warning("This test does not establish improved accuracy. Keep the candidate experimental.")
+    st.caption(report["scope"])
+    with st.expander("Test coverage and limitations"):
+        st.json({"usable_games": report["usable_games"], "seasons": report["counts_by_season"], "excluded": report["excluded_reasons"], "limitations": report["limitations"]})
