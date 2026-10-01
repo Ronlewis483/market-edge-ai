@@ -11319,6 +11319,24 @@ if st.button("Build and evaluate MLB matchup model", key="mlb_matchup_run", type
         progress_bar.empty()
     except Exception as exc:
         st.error("Matchup model stopped: " + str(exc))
+# Read an existing archive without retraining or downloading historical games.
+with st.expander("Load saved MLB results — no model rerun"):
+    saved_mlb_upload = st.file_uploader("Saved matchup model JSON", type=["json"], key="mlb_confidence_saved_upload")
+    if st.button("Open saved MLB results", key="mlb_confidence_saved_open"):
+        try:
+            if saved_mlb_upload is None:
+                raise ValueError("Choose your saved matchup model JSON first.")
+            import json as mlb_report_json
+            saved_mlb_report = mlb_report_json.load(saved_mlb_upload)
+            required = {"predictions", "scores", "cohort", "confidence_selection", "accuracy_change", "accuracy_change_95_interval", "run_MAE"}
+            if not isinstance(saved_mlb_report, dict) or not required.issubset(saved_mlb_report):
+                raise ValueError("This is not a complete matchup model result archive.")
+            if not isinstance(saved_mlb_report["predictions"], list):
+                raise ValueError("The archive has invalid prediction rows.")
+            st.session_state["mlb_matchup_result"] = saved_mlb_report
+            st.success("Saved results loaded. No model training was started.")
+        except Exception as exc:
+            st.error("Unable to open saved MLB results: " + str(exc))
 matchup = st.session_state.get("mlb_matchup_result")
 if matchup:
     st.caption("Displayed result cohort: " + matchup["cohort"])
@@ -11365,6 +11383,44 @@ if matchup:
             st.info("Sustained 70% accuracy has not been established. Keep gathering future evidence before live promotion.")
     if "win_layer_selected" in matchup:
         st.write("Recommendation model chosen using 2025: " + ("Matchup + Elo + logistic layer" if matchup["win_layer_selected"] else "Matchup runs — the Elo layer did not improve development log loss"))
+    st.subheader("MLB confidence selection — same comparison as football")
+    confidence_rows = pd.DataFrame(matchup.get("predictions", []))
+    if not confidence_rows.empty and {"Home win probability", "Correct"}.issubset(confidence_rows.columns):
+        probability = pd.to_numeric(confidence_rows["Home win probability"], errors="coerce")
+        valid = probability.between(0, 1) & confidence_rows["Correct"].isin([True, False, 0, 1])
+        confidence_rows = confidence_rows.loc[valid].copy()
+        confidence_rows["winner_confidence"] = probability.loc[valid].map(lambda value: max(value, 1-value))
+        confidence_rows["correct_numeric"] = confidence_rows["Correct"].astype(int)
+        def mlb_confidence_summary(group, label):
+            count = len(group)
+            correct = int(group["correct_numeric"].sum())
+            rate = correct/count if count else None
+            average = float(group["winner_confidence"].mean()) if count else None
+            lower = upper = None
+            if count:
+                z = 1.96
+                denominator = 1 + z*z/count
+                center = (rate + z*z/(2*count))/denominator
+                half = z*((rate*(1-rate)/count + z*z/(4*count*count))**.5)/denominator
+                lower, upper = max(0, center-half), min(1, center+half)
+            return {"Picks": label, "Games": count, "Correct": correct,
+                    "Accuracy (%)": round(100*rate, 1) if count else None,
+                    "Average confidence (%)": round(100*average, 1) if count else None,
+                    "Calibration gap (pp)": round(100*(rate-average), 1) if count else None,
+                    "95% lower bound (%)": round(100*lower, 1) if count else None,
+                    "95% upper bound (%)": round(100*upper, 1) if count else None}
+        threshold_rows = [mlb_confidence_summary(confidence_rows, "All predictions")]
+        for threshold in [.60, .70]:
+            threshold_rows.append(mlb_confidence_summary(confidence_rows[confidence_rows.winner_confidence >= threshold], f"{threshold:.0%} confidence or higher"))
+        st.dataframe(pd.DataFrame(threshold_rows), use_container_width=True, hide_index=True)
+        band_rows = []
+        for low, high in [(.5,.6),(.6,.7),(.7,.8),(.8,.9),(.9,1.000001)]:
+            group = confidence_rows[(confidence_rows.winner_confidence >= low) & (confidence_rows.winner_confidence < high)]
+            band_rows.append(mlb_confidence_summary(group, f"{low:.0%} to below {high:.0%}" if high < 1 else "90%–100%"))
+        st.dataframe(pd.DataFrame(band_rows), use_container_width=True, hide_index=True)
+        st.caption("These fixed 60% and 70% comparisons use saved historical predictions. They do not change the model or choose a cutoff from evaluation outcomes. Confidence is the predicted winner's probability. Intervals assume independent games.")
+        st.info("The recommendation cutoff remains the rule selected on development games. A confidence label alone does not establish a 70% win rate; future picks must confirm the rule.")
+        st.download_button("Download saved matchup results", data=__import__("json").dumps(matchup, default=str), file_name="mlb_matchup_saved_results.json", mime="application/json", key="mlb_confidence_report_download")
     diagnostics=matchup.get("confidence_diagnostics",{})
     with st.expander("Confidence ranking — where strong picks succeed or fail", expanded=True):
         for label,key in [("Development games — used to choose the rule","development"),("Evaluation games — diagnostic only","evaluation")]:
