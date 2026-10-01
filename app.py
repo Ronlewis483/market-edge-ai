@@ -11270,6 +11270,10 @@ if st.button("Build and evaluate MLB matchup model", key="mlb_matchup_run", type
             actual_functions = {node.name for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
             if "test_alpaca_connection" in source or not expected_functions.issubset(actual_functions):
                 raise RuntimeError("Wrong or outdated content in dual_agent/" + filename + ". Replace it with the matching downloaded file; app.py belongs only in the repository root.")
+            if filename == "mlb_matchup_model.py":
+                runner = next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name == "run_mlb_matchup_model")
+                if "stage_callback" not in {arg.arg for arg in runner.args.args}:
+                    raise RuntimeError("dual_agent/mlb_matchup_model.py is an older version. Replace it with the supplied version 7 file containing small-slate evaluation and stage_callback.")
         import importlib
         import inspect
         import dual_agent.mlb_historical_accuracy_test as matchup_archive_module
@@ -11277,6 +11281,10 @@ if st.button("Build and evaluate MLB matchup model", key="mlb_matchup_run", type
         # Streamlit reruns app.py while imported modules may retain earlier code.
         importlib.invalidate_caches()
         matchup_archive_module = importlib.reload(matchup_archive_module)
+        import dual_agent.mlb_handedness as matchup_handedness_module
+        import dual_agent.mlb_matchup_context as matchup_context_module
+        importlib.reload(matchup_handedness_module)
+        importlib.reload(matchup_context_module)
         import dual_agent.mlb_bullpen_freshness as matchup_freshness_module
         importlib.reload(matchup_freshness_module)
         import dual_agent.mlb_matchup_elo as matchup_elo_module
@@ -11285,7 +11293,15 @@ if st.button("Build and evaluate MLB matchup model", key="mlb_matchup_run", type
         run_mlb_matchup_model = matchup_module.run_mlb_matchup_model
         if not {"player_logs", "include_handedness", "include_context"}.issubset(inspect.signature(run_mlb_matchup_model).parameters):
             raise RuntimeError("The deployed matchup module is outdated: " + str(matchup_module.__file__) + ". Its run_mlb_matchup_model function must accept player_logs, include_handedness, and include_context. Check the repository branch used by this deployment.")
+        stage_display = st.empty()
+        stage_name = {"value":"Checking pregame archives"}
         progress_bar = st.progress(0, text="Checking pregame archives...")
+        def matchup_stage(message):
+            stage_name["value"]=message
+            stage_display.info(message + "…")
+            progress_bar.progress(0.0,text=message)
+        def matchup_progress(done,total):
+            progress_bar.progress(done/total if total else 0.0,text=f"{stage_name['value']}: {done:,} / {total:,}")
         with st.spinner("Learning expected runs and checking matchup predictions..."):
             bullpen_logs = st.session_state.get("mlb_v3_player_logs")
             if bullpen_logs is None or bullpen_logs.empty:
@@ -11295,9 +11311,11 @@ if st.button("Build and evaluate MLB matchup model", key="mlb_matchup_run", type
                 raise ValueError("Historical player warehouse is empty; load it before bullpen modeling")
             from dual_agent.supabase_db import load_mlb_capture_learning_dataset
             matchup_context = load_mlb_capture_learning_dataset()
-            result = run_mlb_matchup_model(include_context=True, context_dataset=matchup_context, include_handedness=handedness_enabled, player_logs=bullpen_logs, cohort="june_pilot" if matchup_scope.startswith("Cached") else "seasonwide", progress=lambda done,total: progress_bar.progress(done/total, text=f"Checked {done} of {total} games"))
+            result = run_mlb_matchup_model(stage_callback=matchup_stage, include_context=True, context_dataset=matchup_context, include_handedness=handedness_enabled, player_logs=bullpen_logs, cohort="june_pilot" if matchup_scope.startswith("Cached") else "seasonwide", progress=matchup_progress)
+        matchup_stage("Saving completed model and features")
         result["archive_status"] = matchup_module.save_mlb_matchup_record(result)
         st.session_state["mlb_matchup_result"] = result
+        stage_display.success("Model build complete.")
         progress_bar.empty()
     except Exception as exc:
         st.error("Matchup model stopped: " + str(exc))
