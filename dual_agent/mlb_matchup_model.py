@@ -133,13 +133,15 @@ def run_mlb_matchup_model(cache_root='mlb_accuracy_results', progress=None, coho
         handedness_coverage=attach_handedness(games,records)
         if not any(row['lineup_players_with_splits']>=8 for row in handedness_coverage):
             raise ValueError('No lineups have sufficient prior handedness coverage')
+    from dual_agent.mlb_matchup_elo import attach_elo, chronological_win_layer, select_recommendations, recommendation_metrics
+    schedule_games=[]
+    for year in [2024,2025,2026]:
+        schedule=json.loads((Path(cache_root)/'historical_pilot_cache'/f'schedule_{year}.json').read_text())
+        schedule_games.extend(g for day in schedule['dates'] for g in day['games'] if g.get('gameType')=='R')
+    elo_source=attach_elo(games,schedule_games)
     context_coverage=[]
     if include_context:
         from dual_agent.mlb_matchup_context import attach_matchup_context
-        schedule_games=[]
-        for year in [2024,2025,2026]:
-            schedule=json.loads((Path(cache_root)/'historical_pilot_cache'/f'schedule_{year}.json').read_text())
-            schedule_games.extend(g for day in schedule['dates'] for g in day['games'] if g.get('gameType')=='R')
         context_coverage=attach_matchup_context(games,player_logs,schedule_games,context_dataset)
     development_train = [g for g in games if g['season'] == 2024]
     development_test = [g for g in games if g['season'] == 2025]
@@ -162,6 +164,12 @@ def run_mlb_matchup_model(cache_root='mlb_accuracy_results', progress=None, coho
         baseline = make_pipeline(SimpleImputer(strategy='median'), StandardScaler(), LogisticRegression(C=1., max_iter=3000, random_state=42))
         baseline.fit(np.asarray([g['features'][:8] for g in train]), [g['home_win'] for g in train])
         control = baseline.predict_proba(np.asarray([g['features'][:8] for g in test]))[:, 1]
+    raw_matchup_p=p.copy()
+    with threadpool_limits(limits=2):
+        p, dp, win_bundle, win_development = chronological_win_layer(
+            development_train, development_test, test, selected,
+            (chosen_config['bullpen'],include_handedness,include_context),
+            fit_run_model,predict_matchups,rates,raw_matchup_p)
     differences = ((p >= .5) == y).astype(int) - ((control >= .5) == y).astype(int)
     daily = pd.DataFrame({'date': [g['start_time'][:10] for g in test], 'difference': differences}).groupby('date').difference.agg(['sum', 'count'])
     rng = np.random.default_rng(42)
@@ -169,21 +177,16 @@ def run_mlb_matchup_model(cache_root='mlb_accuracy_results', progress=None, coho
     for _ in range(2000):
         draw = daily.iloc[rng.integers(0, len(daily), len(daily))]
         boot.append(float(draw['sum'].sum()/draw['count'].sum()))
-    # Confidence threshold is selected on 2025, never on the 2026 outcomes.
-    development_model = fit_run_model(development_train, selected, chosen_config['bullpen'], include_handedness, include_context)
-    _, dp = predict_matchups(development_model, development_test)
-    dy = np.asarray([g['home_win'] for g in development_test])
-    thresholds = []
-    for threshold in [.55, .60, .65]:
-        mask = np.maximum(dp, 1-dp) >= threshold
-        if mask.sum() >= 50:
-            thresholds.append({'threshold': threshold, 'games': int(mask.sum()), 'accuracy': float(np.mean((dp[mask] >= .5) == dy[mask]))})
-    chosen = max(thresholds, key=lambda r: (r['accuracy'], r['games']))['threshold'] if thresholds else None
-    mask = np.maximum(p, 1-p) >= chosen if chosen is not None else np.zeros(len(p), dtype=bool)
+    # Recommendation rule uses 2025 outcomes only; never choose cutoff on test outcomes.
+    dy=np.asarray([g['home_win'] for g in development_test])
+    chosen, thresholds=select_recommendations(dp,dy)
+    mask, recommended_metrics=recommendation_metrics(p,y,chosen)
     predictions = [{'game_id': g['game_id'], 'Start UTC': g['start_time'], 'Home': g['home_team'], 'Away': g['away_team'],
                     'Projected home runs': float(rate[0]), 'Projected away runs': float(rate[1]),
                     'Home win probability': float(probability), 'Actual home runs': g['home_runs'], 'Actual away runs': g['away_runs'],
-                    'Correct': bool((probability >= .5) == g['home_win'])} for g, rate, probability in zip(test, rates, p)]
+                    'Elo home':g['elo_home'], 'Elo away':g['elo_away'],
+                    'Recommended':bool(mask[index]), 'Pick':g['home_team'] if probability>=.5 else g['away_team'],
+                    'Record type':'historical evaluation', 'Correct': bool((probability >= .5) == g['home_win'])} for index,(g, rate, probability) in enumerate(zip(test, rates, p))]
     fitted = model.steps[-1][1]
     names = FEATURES + (BULLPEN_FEATURES if chosen_config['bullpen'] else [])
     if include_handedness:
@@ -200,15 +203,17 @@ def run_mlb_matchup_model(cache_root='mlb_accuracy_results', progress=None, coho
             comparison=fit_run_model(train,config['alpha'],flag, include_handedness, include_context)
             _,probability=predict_matchups(comparison,test)
             extra_scores.append(score(label,y,probability))
-    result = {'version': 4, 'cohort': cohort, 'training_games': len(train), 'test_games': len(test),
-              'scores': [score('Historical team baseline', y, control), score('Development-selected matchup model', y, p)]+extra_scores,
+    result = {'version': 5, 'cohort': cohort, 'training_games': len(train), 'test_games': len(test),
+              'scores': [score('Historical team baseline', y, control), score('Matchup runs only', y, raw_matchup_p), score('Matchup + Elo + logistic win layer', y, p)]+extra_scores,
               'accuracy_change': float(differences.mean()), 'accuracy_change_95_interval': np.quantile(boot, [.025, .975]).tolist(),
               'run_MAE': float(mean_absolute_error(np.asarray([[g['home_runs'], g['away_runs']] for g in test]), rates)),
               'handedness_connected':include_handedness, 'handedness_source':handedness_source, 'handedness_coverage':handedness_coverage, 'handedness_note':'Prior completed plate appearances only. Three-day and recent-game data remain delayed by 48 hours. Split rates shrink toward the player prior overall rates with 100 pseudo-observations; at least eight lineup players required. No full-season split endpoint is used.', 'context_connected':include_context, 'context_coverage':context_coverage, 'unlearned_features':[name for name in names if name not in retained], 'context_note':'Rest and form use prior warehouse records with a 48-hour buffer. Rest is measured since last known start, not verified latest start. Thirty-day rates blend toward prior season rates. Park ratio uses only prior same-season scores with 50-game shrinkage. Weather/roof/dimensions require schema-versioned frozen captures no later than archived prediction time; unsupported inputs remain unknown.', 'selected_alpha': selected, 'development_scores': development_scores,
+              'elo_connected':True,'elo_source':elo_source,'win_layer_bundle':win_bundle,'win_layer_development':win_development,
+              'recommendation_metrics':recommended_metrics, 'recommendation_policy':{'target_accuracy':.70,'minimum_development_picks':50,'cutoff_locked_on_season':2025,'no_qualifying_rule':chosen is None,'note':'70% on recommended games is the objective, not a guaranteed probability or observed future record. No cutoff is issued if no development group qualifies.'},
               'confidence_selection': {'threshold': chosen, 'development': thresholds, 'test_games': int(mask.sum()), 'test_accuracy': float(np.mean((p[mask] >= .5) == y[mask])) if mask.any() else None},
               'bullpen_selected':chosen_config['bullpen'], 'bullpen_coverage':bullpen_coverage, 'bullpen_coverage_by_season':pd.DataFrame(bullpen_coverage).groupby('season').prior_relief_history.agg(['sum','count']).reset_index().to_dict('records') if bullpen_coverage else [], 'coefficients': dict(zip(retained, fitted.coef_.tolist())), 'predictions': predictions,
               'missing_inputs': [* ([] if include_handedness else ['Verified historical pitcher/hitter handedness splits']), 'Confirmed bullpen health/rest availability; immediate prior 48 hours are excluded from warehouse-based workload', 'Historical weather and roof status'],
-              'limitations': ['2026 has been inspected in earlier experiments; it is not an untouched holdout.', 'Archive provider reconstruction/corrections remain possible; prior score availability uses a conservative 48-hour delay.', 'Independent Poisson scoring is an approximation; regulation ties are split equally.', 'Confidence subgroup results must include their sample size. Small subgroups do not establish reliability.'],
+              'limitations': ['2026 has been inspected in earlier experiments; it is not an untouched holdout.', 'Archive provider reconstruction/corrections remain possible; prior score availability uses a conservative 48-hour delay.', 'Independent Poisson scoring is an approximation; regulation ties are split equally.', 'The logistic win layer uses earlier-block run forecasts. Hyperparameters still share 2025 development data; a new future record is required.', 'Historical recommendations are evaluations, not timestamped live picks. The live engine remains unpromoted.', 'Confidence subgroup results must include their sample size. Small subgroups do not establish reliability.'],
               'bullpen_note':'Archived bullpen list is a feed observation, not confirmed availability. Relief counts use listed pitchers with prior relief appearances. Workload covers three days ending 48 hours before capture; quality covers 30 days before that cutoff. Missing history stays unknown. Stored zero values cannot establish source completeness.', 'retained_feature_rows':games, 'created_at':pd.Timestamp.now(tz='UTC').isoformat(), 'model_bundle':{'columns':retained,'median':model.steps[0][1].statistics_[np.isfinite(model.steps[0][1].statistics_)].tolist(),'mean':model.steps[1][1].mean_.tolist(),'scale':model.steps[1][1].scale_.tolist(),'weights':fitted.coef_.tolist(),'intercept':float(fitted.intercept_)}, 'live_model_changed': False}
     (Path(cache_root)/'mlb_matchup_model_result.json').write_text(json.dumps(result, indent=2))
     return result
@@ -229,3 +234,41 @@ def save_mlb_matchup_record(result):
         return {'success':True,'archive_file':path}
     except Exception as exc:
         return {'success':False,'message':str(exc)}
+
+def generate_saved_matchup_recommendations(result, games):
+    """Score fresh enriched game rows and persist every qualifying research pick.
+
+    Caller supplies frozen pregame rows with the same feature schema as training.
+    This entry point does not collect data or replace the live engine/scanner.
+    """
+    from dual_agent.mlb_matchup_elo import predict_win_bundle, freeze_recommendation, save_recommendation
+    import hashlib
+    if result.get('version',0)<5: raise ValueError('Build the Elo matchup version first')
+    threshold=result['confidence_selection']['threshold']
+    if threshold is None: return {'recommendations':[],'errors':[],'note':'No development-qualified 70% recommendation rule'}
+    model_id=hashlib.sha256(json.dumps({'runs':result['model_bundle'],'wins':result['win_layer_bundle'],'threshold':threshold},sort_keys=True).encode()).hexdigest()
+    names=FEATURES+(BULLPEN_FEATURES if result['bullpen_selected'] else [])
+    if result['handedness_connected']:
+        from dual_agent.mlb_handedness import HAND_FEATURES
+        names+=HAND_FEATURES
+    if result['context_connected']:
+        from dual_agent.mlb_matchup_context import FORM_FEATURES, ENVIRONMENT_FEATURES
+        names+=FORM_FEATURES+ENVIRONMENT_FEATURES
+    rows=[dict(g,home_runs=0,away_runs=0) for g in games]  # labels unused for inference
+    X,_=matchup_rows(rows,result['bullpen_selected'],result['handedness_connected'],result['context_connected'])
+    bundle=result['model_bundle'];indices=[names.index(name) for name in bundle['columns']]
+    X=X[:,indices];X=np.where(np.isfinite(X),X,np.asarray(bundle['median']))
+    z=((X-np.asarray(bundle['mean']))/np.asarray(bundle['scale']))@np.asarray(bundle['weights'])+bundle['intercept']
+    rates=np.exp(np.clip(z,-20,20)).reshape(-1,2)
+    raw=skellam.sf(0,rates[:,0],rates[:,1])+.5*skellam.pmf(0,rates[:,0],rates[:,1])
+    probabilities=predict_win_bundle(games,rates,raw,result['win_layer_bundle'])
+    recommendations=[];errors=[]
+    for game,probability in zip(games,probabilities):
+        if max(probability,1-probability)<threshold: continue
+        try:
+            record=freeze_recommendation(game,probability,threshold,model_id)
+            saved=save_recommendation(record)
+            recommendations.append(dict(record,archive_file=saved['archive_file']))
+        except Exception as exc:
+            errors.append({'game_id':game['game_id'],'error':str(exc)})
+    return {'recommendations':recommendations,'errors':errors,'note':'Research recommendations; each successful record saved before game time'}
