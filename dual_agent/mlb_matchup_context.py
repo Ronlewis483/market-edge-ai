@@ -11,7 +11,7 @@ ENVIRONMENT_FEATURES=['prior_park_scoring_ratio','forecast_temperature_f','forec
  'roof_closed','stadium_center_field_ft','stadium_elevation_ft']
 
 
-def attach_matchup_context(games,player_logs,schedule_games,context_dataset=None):
+def attach_matchup_context(games,player_logs,schedule_games,context_dataset=None,progress=None):
     needed={'player_id','game_id','start_time','games_started','pitches','pitching_outs',
      'pitcher_strikeouts','pitcher_walks','at_bats','hits','doubles','triples','batting_home_runs',
      'plate_appearances','batting_walks','batting_strikeouts'}
@@ -50,7 +50,7 @@ def attach_matchup_context(games,player_logs,schedule_games,context_dataset=None
         rn,rd=total(recent,numerator),total(recent,denominator)
         return (rn+pseudo*n/d)/(rd+pseudo) if d and n is not None and rn is not None and rd is not None else None
     coverage=[]
-    for game in games:
+    for index,game in enumerate(games,1):
         capture=pd.to_datetime(game['timecode'],format='%Y%m%d_%H%M%S',utc=True)
         cutoff=capture-pd.Timedelta(hours=48)
         game['form_sides']={}
@@ -92,4 +92,5 @@ def attach_matchup_context(games,player_logs,schedule_games,context_dataset=None
             except (ValueError,TypeError):environment.append(None)
         game['environment']=environment
         coverage.append({'game_id':game['game_id'],'season':game['season'],'park_prior_games':len(local),'dated_environment_capture':bool(candidates), 'home_form_values':sum(v is not None for v in game['form_sides']['home']),'away_form_values':sum(v is not None for v in game['form_sides']['away'])})
+        if progress and (index%10==0 or index==len(games)):progress(index,len(games))
     return coverage
