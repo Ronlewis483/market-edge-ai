@@ -11247,7 +11247,17 @@ st.caption("Estimate each team's scoring from its lineup and the opposing starte
 matchup_scope = st.selectbox("Matchup test coverage", ["Cached June pilot — verify model", "May–September — up to 1,800 games"], key="mlb_matchup_scope")
 if st.button("Build and evaluate MLB matchup model", key="mlb_matchup_run", type="primary"):
     try:
-        from dual_agent.mlb_matchup_model import run_mlb_matchup_model
+        import importlib
+        import inspect
+        import dual_agent.mlb_historical_accuracy_test as matchup_archive_module
+        import dual_agent.mlb_matchup_model as matchup_module
+        # Streamlit reruns app.py while imported modules may retain earlier code.
+        importlib.invalidate_caches()
+        matchup_archive_module = importlib.reload(matchup_archive_module)
+        matchup_module = importlib.reload(matchup_module)
+        run_mlb_matchup_model = matchup_module.run_mlb_matchup_model
+        if "player_logs" not in inspect.signature(run_mlb_matchup_model).parameters:
+            raise RuntimeError("The deployed matchup module is outdated: " + str(matchup_module.__file__) + ". Its run_mlb_matchup_model function must accept player_logs. Check the repository branch used by this deployment.")
         progress_bar = st.progress(0, text="Checking pregame archives...")
         with st.spinner("Learning expected runs and checking matchup predictions..."):
             bullpen_logs = st.session_state.get("mlb_v3_player_logs")
