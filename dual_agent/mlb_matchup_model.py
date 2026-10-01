@@ -67,7 +67,7 @@ def attach_bullpen_history(games, player_logs):
     return coverage
 
 
-def matchup_rows(games, include_bullpen=False, include_handedness=False):
+def matchup_rows(games, include_bullpen=False, include_handedness=False, include_context=False):
     """Each game produces two scoring rows from frozen pregame observations."""
     rows, targets = [], []
     for game in games:
@@ -86,22 +86,25 @@ def matchup_rows(games, include_bullpen=False, include_handedness=False):
                 rows[-1].extend(game['bullpen_sides'][other])
             if include_handedness:
                 rows[-1].extend(game['hand_sides'][side])
+            if include_context:
+                rows[-1].extend(game['form_sides'][side]+game['environment'])
             targets.append(game[side + '_runs'])
     return np.asarray(rows, dtype=float), np.asarray(targets, dtype=float)
 
 
-def fit_run_model(games, alpha, include_bullpen=False, include_handedness=False):
-    X, y = matchup_rows(games, include_bullpen, include_handedness)
+def fit_run_model(games, alpha, include_bullpen=False, include_handedness=False, include_context=False):
+    X, y = matchup_rows(games, include_bullpen, include_handedness, include_context)
     model = make_pipeline(SimpleImputer(strategy='median'), StandardScaler(),
                           PoissonRegressor(alpha=alpha, max_iter=2000, tol=1e-7))
     model.fit(X, y)
     model.matchup_has_bullpen = include_bullpen
     model.matchup_has_handedness = include_handedness
+    model.matchup_has_context = include_context
     return model
 
 
 def predict_matchups(model, games):
-    X, _ = matchup_rows(games, getattr(model, "matchup_has_bullpen", False), getattr(model, "matchup_has_handedness", False))
+    X, _ = matchup_rows(games, getattr(model, "matchup_has_bullpen", False), getattr(model, "matchup_has_handedness", False), getattr(model, "matchup_has_context", False))
     rates = model.predict(X).reshape(-1, 2)
     # Independent Poisson scoring; tied regulation games split equally.
     probabilities = skellam.sf(0, rates[:, 0], rates[:, 1]) + .5 * skellam.pmf(0, rates[:, 0], rates[:, 1])
@@ -114,7 +117,7 @@ def score(label, actual, probabilities):
             'Log loss': float(log_loss(actual, probabilities, labels=[0, 1]))}
 
 
-def run_mlb_matchup_model(cache_root='mlb_accuracy_results', progress=None, cohort='seasonwide', games_per_season=600, player_logs=None, include_handedness=False):
+def run_mlb_matchup_model(cache_root='mlb_accuracy_results', progress=None, cohort='seasonwide', games_per_season=600, player_logs=None, include_handedness=False, include_context=True, context_dataset=None):
     from dual_agent.mlb_historical_accuracy_test import run_historical_accuracy_test
     from threadpoolctl import threadpool_limits
     run_historical_accuracy_test(cache_root, progress=progress, expanded=True,
@@ -130,6 +133,14 @@ def run_mlb_matchup_model(cache_root='mlb_accuracy_results', progress=None, coho
         handedness_coverage=attach_handedness(games,records)
         if not any(row['lineup_players_with_splits']>=8 for row in handedness_coverage):
             raise ValueError('No lineups have sufficient prior handedness coverage')
+    context_coverage=[]
+    if include_context:
+        from dual_agent.mlb_matchup_context import attach_matchup_context
+        schedule_games=[]
+        for year in [2024,2025,2026]:
+            schedule=json.loads((Path(cache_root)/'historical_pilot_cache'/f'schedule_{year}.json').read_text())
+            schedule_games.extend(g for day in schedule['dates'] for g in day['games'] if g.get('gameType')=='R')
+        context_coverage=attach_matchup_context(games,player_logs,schedule_games,context_dataset)
     development_train = [g for g in games if g['season'] == 2024]
     development_test = [g for g in games if g['season'] == 2025]
     train = [g for g in games if g['season'] < 2026]
@@ -141,12 +152,12 @@ def run_mlb_matchup_model(cache_root='mlb_accuracy_results', progress=None, coho
     with threadpool_limits(limits=2):
         for include_bullpen in ([False,True] if bullpen_coverage else [False]):
             for alpha in [.1, 1., 10.]:
-                model = fit_run_model(development_train, alpha, include_bullpen, include_handedness)
+                model = fit_run_model(development_train, alpha, include_bullpen, include_handedness, include_context)
                 _, p = predict_matchups(model, development_test)
                 development_scores.append({'alpha': alpha, 'bullpen':include_bullpen, 'Log loss': float(log_loss([g['home_win'] for g in development_test], p, labels=[0, 1]))})
         chosen_config = min(development_scores, key=lambda r: r['Log loss'])
         selected = chosen_config['alpha']
-        model = fit_run_model(train, selected, chosen_config['bullpen'], include_handedness)
+        model = fit_run_model(train, selected, chosen_config['bullpen'], include_handedness, include_context)
         rates, p = predict_matchups(model, test)
         baseline = make_pipeline(SimpleImputer(strategy='median'), StandardScaler(), LogisticRegression(C=1., max_iter=3000, random_state=42))
         baseline.fit(np.asarray([g['features'][:8] for g in train]), [g['home_win'] for g in train])
@@ -159,7 +170,7 @@ def run_mlb_matchup_model(cache_root='mlb_accuracy_results', progress=None, coho
         draw = daily.iloc[rng.integers(0, len(daily), len(daily))]
         boot.append(float(draw['sum'].sum()/draw['count'].sum()))
     # Confidence threshold is selected on 2025, never on the 2026 outcomes.
-    development_model = fit_run_model(development_train, selected, chosen_config['bullpen'], include_handedness)
+    development_model = fit_run_model(development_train, selected, chosen_config['bullpen'], include_handedness, include_context)
     _, dp = predict_matchups(development_model, development_test)
     dy = np.asarray([g['home_win'] for g in development_test])
     thresholds = []
@@ -178,23 +189,43 @@ def run_mlb_matchup_model(cache_root='mlb_accuracy_results', progress=None, coho
     if include_handedness:
         from dual_agent.mlb_handedness import HAND_FEATURES
         names += HAND_FEATURES
+    if include_context:
+        from dual_agent.mlb_matchup_context import FORM_FEATURES, ENVIRONMENT_FEATURES
+        names += FORM_FEATURES+ENVIRONMENT_FEATURES
     retained = model.steps[0][1].get_feature_names_out(names).tolist()
     extra_scores=[]
     if bullpen_coverage:
         for flag,label in [(False,'Matchup without bullpen'),(True,'Matchup with lagged bullpen history')]:
             config=min([row for row in development_scores if row['bullpen']==flag],key=lambda row:row['Log loss'])
-            comparison=fit_run_model(train,config['alpha'],flag, include_handedness)
+            comparison=fit_run_model(train,config['alpha'],flag, include_handedness, include_context)
             _,probability=predict_matchups(comparison,test)
             extra_scores.append(score(label,y,probability))
-    result = {'version': 3, 'cohort': cohort, 'training_games': len(train), 'test_games': len(test),
+    result = {'version': 4, 'cohort': cohort, 'training_games': len(train), 'test_games': len(test),
               'scores': [score('Historical team baseline', y, control), score('Development-selected matchup model', y, p)]+extra_scores,
               'accuracy_change': float(differences.mean()), 'accuracy_change_95_interval': np.quantile(boot, [.025, .975]).tolist(),
               'run_MAE': float(mean_absolute_error(np.asarray([[g['home_runs'], g['away_runs']] for g in test]), rates)),
-              'handedness_connected':include_handedness, 'handedness_source':handedness_source, 'handedness_coverage':handedness_coverage, 'handedness_note':'Prior completed plate appearances only. Three-day and recent-game data remain delayed by 48 hours. Split rates shrink toward the player prior overall rates with 100 pseudo-observations; at least eight lineup players required. No full-season split endpoint is used.', 'selected_alpha': selected, 'development_scores': development_scores,
+              'handedness_connected':include_handedness, 'handedness_source':handedness_source, 'handedness_coverage':handedness_coverage, 'handedness_note':'Prior completed plate appearances only. Three-day and recent-game data remain delayed by 48 hours. Split rates shrink toward the player prior overall rates with 100 pseudo-observations; at least eight lineup players required. No full-season split endpoint is used.', 'context_connected':include_context, 'context_coverage':context_coverage, 'unlearned_features':[name for name in names if name not in retained], 'context_note':'Rest and form use prior warehouse records with a 48-hour buffer. Rest is measured since last known start, not verified latest start. Thirty-day rates blend toward prior season rates. Park ratio uses only prior same-season scores with 50-game shrinkage. Weather/roof/dimensions require schema-versioned frozen captures no later than archived prediction time; unsupported inputs remain unknown.', 'selected_alpha': selected, 'development_scores': development_scores,
               'confidence_selection': {'threshold': chosen, 'development': thresholds, 'test_games': int(mask.sum()), 'test_accuracy': float(np.mean((p[mask] >= .5) == y[mask])) if mask.any() else None},
               'bullpen_selected':chosen_config['bullpen'], 'bullpen_coverage':bullpen_coverage, 'bullpen_coverage_by_season':pd.DataFrame(bullpen_coverage).groupby('season').prior_relief_history.agg(['sum','count']).reset_index().to_dict('records') if bullpen_coverage else [], 'coefficients': dict(zip(retained, fitted.coef_.tolist())), 'predictions': predictions,
               'missing_inputs': [* ([] if include_handedness else ['Verified historical pitcher/hitter handedness splits']), 'Confirmed bullpen health/rest availability; immediate prior 48 hours are excluded from warehouse-based workload', 'Historical weather and roof status'],
               'limitations': ['2026 has been inspected in earlier experiments; it is not an untouched holdout.', 'Archive provider reconstruction/corrections remain possible; prior score availability uses a conservative 48-hour delay.', 'Independent Poisson scoring is an approximation; regulation ties are split equally.', 'Confidence subgroup results must include their sample size. Small subgroups do not establish reliability.'],
-              'bullpen_note':'Archived bullpen list is a feed observation, not confirmed availability. Relief counts use listed pitchers with prior relief appearances. Workload covers three days ending 48 hours before capture; quality covers 30 days before that cutoff. Missing history stays unknown. Stored zero values cannot establish source completeness.', 'live_model_changed': False}
+              'bullpen_note':'Archived bullpen list is a feed observation, not confirmed availability. Relief counts use listed pitchers with prior relief appearances. Workload covers three days ending 48 hours before capture; quality covers 30 days before that cutoff. Missing history stays unknown. Stored zero values cannot establish source completeness.', 'retained_feature_rows':games, 'created_at':pd.Timestamp.now(tz='UTC').isoformat(), 'model_bundle':{'columns':retained,'median':model.steps[0][1].statistics_[np.isfinite(model.steps[0][1].statistics_)].tolist(),'mean':model.steps[1][1].mean_.tolist(),'scale':model.steps[1][1].scale_.tolist(),'weights':fitted.coef_.tolist(),'intercept':float(fitted.intercept_)}, 'live_model_changed': False}
     (Path(cache_root)/'mlb_matchup_model_result.json').write_text(json.dumps(result, indent=2))
     return result
+
+
+def save_mlb_matchup_record(result):
+    """Archive model and retained pregame features separately from player model."""
+    from uuid import uuid4
+    from dual_agent import supabase_db as storage
+    try:
+        ready=storage.ensure_market_edge_storage_bucket()
+        if not ready.get('success'):
+            raise RuntimeError(ready.get('error','Storage bucket unavailable'))
+        payload=json.dumps(storage._json_safe(result),allow_nan=False).encode('utf-8')
+        path='mlb/matchup_model/'+pd.Timestamp.now(tz='UTC').strftime('%Y%m%dT%H%M%S%fZ')+'_'+uuid4().hex+'.json'
+        bucket=storage.get_supabase_client().storage.from_(storage.MLB_STORAGE_BUCKET)
+        bucket.upload(path,payload,{'content-type':'application/json','upsert':'false'})
+        return {'success':True,'archive_file':path}
+    except Exception as exc:
+        return {'success':False,'message':str(exc)}
