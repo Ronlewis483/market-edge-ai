@@ -4,6 +4,9 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 import json
+import os
+import tempfile
+import time
 import urllib.request
 import numpy as np
 
@@ -33,6 +36,56 @@ def parse_appearances(payload, game):
     return rows
 
 
+def valid_appearance_cache(rows, game):
+    required={'game_id','season','start_time','ended','batter','pitcher','hand','bat','pa','ab','hit','tb','bb','hbp','sf'}
+    if not isinstance(rows,list) or not rows:return False
+    for row in rows:
+        if not isinstance(row,dict) or not required.issubset(row):return False
+        if row['game_id']!=game['gamePk'] or row['season']!=int(game['season']):return False
+        if row['hand'] not in {'L','R'} or row['bat'] not in {'L','R'}:return False
+        try:
+            timestamp(row['start_time']);timestamp(row['ended'])
+        except (TypeError,ValueError,AttributeError):return False
+    return True
+
+
+def fetch_prior_appearances(game, cache, attempts=3):
+    """Recover invalid caches; retry downloads; atomically retain valid rows."""
+    cache=Path(cache);cache.mkdir(parents=True,exist_ok=True)
+    path=cache/f"{game['gamePk']}_appearances_v1.json"
+    if path.exists():
+        try:
+            rows=json.loads(path.read_text())
+            if valid_appearance_cache(rows,game):return rows
+        except (OSError,ValueError,TypeError):
+            pass  # Redownload this entry only; other cache files remain intact.
+    error=None
+    for attempt in range(attempts):
+        temp_path=None
+        try:
+            request=urllib.request.Request(
+                f"https://statsapi.mlb.com/api/v1/game/{game['gamePk']}/playByPlay",
+                headers={'Accept':'application/json','User-Agent':'MarketEdgeAI-history/1.0'})
+            with urllib.request.urlopen(request,timeout=25) as response:
+                data=json.load(response)
+            rows=parse_appearances(data,game)
+            if not valid_appearance_cache(rows,game):
+                raise ValueError('No valid supported completed plate appearances')
+            with tempfile.NamedTemporaryFile(mode='w',encoding='utf-8',dir=cache,
+                                             prefix=f"{game['gamePk']}_",suffix='.tmp',delete=False) as handle:
+                temp_path=Path(handle.name)
+                json.dump(rows,handle,allow_nan=False)
+                handle.flush();os.fsync(handle.fileno())
+            os.replace(temp_path,path)
+            return rows
+        except Exception as exc:
+            error=exc
+            if attempt+1<attempts:time.sleep(.5*(attempt+1))
+        finally:
+            if temp_path is not None:temp_path.unlink(missing_ok=True)
+    raise ValueError(f"Game {game['gamePk']} failed after {attempts} attempts: {error}") from error
+
+
 def collect_prior_appearances(games, cache_root, progress=None):
     root=Path(cache_root);cache=root/'handedness_play_cache';cache.mkdir(exist_ok=True)
     maximum={}
@@ -44,14 +97,7 @@ def collect_prior_appearances(games, cache_root, progress=None):
         schedule=json.loads((root/'historical_pilot_cache'/f'schedule_{year}.json').read_text())
         requested.extend(g for day in schedule['dates'] for g in day['games'] if g.get('gameType')=='R' and g['status'].get('abstractGameState')=='Final' and not g.get('resumeDate') and timestamp(g['gameDate'])<limit)
     def fetch(g):
-        path=cache/f"{g['gamePk']}_appearances_v1.json"
-        if path.exists():return json.loads(path.read_text())
-        with urllib.request.urlopen(f"https://statsapi.mlb.com/api/v1/game/{g['gamePk']}/playByPlay",timeout=25) as response:
-            data=json.load(response)
-        rows=parse_appearances(data,g)
-        if not rows:raise ValueError('No supported completed plate appearances')
-        path.write_text(json.dumps(rows))
-        return rows
+        return fetch_prior_appearances(g,cache)
     records=[];errors=[]
     with ThreadPoolExecutor(max_workers=8) as pool:
         pending={pool.submit(fetch,g):g for g in requested}
