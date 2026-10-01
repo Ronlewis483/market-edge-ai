@@ -11319,6 +11319,88 @@ if st.button("Build and evaluate MLB matchup model", key="mlb_matchup_run", type
         progress_bar.empty()
     except Exception as exc:
         st.error("Matchup model stopped: " + str(exc))
+def audit_saved_mlb_engine(archive):
+    """Replay the saved engine, without fitting, fetching data, or saving picks."""
+    import numpy as audit_np
+    from scipy.stats import skellam as audit_skellam
+    from scipy.special import expit as audit_expit
+    from dual_agent.mlb_matchup_model import matchup_rows, FEATURES, BULLPEN_FEATURES
+    from dual_agent.mlb_handedness import HAND_FEATURES
+    from dual_agent.mlb_matchup_context import FORM_FEATURES, ENVIRONMENT_FEATURES
+    from dual_agent.mlb_matchup_elo import WIN_COLUMNS
+    stored = archive.get("predictions", [])
+    history = archive.get("retained_feature_rows", [])
+    if not stored or not history:
+        raise ValueError("The full saved model archive must contain predictions and retained_feature_rows.")
+    by_id = {int(g["game_id"]):g for g in history}
+    ids = [int(g["game_id"]) for g in stored]
+    if len(set(ids)) != len(ids) or len(by_id) != len(history):
+        raise ValueError("Duplicate game IDs in saved archive.")
+    if any(gid not in by_id for gid in ids):
+        raise ValueError("Saved feature rows are missing evaluation games.")
+    games = [by_id[gid] for gid in ids]
+    flags = [bool(archive.get(k, False)) for k in ["bullpen_selected", "handedness_connected", "context_connected"]]
+    names = FEATURES + (BULLPEN_FEATURES if flags[0] else []) + (HAND_FEATURES if flags[1] else []) + (FORM_FEATURES+ENVIRONMENT_FEATURES if flags[2] else [])
+    # Targets supplied to the row builder are unused during inference.
+    rows = [dict(g, home_runs=0, away_runs=0) for g in games]
+    matrix, _ = matchup_rows(rows, *flags)
+    bundle = archive["model_bundle"]
+    columns = bundle["columns"]
+    if len(set(columns)) != len(columns) or any(name not in names for name in columns):
+        raise ValueError("Saved model has an unsupported or duplicate feature schema.")
+    vectors = {key:audit_np.asarray(bundle[key],dtype=float) for key in ["median","mean","scale","weights"]}
+    if any(value.shape != (len(columns),) or not audit_np.isfinite(value).all() for value in vectors.values()) or (vectors["scale"] <= 0).any():
+        raise ValueError("Saved scoring weights/scaler are invalid.")
+    X = matrix[:,[names.index(name) for name in columns]]
+    missing = ~audit_np.isfinite(X)
+    filled = audit_np.where(missing, vectors["median"], X)
+    contributions = ((filled-vectors["mean"])/vectors["scale"])*vectors["weights"]
+    z = contributions.sum(axis=1)+float(bundle["intercept"])
+    rates = audit_np.exp(z).reshape(-1,2)
+    if not audit_np.isfinite(rates).all() or (rates <= 0).any():
+        raise ValueError("Saved model produced invalid scoring rates.")
+    raw = audit_np.clip(audit_skellam.sf(0,rates[:,0],rates[:,1])+.5*audit_skellam.pmf(0,rates[:,0],rates[:,1]),1e-6,1-1e-6)
+    wb = archive["win_layer_bundle"]
+    if wb["columns"] != WIN_COLUMNS:
+        raise ValueError("Unsupported Elo win-layer schema.")
+    WX = audit_np.column_stack([audit_np.log(raw/(1-raw)),[g["elo_difference"] for g in games],rates[:,0]-rates[:,1]])
+    wm,ws,ww = [audit_np.asarray(wb[key],dtype=float) for key in ["mean","scale","weights"]]
+    if any(v.shape != (3,) or not audit_np.isfinite(v).all() for v in [wm,ws,ww]) or (ws <= 0).any() or not audit_np.isfinite(WX).all():
+        raise ValueError("Invalid Elo layer inputs/scaler.")
+    win_terms = (WX-wm)/ws*ww
+    hybrid = audit_expit(audit_np.clip(win_terms.sum(axis=1)+float(wb["intercept"]),-40,40))
+    selected = hybrid if archive.get("win_layer_selected",True) else raw
+    saved = audit_np.asarray([g["Home win probability"] for g in stored],dtype=float)
+    saved_rates = audit_np.asarray([[g["Projected home runs"],g["Projected away runs"]] for g in stored],dtype=float)
+    probability_error = float(audit_np.max(audit_np.abs(selected-saved)))
+    rate_error = float(audit_np.max(audit_np.abs(rates-saved_rates)))
+    if not audit_np.isfinite(saved).all() or not audit_np.isfinite(saved_rates).all() or probability_error > 1e-7 or rate_error > 1e-7:
+        raise ValueError(f"Saved inference does not reproduce the archive: probability difference={probability_error:.8g}, run difference={rate_error:.8g}. Investigate this mismatch before comparing accuracy.")
+    outcomes = audit_np.asarray([g["home_win"] for g in games],dtype=int)
+    def summary(label,probability,mask):
+        count=int(mask.sum());correct=int(((probability[mask]>=.5)==outcomes[mask]).sum())
+        return {"Group":label,"Games":count,"Correct":correct,"Accuracy (%)":round(100*correct/count,2) if count else None}
+    all_games=audit_np.ones(len(games),dtype=bool)
+    scores=[]
+    for label,probability in [("Runs model",raw),("Runs + Elo layer",hybrid),("Selected engine",selected)]:
+        row=summary(label,probability,all_games)
+        row["Brier"]=float(audit_np.mean((probability-outcomes)**2))
+        scores.append(row)
+    flips=(raw>=.5)!=(hybrid>=.5)
+    coverage=[{"Feature":name,"Missing scoring rows":int(missing[:,i].sum()),"Scoring rows":len(X),"Missing (%)":round(100*float(missing[:,i].mean()),2)} for i,name in enumerate(columns)]
+    for name in names:
+        if name not in columns:coverage.append({"Feature":name,"Missing scoring rows":None,"Scoring rows":len(X),"Missing (%)":None,"Status":"Not retained in training"})
+    counts=missing.reshape(len(games),2,-1).sum(axis=(1,2))
+    groups=[summary("Elo changed winner",hybrid,flips),summary("Elo kept winner",hybrid,~flips),summary("Selected: no imputed inputs",selected,counts==0),summary("Selected: imputed inputs",selected,counts>0)]
+    for cutoff in [.60,.70]:groups.append(summary(f"Selected: confidence >= {cutoff:.0%}",selected,audit_np.maximum(selected,1-selected)>=cutoff))
+    detail=[]
+    for i,g in enumerate(games):
+        difference=contributions[2*i]-contributions[2*i+1]
+        strongest=audit_np.argsort(-audit_np.abs(difference))[:3]
+        detail.append({"game_id":g["game_id"],"Home":g["home_team"],"Away":g["away_team"],"Runs home probability":float(raw[i]),"Elo-layer home probability":float(hybrid[i]),"Selected home probability":float(selected[i]),"Confidence change (pp)":float(100*(max(hybrid[i],1-hybrid[i])-max(raw[i],1-raw[i]))),"Winner changed":bool(flips[i]),"Runs correct":bool((raw[i]>=.5)==outcomes[i]),"Elo correct":bool((hybrid[i]>=.5)==outcomes[i]),"Imputed inputs":int(counts[i]),"Largest scoring contributions":", ".join(f"{columns[j]}: {difference[j]:+.3f}" for j in strongest),"Elo log-odds contribution":float(win_terms[i,1])})
+    return {"archive_id":str(archive.get("created_at","")),"verification":{"Games replayed":len(games),"Max probability difference":probability_error,"Max projected-run difference":rate_error,"Inference matches saved predictions":True},"layer_scores":scores,"coverage":coverage,"change_groups":groups,"games":detail}
+
+
 # Read an existing archive without retraining or downloading historical games.
 with st.expander("Load saved MLB results — no model rerun"):
     saved_mlb_upload = st.file_uploader("Saved matchup model JSON", type=["json"], key="mlb_confidence_saved_upload")
@@ -11383,6 +11465,22 @@ if matchup:
             st.info("Sustained 70% accuracy has not been established. Keep gathering future evidence before live promotion.")
     if "win_layer_selected" in matchup:
         st.write("Recommendation model chosen using 2025: " + ("Matchup + Elo + logistic layer" if matchup["win_layer_selected"] else "Matchup runs — the Elo layer did not improve development log loss"))
+    with st.expander("Trace saved MLB predictions — no retraining", expanded=True):
+        st.caption("Reconstruct the scoring and Elo layers from archived weights and inputs. Outcomes are used only to grade the reconstructed predictions.")
+        if st.button("Audit saved prediction engine", key="mlb_saved_engine_audit"):
+            try:
+                st.session_state["mlb_saved_engine_audit"] = audit_saved_mlb_engine(matchup)
+            except Exception as exc:
+                st.session_state.pop("mlb_saved_engine_audit", None)
+                st.error("Saved engine audit stopped: " + str(exc))
+        saved_audit = st.session_state.get("mlb_saved_engine_audit")
+        if saved_audit and saved_audit["archive_id"] == str(matchup.get("created_at", "")):
+            st.json(saved_audit["verification"])
+            st.dataframe(pd.DataFrame(saved_audit["layer_scores"]), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(saved_audit["coverage"]), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(saved_audit["change_groups"]), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(saved_audit["games"]), use_container_width=True, hide_index=True)
+            st.caption("Imputation counts describe availability, not source freshness. Layer comparisons diagnose this archive; they do not authorize choosing the best layer on evaluation outcomes. All-missing training features were not learned.")
     st.subheader("MLB confidence selection — same comparison as football")
     confidence_rows = pd.DataFrame(matchup.get("predictions", []))
     if not confidence_rows.empty and {"Home win probability", "Correct"}.issubset(confidence_rows.columns):
