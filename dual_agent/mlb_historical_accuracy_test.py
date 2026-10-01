@@ -96,7 +96,7 @@ def run_historical_accuracy_test(cache_root="mlb_accuracy_results", progress=Non
                         values=[value for value in values if value is not None]
                         return sum(values)/len(values) if len(values)>=8 else None
                     sidevals[side] += [rate('strikeOuts'), rate('baseOnBalls'), lineup_rate('obp'), lineup_rate('slg')]
-                ids[side]={'pitcher_id':pid,'lineup_ids':order}
+                ids[side]={'pitcher_id':pid,'lineup_ids':order, 'bullpen_ids':team.get('bullpen', []), 'team_id':g['teams'][side]['team']['id']}
             h=g['teams']['home'].get('score');a=g['teams']['away'].get('score')
             if h is None or a is None or h==a:return {'game_id':gid,'error':'Final label invalid'}
             return {'game_id':gid,'season':int(g['season']),'start_time':g['gameDate'],'timecode':code,'home_win':int(h>a),
