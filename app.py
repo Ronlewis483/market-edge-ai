@@ -11481,6 +11481,47 @@ if matchup:
             st.dataframe(pd.DataFrame(saved_audit["change_groups"]), use_container_width=True, hide_index=True)
             st.dataframe(pd.DataFrame(saved_audit["games"]), use_container_width=True, hide_index=True)
             st.caption("Imputation counts describe availability, not source freshness. Layer comparisons diagnose this archive; they do not authorize choosing the best layer on evaluation outcomes. All-missing training features were not learned.")
+    with st.expander("Strengthen MLB probability layers from saved features", expanded=True):
+        st.caption("Fits a consistent frozen-base comparison from saved features only. Selects runs settings on 2024, fits probability layers on early 2025, chooses the layer and cutoff on late 2025, then grades 2026. No historical downloads. The live engine is unchanged.")
+        probability_odds_upload = st.file_uploader("Optional historical sportsbook consensus JSON", type=["json"], key="mlb_probability_odds_upload")
+        st.caption('Odds format: {"rows": [{"game_id": 123, "captured_at": "2025-06-01T18:00:00Z", "bookmaker": "book-name", "home_decimal": 1.5, "away_decimal": 2.8}]}. At least two distinct books per game; quotes must be at or before the saved prediction and no more than 30 minutes old. No API requests or purchases are made.')
+        if st.button("Build consistent MLB probability comparison", key="mlb_probability_upgrade_run"):
+            try:
+                import json as mlb_upgrade_json
+                import importlib as mlb_upgrade_importlib
+                import dual_agent.mlb_probability_upgrade as mlb_upgrade_module
+                mlb_upgrade_module = mlb_upgrade_importlib.reload(mlb_upgrade_module)
+                odds_payload = mlb_upgrade_json.load(probability_odds_upload) if probability_odds_upload is not None else None
+                with st.spinner("Fitting probability layers from saved features..."):
+                    upgraded = mlb_upgrade_module.run_saved_probability_upgrade(matchup, odds_payload)
+                from dual_agent.mlb_matchup_model import save_mlb_matchup_record
+                upgraded["archive_status"] = save_mlb_matchup_record(upgraded)
+                st.session_state["mlb_probability_upgrade_result"] = upgraded
+            except Exception as exc:
+                st.session_state.pop("mlb_probability_upgrade_result", None)
+                st.error("Probability upgrade stopped: " + str(exc))
+        upgraded = st.session_state.get("mlb_probability_upgrade_result")
+        if upgraded and upgraded.get("source_archive") == matchup.get("created_at"):
+            st.write(upgraded["protocol"])
+            st.write("Layer selected on late 2025: " + upgraded["selected_layer"])
+            st.json(upgraded["counts"])
+            st.dataframe(pd.DataFrame([{k:v for k,v in row.items() if k != "confidence"} for row in upgraded["evaluation"]]), use_container_width=True, hide_index=True)
+            st.write("Selected recommendation rule and measured results")
+            st.json({"threshold":upgraded["threshold"], **upgraded["recommendations"]})
+            selected_report = next(row for row in upgraded["evaluation"] if row["Model"] == upgraded["selected_layer"])
+            st.dataframe(pd.DataFrame(selected_report["confidence"]["bands"]), use_container_width=True, hide_index=True)
+            st.info(upgraded["market"]["status"])
+            if upgraded["market"].get("evaluation"):
+                st.write("Market comparison — identical odds-covered games")
+                st.dataframe(pd.DataFrame([{k:v for k,v in row.items() if k != "confidence"} for row in upgraded["market"]["evaluation"]]), use_container_width=True, hide_index=True)
+                st.json({"selected_on_late_2025":upgraded["market"]["selected_on_late_2025"],"covered_games":upgraded["market"]["covered_games"],"recommendations":upgraded["market"]["recommendations"]})
+            if upgraded["archive_status"].get("success"):
+                st.success("Probability comparison and learned weights saved.")
+            else:
+                st.warning("Comparison completed, but permanent saving failed: " + upgraded["archive_status"].get("message","Unknown error"))
+            st.download_button("Download probability comparison JSON", data=__import__("json").dumps(upgraded, default=str), file_name="mlb_probability_comparison.json", mime="application/json", key="mlb_probability_upgrade_download")
+            with st.expander("Probability training choices and limitations"):
+                st.json({key:upgraded[key] for key in ["run_selection","development","threshold_development","limitations"]})
     st.subheader("MLB confidence selection — same comparison as football")
     confidence_rows = pd.DataFrame(matchup.get("predictions", []))
     if not confidence_rows.empty and {"Home win probability", "Correct"}.issubset(confidence_rows.columns):
