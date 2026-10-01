@@ -11120,73 +11120,6 @@ def _display_mlb_player_update_table(package):
                     "Roster fetched UTC": team.get("roster_fetched_at"), "Stats collected in capture UTC": game.get("capture_finished_at") if recent else None})
     return pd.DataFrame(rows)
 
-# ==========================================
-# AUTOMATIC MLB SCANNER DASHBOARD
-# ==========================================
-st.divider()
-st.subheader("⚾ Automatic MLB Information Scanner")
-st.caption("The background worker collects pregame information, saves features, and checks final results. This page reads saved data; it does not start the worker.")
-
-
-def _render_mlb_scanner_dashboard():
-    try:
-        import importlib
-        storage = _mlb_pregame_storage_module()
-        if getattr(storage, "MLB_SCANNER_STORAGE_VERSION", None) != 1:
-            importlib.invalidate_caches()
-            storage = importlib.reload(storage)
-        if getattr(storage, "MLB_SCANNER_STORAGE_VERSION", None) != 1:
-            raise RuntimeError("Deploy the matching supabase_db.py scanner update.")
-        status = storage.load_mlb_scanner_status()
-        if not status:
-            st.info("No automatic scan has been recorded yet. Deploy the always-on scanner worker with its Supabase environment variables to enable it.")
-        else:
-            stamp = status.get("finished_at") or status.get("started_at")
-            st.write(f"Last scanner status: {status.get('state')} | UTC: {stamp}")
-            age = (pd.Timestamp.now(tz="UTC") - pd.Timestamp(stamp)).total_seconds()/60
-            if age > 10:
-                st.warning(f"Last scanner update was {age:.0f} minutes ago. Check the always-on scanner worker.")
-            if status.get("interval_exceeded"):
-                st.warning("The last scan took longer than three minutes. The worker avoids overlapping writes; this scan cadence needs tuning.")
-            if status.get("state") == "failed":
-                st.error("The last automatic scan failed. See details below.")
-            elif status.get("state") == "running":
-                st.info("A scan is running. The page will refresh its saved status automatically.")
-            else:
-                st.success(f"Last scan captured {status.get('captured_games', 0)} games. Completed games stored: {status.get('completed_games', 0)}.")
-            if status.get("errors"):
-                with st.expander("Scanner source errors"):
-                    st.json(status["errors"])
-        stored = storage.load_mlb_pregame_intelligence()
-        if stored and isinstance(stored.get("data"), dict):
-            package = stored["data"]
-            import dual_agent.mlb_research as research
-            st.caption(f"Latest archived slate: {package.get('game_date')} | Captured UTC: {package.get('snapshot_time')}")
-            st.dataframe(research.summarize_mlb_upcoming_information(package), use_container_width=True)
-            with st.expander("Player information from latest capture"):
-                st.dataframe(_display_mlb_player_update_table(package), use_container_width=True)
-        data = storage.load_mlb_capture_learning_dataset()
-        records = data["rows"]
-        latest = {}
-        for row in sorted(records, key=lambda r: r["capture_finished_at"]):
-            latest[row["game_id"]] = row
-        st.write(f"Saved pregame captures: {len(records)} | Unique games: {len(latest)}")
-        if latest:
-            st.dataframe(pd.DataFrame([{"Game ID": r["game_id"], "Captured UTC": r["capture_finished_at"],
-                "Home": r.get("home_team"), "Away": r.get("away_team"),
-                "Status": r["outcome"].get("status"), "Home runs": r["outcome"].get("home_runs"),
-                "Away runs": r["outcome"].get("away_runs")} for r in latest.values()]), use_container_width=True)
-        st.caption("The always-on worker targets a new scan every three minutes. Slow scans are reported and never overlap. Upcoming games are enriched within six hours of scheduled first pitch. Saved timestamps show source age. The live model has not been retrained.")
-    except Exception as exc:
-        st.error("Unable to load automatic scanner data: " + str(exc))
-
-
-# Refresh the read-only dashboard while open; collection runs independently.
-if hasattr(st, "fragment"):
-    st.fragment(run_every="60s")(_render_mlb_scanner_dashboard)()
-else:
-    _render_mlb_scanner_dashboard()
-
 st.divider()
 st.subheader("⚾ Model With Saved Pitcher and Lineup Information")
 st.caption("Connect real saved pregame player features to a research model. Compare team statistics alone with team statistics plus probable pitchers and feed lineup strength, using identical games.")
@@ -11199,8 +11132,13 @@ if st.button("Build Player-Information Candidate", key="mlb_saved_player_candida
             research = importlib.reload(research)
         if getattr(storage, "MLB_SAVED_PLAYER_MODEL_STORAGE_VERSION", None) != 1:
             storage = importlib.reload(storage)
-        if getattr(research, "MLB_SAVED_PLAYER_MODEL_VERSION", None) != 1 or getattr(storage, "MLB_SAVED_PLAYER_MODEL_STORAGE_VERSION", None) != 1:
-            raise RuntimeError("Deploy all three matching app.py, mlb_research.py, and supabase_db.py files.")
+        missing_modules = []
+        if getattr(research, "MLB_SAVED_PLAYER_MODEL_VERSION", None) != 1:
+            missing_modules.append("dual_agent/mlb_research.py (player-model version 1)")
+        if getattr(storage, "MLB_SAVED_PLAYER_MODEL_STORAGE_VERSION", None) != 1:
+            missing_modules.append("dual_agent/supabase_db.py (player-model storage version 1)")
+        if missing_modules:
+            raise RuntimeError("The loaded code is missing: " + "; ".join(missing_modules) + ". Replace those exact repository files and reboot Streamlit.")
         with st.spinner("Checking saved game results and connecting player features..."):
             dataset = storage.load_mlb_capture_learning_dataset()
             archived = storage.load_mlb_pregame_intelligence()
