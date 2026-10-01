@@ -93,7 +93,8 @@ def chronological_win_layer(train24,dev25,test26,alpha,flags,fit_runs,predict_ru
     return probabilities,development,bundle,candidates
 
 def select_recommendations(probabilities,outcomes):
-    """Choose a fixed cutoff on development data, targeting 70% with >=50 picks."""
+    """Choose on development only; show research picks even below the target."""
+    probabilities=np.asarray(probabilities,dtype=float)
     rows=[]
     for cutoff in [.55,.60,.65,.70,.75,.80]:
         mask=np.maximum(probabilities,1-probabilities)>=cutoff
@@ -102,8 +103,8 @@ def select_recommendations(probabilities,outcomes):
             correct=int(((probabilities[mask]>=.5)==np.asarray(outcomes)[mask]).sum())
             rows.append({'threshold':cutoff,'games':n,'correct':correct,'accuracy':correct/n})
     meets=[r for r in rows if r['accuracy']>=.70]
-    chosen=max(meets,key=lambda r:r['games']) if meets else None
-    return (chosen['threshold'] if chosen else None),rows
+    chosen=max(meets,key=lambda r:r['games']) if meets else (max(rows,key=lambda r:(r['accuracy'],r['games'])) if rows else {'threshold':.5})
+    return chosen['threshold'],rows
 
 def recommendation_metrics(probabilities,outcomes,threshold):
     mask=np.maximum(probabilities,1-probabilities)>=threshold if threshold is not None else np.zeros(len(probabilities),dtype=bool)
@@ -182,3 +183,22 @@ def settle_recommendation(game_id):
     path=f'mlb/matchup_recommendations/results/{int(game_id)}.json'
     bucket.upload(path,json.dumps(grade).encode(),{'content-type':'application/json','upsert':'false'})
     return grade
+
+
+def confidence_diagnostics(probabilities,outcomes):
+    """Report ranking quality without choosing a rule on evaluated outcomes."""
+    p=np.asarray(probabilities);y=np.asarray(outcomes);confidence=np.maximum(p,1-p)
+    correct=(p>=.5)==y
+    bands=[]
+    for low,high in [(.5,.55),(.55,.6),(.6,.65),(.65,.7),(.7,.8),(.8,1.00001)]:
+        mask=(confidence>=low)&(confidence<high);n=int(mask.sum())
+        bands.append({'Confidence band':f'{low:.0%}–{min(high,1):.0%}','Games':n,
+                      'Correct':int(correct[mask].sum()),'Accuracy':float(correct[mask].mean()) if n else None,
+                      'Mean confidence':float(confidence[mask].mean()) if n else None})
+    order=np.argsort(-confidence,kind='stable');ranked=[]
+    for count in [10,25,50,100]:
+        if len(order)<count:continue
+        chosen=order[:count]
+        ranked.append({'Top ranked games':count,'Correct':int(correct[chosen].sum()),
+                       'Accuracy':float(correct[chosen].mean()),'Mean confidence':float(confidence[chosen].mean())})
+    return {'bands':bands,'ranked_groups':ranked,'note':'Diagnostic groups only. Never select a cutoff from these evaluation outcomes; top groups are across the whole evaluated period, not a daily quota.'}
