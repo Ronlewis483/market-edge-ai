@@ -81,6 +81,12 @@ def render_nfl_player_props():
             with st.spinner(
                 "Scanning the next seven days of NFL player props..."
             ):
+                import inspect,importlib
+                from dual_agent import nfl_player_prop_prediction_pipeline as pipeline_module
+                if 'horizon_days' not in inspect.signature(pipeline_module.run_nfl_player_prop_prediction_pipeline).parameters:
+                    pipeline_module=importlib.reload(pipeline_module)
+                if 'horizon_days' not in inspect.signature(pipeline_module.run_nfl_player_prop_prediction_pipeline).parameters:
+                    raise RuntimeError('Update dual_agent/nfl_player_prop_prediction_pipeline.py alongside this UI file to enable the seven-day scan.')
                 live_events = cached_events(key)
 
                 now_utc = pd.Timestamp.now(
@@ -143,10 +149,11 @@ def render_nfl_player_props():
                         )
 
                         predictions = (
-                            run_nfl_player_prop_prediction_pipeline(
+                            pipeline_module.run_nfl_player_prop_prediction_pipeline(
                                 prop_lines=all_today_props,
                                 player_history=player_history,
                                 window=12,
+                                horizon_days=7,
                             )
                         )
 
