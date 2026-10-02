@@ -15,7 +15,7 @@ import requests
 from scipy.stats import skellam
 
 ACTIVE_MODEL_PATH = 'mlb/live_matchup/active.json'
-MLB_PIPELINE_VERSION = 7
+MLB_PIPELINE_VERSION = 8
 _HISTORY_CACHE = {}
 _CACHE_LOCK = RLock()
 CORE = ['home_field', 'offense_runs_per_game', 'opponent_runs_allowed',
@@ -52,6 +52,19 @@ def collect_prediction_inputs(dates, now, research, update):
                'snapshot_time': now.isoformat(), 'capture_mode': 'prediction_button', 'source': 'MLB Stats API',
                'scheduled_games': [{'game_id': g['gamePk'], 'start_time': g['gameDate'],
                     'home_team': g['teams']['home']['team']['name'], 'away_team': g['teams']['away']['team']['name']} for g in scheduled.values()]}
+    response_cache = {}; request_locks = {}; cache_lock = RLock()
+    class CollectionSession(requests.Session):
+        def get(self, url, **kwargs):
+            key = (url, json.dumps(kwargs.get('params'), sort_keys=True, default=str))
+            with cache_lock:
+                lock = request_locks.setdefault(key, RLock())
+            with lock:
+                if key not in response_cache:
+                    response = super().get(url, **kwargs)
+                    if response.status_code == 200:
+                        response_cache[key] = response
+                    return response
+                return response_cache[key]
     def collect(g):
         snapshot = research.fetch_mlb_pregame_game_snapshot(int(g['gamePk']), timeout=15)
         box = snapshot.get('raw_feed', {}).get('liveData', {}).get('boxscore', {}).get('teams', {})
@@ -62,7 +75,7 @@ def collect_prediction_inputs(dates, now, research, update):
         if snapshot.get('status', {}).get('abstractGameState')!='Preview' or pd.to_datetime(snapshot['start_time'], utc=True)<=pd.Timestamp.now(tz='UTC'):
             return None, {'game_id': g['gamePk'], 'reason': 'Game started or changed status.'}
         snapshot['schedule'] = {'start_time': g['gameDate'], 'season_id': g.get('season'), 'venue_id': g.get('venue', {}).get('id')}
-        with requests.Session() as session:
+        with CollectionSession() as session:
             snapshot = research._attach_mlb_current_information(snapshot, session, {}, timeout=10)
         finished = pd.Timestamp.now(tz='UTC')
         snapshot['capture_finished_at'] = finished.isoformat()
@@ -183,7 +196,28 @@ def _number(value):
         return None
 
 
-def build_live_row(snapshot, schedules):
+def index_team_results(schedules):
+    """Parse each completed scoring result once, preserving the training buffer."""
+    indexed = {}
+    for prior in schedules:
+        if (prior.get('gameType') != 'R' or prior.get('resumeDate')
+                or prior.get('status', {}).get('abstractGameState') != 'Final'):
+            continue
+        stamp = pd.to_datetime(prior['gameDate'], utc=True)
+        for side, other in [('home', 'away'), ('away', 'home')]:
+            runs = prior['teams'][side].get('score'); against = prior['teams'][other].get('score')
+            if runs is None or against is None or runs == against:
+                continue
+            key = (int(prior['season']), int(prior['teams'][side]['team']['id']))
+            indexed.setdefault(key, []).append({'date': prior['gameDate'], 'stamp': stamp,
+                'id': prior['gamePk'], 'for': runs, 'against': against,
+                'diff': runs-against, 'win': int(runs>against)})
+    for rows in indexed.values():
+        rows.sort(key=lambda r: (r['date'], r['id']))
+    return indexed
+
+
+def build_live_row(snapshot, schedules, team_results=None):
     """Use the same side order, player rates and 48-hour team buffer as training."""
     start = pd.to_datetime(snapshot['start_time'], utc=True)
     capture = pd.to_datetime(snapshot['capture_finished_at'], utc=True)
@@ -236,19 +270,10 @@ def build_live_row(snapshot, schedules):
         game['player_sides'][side] = [np.nan if v is None else v for v in rates + [ops, per9('strikeOuts'), per9('baseOnBalls'), obp, slg]]
         team_id = int(snapshot[side+'_team']['id'])
         game['recorded_identities'][side] = {'team_id': team_id, 'pitcher_id': pid, 'lineup_ids': order, 'bullpen_ids': team.get('bullpen', [])}
-        history = []
-        for prior in schedules:
-            if (int(prior['season']) != start.year or prior.get('gameType') != 'R' or prior.get('resumeDate')
-                    or prior.get('status', {}).get('abstractGameState') != 'Final'
-                    or pd.to_datetime(prior['gameDate'], utc=True) >= capture-pd.Timedelta(hours=48)):
-                continue
-            for prior_side, opponent in [('home', 'away'), ('away', 'home')]:
-                if int(prior['teams'][prior_side]['team']['id']) != team_id:
-                    continue
-                runs = prior['teams'][prior_side].get('score'); against = prior['teams'][opponent].get('score')
-                if runs is not None and against is not None and runs != against:
-                    history.append({'date': prior['gameDate'], 'id': prior['gamePk'], 'for': runs, 'against': against, 'diff': runs-against, 'win': int(runs>against)})
-        history.sort(key=lambda r: (r['date'], r['id']))
+        if team_results is None:
+            team_results = index_team_results(schedules)
+        cutoff = capture-pd.Timedelta(hours=48)
+        history = [row for row in team_results.get((start.year, team_id), []) if row['stamp'] < cutoff]
         if not history:
             raise ValueError('Prior regular-season team scoring history missing.')
         def mean(key, count=None):
@@ -322,9 +347,17 @@ def _generate_mlb_predictions(game_date=None, api_key=None, progress=None, on_te
     from dual_agent.mlb_matchup_model import attach_bullpen_history, BULLPEN_FEATURES
     from dual_agent.mlb_bullpen_freshness import collect_bullpen_completion_times
     from dual_agent.mlb_handedness import attach_handedness, HAND_FEATURES
+    started = time.monotonic(); timings = {}; stage_started = started; stage_name = 'Load saved model'
     def update(message):
-        if progress: progress(message)
+        if progress: progress(f"{message} ({time.monotonic()-started:.1f}s elapsed)")
+    def mark(next_stage):
+        nonlocal stage_started, stage_name
+        instant = time.monotonic()
+        timings[stage_name] = round(instant-stage_started, 3)
+        update(f"{stage_name} completed in {timings[stage_name]:.1f}s. {next_stage}...")
+        stage_started = instant; stage_name = next_stage
     model = load_active_model()
+    mark('Collect fresh feeds and prepare history')
     update('Collecting current lineups, pitchers, player updates and stadium forecasts...')
     now = pd.Timestamp.now(tz='UTC')
     automatic = game_date is None
@@ -352,6 +385,7 @@ def _generate_mlb_predictions(game_date=None, api_key=None, progress=None, on_te
         update('Finishing historical input preparation...')
         schedules = schedule_job.result()
         logs = history_job.result()
+    mark('Save fresh game information')
     errors = list(package.get('errors', [])); skipped = list(package.get('skipped', []))
     saved_capture = storage.save_mlb_pregame_intelligence(package, snapshot_date=str(game_date))
     if not saved_capture.get('success'):
@@ -360,11 +394,12 @@ def _generate_mlb_predictions(game_date=None, api_key=None, progress=None, on_te
         scheduled = package.get('scheduled_games', [])
         return {'predictions': [], 'scheduled_games': scheduled, 'skipped': skipped, 'errors': errors,
                 'message': f'{len(scheduled)} upcoming games found; their pregame feeds could not be captured.' if scheduled else 'No scheduled MLB games in the next seven days.'}
-    update('Loading prior team results and saved player history...')
+    mark('Build matchup features')
+    team_results = index_team_results(schedules)
     games = []; snapshots = {}
     for snapshot in package['games']:
         try:
-            games.append(build_live_row(snapshot, schedules)); snapshots[int(snapshot['game_id'])] = snapshot
+            games.append(build_live_row(snapshot, schedules, team_results)); snapshots[int(snapshot['game_id'])] = snapshot
         except (ValueError, KeyError, TypeError) as exc:
             skipped.append({'game_id': snapshot.get('game_id'), 'reason': str(exc)})
     if not games:
@@ -373,11 +408,14 @@ def _generate_mlb_predictions(game_date=None, api_key=None, progress=None, on_te
     columns = model['model_bundle']['columns']
     if set(columns)&set(BULLPEN_FEATURES):
         update('Connecting verified bullpen workload...')
-        completion, details = collect_bullpen_completion_times(games, schedules, 'mlb_accuracy_results')
         ready = [g for g in games if all(g['recorded_identities'][s]['pitcher_id'] is not None for s in ['home','away'])]
+        completion, details = (collect_bullpen_completion_times(ready, schedules, 'mlb_accuracy_results')
+                               if ready and not logs.empty else ({}, {'conservative_game_ids': []}))
         for game in games: game['bullpen_sides'] = {s: [None]*len(BULLPEN_FEATURES) for s in ['home','away']}
         if not logs.empty and ready:
-            attach_bullpen_history(ready, logs, completion, details['conservative_game_ids'])
+            needed_teams = {identity['team_id'] for g in ready for identity in g['recorded_identities'].values()}
+            bullpen_logs = logs.loc[pd.to_numeric(logs.team_id, errors='coerce').isin(needed_teams)]
+            attach_bullpen_history(ready, bullpen_logs, completion, details['conservative_game_ids'])
         # A missing warehouse game must not turn unrecorded workload into zero.
         for game in games:
             capture = pd.to_datetime(game['timecode'], format='%Y%m%d_%H%M%S', utc=True)
@@ -408,7 +446,10 @@ def _generate_mlb_predictions(game_date=None, api_key=None, progress=None, on_te
         # Sentinel used only for a missing-player lookup, never presented as an identity.
         context_games = [dict(g, recorded_identities={s:dict(g['recorded_identities'][s], pitcher_id=g['recorded_identities'][s]['pitcher_id'] if g['recorded_identities'][s]['pitcher_id'] is not None else -1) for s in ['home','away']}) for g in games]
         if not logs.empty:
-            attach_matchup_context(context_games, logs, schedules, context)
+            needed_players = {pid for g in games for identity in g['recorded_identities'].values()
+                              for pid in identity['lineup_ids']+[identity['pitcher_id']] if pid is not None}
+            form_logs = logs.loc[pd.to_numeric(logs.player_id, errors='coerce').isin(needed_players)]
+            attach_matchup_context(context_games, form_logs, schedules, context)
         else:
             values_by_game = {row['game_id']: row['context_features'] for row in context['rows']}
             for game in context_games:
@@ -424,13 +465,14 @@ def _generate_mlb_predictions(game_date=None, api_key=None, progress=None, on_te
             market = fetch_live_consensus(games, api_key)
         except Exception:
             errors.append({'error': 'Current odds unavailable; using the saved matchup equation.'})
-    update('Applying saved matchup coefficients and saving predictions...')
+    mark('Score team winners')
     predictions = score_live_games(model, games, market)
     now = pd.Timestamp.now(tz='UTC')
     predictions = [r for r in predictions if pd.Timestamp(r['start_time'])>now and now-pd.Timestamp(r['Captured UTC'])<=pd.Timedelta(minutes=15)]
     predictions.sort(key=lambda r: (-r['Winner probability'], r['start_time'], r['game_id']))
     all_eligible_predictions = list(predictions)
     predictions = predictions[:10]
+    mark('Collect player props')
     if on_team_predictions:
         on_team_predictions(predictions)
     update('Team forecasts ready. Collecting player props in parallel...')
@@ -443,7 +485,8 @@ def _generate_mlb_predictions(game_date=None, api_key=None, progress=None, on_te
     now = pd.Timestamp.now(tz='UTC')
     predictions = [r for r in predictions if pd.Timestamp(r['start_time'])>now and now-pd.Timestamp(r['Captured UTC'])<=pd.Timedelta(minutes=15)]
     props['picks'] = [r for r in props.get('picks', []) if pd.Timestamp(r['start_time'])>now and now-pd.Timestamp(r['Captured UTC'])<=pd.Timedelta(minutes=15)]
-    result = {'version': 1, 'created_at': now.isoformat(), 'game_date': str(game_date),
+    mark('Save predictions')
+    result = {'stage_timings_seconds': dict(timings), 'version': 1, 'created_at': now.isoformat(), 'game_date': str(game_date),
               'model_id': hashlib.sha256(json.dumps(model, sort_keys=True, allow_nan=False).encode()).hexdigest(),
               'predictions': predictions, 'all_predictions': all_eligible_predictions, 'player_props': props,
               'scheduled_games': package.get('scheduled_games', []), 'skipped': skipped, 'errors': errors,
