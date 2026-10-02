@@ -116,61 +116,62 @@ st.set_page_config(page_title="Market Edge AI V5", page_icon="📊", layout="wid
 
 import requests
 
-with st.sidebar.expander("Alpaca Connection Test"):
+def render_stock_connection():
+    with st.expander("Alpaca Connection"):
 
-    if st.button("Test Alpaca API", key="test_alpaca_connection"):
+        if st.button("Test Alpaca API", key="test_alpaca_connection"):
 
-        try:
-            api_key = st.secrets["ALPACA_API_KEY"]
-            secret_key = st.secrets["ALPACA_SECRET_KEY"]
+            try:
+                api_key = st.secrets["ALPACA_API_KEY"]
+                secret_key = st.secrets["ALPACA_SECRET_KEY"]
 
-            headers = {
-                "APCA-API-KEY-ID": api_key,
-                "APCA-API-SECRET-KEY": secret_key,
-            }
+                headers = {
+                    "APCA-API-KEY-ID": api_key,
+                    "APCA-API-SECRET-KEY": secret_key,
+                }
 
-            response = requests.get(
-                "https://data.alpaca.markets/v2/stocks/AAPL/bars",
-                headers=headers,
-                params={
-                    "timeframe": "1Day",
-                    "limit": 1,
-                    "feed": "iex",
-                },
-                timeout=15,
-            )
-
-            if response.status_code == 200:
-
-                data = response.json()
-                bars = data.get("bars", [])
-
-                st.success("Alpaca API connected successfully!")
-
-                if bars:
-                    st.write("Latest available AAPL bar:")
-                    st.json(bars[0])
-                else:
-                    st.warning(
-                        "Connection successful, but no price bars were returned."
-                    )
-
-            else:
-                st.error(
-                    f"Alpaca API returned HTTP {response.status_code}."
+                response = requests.get(
+                    "https://data.alpaca.markets/v2/stocks/AAPL/bars",
+                    headers=headers,
+                    params={
+                        "timeframe": "1Day",
+                        "limit": 1,
+                        "feed": "iex",
+                    },
+                    timeout=15,
                 )
-                st.write(response.text[:500])
 
-        except KeyError as error:
-            st.error(
-                f"Missing Alpaca credential in Streamlit Secrets: {error}"
-            )
+                if response.status_code == 200:
 
-        except requests.RequestException as error:
-            st.error(f"Alpaca connection error: {error}")
+                    data = response.json()
+                    bars = data.get("bars", [])
 
-        except Exception as error:
-            st.error(f"Connection test failed: {error}")
+                    st.success("Alpaca API connected successfully!")
+
+                    if bars:
+                        st.write("Latest available AAPL bar:")
+                        st.json(bars[0])
+                    else:
+                        st.warning(
+                            "Connection successful, but no price bars were returned."
+                        )
+
+                else:
+                    st.error(
+                        f"Alpaca API returned HTTP {response.status_code}."
+                    )
+                    st.write(response.text[:500])
+
+            except KeyError as error:
+                st.error(
+                    f"Missing Alpaca credential in Streamlit Secrets: {error}"
+                )
+
+            except requests.RequestException as error:
+                st.error(f"Alpaca connection error: {error}")
+
+            except Exception as error:
+                st.error(f"Connection test failed: {error}")
 from dual_agent.research import DEFAULT_UNIVERSE, latest_scan, run_research
 
 from dual_agent.stock import (
@@ -770,23 +771,16 @@ with st.sidebar:
 
     
     navigation_options = [
-        "🏠 Home",
-        "🏀 Sports Center",
-        "📈 Trading Center",
-        "🎟️ My Bets",
-        "📊 Performance",
-        "🧪 Research Lab",
+        "🏠 Home", "🏈 NFL", "🏀 NBA", "⚾ MLB", "📈 Stocks",
+        "🎟️ My Bets", "📊 Performance", "🧪 Research Lab",
     ]
-
-    if "main_navigation" not in st.session_state:
+    if st.session_state.get("main_navigation") not in navigation_options:
         st.session_state["main_navigation"] = "🏠 Home"
-
-    page = st.radio(
-        "NAVIGATION",
-        navigation_options,
-        key="main_navigation",
-        label_visibility="collapsed",
-    )
+    for destination in navigation_options:
+        if st.button(destination, key="nav_" + destination, use_container_width=True,
+                     type="primary" if st.session_state["main_navigation"] == destination else "secondary"):
+            st.session_state["main_navigation"] = destination
+    page = st.session_state["main_navigation"]
 
     st.divider()
 
@@ -794,6 +788,51 @@ with st.sidebar:
     st.success("System Online")
 
 default=clean_symbols(DEFAULT_UNIVERSE)
+
+
+def render_mlb_prediction_center(location):
+    st.subheader("⚾ MLB Prediction Center")
+    st.caption("Current lineups, starters, team form and available game conditions feed the saved matchup equation.")
+    with st.expander("Saved MLB model setup", expanded=False):
+        st.caption("Activate your full saved matchup model JSON once. Predictions reuse it after app restarts.")
+        model_upload = st.file_uploader("Saved matchup model", type=["json"], key=location + "_model_upload")
+        if model_upload is not None and st.button("Use this MLB model", key=location + "_activate"):
+            try:
+                from dual_agent.mlb_prediction_pipeline import activate_model
+                activated = activate_model(__import__("json").load(model_upload))
+                st.success("MLB model activated.")
+                st.session_state.pop("mlb_live_pipeline_result", None)
+            except Exception as exc:
+                st.error("Unable to activate MLB model: " + str(exc))
+    game_date = st.date_input("MLB game date", value=pd.Timestamp.now(tz="America/Chicago").date(), key=location + "_date")
+    if st.button("⚡ Generate MLB Predictions", key=location + "_generate", type="primary", use_container_width=True):
+        try:
+            import os
+            from dual_agent.mlb_prediction_pipeline import run_mlb_prediction_pipeline
+            odds_key = os.environ.get("ODDS_API_KEY") or os.environ.get("THE_ODDS_API_KEY")
+            if not odds_key:
+                try:
+                    odds_key = st.secrets.get("ODDS_API_KEY") or st.secrets.get("THE_ODDS_API_KEY")
+                except Exception:
+                    odds_key = None
+            status = st.empty()
+            result = run_mlb_prediction_pipeline(game_date, api_key=odds_key, progress=status.info)
+            st.session_state["mlb_live_pipeline_result"] = result
+            status.success(result["message"])
+        except Exception as exc:
+            st.error("MLB prediction pipeline stopped: " + str(exc))
+    result = st.session_state.get("mlb_live_pipeline_result")
+    if result and result.get("game_date") == str(game_date):
+        now = pd.Timestamp.now(tz="UTC")
+        rows = [r for r in result.get("predictions", []) if pd.Timestamp(r["start_time"])>now and now-pd.Timestamp(r["Captured UTC"])<=pd.Timedelta(minutes=15)]
+        if rows:
+            st.dataframe(pd.DataFrame(rows).drop(columns=["Missing model inputs"]), use_container_width=True, hide_index=True)
+            st.caption("Picks are saved before first pitch. Confidence reflects the saved model; the 70% accuracy goal is not established.")
+        else:
+            st.info("No fresh upcoming predictions. Generate again to collect current game information.")
+        with st.expander("Game information coverage"):
+            st.json({"skipped_games": result.get("skipped", []), "source_updates": result.get("errors", []),
+                     "missing_inputs": [{"game_id": r["game_id"], "features": r["Missing model inputs"]} for r in rows]})
 
 
 if page == "🏠 Home":
@@ -1409,26 +1448,10 @@ if page == "🏠 Home":
 # SPORTS CENTER — LEAGUE PREDICTION HUB
 # ============================================
 
-if page == "🏀 Sports Center":
-
-    st.title("🏀 Sports Center")
-
-    st.caption(
-        "AI-powered game predictions, player props, "
-        "and model-vs-market opportunities."
-    )
-
-    selected_league = st.radio(
-        "League",
-        [
-            "🏈 NFL",
-            "🏀 NBA",
-            "⚾ MLB",
-        ],
-        horizontal=True,
-        key="sports_center_league",
-        label_visibility="collapsed",
-    )
+if page in ["🏈 NFL", "🏀 NBA", "⚾ MLB"]:
+    selected_league = page
+    st.title(page + " Center")
+    st.caption("Game predictions, player props, and current game information.")
 
     st.divider()
 
@@ -1447,6 +1470,13 @@ if page == "🏀 Sports Center":
             "shop available moneylines, and analyze "
             "model-vs-market opportunities."
         )
+
+        if st.button("⚡ Generate NFL Predictions", key="nfl_sidebar_generate", type="primary"):
+            try:
+                with st.spinner("Generating NFL predictions..."):
+                    st.session_state["nfl_prediction_pipeline_result"] = run_nfl_prediction_pipeline()
+            except Exception as exc:
+                st.error("NFL prediction pipeline failed: " + str(exc))
 
         nfl_result = st.session_state.get(
             "nfl_prediction_pipeline_result"
@@ -1538,53 +1568,7 @@ if page == "🏀 Sports Center":
 
     elif selected_league == "⚾ MLB":
 
-        st.subheader(
-            "⚾ MLB Prediction Center"
-        )
-
-        st.caption("Saved pregame data → timing and coverage checks → learned complete-context candidate → predictions. This candidate is experimental until its accuracy is established.")
-        prediction_date = st.date_input("MLB game date", value=pd.Timestamp.now(tz="America/Chicago").date(), key="mlb_connected_date")
-        if st.button("Generate MLB predictions from collected data", key="mlb_connected_generate", type="primary"):
-            try:
-                import dual_agent.mlb_research as research
-                import dual_agent.supabase_db as storage
-                with st.spinner("Checking saved outcomes and generating predictions..."):
-                    dataset = storage.load_mlb_capture_learning_dataset()
-                    archived = storage.load_mlb_pregame_intelligence()
-                    batch = research.build_mlb_capture_learning_rows(archived["data"]) if archived and isinstance(archived.get("data"), dict) else {"rows": [], "errors": []}
-                    keys = {row["capture_key"] for row in batch["rows"]}
-                    refreshed = research.refresh_mlb_capture_learning_results([row for row in dataset["rows"] if row["capture_key"] not in keys])
-                    batch["rows"] = refreshed["rows"] + batch["rows"]
-                    merged = storage.update_mlb_capture_learning_dataset(batch)
-                    if not merged.get("success"):
-                        raise RuntimeError(merged.get("message", "Unable to save result checks"))
-                    result = research.run_mlb_saved_player_model(merged["data"])
-                    saved = storage.save_mlb_saved_player_model(result)
-                    if not saved.get("success"):
-                        raise RuntimeError(saved.get("message", "Unable to save model record"))
-                    st.session_state["mlb_connected_result"] = result
-                    st.session_state["mlb_connected_dates"] = {int(row["game_id"]): pd.Timestamp(row["start_time"]).tz_convert("America/Chicago").date() for row in merged["data"]["rows"]}
-            except Exception as exc:
-                st.error("MLB prediction pipeline stopped: " + str(exc))
-        connected = st.session_state.get("mlb_connected_result")
-        if connected:
-            st.info(connected["message"])
-            picks = [r for r in connected.get("upcoming_predictions", []) if r["Model"] == "Complete pregame candidate" and st.session_state.get("mlb_connected_dates", {}).get(r["game_id"]) == prediction_date]
-            now_utc = pd.Timestamp.now(tz="UTC")
-            picks = [r for r in picks if now_utc - pd.Timestamp(r["Captured UTC"]) <= pd.Timedelta(minutes=15)]
-            if picks:
-                for pick in picks:
-                    probability = pick["Home win probability"]
-                    pick["Predicted winner"] = pick["Home"] if probability >= .5 else pick["Away"]
-                    pick["Winner probability"] = max(probability, 1-probability)
-                st.dataframe(pd.DataFrame(picks), use_container_width=True, hide_index=True)
-                st.caption("Experimental candidate predictions. Weather and other context affect the equation only when training observations exist.")
-            else:
-                st.warning("No usable candidate predictions for this date. The engine requires 200 completed captures to fit, plus eligible upcoming captures collected within 15 minutes. The scanner remains deferred.")
-            if connected.get("scores"):
-                st.dataframe(pd.DataFrame(connected["scores"]), use_container_width=True, hide_index=True)
-            with st.expander("Data coverage and model controllers"):
-                st.json({"completed_games": connected["completed_games"], "minimum_training_games": connected["minimum_training_games"], "excluded": connected["excluded"], "models": connected["models"], "coverage": connected.get("feature_coverage", [])})
+        render_mlb_prediction_center("mlb_sidebar")
 
 
 # ============================================
@@ -1650,7 +1634,7 @@ nba_pipeline_result = st.session_state.get(
     None,
 )
 
-if nba_pipeline_result is not None:
+if page == "🏠 Home" and nba_pipeline_result is not None:
 
     nba_predictions = nba_pipeline_result.get(
         "predictions"
@@ -2069,6 +2053,7 @@ if nba_pipeline_result is not None:
 
     
     
+if page == "🏈 NFL":
     sports_tab = st.radio(
         "Sports Center Navigation",
         [
@@ -2128,31 +2113,7 @@ if nba_pipeline_result is not None:
 
         # Sports selection
 
-        st.subheader("Choose Your Sport")
-
-        sport = st.selectbox(
-            "Which sport would you like to analyze?",
-            [ 
-                "Game Winner",
-                "Player Points",
-                "Player Rebounds",
-                "Player Assists",
-                "Player Passing Yards",
-                "Player Rushing Yards",
-                "Player Receiving Yards",
-                "Player Receptions",
-                "Player Passing Touchdowns",
-                "Player Anytime Touchdown",
-                "Player Rushing + Receiving Yards",
-                "Player Passing Completions",
-                "Player Interceptions Thrown",
-                "Game Total Points",
-                "Point Spread",
-                "Other",
-            ],
-        )
-
-        st.divider()
+        sport = "NFL Football"
 
         # Betting market selection
 
@@ -2448,10 +2409,13 @@ if nba_pipeline_result is not None:
             st.session_state["main_navigation"] = "📊 Performance"
             st.rerun()
 
-if page=="🏠 Home":
+if page == "🏠 Home":
+    st.divider()
+    render_mlb_prediction_center("mlb_home")
+
+if page == "📈 Stocks":
     st.success(f"VALIDATED MODEL LOADED — {M['target']} • {M['features']} • AUC {M['auc']:.3f}")
-    c1,c2=st.columns(2)
-    with c1:
+    with st.container():
         st.subheader("📈 Best Stock Signal")
         txt=st.text_input("Symbols to scan", "AAPL,MSFT,NVDA,AMZN,META,GOOGL,TSLA,AVGO,AMD,JPM,LLY,XOM")
         syms=clean_symbols(txt)
@@ -2490,19 +2454,14 @@ if page=="🏠 Home":
                 st.markdown("#### Today's top candidates")
                 st.dataframe(show,use_container_width=True,hide_index=True)
 
-    with c2:
-        st.subheader("🏀 Best Sports Signal")
-        sd=sports_decision()
-        st.warning(sd["status"])
-        st.caption(sd["reason"])
-        st.code("PICK THIS TEAM / PICK THIS PLAYER PROP\nor\nNO QUALIFYING SPORTS PICK")
 
+if page == "🏀 NBA":
 
     # ============================================
     # NBA PREDICTION CENTER
     # ============================================
 
-    if page == "🏠 Home":
+    if page == "🏀 NBA":
 
         st.divider()
         st.subheader("🏀 NBA Prediction Center")
@@ -4240,7 +4199,8 @@ if page == "📊 Performance":
         st.error(f"Could not load betting performance: {e}")
 
 
-if page == "📈 Trading Center":
+if page == "📈 Stocks":
+    render_stock_connection()
     render_trading_center(
         latest_scan=latest_scan,
         stock_decision=stock_decision,
@@ -9069,321 +9029,322 @@ if page == "🧪 Research Lab":
 # MLB V3 HISTORICAL PLAYER RESEARCH
 # ==========================================
 
-st.divider()
-st.subheader("⚾ MLB Historical Player Data")
-st.caption(
-    "Build the permanent player-game warehouse used by the V3 "
-    "prediction engine. Each successful "
-    "250-game checkpoint is saved permanently to Supabase."
-)
+if page == "🧪 Research Lab":
+    st.divider()
+    st.subheader("⚾ MLB Historical Player Data")
+    st.caption(
+        "Build the permanent player-game warehouse used by the V3 "
+        "prediction engine. Each successful "
+        "250-game checkpoint is saved permanently to Supabase."
+    )
 
-# V3 must also work before any V1 benchmark or V2A action has run.
-mlb_v3_games = st.session_state.get("mlb_v3_games")
-if mlb_v3_games is None or mlb_v3_games.empty:
-    mlb_v3_games = st.session_state.get("mlb_v2a_games")
-
-v3_history_ready = False
-try:
+    # V3 must also work before any V1 benchmark or V2A action has run.
+    mlb_v3_games = st.session_state.get("mlb_v3_games")
     if mlb_v3_games is None or mlb_v3_games.empty:
-        with st.spinner("Loading MLB historical games for V3..."):
-            mlb_v3_games = fetch_mlb_games(
-                start_date="2023-03-01",
-                end_date="2026-09-30",
+        mlb_v3_games = st.session_state.get("mlb_v2a_games")
+
+    v3_history_ready = False
+    try:
+        if mlb_v3_games is None or mlb_v3_games.empty:
+            with st.spinner("Loading MLB historical games for V3..."):
+                mlb_v3_games = fetch_mlb_games(
+                    start_date="2023-03-01",
+                    end_date="2026-09-30",
+                )
+
+        if mlb_v3_games is None or mlb_v3_games.empty:
+            st.warning(
+                "No completed MLB historical games were loaded. "
+                "Reload the page to retry before building V3 player history."
+            )
+        else:
+            st.session_state["mlb_v3_games"] = mlb_v3_games
+            if st.session_state.get("mlb_v3_player_logs") is None:
+                with st.spinner("Loading permanent MLB player history..."):
+                    st.session_state["mlb_v3_player_logs"] = load_mlb_player_history()
+
+            cached_player_logs = st.session_state.get("mlb_v3_player_logs")
+            if cached_player_logs is None:
+                raise RuntimeError("Permanent MLB player history did not load. Reload the page to retry.")
+
+            missing_player_games = get_missing_mlb_player_log_games(
+                mlb_v3_games,
+                existing_logs=cached_player_logs,
+            )
+            v3_history_ready = True
+    except Exception as exc:
+        st.error("MLB V3 history could not be initialized. Reload the page to retry.")
+        st.exception(exc)
+
+    if v3_history_ready:
+        player_total_games = len(mlb_v3_games)
+        player_completed_games = (
+            player_total_games
+            - len(missing_player_games)
+        )
+        player_coverage_pct = (
+            player_completed_games / player_total_games
+            if player_total_games
+            else 0.0
+        )
+
+        player_count = (
+            int(cached_player_logs["player_id"].nunique())
+            if (
+                cached_player_logs is not None
+                and not cached_player_logs.empty
+                and "player_id" in cached_player_logs.columns
+            )
+            else 0
+        )
+
+        player_col1, player_col2, player_col3, player_col4 = (
+            st.columns(4)
+        )
+
+        player_col1.metric(
+            "Player Rows Collected",
+            f"{len(cached_player_logs):,}",
+        )
+        player_col2.metric(
+            "Unique Players",
+            f"{player_count:,}",
+        )
+        player_col3.metric(
+            "Games Remaining",
+            f"{len(missing_player_games):,}",
+        )
+        player_col4.metric(
+            "V3 Data Progress",
+            f"{player_coverage_pct:.1%}",
+        )
+
+        st.progress(
+            min(max(player_coverage_pct, 0.0), 1.0)
+        )
+
+        if missing_player_games.empty:
+
+            st.success(
+                "Historical MLB player-game warehouse is 100% complete. "
+                "The permanent V3 cache is ready for historical feature "
+                "reconstruction and challenger-model validation."
             )
 
-    if mlb_v3_games is None or mlb_v3_games.empty:
-        st.warning(
-            "No completed MLB historical games were loaded. "
-            "Reload the page to retry before building V3 player history."
-        )
-    else:
-        st.session_state["mlb_v3_games"] = mlb_v3_games
-        if st.session_state.get("mlb_v3_player_logs") is None:
-            with st.spinner("Loading permanent MLB player history..."):
-                st.session_state["mlb_v3_player_logs"] = load_mlb_player_history()
+        else:
 
-        cached_player_logs = st.session_state.get("mlb_v3_player_logs")
-        if cached_player_logs is None:
-            raise RuntimeError("Permanent MLB player history did not load. Reload the page to retry.")
-
-        missing_player_games = get_missing_mlb_player_log_games(
-            mlb_v3_games,
-            existing_logs=cached_player_logs,
-        )
-        v3_history_ready = True
-except Exception as exc:
-    st.error("MLB V3 history could not be initialized. Reload the page to retry.")
-    st.exception(exc)
-
-if v3_history_ready:
-    player_total_games = len(mlb_v3_games)
-    player_completed_games = (
-        player_total_games
-        - len(missing_player_games)
-    )
-    player_coverage_pct = (
-        player_completed_games / player_total_games
-        if player_total_games
-        else 0.0
-    )
-
-    player_count = (
-        int(cached_player_logs["player_id"].nunique())
-        if (
-            cached_player_logs is not None
-            and not cached_player_logs.empty
-            and "player_id" in cached_player_logs.columns
-        )
-        else 0
-    )
-
-    player_col1, player_col2, player_col3, player_col4 = (
-        st.columns(4)
-    )
-
-    player_col1.metric(
-        "Player Rows Collected",
-        f"{len(cached_player_logs):,}",
-    )
-    player_col2.metric(
-        "Unique Players",
-        f"{player_count:,}",
-    )
-    player_col3.metric(
-        "Games Remaining",
-        f"{len(missing_player_games):,}",
-    )
-    player_col4.metric(
-        "V3 Data Progress",
-        f"{player_coverage_pct:.1%}",
-    )
-
-    st.progress(
-        min(max(player_coverage_pct, 0.0), 1.0)
-    )
-
-    if missing_player_games.empty:
-
-        st.success(
-            "Historical MLB player-game warehouse is 100% complete. "
-            "The permanent V3 cache is ready for historical feature "
-            "reconstruction and challenger-model validation."
-        )
-
-    else:
-
-        st.caption(
-            "The builder resumes from the permanent Supabase checkpoint, "
-            "fetches up to 10 MLB boxscores concurrently, skips games "
-            "already collected, and saves after every successful "
-            "250-game checkpoint."
-        )
-
-        if st.button(
-            "Build Remaining MLB Player History",
-            key="build_remaining_mlb_player_history",
-            type="primary",
-        ):
-
-            working_player_logs = cached_player_logs.copy()
-            total_player_requested = 0
-            total_player_new_rows = 0
-            player_batches = 0
-
-            player_progress_bar = st.progress(
-                player_coverage_pct
+            st.caption(
+                "The builder resumes from the permanent Supabase checkpoint, "
+                "fetches up to 10 MLB boxscores concurrently, skips games "
+                "already collected, and saves after every successful "
+                "250-game checkpoint."
             )
-            player_status_box = st.empty()
 
-            try:
+            if st.button(
+                "Build Remaining MLB Player History",
+                key="build_remaining_mlb_player_history",
+                type="primary",
+            ):
 
-                while True:
+                working_player_logs = cached_player_logs.copy()
+                total_player_requested = 0
+                total_player_new_rows = 0
+                player_batches = 0
 
-                    remaining_before = (
-                        get_missing_mlb_player_log_games(
-                            mlb_v3_games,
-                            existing_logs=working_player_logs,
+                player_progress_bar = st.progress(
+                    player_coverage_pct
+                )
+                player_status_box = st.empty()
+
+                try:
+
+                    while True:
+
+                        remaining_before = (
+                            get_missing_mlb_player_log_games(
+                                mlb_v3_games,
+                                existing_logs=working_player_logs,
+                            )
                         )
-                    )
 
-                    if remaining_before.empty:
-                        break
+                        if remaining_before.empty:
+                            break
 
-                    player_batches += 1
-                    batch_target = min(
-                        250,
-                        len(remaining_before),
-                    )
+                        player_batches += 1
+                        batch_target = min(
+                            250,
+                            len(remaining_before),
+                        )
 
-                    player_status_box.info(
-                        "Building MLB V3 player history — "
-                        f"checkpoint {player_batches:,} | "
-                        f"{len(remaining_before):,} games remaining..."
-                    )
+                        player_status_box.info(
+                            "Building MLB V3 player history — "
+                            f"checkpoint {player_batches:,} | "
+                            f"{len(remaining_before):,} games remaining..."
+                        )
 
-                    collection = collect_mlb_player_logs_batch(
-                        games=mlb_v3_games,
-                        existing_logs=working_player_logs,
-                        batch_size=batch_target,
-                    )
+                        collection = collect_mlb_player_logs_batch(
+                            games=mlb_v3_games,
+                            existing_logs=working_player_logs,
+                            batch_size=batch_target,
+                        )
 
-                    batch_requested = int(
-                        collection.get("games_requested", 0)
-                    )
-                    new_logs = collection.get(
-                        "new_logs",
-                        pd.DataFrame(),
-                    )
-                    updated_logs = collection.get(
-                        "combined_logs",
-                        working_player_logs,
-                    )
+                        batch_requested = int(
+                            collection.get("games_requested", 0)
+                        )
+                        new_logs = collection.get(
+                            "new_logs",
+                            pd.DataFrame(),
+                        )
+                        updated_logs = collection.get(
+                            "combined_logs",
+                            working_player_logs,
+                        )
 
-                    working_player_logs = updated_logs.copy()
+                        working_player_logs = updated_logs.copy()
+                        st.session_state[
+                            "mlb_v3_player_logs"
+                        ] = working_player_logs
+
+                        if (
+                            working_player_logs is not None
+                            and not working_player_logs.empty
+                        ):
+
+                            save_result = save_mlb_player_history(
+                                working_player_logs
+                            )
+
+                            if not save_result.get("success", False):
+                                raise RuntimeError(
+                                    "Player checkpoint was collected but could "
+                                    "not be permanently saved: "
+                                    f"{save_result.get('error')}"
+                                )
+
+                        batch_new_rows = (
+                            len(new_logs)
+                            if new_logs is not None
+                            else 0
+                        )
+                        total_player_requested += batch_requested
+                        total_player_new_rows += batch_new_rows
+
+                        remaining_after = (
+                            get_missing_mlb_player_log_games(
+                                mlb_v3_games,
+                                existing_logs=working_player_logs,
+                            )
+                        )
+
+                        completed_games = (
+                            player_total_games
+                            - len(remaining_after)
+                        )
+                        current_progress = (
+                            completed_games / player_total_games
+                            if player_total_games
+                            else 0.0
+                        )
+
+                        current_players = (
+                            int(working_player_logs["player_id"].nunique())
+                            if (
+                                not working_player_logs.empty
+                                and "player_id" in working_player_logs.columns
+                            )
+                            else 0
+                        )
+
+                        player_progress_bar.progress(
+                            min(max(current_progress, 0.0), 1.0)
+                        )
+                        player_status_box.info(
+                            "Building MLB V3 player history — "
+                            f"{len(working_player_logs):,} rows | "
+                            f"{current_players:,} players | "
+                            f"{len(remaining_after):,} games remaining | "
+                            f"{current_progress:.1%} complete"
+                        )
+
+                        if remaining_after.empty:
+                            break
+
+                        if collection.get("complete", False):
+                            break
+
+                        if len(remaining_after) >= len(remaining_before):
+                            st.warning(
+                                "Player-history build stopped because the latest "
+                                "checkpoint made no additional progress. All "
+                                "completed data was preserved in Supabase."
+                            )
+                            break
+
+                        if batch_requested == 0:
+                            break
+
+                except Exception as exc:
+
                     st.session_state[
                         "mlb_v3_player_logs"
                     ] = working_player_logs
 
+                    player_status_box.error(
+                        "MLB V3 player-history build encountered an error. "
+                        "All successfully saved checkpoints were preserved."
+                    )
+                    st.exception(exc)
+
+                final_missing_players = (
+                    get_missing_mlb_player_log_games(
+                        mlb_v3_games,
+                        existing_logs=working_player_logs,
+                    )
+                )
+                final_player_coverage = (
+                    (player_total_games - len(final_missing_players))
+                    / player_total_games
+                    if player_total_games
+                    else 0.0
+                )
+                final_unique_players = (
+                    int(working_player_logs["player_id"].nunique())
                     if (
-                        working_player_logs is not None
-                        and not working_player_logs.empty
-                    ):
-
-                        save_result = save_mlb_player_history(
-                            working_player_logs
-                        )
-
-                        if not save_result.get("success", False):
-                            raise RuntimeError(
-                                "Player checkpoint was collected but could "
-                                "not be permanently saved: "
-                                f"{save_result.get('error')}"
-                            )
-
-                    batch_new_rows = (
-                        len(new_logs)
-                        if new_logs is not None
-                        else 0
+                        not working_player_logs.empty
+                        and "player_id" in working_player_logs.columns
                     )
-                    total_player_requested += batch_requested
-                    total_player_new_rows += batch_new_rows
-
-                    remaining_after = (
-                        get_missing_mlb_player_log_games(
-                            mlb_v3_games,
-                            existing_logs=working_player_logs,
-                        )
-                    )
-
-                    completed_games = (
-                        player_total_games
-                        - len(remaining_after)
-                    )
-                    current_progress = (
-                        completed_games / player_total_games
-                        if player_total_games
-                        else 0.0
-                    )
-
-                    current_players = (
-                        int(working_player_logs["player_id"].nunique())
-                        if (
-                            not working_player_logs.empty
-                            and "player_id" in working_player_logs.columns
-                        )
-                        else 0
-                    )
-
-                    player_progress_bar.progress(
-                        min(max(current_progress, 0.0), 1.0)
-                    )
-                    player_status_box.info(
-                        "Building MLB V3 player history — "
-                        f"{len(working_player_logs):,} rows | "
-                        f"{current_players:,} players | "
-                        f"{len(remaining_after):,} games remaining | "
-                        f"{current_progress:.1%} complete"
-                    )
-
-                    if remaining_after.empty:
-                        break
-
-                    if collection.get("complete", False):
-                        break
-
-                    if len(remaining_after) >= len(remaining_before):
-                        st.warning(
-                            "Player-history build stopped because the latest "
-                            "checkpoint made no additional progress. All "
-                            "completed data was preserved in Supabase."
-                        )
-                        break
-
-                    if batch_requested == 0:
-                        break
-
-            except Exception as exc:
+                    else 0
+                )
 
                 st.session_state[
-                    "mlb_v3_player_logs"
-                ] = working_player_logs
+                    "mlb_v3_last_player_collection"
+                ] = {
+                    "requested_games": total_player_requested,
+                    "new_player_rows": total_player_new_rows,
+                    "cached_player_rows": len(working_player_logs),
+                    "unique_players": final_unique_players,
+                    "remaining_games": len(final_missing_players),
+                    "coverage": final_player_coverage,
+                }
 
-                player_status_box.error(
-                    "MLB V3 player-history build encountered an error. "
-                    "All successfully saved checkpoints were preserved."
-                )
-                st.exception(exc)
-
-            final_missing_players = (
-                get_missing_mlb_player_log_games(
-                    mlb_v3_games,
-                    existing_logs=working_player_logs,
-                )
-            )
-            final_player_coverage = (
-                (player_total_games - len(final_missing_players))
-                / player_total_games
-                if player_total_games
-                else 0.0
-            )
-            final_unique_players = (
-                int(working_player_logs["player_id"].nunique())
-                if (
-                    not working_player_logs.empty
-                    and "player_id" in working_player_logs.columns
-                )
-                else 0
-            )
-
-            st.session_state[
-                "mlb_v3_last_player_collection"
-            ] = {
-                "requested_games": total_player_requested,
-                "new_player_rows": total_player_new_rows,
-                "cached_player_rows": len(working_player_logs),
-                "unique_players": final_unique_players,
-                "remaining_games": len(final_missing_players),
-                "coverage": final_player_coverage,
-            }
-
-            if final_missing_players.empty:
-                player_progress_bar.progress(1.0)
-                player_status_box.success(
-                    "MLB V3 historical player warehouse is 100% complete."
-                )
-                st.success(
-                    f"V3 player history complete — "
-                    f"{len(working_player_logs):,} player-game rows across "
-                    f"{final_unique_players:,} players are permanently saved."
-                )
-            else:
-                st.info(
-                    "Player-history checkpoint finished — "
-                    f"{total_player_requested:,} games processed this run, "
-                    f"{total_player_new_rows:,} player rows added, "
-                    f"{len(final_missing_players):,} games remain, "
-                    f"{final_player_coverage:.1%} complete."
-                )
+                if final_missing_players.empty:
+                    player_progress_bar.progress(1.0)
+                    player_status_box.success(
+                        "MLB V3 historical player warehouse is 100% complete."
+                    )
+                    st.success(
+                        f"V3 player history complete — "
+                        f"{len(working_player_logs):,} player-game rows across "
+                        f"{final_unique_players:,} players are permanently saved."
+                    )
+                else:
+                    st.info(
+                        "Player-history checkpoint finished — "
+                        f"{total_player_requested:,} games processed this run, "
+                        f"{total_player_new_rows:,} player rows added, "
+                        f"{len(final_missing_players):,} games remain, "
+                        f"{final_player_coverage:.1%} complete."
+                    )
 
 
 
