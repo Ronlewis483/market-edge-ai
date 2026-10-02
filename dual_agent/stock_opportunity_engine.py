@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 import requests
 
-ENGINE_VERSION = 2
+ENGINE_VERSION = 3
 DEFAULT_SYMBOLS = ['AAPL','MSFT','NVDA','AMZN','META','GOOGL','TSLA','AVGO','AMD','JPM','LLY','XOM']
 STRATEGIES = {'hour': ['Trend + VWAP', 'Range breakout', 'VWAP reclaim'],
               'hold': ['Long-term momentum', '63-day breakout', 'Trend pullback']}
@@ -203,3 +203,74 @@ def opportunities(raw, quotes, clock, horizon, now=None):
     result['picks']=result['picks'][:5]
     result['message']='Candidates ranked by observed mean net return in the separate verification period.' if result['picks'] else 'No current setup passes the signal, history, quote and liquidity checks.'
     return result
+
+
+def fetch_universe(key, secret, trading_url):
+    if trading_url not in ['https://paper-api.alpaca.markets','https://api.alpaca.markets']:
+        raise ValueError('Use the official Alpaca paper or live API URL.')
+    assets = _get(trading_url, '/v2/assets', key, secret,
+                  {'status':'active','asset_class':'us_equity'})
+    return sorted({a['symbol'] for a in assets if a.get('tradable') and
+                   a.get('exchange') not in ['OTC', 'CRYPTO']})
+
+
+def screen_universe(symbols, key, secret, feed):
+    """Screen every provider-listed symbol; never truncate to a preset shortlist."""
+    snapshots = {}
+    for i in range(0,len(symbols),100):
+        snapshots.update(_get('https://data.alpaca.markets','/v2/stocks/snapshots',key,secret,
+                              {'symbols':','.join(symbols[i:i+100]),'feed':feed}))
+    eligible=[]
+    for symbol in symbols:
+        snap=snapshots.get(symbol) or {}
+        bar=snap.get('prevDailyBar') or {}
+        try:
+            price=float(bar['c']); dollars=price*float(bar['v'])
+        except (KeyError, TypeError, ValueError):continue
+        if price>=5 and dollars>=1000000:eligible.append(symbol)
+    return eligible, {'listed':len(symbols),'snapshots':len(snapshots),'eligible':len(eligible)}
+
+
+def scan_market(key, secret, feed, trading_url, cache):
+    """Background-safe scan; cache is private to a single sequential worker."""
+    import time
+    started=time.monotonic()
+    cached=cache.get('universe')
+    if not cached or time.monotonic()-cached[0]>86400:
+        cache['universe']=(time.monotonic(),fetch_universe(key,secret,trading_url))
+    symbols=cache['universe'][1]
+    clock=fetch_clock(key,secret,trading_url)
+    if not clock.get('is_open'):
+        return {'closed':True,'coverage':{'listed':len(symbols)},'as_of':pd.Timestamp.now(tz='UTC').isoformat()}
+    eligible,coverage=screen_universe(symbols,key,secret,feed)
+    results={}; histories={}
+    for horizon in ['hour','hold']:
+        frames=[]; failed=[]
+        for i in range(0,len(eligible),10):
+            batch=tuple(eligible[i:i+10]); token=(horizon,batch)
+            cached=cache.get(token); ttl=300 if horizon=='hour' else 3600
+            try:
+                if not cached or time.monotonic()-cached[0]>ttl:
+                    cached=(time.monotonic(),fetch_bars(batch,key,secret,horizon,feed))
+                    cache[token]=cached
+                frames.append(cached[1])
+            except Exception as exc:
+                failed.append({'symbols':list(batch),'reason':str(exc)})
+        if not frames:
+            results[horizon]={'picks':[],'strategy_evidence':{},'message':'No usable history was returned for the eligible stocks.'}
+        else:
+            raw=pd.concat(frames,ignore_index=True)
+            histories[horizon]=raw
+            results[horizon]={'picks':[],'strategy_evidence':{},'history_symbols':raw.symbol.nunique()}
+        results[horizon]['failed_batches']=failed
+    for horizon,raw in histories.items():
+        quotes={}
+        present=sorted(raw.symbol.unique())
+        for i in range(0,len(present),100):
+            quotes.update(fetch_quotes(present[i:i+100],key,secret,feed))
+        clock=fetch_clock(key,secret,trading_url)
+        metadata=results[horizon]
+        results[horizon]=opportunities(raw,quotes,clock,horizon)
+        results[horizon].update(history_symbols=len(present),failed_batches=metadata['failed_batches'])
+    return {'closed':False,'results':results,'coverage':coverage,
+            'as_of':pd.Timestamp.now(tz='UTC').isoformat(),'seconds':time.monotonic()-started}
