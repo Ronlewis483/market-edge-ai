@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 import requests
 
-ENGINE_VERSION = 7
+ENGINE_VERSION = 9
 DEFAULT_SYMBOLS = ['AAPL','MSFT','NVDA','AMZN','META','GOOGL','TSLA','AVGO','AMD','JPM','LLY','XOM']
 STRATEGIES = {'hour': ['Trend + VWAP', 'Range breakout', 'VWAP reclaim', 'EMA pullback', 'Opening range breakout', 'Momentum continuation', 'RSI recovery', 'Bollinger recovery'],
               'hold': ['Long-term momentum', '63-day breakout', 'Trend pullback', '50-day reclaim', '20-day breakout']}
@@ -196,7 +196,7 @@ def select_strategy(frames, horizon):
     for strategy in STRATEGIES[horizon]:
         chosen=selection[strategy];held=verification[strategy]
         passed=(chosen['trades']>=25 and held['trades']>=8 and
-                chosen['mean_net_return'] is not None and chosen['mean_net_return']>0 and
+                (horizon=='hour' or (chosen['mean_net_return'] is not None and chosen['mean_net_return']>0)) and
                 held['mean_net_return'] is not None and held['mean_net_return']>0)
         checked.append({'qualified':passed,'strategy':strategy,'selection':chosen,'verification':held,
                         'split_utc':split.isoformat(),'cost_assumption_bps':10 if horizon=='hour' else 20})
@@ -217,33 +217,43 @@ def _single_opportunities(raw, quotes, clock, horizon, now=None, prepared_frames
     if horizon=='hour' and pd.Timestamp(clock['next_close'])-now<pd.Timedelta(hours=1):
         result['message']='Less than one hour remains in the regular session. No new hour-long trade.';return result
     strategy=evidence['strategy']
+    result['exclusions']=[]
+    def reject(symbol,reason):
+        result['exclusions'].append({'symbol':symbol,'strategy':strategy,'reason':reason})
     for symbol,g in frames.items():
-        if g.empty or not bool(g.iloc[-1][strategy]):continue
+        if g.empty or not bool(g.iloc[-1][strategy]):reject(symbol,'No current entry signal');continue
         row=g.iloc[-1];quote=quotes.get(symbol,{})
         stamp=pd.to_datetime(quote.get('t'),utc=True,errors='coerce')
         try:ask=float(quote['ap']);bid=float(quote['bp'])
-        except (KeyError,ValueError,TypeError):continue
-        if pd.isna(stamp) or stamp>now or now-stamp>pd.Timedelta(seconds=90) or not 0<bid<=ask:continue
+        except (KeyError,ValueError,TypeError):reject(symbol,'Live bid or ask unavailable');continue
+        if pd.isna(stamp) or stamp>now or now-stamp>pd.Timedelta(seconds=90) or not 0<bid<=ask:reject(symbol,'Quote missing, older than 90 seconds, or invalid');continue
         spread=(ask-bid)/((ask+bid)/2)
-        if spread>.005 or ask<5:continue
-        if horizon=='hour' and now-pd.Timestamp(row.timestamp)>pd.Timedelta(minutes=12):continue
-        if horizon=='hold' and now-pd.Timestamp(row.timestamp)>pd.Timedelta(days=5):continue
-        if horizon=='hour' and float(row.volume)*float(row.close)<50000:continue
+        if spread>.005 or ask<5:reject(symbol,'Spread above 0.5% or price below five dollars');continue
+        if horizon=='hour' and now-pd.Timestamp(row.timestamp)>pd.Timedelta(minutes=12):reject(symbol,'Completed intraday bars are older than 12 minutes');continue
+        if horizon=='hold' and now-pd.Timestamp(row.timestamp)>pd.Timedelta(days=5):reject(symbol,'Daily history is stale');continue
+        if horizon=='hour' and float(row.volume)*float(row.close)<50000:reject(symbol,'Latest five-minute dollar volume below 50,000 on this feed');continue
         atr=float(row.atr)
-        if not np.isfinite(atr) or atr<=0:continue
+        if not np.isfinite(atr) or atr<=0:reject(symbol,'Not enough usable volatility history');continue
         # Don't chase a price far from the latest completed signal bar.
-        if abs(ask/float(row.close)-1)>(.01 if horizon=='hour' else .05):continue
+        if abs(ask/float(row.close)-1)>(.01 if horizon=='hour' else .05):reject(symbol,'Current price moved too far from the signal');continue
         split=pd.Timestamp(evidence['split_utc'])
         sample=summarize(historical_trades(g,strategy,horizon,split,'verification'))
-        if sample['trades']<2 or sample['mean_net_return'] is None or sample['mean_net_return']<=0:continue
+        if sample['trades']<2:reject(symbol,'Fewer than two recent historical trades for this stock and strategy');continue
+        if sample['mean_net_return'] is None or sample['mean_net_return']<=0:reject(symbol,'This stock and strategy have no positive recent average net return');continue
         picks={'symbol':symbol,'strategy':strategy,'entry_reference':ask,'spread_pct':spread,
                'quote_time':stamp.isoformat(),'signal_time':pd.Timestamp(row.timestamp).isoformat(),
                'historical_mean_net_return':sample['mean_net_return'],'historical_win_rate':sample['win_rate'],
                'verification_trades':sample['trades'],'holding_period':'Up to 1 hour' if horizon=='hour' else 'About 63 trading sessions',
                'direction':'Long','rank_score':sample['mean_net_return']}
         if horizon=='hour':
+            # Wilson lower bound: discounts high observed win rates from tiny samples.
+            n=sample['trades']; rate=sample['win_rate']; z=1.96
+            support=(rate+z*z/(2*n)-z*np.sqrt(rate*(1-rate)/n+z*z/(4*n*n)))/(1+z*z/n)
+            picks.update(rank_score=float(support),evidence_score=float(support),
+                         evidence_label='Limited history' if n<10 else 'Historical evidence',
+                         strategy_earlier_net_return=evidence['selection']['mean_net_return'])
             stop=ask-1.5*atr
-            if stop<=0:continue
+            if stop<=0:reject(symbol,'Stop reference is invalid');continue
             picks.update(stop_reference=stop,exit_time=min(now+pd.Timedelta(hours=1),pd.Timestamp(clock['next_close'])).isoformat())
         result['picks'].append(picks)
     result['picks'].sort(key=lambda p:(-p['rank_score'],-p['verification_trades'],p['symbol']))
@@ -259,6 +269,7 @@ def opportunities(raw,quotes,clock,horizon,now=None,prepared_frames=None,prepare
     if not evidence.get('qualified'):
         result['message']=evidence['reason'];return result
     groups=[_single_opportunities(raw,quotes,clock,horizon,now,frames,item) for item in evidence['qualified_strategies']]
+    result['exclusions']=[item for group in groups for item in group.get('exclusions',[])]
     picks=sorted([pick for group in groups for pick in group['picks']],key=lambda p:(-p['rank_score'],-p['verification_trades'],p['symbol'],p['strategy']))
     seen=set()
     for pick in picks:
