@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 import requests
 
-ENGINE_VERSION = 3
+ENGINE_VERSION = 4
 DEFAULT_SYMBOLS = ['AAPL','MSFT','NVDA','AMZN','META','GOOGL','TSLA','AVGO','AMD','JPM','LLY','XOM']
 STRATEGIES = {'hour': ['Trend + VWAP', 'Range breakout', 'VWAP reclaim'],
               'hold': ['Long-term momentum', '63-day breakout', 'Trend pullback']}
@@ -235,6 +235,7 @@ def scan_market(key, secret, feed, trading_url, cache):
     """Background-safe scan; cache is private to a single sequential worker."""
     import time
     started=time.monotonic()
+    cache['progress']={'text':'Loading the active stock list','done':0,'total':0}
     cached=cache.get('universe')
     if not cached or time.monotonic()-cached[0]>86400:
         cache['universe']=(time.monotonic(),fetch_universe(key,secret,trading_url))
@@ -242,11 +243,13 @@ def scan_market(key, secret, feed, trading_url, cache):
     clock=fetch_clock(key,secret,trading_url)
     if not clock.get('is_open'):
         return {'closed':True,'coverage':{'listed':len(symbols)},'as_of':pd.Timestamp.now(tz='UTC').isoformat()}
+    cache['progress']={'text':f'Checking prices and liquidity across {len(symbols):,} symbols','done':0,'total':0}
     eligible,coverage=screen_universe(symbols,key,secret,feed)
     results={}; histories={}
     for horizon in ['hour','hold']:
         frames=[]; failed=[]
         for i in range(0,len(eligible),10):
+            cache['progress']={'text':('Loading day-trade history' if horizon=='hour' else 'Loading buy-and-hold history'),'done':i,'total':len(eligible)}
             batch=tuple(eligible[i:i+10]); token=(horizon,batch)
             cached=cache.get(token); ttl=300 if horizon=='hour' else 3600
             try:
@@ -264,6 +267,7 @@ def scan_market(key, secret, feed, trading_url, cache):
             results[horizon]={'picks':[],'strategy_evidence':{},'history_symbols':raw.symbol.nunique()}
         results[horizon]['failed_batches']=failed
     for horizon,raw in histories.items():
+        cache['progress']={'text':('Evaluating day-trade strategies' if horizon=='hour' else 'Evaluating buy-and-hold strategies'),'done':len(eligible),'total':len(eligible)}
         quotes={}
         present=sorted(raw.symbol.unique())
         for i in range(0,len(present),100):
