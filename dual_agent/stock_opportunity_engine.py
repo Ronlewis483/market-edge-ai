@@ -7,18 +7,43 @@ import numpy as np
 import pandas as pd
 import requests
 
-ENGINE_VERSION = 5
+ENGINE_VERSION = 6
 DEFAULT_SYMBOLS = ['AAPL','MSFT','NVDA','AMZN','META','GOOGL','TSLA','AVGO','AMD','JPM','LLY','XOM']
 STRATEGIES = {'hour': ['Trend + VWAP', 'Range breakout', 'VWAP reclaim'],
               'hold': ['Long-term momentum', '63-day breakout', 'Trend pullback']}
 
 
+# Shared request pacing across workers in this process.
+import threading
+import time
+_REQUEST_LOCK = threading.Lock()
+_NEXT_REQUEST = 0.0
+
+
+class RateLimitError(RuntimeError):
+    pass
+
+
 def _get(base, path, key, secret, params=None):
-    response = requests.get(base+path, headers={'APCA-API-KEY-ID':key,
-        'APCA-API-SECRET-KEY':secret}, params=params, timeout=20)
-    if response.status_code != 200:
-        raise RuntimeError('Alpaca request failed (HTTP '+str(response.status_code)+'). Check credentials and data access.')
-    return response.json()
+    global _NEXT_REQUEST
+    for attempt in range(3):
+        with _REQUEST_LOCK:
+            delay=max(0.0,_NEXT_REQUEST-time.monotonic())
+            if delay>0:time.sleep(delay)
+            _NEXT_REQUEST=time.monotonic()+.7
+        response=requests.get(base+path,headers={'APCA-API-KEY-ID':key,
+            'APCA-API-SECRET-KEY':secret},params=params,timeout=20)
+        if response.status_code==429:
+            try:wait=max(5.0,float(response.headers.get('Retry-After',15)))
+            except (TypeError,ValueError):wait=15.0
+            with _REQUEST_LOCK:
+                _NEXT_REQUEST=max(_NEXT_REQUEST,time.monotonic()+min(wait,30))
+            if attempt==2 or wait>30:
+                raise RateLimitError('Alpaca temporarily limited requests (HTTP 429). The scanner will pause and retry automatically; this does not indicate invalid credentials.')
+            continue
+        if response.status_code!=200:
+            raise RuntimeError('Alpaca request failed (HTTP '+str(response.status_code)+'). Check credentials and data access.')
+        return response.json()
 
 
 def fetch_clock(key, secret, trading_url='https://paper-api.alpaca.markets'):
@@ -217,9 +242,9 @@ def fetch_universe(key, secret, trading_url):
 def screen_universe(symbols, key, secret, feed):
     """Screen every provider-listed symbol; never truncate to a preset shortlist."""
     snapshots = {}
-    for i in range(0,len(symbols),100):
+    for i in range(0,len(symbols),500):
         snapshots.update(_get('https://data.alpaca.markets','/v2/stocks/snapshots',key,secret,
-                              {'symbols':','.join(symbols[i:i+100]),'feed':feed}))
+                              {'symbols':','.join(symbols[i:i+500]),'feed':feed}))
     eligible=[]
     for symbol in symbols:
         snap=snapshots.get(symbol) or {}
@@ -299,6 +324,7 @@ def reusable_history(symbols,key,secret,horizon,feed,cache):
                     temporary.replace(path)
                 except OSError:
                     cache['cache_warning']='Local history could not be saved; this process still reuses its memory cache.'
+        except RateLimitError:raise
         except Exception as exc:failed.append({'symbols':[b[0] for b in batch],'reason':str(exc)})
     return (pd.concat(frames,ignore_index=True) if frames else pd.DataFrame()),failed
 
@@ -315,7 +341,13 @@ def scan_market(key, secret, feed, trading_url, cache):
     if not clock.get('is_open'):
         return {'closed':True,'coverage':{'listed':len(symbols)},'as_of':pd.Timestamp.now(tz='UTC').isoformat()}
     cache['progress']={'text':f'Screening current data for {len(symbols):,} stocks','done':0,'total':0}
-    eligible,coverage=screen_universe(symbols,key,secret,feed)
+    screen=cache.get('market_screen')
+    if not screen or time.monotonic()-screen[0]>=300:
+        eligible,coverage=screen_universe(symbols,key,secret,feed)
+        cache['market_screen']=(time.monotonic(),eligible,coverage)
+    else:
+        eligible,coverage=screen[1],screen[2]
+    coverage=dict(coverage)
     snapshots=coverage.pop('snapshot_data')
     candidates=shortlist(eligible,snapshots,40)
     coverage['detailed_candidates']=len(candidates)
