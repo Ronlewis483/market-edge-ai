@@ -843,12 +843,45 @@ def render_player_prop_picks(league, result):
                             st.caption(f"Projection {pick['Projected stat']:.1f} · {pick['Prior games']} prior appearances · {pick['Books']} books")
                             st.caption(f"Historical wins: {pick['Historical wins']} · pushes: {pick['Historical pushes']}")
             st.caption(props.get("note", "Player participation is required; availability is not confirmed by an offered line."))
-        if props.get("errors") or props.get("exclusions"):
-            with st.expander("Player-prop data coverage"):
-                if props.get("errors"):
-                    st.write(props["errors"])
-                if props.get("exclusions"):
-                    st.dataframe(pd.DataFrame(props["exclusions"]), use_container_width=True, hide_index=True)
+        issues = list(props.get("errors", [])) + list(props.get("exclusions", []))
+        if issues:
+            with st.expander(f"🔎 Why some props aren't available ({len(issues)})"):
+                st.caption("These games or players were left out of the prop picks. Here's why.")
+                def friendly_time(value):
+                    stamp = pd.to_datetime(value, utc=True, errors="coerce")
+                    return stamp.tz_convert("America/Chicago").strftime("%a, %b %d · %-I:%M %p CT") if pd.notna(stamp) else None
+                for offset in range(0, len(issues), 2):
+                    for column, issue in zip(st.columns(2), issues[offset:offset+2]):
+                        with column:
+                            with st.container(border=True):
+                                if isinstance(issue, dict):
+                                    st.markdown("**" + str(issue.get("Player") or issue.get("Game") or "Player-prop update") + "**")
+                                    if issue.get("Player") and issue.get("Game"):
+                                        st.caption(str(issue["Game"]))
+                                    reason = str(issue.get("Reason") or issue.get("error") or issue.get("error_type") or "Information is unavailable.")
+                                    messages = {
+                                        "No event returned for these teams and home/away order.": "The odds provider hasn't returned a matching game for this matchup.",
+                                        "Start-time mismatch or multiple same-day games; automatic match withheld.": "The game dates or times don't line up, or there is more than one possible game. This prop was left out until the match is clear.",
+                                        "Odds feed has the opposite home/away order; automatic match withheld.": "The two sources disagree about which team is at home. This prop was left out until the matchup is clear.",
+                                        "Multiple sportsbook events match this start time.": "More than one sportsbook game matches. We couldn't identify the correct one.",
+                                        "One sportsbook event would map to multiple MLB games.": "This sportsbook game matches multiple scheduled games. We couldn't identify the correct one.",
+                                        "Event matched, but no sportsbook prop lines were returned.": "The game was found, but the provider returned no player-prop lines.",
+                                        "Fewer than two books offer this same two-sided line.": "We need matching over/under lines from two sportsbooks. This candidate doesn't have enough coverage.",
+                                        "No unique player identity found in this game feed.": "We couldn't confidently identify this player in the game information.",
+                                        "No saved prior appearances for this player.": "Saved player history is unavailable for this estimate.",
+                                        "Player is outside the posted lineup or is not a recorded/probable starter.": "This player isn't in the posted lineup or listed as a starting pitcher.",
+                                    }
+                                    st.write(messages.get(reason, reason))
+                                    scheduled = friendly_time(issue.get("MLB start UTC"))
+                                    if scheduled:
+                                        st.caption("MLB schedule: " + scheduled)
+                                    odds_times = [friendly_time(t) for t in issue.get("Odds starts UTC", [])]
+                                    odds_times = [t for t in odds_times if t]
+                                    if odds_times:
+                                        st.caption("Sportsbook schedule: " + " · ".join(odds_times))
+                                else:
+                                    st.markdown("**Player-prop update**")
+                                    st.write(str(issue))
 
 
 def run_nba_prediction_with_props(progress_callback=None):
