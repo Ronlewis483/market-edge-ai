@@ -891,10 +891,10 @@ def load_mlb_prediction_pipeline():
     if "run_mlb_prediction_pipeline" not in definitions or "render_mlb_prediction_center" in definitions:
         raise RuntimeError("dual_agent/mlb_prediction_pipeline.py contains the wrong code. Replace it with the supplied pipeline file; app.py belongs only in the repository root.")
     pipeline = importlib.import_module("dual_agent.mlb_prediction_pipeline")
-    if getattr(pipeline, "MLB_PIPELINE_VERSION", None) != 7:
+    if getattr(pipeline, "MLB_PIPELINE_VERSION", None) != 8:
         importlib.invalidate_caches()
         pipeline = importlib.reload(pipeline)
-    if getattr(pipeline, "MLB_PIPELINE_VERSION", None) != 7:
+    if getattr(pipeline, "MLB_PIPELINE_VERSION", None) != 8:
         raise RuntimeError("Deploy the matching dual_agent/mlb_prediction_pipeline.py from this update. The running MLB module is older than the seven-day forecast fix.")
     return pipeline
 
@@ -959,7 +959,7 @@ def render_mlb_prediction_center(location):
         except Exception as exc:
             st.error("MLB prediction pipeline stopped: " + str(exc))
     result = st.session_state.get("mlb_live_pipeline_result")
-    if result and result.get("pipeline_version") != 7:
+    if result and result.get("pipeline_version") != 8:
         st.session_state.pop("mlb_live_pipeline_result", None)
         result = None
         st.info("The MLB pipeline was updated. Generate again to search the upcoming seven-day schedule.")
@@ -978,6 +978,7 @@ def render_mlb_prediction_center(location):
             st.json({"skipped_games": result.get("skipped", []), "source_updates": result.get("errors", []),
                      "scheduled_games_found": len(result.get("scheduled_games", [])), "games_scored": len(result.get("all_predictions", [])),
                      "pipeline_version": result.get("pipeline_version"),
+                     "loading_seconds": result.get("stage_timings_seconds", {}),
                      "missing_inputs": [{"game_id": r["game_id"], "features": r["Missing model inputs"]} for r in rows]})
 
 
