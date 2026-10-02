@@ -15,7 +15,7 @@ import requests
 from scipy.stats import skellam
 
 ACTIVE_MODEL_PATH = 'mlb/live_matchup/active.json'
-MLB_PIPELINE_VERSION = 9
+MLB_PIPELINE_VERSION = 10
 _HISTORY_CACHE = {}
 _CACHE_LOCK = RLock()
 CORE = ['home_field', 'offense_runs_per_game', 'opponent_runs_allowed',
@@ -477,7 +477,13 @@ def _generate_mlb_predictions(game_date=None, api_key=None, progress=None, on_te
         on_team_predictions(predictions)
     update('Team forecasts ready. Collecting player props in parallel...')
     try:
-        from dual_agent.sports_player_prop_predictions import generate_player_prop_picks
+        import importlib
+        prop_module = importlib.import_module('dual_agent.sports_player_prop_predictions')
+        if getattr(prop_module, 'MLB_PROP_MATCH_VERSION', None) != 2:
+            prop_module = importlib.reload(prop_module)
+        if getattr(prop_module, 'MLB_PROP_MATCH_VERSION', None) != 2:
+            raise RuntimeError('Install the matching sports_player_prop_predictions.py update.')
+        generate_player_prop_picks = prop_module.generate_player_prop_picks
         prop_games = [{'game_id': r['game_id'], 'start_time': r['start_time'], 'home_team': r['Home'], 'away_team': r['Away']} for r in all_eligible_predictions]
         props = generate_player_prop_picks('MLB', prop_games, api_key, player_logs=logs, snapshots=snapshots)
     except Exception as exc:
