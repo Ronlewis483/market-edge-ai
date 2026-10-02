@@ -99,11 +99,16 @@ def render_stock_opportunities():
             state['result']=future.result();state.pop('error',None)
         except Exception as exc:
             state['error']=str(exc)
+            import time
+            state['retry_after']=time.monotonic()+120
         state['future']=None
     import time
     busy=state.get('future') is not None
-    requested=st.button('🔎 Scan stocks now', key='scan_full_stock_market', type='primary', disabled=busy)
-    if state.get('future') is None and (requested or time.monotonic()-state.get('submitted',-1000)>=60):
+    cooling=time.monotonic()<state.get('retry_after',0)
+    requested=st.button('🔎 Scan stocks now', key='scan_full_stock_market', type='primary', disabled=busy or cooling)
+    if cooling:st.info('Pausing requests to let the data connection recover. Automatic retry in '+str(max(1,int(state['retry_after']-time.monotonic())))+' seconds.')
+    if not cooling and state.get('future') is None and (requested or time.monotonic()-state.get('submitted',-1000)>=60):
+        state.pop('error',None)
         state['submitted']=time.monotonic()
         state['future']=state['pool'].submit(engine.scan_market,key,secret,feed,url,state['cache'])
     if state.get('future') is not None:
@@ -149,4 +154,4 @@ def render_stock_opportunities():
                 with st.expander('Stocks with unavailable history'):
                     for failure in failures:st.write(', '.join(failure['symbols'])+': '+failure['reason'])
     if state.get('future') is not None:st.caption('The next full-market scan is running in the background.')
-    st.caption('Scan status updates every ten seconds; new scans start at most once a minute while this screen is open. The worker can finish a started scan after navigation, but this is not a scheduled service when the app is shut down. Detailed history is loaded for up to 40 candidates selected from the full-market screen. Saved history is reused; intraday updates fetch only recent bars. Local saved files may be lost when the hosting environment resets.')
+    st.caption('Scan status updates every ten seconds; fresh quotes are checked about once a minute, and the full-market screen is reused for five minutes. The worker can finish a started scan after navigation, but this is not a scheduled service when the app is shut down. Detailed history is loaded for up to 40 candidates selected from the full-market screen. Saved history is reused; intraday updates fetch only recent bars. Local saved files may be lost when the hosting environment resets.')
