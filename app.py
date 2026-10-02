@@ -1632,11 +1632,7 @@ if page == "🏠 Home":
 # ============================================
 
 if page == "🏠 Home":
-    with st.expander(
-        "🎯 NFL Player Prop Predictions",
-        expanded=False,
-    ):
-        render_nfl_player_props()
+    render_nfl_player_props()
 
 
 # ============================================
@@ -1895,6 +1891,7 @@ if page == "🏈 NFL":
 
 
     if show_today:
+        render_nfl_player_props()
         st.divider()
         st.subheader("Today's Picks")
 
@@ -2037,14 +2034,11 @@ if page == "🏈 NFL":
                         "player prop forecast(s) available."
                     )
 
-                    # Show most recently generated first.
-
+                    # Display saved forecasts from highest estimated chance to lowest.
                     matching_forecasts = sorted(
                         matching_forecasts,
-                        key=lambda item: item.get(
-                            "generated_at", ""
-                        ),
-                        reverse=True
+                        key=lambda item: (float(item.get("estimated_chance",0)),item.get("generated_at","")),
+                        reverse=True,
                     )
 
                     for forecast_index, forecast in enumerate(matching_forecasts):
