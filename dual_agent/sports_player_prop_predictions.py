@@ -123,6 +123,47 @@ def _nba_history(player, api_key):
     return rows
 
 
+def mlb_prop_identities(snapshots):
+    """Resolve names within each game's teams; posted lineups override guesses."""
+    candidates = {}
+    for gid, snapshot in (snapshots or {}).items():
+        feed = snapshot.get('raw_feed', {})
+        box = feed.get('liveData', {}).get('boxscore', {}).get('teams', {})
+        people = feed.get('gameData', {}).get('players', {})
+        for side in ['home', 'away']:
+            team = box.get(side, {})
+            lineup = {int(pid) for pid in team.get('battingOrder', [])}
+            posted = len(lineup) == 9
+            pitchers = team.get('pitchers', [])
+            recorded = int(pitchers[0]) if pitchers else None
+            probable = (snapshot.get('probable_pitchers', {}).get(side) or {})
+            probable_id = int(probable['id']) if probable.get('id') else None
+            conflict = recorded is not None and probable_id is not None and recorded != probable_id
+            starter = None if conflict else recorded if recorded is not None else probable_id
+            players = dict(team.get('players', {}))
+            if starter is not None and 'ID'+str(starter) not in players:
+                person = people.get('ID'+str(starter), {})
+                players['ID'+str(starter)] = {'person': {'id': starter,
+                    'fullName': person.get('fullName') or probable.get('fullName')}, 'position': {'code': '1'}}
+            for player in players.values():
+                person = player.get('person', {})
+                if not person.get('id') or not person.get('fullName'):
+                    continue
+                pid = int(person['id'])
+                position = player.get('position', {})
+                # A sportsbook line is still required. Bench players are excluded
+                # once a full lineup is posted; unknown lineups stay provisional.
+                hitter = pid in lineup or (not posted and position.get('code') != '1'
+                    and position.get('abbreviation') != 'P')
+                pitching = pid == starter
+                hitting_status = 'Confirmed lineup' if pid in lineup else 'Provisional — lineup unannounced'
+                pitching_status = 'Recorded starter' if recorded == starter and starter is not None else 'Probable starter — subject to change'
+                value = (pid, hitter, pitching, hitting_status, pitching_status)
+                key = (int(gid), name_key(person['fullName']))
+                candidates.setdefault(key, {})[pid] = value
+    return {key: next(iter(values.values())) for key, values in candidates.items() if len(values) == 1}
+
+
 def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapshots=None, nba_key=None):
     if not odds_key:
         return {'picks':[], 'message':'Player props need the configured Odds API key.', 'errors':[]}
@@ -147,15 +188,7 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
     else:
         if player_logs is None or player_logs.empty:
             return {'picks':[], 'message':'MLB player warehouse is unavailable; no prop estimates generated.', 'errors':errors}
-        for gid,snapshot in (snapshots or {}).items():
-            box = snapshot.get('raw_feed', {}).get('liveData', {}).get('boxscore', {}).get('teams', {})
-            for side in ['home','away']:
-                team = box.get(side, {})
-                allowed = set(team.get('battingOrder', []))|set(team.get('pitchers', [])[:1])
-                for player in team.get('players', {}).values():
-                    person=player.get('person', {})
-                    if person.get('id') in allowed:
-                        identities[(int(gid),name_key(person.get('fullName')))] = (int(person['id']), person['id'] in team.get('battingOrder', []), person['id'] in team.get('pitchers', [])[:1])
+        identities = mlb_prop_identities(snapshots)
         wanted = {identity[0] for identity in identities.values()}
         player_ids = pd.to_numeric(player_logs.player_id, errors='coerce')
         subset = player_logs.loc[player_ids.isin(wanted)].copy()
@@ -163,20 +196,34 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
         subset['prior_start'] = pd.to_datetime(subset.start_time, utc=True, errors='coerce')
         subset['game_id'] = pd.to_numeric(subset.game_id, errors='coerce')
         mlb_histories = {int(pid): frame for pid,frame in subset.groupby('player_id')}
-    picks = []
+    picks = []; exclusions = []
+    def excluded(first, player, market, line, reason):
+        exclusions.append({'Player': player, 'Market': market, 'Line': line,
+            'Game': first['away_team']+' @ '+first['home_team'], 'Reason': reason})
     for (_,player,market,line), group in groups.items():
         first = group[0]; start = pd.Timestamp(first['start_time'])
         unique = {q['book']:q for q in group if q['book']}
-        if len(unique)<2: continue
+        if len(unique)<2:
+            if league == 'MLB': excluded(first, player, market, line, 'Fewer than two books offer this same two-sided line.')
+            continue
+        participation = None
         probability = float(np.median([q['over_probability'] for q in unique.values()]))
         stat = MARKETS[league][market][1]
         if league=='NBA':
             values = [r.get(stat) for r in history_by_name.get(player, []) if pd.Timestamp(r['source_date'])+pd.Timedelta(hours=48)<start]
         else:
             identity = identities.get((int(first['game_id']),name_key(player)))
-            if not identity or (market=='batter_hits' and not identity[1]) or (market=='pitcher_strikeouts' and not identity[2]): continue
+            if not identity:
+                excluded(first, player, market, line, 'No unique player identity found in this game feed.')
+                continue
+            if (market=='batter_hits' and not identity[1]) or (market=='pitcher_strikeouts' and not identity[2]):
+                excluded(first, player, market, line, 'Player is outside the posted lineup or is not a recorded/probable starter.')
+                continue
+            participation = identity[3] if market=='batter_hits' else identity[4]
             logs = mlb_histories.get(identity[0])
-            if logs is None: continue
+            if logs is None:
+                excluded(first, player, market, line, 'No saved prior appearances for this player.')
+                continue
             cutoff = min(start,pd.Timestamp(first['capture_time']))-pd.Timedelta(hours=48)
             logs = logs[(logs.prior_start<cutoff)&(logs.game_id!=int(first['game_id']))]
             if market=='pitcher_strikeouts': logs = logs[pd.to_numeric(logs.games_started, errors='coerce')>0]
@@ -184,12 +231,18 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
             logs = logs.sort_values('prior_start').drop_duplicates('game_id', keep='last')
             values = pd.to_numeric(logs[stat], errors='coerce').tolist()
         values = [float(v) for v in values if v is not None and np.isfinite(float(v))]
+        if league == 'MLB':
+            sample = values[-30:]
+            if len(sample) < 10 or sum(v != line for v in sample) < 10:
+                excluded(first, player, market, line, f'Need 10 usable non-push appearances; found {len(sample)} appearances and {sum(v != line for v in sample)} non-push results.')
+                continue
         for side,market_p in [('Over',probability),('Under',1-probability)]:
             estimate = estimate_prop(values,line,side,market_p)
             if estimate:
                 picks.append({'Player':player,'Market':MARKETS[league][market][0],'Pick':side,'Line':line,
                               'Market chance':market_p,'Books':len(unique),'Game':first['away_team']+' @ '+first['home_team'],
-                              'start_time':first['start_time'],'Captured UTC':first['capture_time'], **estimate})
+                              'start_time':first['start_time'],'Captured UTC':first['capture_time'],
+                              **({'Participation status': participation} if league=='MLB' else {}), **estimate})
     # One side of one line per player/market/game; avoid ranking duplicate books or alternatives.
     picks.sort(key=lambda r:(-r['Estimated chance'],-r['Prior games'],r['Player']))
     seen=set(); chosen=[]
@@ -198,5 +251,5 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
         if key not in seen:
             seen.add(key);chosen.append(pick)
         if len(chosen)==10:break
-    return {'picks':chosen,'errors':errors,'message':f'{len(chosen)} player-prop estimates ranked from actual lines and prior appearances.',
+    return {'picks':chosen,'errors':errors, **({'exclusions': exclusions, 'quoted_candidates':len(groups)} if league=='MLB' else {}), 'message':f'{len(chosen)} player-prop estimates ranked from actual lines and prior appearances.',
             'note':'Estimated chance is conditional on no push and player participation. Estimates are not calibrated; no availability or injury clearance is implied.'}
