@@ -241,7 +241,7 @@ def score_live_games(model, games, market=None):
             for i, g in enumerate(games)]
 
 
-def run_mlb_prediction_pipeline(game_date, api_key=None, progress=None):
+def run_mlb_prediction_pipeline(game_date=None, api_key=None, progress=None):
     from dual_agent import mlb_research as research, supabase_db as storage
     from dual_agent.mlb_matchup_elo import attach_elo
     from dual_agent.mlb_matchup_context import attach_matchup_context
@@ -252,7 +252,23 @@ def run_mlb_prediction_pipeline(game_date, api_key=None, progress=None):
         if progress: progress(message)
     model = load_active_model()
     update('Collecting current lineups, pitchers, player updates and stadium forecasts...')
-    package = research.collect_mlb_upcoming_game_information(game_date)
+    now = pd.Timestamp.now(tz='UTC')
+    automatic = game_date is None
+    game_date = game_date or now.tz_convert('America/Chicago').date()
+    dates = [game_date]
+    if automatic:
+        next_date = (now+pd.Timedelta(hours=24)).tz_convert('America/Chicago').date()
+        if next_date != game_date: dates.append(next_date)
+    package = {'games': [], 'errors': [], 'skipped': [], 'game_date': str(game_date)}
+    for date in dates:
+        slate = research.fetch_mlb_daily_slate(date) if automatic else None
+        ids = None
+        if slate is not None:
+            times = pd.to_datetime(slate['start_time'], utc=True, errors='coerce') if not slate.empty else pd.Series(dtype='datetime64[ns, UTC]')
+            ids = slate.loc[(times>now)&(times<=now+pd.Timedelta(hours=24)), 'game_id'].tolist() if not slate.empty else []
+            if not ids: continue
+        captured = research.collect_mlb_upcoming_game_information(date, game_ids=ids) if automatic else research.collect_mlb_upcoming_game_information(date)
+        for key in ['games', 'errors', 'skipped']: package[key].extend(captured.get(key, []))
     errors = list(package.get('errors', [])); skipped = list(package.get('skipped', []))
     saved_capture = storage.save_mlb_pregame_intelligence(package, snapshot_date=str(game_date))
     if not saved_capture.get('success'):
@@ -321,9 +337,22 @@ def run_mlb_prediction_pipeline(game_date, api_key=None, progress=None):
     predictions = score_live_games(model, games, market)
     now = pd.Timestamp.now(tz='UTC')
     predictions = [r for r in predictions if pd.Timestamp(r['start_time'])>now and now-pd.Timestamp(r['Captured UTC'])<=pd.Timedelta(minutes=15)]
+    predictions.sort(key=lambda r: (-r['Winner probability'], r['start_time'], r['game_id']))
+    all_eligible_predictions = list(predictions)
+    predictions = predictions[:10]
+    update('Generating player-prop estimates from current lines and prior player games...')
+    try:
+        from dual_agent.sports_player_prop_predictions import generate_player_prop_picks
+        prop_games = [{'game_id': r['game_id'], 'start_time': r['start_time'], 'home_team': r['Home'], 'away_team': r['Away']} for r in all_eligible_predictions]
+        props = generate_player_prop_picks('MLB', prop_games, api_key, player_logs=logs, snapshots=snapshots)
+    except Exception:
+        props = {'picks': [], 'errors': [], 'message': 'Player-prop data unavailable. Team predictions are preserved.'}
+    now = pd.Timestamp.now(tz='UTC')
+    predictions = [r for r in predictions if pd.Timestamp(r['start_time'])>now and now-pd.Timestamp(r['Captured UTC'])<=pd.Timedelta(minutes=15)]
+    props['picks'] = [r for r in props.get('picks', []) if pd.Timestamp(r['start_time'])>now and now-pd.Timestamp(r['Captured UTC'])<=pd.Timedelta(minutes=15)]
     result = {'version': 1, 'created_at': now.isoformat(), 'game_date': str(game_date),
               'model_id': hashlib.sha256(json.dumps(model, sort_keys=True, allow_nan=False).encode()).hexdigest(),
-              'predictions': predictions, 'skipped': skipped, 'errors': errors,
+              'predictions': predictions, 'player_props': props, 'skipped': skipped, 'errors': errors,
               'message': f'{len(predictions)} games scored with the saved matchup model.', 'historical_tests_run': False}
     path = 'mlb/live_matchup/predictions/'+now.strftime('%Y%m%dT%H%M%S%fZ')+'.json'
     _bucket().upload(path, json.dumps(storage._json_safe(result), allow_nan=False).encode(), {'content-type': 'application/json', 'upsert': 'false'})
