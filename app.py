@@ -891,10 +891,10 @@ def load_mlb_prediction_pipeline():
     if "run_mlb_prediction_pipeline" not in definitions or "render_mlb_prediction_center" in definitions:
         raise RuntimeError("dual_agent/mlb_prediction_pipeline.py contains the wrong code. Replace it with the supplied pipeline file; app.py belongs only in the repository root.")
     pipeline = importlib.import_module("dual_agent.mlb_prediction_pipeline")
-    if getattr(pipeline, "MLB_PIPELINE_VERSION", None) != 5:
+    if getattr(pipeline, "MLB_PIPELINE_VERSION", None) != 7:
         importlib.invalidate_caches()
         pipeline = importlib.reload(pipeline)
-    if getattr(pipeline, "MLB_PIPELINE_VERSION", None) != 5:
+    if getattr(pipeline, "MLB_PIPELINE_VERSION", None) != 7:
         raise RuntimeError("Deploy the matching dual_agent/mlb_prediction_pipeline.py from this update. The running MLB module is older than the seven-day forecast fix.")
     return pipeline
 
@@ -933,6 +933,14 @@ def render_mlb_prediction_center(location):
             except Exception as exc:
                 st.error("Unable to activate MLB model: " + str(exc))
     st.caption("Automatically ranks up to 10 team winners and 10 player props for games in the next seven days.")
+    team_cards = st.empty()
+    def show_team_cards(rows):
+        winners = pd.DataFrame([{ "home_team": r["Home"], "away_team": r["Away"], "predicted_team": r["Predicted winner"],
+            "confidence": r["Winner probability"], "home_win_probability": r["Home win probability"],
+            "away_win_probability": 1-r["Home win probability"], "commence_time": r["start_time"],
+            "input_status": r.get("Input status"), "input_notes": r.get("Input notes", [])} for r in rows])
+        with team_cards.container():
+            render_league_prediction_results("MLB", "⚾", {"predictions": winners, "opportunities": None})
     if st.button("⚡ Generate MLB Predictions", key=location + "_generate", type="primary", use_container_width=True):
         try:
             import os
@@ -944,14 +952,14 @@ def render_mlb_prediction_center(location):
                 except Exception:
                     odds_key = None
             status = st.empty()
-            result = pipeline.run_mlb_prediction_pipeline(api_key=odds_key, progress=status.info)
+            result = pipeline.run_mlb_prediction_pipeline(api_key=odds_key, progress=status.info, on_team_predictions=show_team_cards)
             result["pipeline_version"] = pipeline.MLB_PIPELINE_VERSION
             st.session_state["mlb_live_pipeline_result"] = result
             status.success(result["message"])
         except Exception as exc:
             st.error("MLB prediction pipeline stopped: " + str(exc))
     result = st.session_state.get("mlb_live_pipeline_result")
-    if result and result.get("pipeline_version") != 5:
+    if result and result.get("pipeline_version") != 7:
         st.session_state.pop("mlb_live_pipeline_result", None)
         result = None
         st.info("The MLB pipeline was updated. Generate again to search the upcoming seven-day schedule.")
@@ -959,11 +967,7 @@ def render_mlb_prediction_center(location):
         now = pd.Timestamp.now(tz="UTC")
         rows = [r for r in result.get("predictions", []) if pd.Timestamp(r["start_time"])>now and now-pd.Timestamp(r["Captured UTC"])<=pd.Timedelta(minutes=15)]
         if rows:
-            winners = pd.DataFrame([{"home_team": r["Home"], "away_team": r["Away"], "predicted_team": r["Predicted winner"],
-                "confidence": r["Winner probability"], "home_win_probability": r["Home win probability"],
-                "away_win_probability": 1-r["Home win probability"], "commence_time": r["start_time"],
-                "input_status": r.get("Input status"), "input_notes": r.get("Input notes", [])} for r in rows])
-            render_league_prediction_results("MLB", "⚾", {"predictions": winners, "opportunities": None})
+            show_team_cards(rows)
             st.caption("Picks are saved before first pitch. Confidence reflects the saved model; the 70% accuracy goal is not established.")
         else:
             st.info(result.get("message", "No fresh upcoming predictions. Generate again to collect current game information."))
