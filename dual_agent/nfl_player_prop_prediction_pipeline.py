@@ -390,9 +390,10 @@ def run_nfl_player_prop_prediction_pipeline(
     player_history,
     window=12,
     max_results=20,
+    horizon_days=1,
 ):
     """
-    Generate and rank today's strongest player-prop forecasts.
+    Generate and rank future player-prop forecasts within the requested horizon.
     """
 
     if prop_lines is None:
@@ -432,13 +433,9 @@ def run_nfl_player_prop_prediction_pipeline(
         tz="UTC"
     )
 
-    current_date_ct = (
-        current_time
-        .tz_convert(
-            "America/Chicago"
-        )
-        .date()
-    )
+    if not isinstance(horizon_days,int) or not 1<=horizon_days<=7:
+        raise ValueError('horizon_days must be an integer from 1 to 7.')
+    forecast_end=current_time+pd.Timedelta(days=horizon_days)
 
     consensus_props = (
         _select_consensus_props(
@@ -469,19 +466,11 @@ def run_nfl_player_prop_prediction_pipeline(
         if kickoff <= current_time:
             continue
 
-        # Today's games only.
-        kickoff_date_ct = (
-            kickoff
-            .tz_convert(
-                "America/Chicago"
-            )
-            .date()
-        )
-
-        if (
-            kickoff_date_ct
-            != current_date_ct
-        ):
+        if horizon_days==1:
+            # Preserve legacy today-only behavior for callers that omit the argument.
+            if kickoff.tz_convert('America/Chicago').date()!=current_time.tz_convert('America/Chicago').date():
+                continue
+        elif kickoff>forecast_end:
             continue
 
         market = market_lookup.get(
