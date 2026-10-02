@@ -40,6 +40,18 @@ def rank_player_props(predictions):
     return ranked.head(10)
 
 
+def upcoming_week_events(events,now):
+    now=pd.Timestamp(now)
+    end=now+pd.Timedelta(days=7)
+    result=[];seen=set()
+    for event in events:
+        kickoff=pd.to_datetime(event.get('commence_time'),utc=True,errors='coerce')
+        identity=event.get('id')
+        if identity and identity not in seen and pd.notna(kickoff) and now<kickoff<=end:
+            seen.add(identity);result.append(event)
+    return sorted(result,key=lambda event:event['commence_time'])
+
+
 def render_nfl_player_props():
     st.header('🏈 NFL Player Prop Picks')
     st.caption('Independent module. Historical frequencies are not calibrated predictions or betting recommendations.')
@@ -47,26 +59,27 @@ def render_nfl_player_props():
     if not key:
         st.warning('Add ODDS_API_KEY to Streamlit Community Cloud → App settings → Secrets.')
         return
-    selected=st.multiselect('Markets', list(MARKETS), default=list(MARKETS), key='props_markets')
+    with st.expander('Markets to include',expanded=False):
+        selected=st.multiselect('Markets', list(MARKETS), default=list(MARKETS), key='props_markets')
       # ==========================================================
     # AUTOMATIC TODAY'S PLAYER PROP PREDICTIONS
     # ==========================================================
 
-    st.markdown("## 🎯 Today's NFL Player Prop Predictions")
+    st.markdown("## 🎯 NFL Player Prop Predictions · Next 7 Days")
 
     st.caption(
-        "Scan today's remaining NFL games and generate "
+        "Scan upcoming NFL games over the next seven days and generate "
         "player-prop forecasts automatically."
     )
 
     if st.button(
-        "⚡ Generate Today's Player Prop Predictions",
+        "⚡ Generate Top 10 NFL Player Props · Next 7 Days",
         key="generate_today_nfl_prop_predictions",
         use_container_width=True,
     ):
         try:
             with st.spinner(
-                "Scanning today's NFL player props..."
+                "Scanning the next seven days of NFL player props..."
             ):
                 live_events = cached_events(key)
 
@@ -74,35 +87,10 @@ def render_nfl_player_props():
                     tz="UTC"
                 )
 
-                today_ct = now_utc.tz_convert(
-                    "America/Chicago"
-                ).date()
-
-                today_events = []
-
-                for event in live_events:
-                    kickoff = pd.to_datetime(
-                        event.get("commence_time"),
-                        utc=True,
-                        errors="coerce",
-                    )
-
-                    if pd.isna(kickoff):
-                        continue
-
-                    if kickoff <= now_utc:
-                        continue
-
-                    if (
-                        kickoff.tz_convert(
-                            "America/Chicago"
-                        ).date()
-                        != today_ct
-                    ):
-                        continue
-
-                    today_events.append(event)
-
+                today_events=upcoming_week_events(live_events,now_utc)
+                if not selected:
+                    st.warning('Select at least one player-prop market.');return
+                st.session_state['nfl_week_prop_scan_issues']=[]
                 if not today_events:
                     st.session_state[
                         "nfl_auto_prop_predictions"
@@ -133,10 +121,8 @@ def render_nfl_player_props():
                                     event_lines
                                 )
 
-                        except (
-                            requests.RequestException,
-                            ValueError,
-                        ):
+                        except (requests.RequestException,ValueError) as exc:
+                            st.session_state['nfl_week_prop_scan_issues'].append(f"{event.get('away_team','')} @ {event.get('home_team','')}: {type(exc).__name__}")
                             continue
 
                     if prop_frames:
@@ -171,6 +157,8 @@ def render_nfl_player_props():
                         "nfl_auto_prop_predictions"
                     ] = predictions
 
+                st.session_state['nfl_prop_scan_scope']='next_7_days_v1'
+
         except Exception as prop_error:
             st.error(
                 "Unable to generate player prop predictions: "
@@ -178,9 +166,18 @@ def render_nfl_player_props():
                 f"{prop_error}"
             )
 
-    auto_prop_predictions = st.session_state.get(
-        "nfl_auto_prop_predictions"
-    )
+    auto_prop_predictions=st.session_state.get('nfl_auto_prop_predictions') if st.session_state.get('nfl_prop_scan_scope')=='next_7_days_v1' else None
+    if isinstance(auto_prop_predictions,pd.DataFrame) and not auto_prop_predictions.empty and 'game_time' in auto_prop_predictions:
+        kickoff=pd.to_datetime(auto_prop_predictions['game_time'],utc=True,errors='coerce')
+        now=pd.Timestamp.now(tz='UTC')
+        auto_prop_predictions=auto_prop_predictions.loc[(kickoff>now)&(kickoff<=now+pd.Timedelta(days=7))].copy()
+    if auto_prop_predictions is None:
+        st.info('Press Generate Top 10 to scan the next seven days. Ranked cards appear here; no game or player selection is required.')
+    issues=st.session_state.get('nfl_week_prop_scan_issues',[])
+    if issues:
+        st.caption(f'{len(issues)} games could not return prop data in this scan.')
+        with st.expander('Games with unavailable prop data'):
+            for issue in issues:st.write(issue)
 
     if isinstance(
         auto_prop_predictions,
@@ -224,9 +221,11 @@ def render_nfl_player_props():
     ):
         st.info(
             "No eligible player-prop forecasts were "
-            "generated for today's remaining games."
+            "generated for upcoming games in the next seven days."
         )
 
+    if not st.checkbox('Open optional player research tools',key='nfl_optional_player_research'):
+        return
     st.divider()
     if st.button('Load upcoming NFL games', key='props_load_games'):
         try: st.session_state['props_events']=cached_events(key)
@@ -237,15 +236,13 @@ def render_nfl_player_props():
         return
     choices={f"{g.get('away_team')} at {g.get('home_team')} — {g.get('commence_time')}":g['id'] for g in games}
     chosen=st.selectbox('Game',list(choices),key='props_event')
-    if st.button('Load player prop lines', key='props_load_lines'):
-        if not selected: st.warning('Select at least one market.')
-        else:
-            try:
-                event,remaining=cached_props(key,choices[chosen],tuple(MARKETS[m] for m in selected))
-                st.session_state['props_lines']=normalize_props(event)
-                st.session_state['props_loaded_event']=choices[chosen]
-                st.session_state['props_quota']=remaining
-            except (requests.RequestException,ValueError) as exc: st.error(f'Prop lines unavailable: {exc}')
+    if selected:
+        try:
+            event,remaining=cached_props(key,choices[chosen],tuple(MARKETS[m] for m in selected))
+            st.session_state['props_lines']=normalize_props(event)
+            st.session_state['props_loaded_event']=choices[chosen]
+            st.session_state['props_quota']=remaining
+        except (requests.RequestException,ValueError) as exc: st.error(f'Prop lines unavailable: {exc}')
     if st.session_state.get('props_loaded_event')!=choices[chosen]:
         st.info('Load lines for the selected game.'); return
     lines=st.session_state.get('props_lines',pd.DataFrame())
