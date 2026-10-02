@@ -15,7 +15,7 @@ import requests
 from scipy.stats import skellam
 
 ACTIVE_MODEL_PATH = 'mlb/live_matchup/active.json'
-MLB_PIPELINE_VERSION = 10
+MLB_PIPELINE_VERSION = 11
 _HISTORY_CACHE = {}
 _CACHE_LOCK = RLock()
 CORE = ['home_field', 'offense_runs_per_game', 'opponent_runs_allowed',
@@ -479,9 +479,9 @@ def _generate_mlb_predictions(game_date=None, api_key=None, progress=None, on_te
     try:
         import importlib
         prop_module = importlib.import_module('dual_agent.sports_player_prop_predictions')
-        if getattr(prop_module, 'MLB_PROP_MATCH_VERSION', None) != 2:
+        if getattr(prop_module, 'MLB_PROP_MATCH_VERSION', None) != 3:
             prop_module = importlib.reload(prop_module)
-        if getattr(prop_module, 'MLB_PROP_MATCH_VERSION', None) != 2:
+        if getattr(prop_module, 'MLB_PROP_MATCH_VERSION', None) != 3:
             raise RuntimeError('Install the matching sports_player_prop_predictions.py update.')
         generate_player_prop_picks = prop_module.generate_player_prop_picks
         prop_games = [{'game_id': r['game_id'], 'start_time': r['start_time'], 'home_team': r['Home'], 'away_team': r['Away']} for r in all_eligible_predictions]
@@ -531,13 +531,15 @@ def fetch_live_consensus(games, api_key):
     return probabilities
 
 
-def run_mlb_prediction_pipeline(game_date=None, api_key=None, progress=None, on_team_predictions=None):
+def run_mlb_prediction_pipeline(game_date=None, api_key=None, progress=None, on_team_predictions=None, force_refresh=False):
     """Reuse completed pregame results for three minutes, retaining source times."""
     import copy
     now = pd.Timestamp.now(tz='UTC')
     date_key = str(game_date or now.tz_convert('America/Chicago').date())
     key = ('completed_predictions', date_key, hashlib.sha256((api_key or '').encode()).hexdigest())
     with _CACHE_LOCK:
+        if force_refresh:
+            _HISTORY_CACHE.pop(key, None)
         cached = _HISTORY_CACHE.get(key)
         reused = bool(cached and time.monotonic()-cached[0]<180)
     if reused and progress:
