@@ -67,6 +67,7 @@ from dual_agent.nfl_accuracy_audit import (
 )
 
 from dual_agent.nfl_prediction_pipeline import (
+    nfl_week_rows,
     run_nfl_prediction_pipeline,
 )
 
@@ -1052,12 +1053,12 @@ if page == "🏠 Home":
     st.subheader("🏈 NFL Prediction Center")
     
     st.caption(
-        "Generate upcoming NFL game predictions, shop available "
+        "Rank NFL games in the next seven days, shop available "
         "moneylines, and analyze model-vs-market opportunities."
     )
     
     if st.button(
-        "⚡ Generate NFL Predictions",
+        "⚡ Generate NFL Predictions · Next 7 Days",
         key="generate_nfl_predictions_one_click",
         type="primary",
         use_container_width=True,
@@ -1230,9 +1231,7 @@ if page == "🏠 Home":
     
     if nfl_pipeline_result is not None:
     
-        predictions = nfl_pipeline_result.get(
-            "predictions"
-        )
+        predictions = nfl_week_rows(nfl_pipeline_result.get("predictions"))
     
         opportunities = nfl_pipeline_result.get(
             "opportunities"
@@ -1256,8 +1255,7 @@ if page == "🏠 Home":
         ):
 
             st.caption(
-                "Model-generated win probabilities "
-                "for upcoming games."
+                "Strongest model picks first, for games in the next seven days."
             )
 
             # ------------------------------------
@@ -8440,7 +8438,7 @@ if page == "🏈 NFL" and st.session_state.get("nfl_accuracy_audit") is not None
                     "Generating predictions for upcoming NFL games..."
                 ):
 
-                    for _, game in best_lines.iterrows():
+                    for _, game in nfl_week_rows(best_lines, now=current_time).iterrows():
 
                         home_team = game["home_team"]
                         away_team = game["away_team"]
@@ -8563,9 +8561,7 @@ if page == "🏈 NFL" and st.session_state.get("nfl_accuracy_audit") is not None
     # DISPLAY LIVE PREDICTIONS
     # ------------------------------------------------------------
 
-    live_predictions = st.session_state.get(
-        "nfl_live_predictions"
-    )
+    live_predictions = nfl_week_rows(st.session_state.get("nfl_live_predictions"))
 
     
     if (
