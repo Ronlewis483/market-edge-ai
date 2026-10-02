@@ -257,15 +257,15 @@ def run_mlb_prediction_pipeline(game_date=None, api_key=None, progress=None):
     game_date = game_date or now.tz_convert('America/Chicago').date()
     dates = [game_date]
     if automatic:
-        next_date = (now+pd.Timedelta(hours=24)).tz_convert('America/Chicago').date()
-        if next_date != game_date: dates.append(next_date)
+        end_date = (now+pd.Timedelta(days=7)).tz_convert('America/Chicago').date()
+        dates = [date.date() for date in pd.date_range(game_date, end_date, freq='D')]
     package = {'games': [], 'errors': [], 'skipped': [], 'game_date': str(game_date)}
     for date in dates:
         slate = research.fetch_mlb_daily_slate(date) if automatic else None
         ids = None
         if slate is not None:
             times = pd.to_datetime(slate['start_time'], utc=True, errors='coerce') if not slate.empty else pd.Series(dtype='datetime64[ns, UTC]')
-            ids = slate.loc[(times>now)&(times<=now+pd.Timedelta(hours=24)), 'game_id'].tolist() if not slate.empty else []
+            ids = slate.loc[(times>now)&(times<=now+pd.Timedelta(days=7)), 'game_id'].tolist() if not slate.empty else []
             if not ids: continue
         captured = research.collect_mlb_upcoming_game_information(date, game_ids=ids) if automatic else research.collect_mlb_upcoming_game_information(date)
         for key in ['games', 'errors', 'skipped']: package[key].extend(captured.get(key, []))
