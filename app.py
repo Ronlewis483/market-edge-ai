@@ -123,7 +123,9 @@ def render_stock_connection():
 
             try:
                 api_key = st.secrets["ALPACA_API_KEY"]
-                secret_key = st.secrets["ALPACA_SECRET_KEY"]
+                secret_key = prediction_api_key("ALPACA_SECRET_KEY", "ALPACA_API_SECRET")
+                if not secret_key:
+                    raise KeyError("ALPACA_SECRET_KEY or ALPACA_API_SECRET")
 
                 headers = {
                     "APCA-API-KEY-ID": api_key,
@@ -2197,45 +2199,8 @@ if page == "🏠 Home":
     render_mlb_prediction_center("mlb_home")
 
 if page == "📈 Stocks":
-    st.success(f"VALIDATED MODEL LOADED — {M['target']} • {M['features']} • AUC {M['auc']:.3f}")
-    with st.container():
-        st.subheader("📈 Best Stock Signal")
-        txt=st.text_input("Symbols to scan", "AAPL,MSFT,NVDA,AMZN,META,GOOGL,TSLA,AVGO,AMD,JPM,LLY,XOM")
-        syms=clean_symbols(txt)
-        if st.button("Scan Today's Market",type="primary",use_container_width=True):
-            try:
-                with st.spinner("Loading recent market data and scoring stocks — no retraining..."):
-                    # Keep existing V4 model/data implementation, but do NOT run walk-forward research.
-                    df=latest_scan(default,syms)
-                    st.session_state["daily"]=stock_decision(df)
-            except Exception as e:
-                st.error(f"Daily scan failed: {e}")
-
-        d=st.session_state.get("daily")
-        if d:
-            if d["status"]=="MAKE THIS TRADE":
-                st.success("MAKE THIS TRADE")
-                st.markdown(f"## {d['symbol']}")
-                a,b=st.columns(2)
-                a.metric("Model probability",f"{d['probability']:.1%}")
-                b.metric("Edge vs base rate",f"+{d['edge']:.1%}")
-                st.write(f"**Direction:** {d['direction']}")
-                st.write(f"**Horizon:** {d['horizon']}")
-                st.write(f"**Target:** {d['target']}")
-            else:
-                st.warning("NO QUALIFYING TRADE")
-                st.caption(d["reason"])
-                top=d.get("top",{})
-                if top:
-                    st.write(f"Top candidate: **{top.get('Symbol','—')}** • probability {float(top.get('P',0)):.1%} • required {GATES['min_probability']:.0%}")
-
-            ranked=d.get("ranked")
-            if ranked is not None and len(ranked):
-                show=ranked.head(10).copy()
-                cols=[x for x in ["Symbol","Close","P","edge"] if x in show.columns]
-                show=show[cols].rename(columns={"P":"Model probability","edge":"Edge vs base"})
-                st.markdown("#### Today's top candidates")
-                st.dataframe(show,use_container_width=True,hide_index=True)
+    from dual_agent.stock_opportunities_ui import render_stock_opportunities
+    render_stock_opportunities()
 
 
 if page == "🏀 NBA":
@@ -3985,13 +3950,14 @@ if page == "📊 Performance":
 
 if page == "📈 Stocks":
     render_stock_connection()
-    render_trading_center(
-        latest_scan=latest_scan,
-        stock_decision=stock_decision,
-        universe=default,
-        clean_symbols=clean_symbols,
-        model=M,
-    )
+    with st.expander("Trade planning and existing five-day research tools", expanded=False):
+        render_trading_center(
+            latest_scan=latest_scan,
+            stock_decision=stock_decision,
+            universe=default,
+            clean_symbols=clean_symbols,
+            model=M,
+        )
 
 
 
