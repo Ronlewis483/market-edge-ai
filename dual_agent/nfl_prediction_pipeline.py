@@ -32,6 +32,28 @@ from dual_agent.nfl_live_engine import (
 )
 
 
+def nfl_week_rows(rows, now=None):
+    """Keep unstarted games in the next seven days, one row per matchup."""
+    if rows is None:
+        return None
+    frame = rows.copy() if isinstance(rows, pd.DataFrame) else pd.DataFrame(rows)
+    if frame.empty:
+        return frame
+    if "commence_time" not in frame:
+        return frame.iloc[:0].copy()
+    current = pd.Timestamp.now(tz="UTC") if now is None else pd.Timestamp(now)
+    current = current.tz_localize("UTC") if current.tzinfo is None else current.tz_convert("UTC")
+    kickoff = pd.to_datetime(frame["commence_time"], utc=True, errors="coerce")
+    frame = frame.loc[(kickoff > current) & (kickoff <= current + pd.Timedelta(days=7))].copy()
+    frame["commence_time"] = kickoff.loc[frame.index]
+    if "confidence" in frame:
+        frame = frame.sort_values("confidence", ascending=False, kind="stable")
+    identity = [c for c in ("home_team", "away_team", "commence_time") if c in frame]
+    if len(identity) == 3:
+        frame = frame.drop_duplicates(identity, keep="first")
+    return frame.reset_index(drop=True)
+
+
 def run_nfl_prediction_pipeline(
     feature_games,
     historical_accuracy=None,
@@ -145,6 +167,8 @@ def run_nfl_prediction_pipeline(
         tz="UTC"
     )
 
+    best_lines = nfl_week_rows(best_lines, now=current_time)
+
     for _, game in best_lines.iterrows():
 
         home_team = game["home_team"]
@@ -225,7 +249,7 @@ def run_nfl_prediction_pipeline(
         )
 
         message = (
-            "No upcoming NFL predictions "
+            "No NFL predictions for the next seven days "
             "could be generated."
         )
 
@@ -235,6 +259,8 @@ def run_nfl_prediction_pipeline(
             )
 
         raise ValueError(message)
+
+    predictions = nfl_week_rows(predictions, now=current_time)
 
     # ==========================================
     # 5. BUILD LIVE NFL OPPORTUNITIES
