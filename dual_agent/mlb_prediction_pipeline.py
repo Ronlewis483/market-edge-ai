@@ -15,7 +15,7 @@ import requests
 from scipy.stats import skellam
 
 ACTIVE_MODEL_PATH = 'mlb/live_matchup/active.json'
-MLB_PIPELINE_VERSION = 8
+MLB_PIPELINE_VERSION = 9
 _HISTORY_CACHE = {}
 _CACHE_LOCK = RLock()
 CORE = ['home_field', 'offense_runs_per_game', 'opponent_runs_allowed',
@@ -480,8 +480,9 @@ def _generate_mlb_predictions(game_date=None, api_key=None, progress=None, on_te
         from dual_agent.sports_player_prop_predictions import generate_player_prop_picks
         prop_games = [{'game_id': r['game_id'], 'start_time': r['start_time'], 'home_team': r['Home'], 'away_team': r['Away']} for r in all_eligible_predictions]
         props = generate_player_prop_picks('MLB', prop_games, api_key, player_logs=logs, snapshots=snapshots)
-    except Exception:
-        props = {'picks': [], 'errors': [], 'message': 'Player-prop data unavailable. Team predictions are preserved.'}
+    except Exception as exc:
+        props = {'picks': [], 'errors': [{'stage': 'MLB prop generation', 'error_type': type(exc).__name__}],
+                 'message': 'MLB player-prop generation failed ('+type(exc).__name__+'). See player-prop data coverage.'}
     now = pd.Timestamp.now(tz='UTC')
     predictions = [r for r in predictions if pd.Timestamp(r['start_time'])>now and now-pd.Timestamp(r['Captured UTC'])<=pd.Timedelta(minutes=15)]
     props['picks'] = [r for r in props.get('picks', []) if pd.Timestamp(r['start_time'])>now and now-pd.Timestamp(r['Captured UTC'])<=pd.Timedelta(minutes=15)]
