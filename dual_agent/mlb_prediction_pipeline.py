@@ -15,7 +15,7 @@ import requests
 from scipy.stats import skellam
 
 ACTIVE_MODEL_PATH = 'mlb/live_matchup/active.json'
-MLB_PIPELINE_VERSION = 5
+MLB_PIPELINE_VERSION = 7
 _HISTORY_CACHE = {}
 _CACHE_LOCK = RLock()
 CORE = ['home_field', 'offense_runs_per_game', 'opponent_runs_allowed',
@@ -145,6 +145,10 @@ def activate_model(model):
     validate_model(model)
     payload = json.dumps(model, allow_nan=False).encode()
     _bucket().upload(ACTIVE_MODEL_PATH, payload, {'content-type': 'application/json', 'upsert': 'true'})
+    with _CACHE_LOCK:
+        for key in list(_HISTORY_CACHE):
+            if isinstance(key, tuple) and key[0] == 'completed_predictions':
+                del _HISTORY_CACHE[key]
     return {'model_id': hashlib.sha256(payload).hexdigest(), 'created_at': model.get('created_at')}
 
 
@@ -311,7 +315,7 @@ def score_live_games(model, games, market=None):
             for i, g in enumerate(games)]
 
 
-def run_mlb_prediction_pipeline(game_date=None, api_key=None, progress=None):
+def _generate_mlb_predictions(game_date=None, api_key=None, progress=None, on_team_predictions=None):
     from dual_agent import mlb_research as research, supabase_db as storage
     from dual_agent.mlb_matchup_elo import attach_elo
     from dual_agent.mlb_matchup_context import attach_matchup_context
@@ -329,7 +333,25 @@ def run_mlb_prediction_pipeline(game_date=None, api_key=None, progress=None):
     if automatic:
         end_date = (now+pd.Timedelta(days=7)).tz_convert('America/Chicago').date()
         dates = [date.date() for date in pd.date_range(game_date, end_date, freq='D')]
-    package = collect_prediction_inputs(dates, now, research, update)
+    def load_schedules():
+        schedules = []
+        first_year = min([int(g['season']) for g in model.get('retained_feature_rows', [])] or [2024])
+        with requests.Session() as session:
+            for year in range(first_year, pd.Timestamp(game_date).year+1):
+                def load_year(year=year):
+                    response = session.get('https://statsapi.mlb.com/api/v1/schedule', params={'sportId': 1, 'startDate': f'{year}-03-01', 'endDate': f'{year}-12-31', 'gameType': 'R'}, timeout=20)
+                    response.raise_for_status()
+                    return [g for day in response.json().get('dates', []) for g in day.get('games', [])]
+                schedules.extend(_cached_history(('schedule', year), 180 if year==now.year else 86400, load_year))
+        return schedules
+    # History preparation is independent of fresh feeds: overlap their I/O.
+    with ThreadPoolExecutor(max_workers=2) as preparation:
+        history_job = preparation.submit(_cached_history, 'player_warehouse', 180, storage.load_mlb_player_history)
+        schedule_job = preparation.submit(load_schedules)
+        package = collect_prediction_inputs(dates, now, research, update)
+        update('Finishing historical input preparation...')
+        schedules = schedule_job.result()
+        logs = history_job.result()
     errors = list(package.get('errors', [])); skipped = list(package.get('skipped', []))
     saved_capture = storage.save_mlb_pregame_intelligence(package, snapshot_date=str(game_date))
     if not saved_capture.get('success'):
@@ -339,15 +361,6 @@ def run_mlb_prediction_pipeline(game_date=None, api_key=None, progress=None):
         return {'predictions': [], 'scheduled_games': scheduled, 'skipped': skipped, 'errors': errors,
                 'message': f'{len(scheduled)} upcoming games found; their pregame feeds could not be captured.' if scheduled else 'No scheduled MLB games in the next seven days.'}
     update('Loading prior team results and saved player history...')
-    schedules = []
-    first_year = min([int(g['season']) for g in model.get('retained_feature_rows', [])] or [2024])
-    with requests.Session() as session:
-        for year in range(first_year, pd.Timestamp(game_date).year+1):
-            def load_year(year=year):
-                response = session.get('https://statsapi.mlb.com/api/v1/schedule', params={'sportId': 1, 'startDate': f'{year}-03-01', 'endDate': f'{year}-12-31', 'gameType': 'R'}, timeout=20)
-                response.raise_for_status()
-                return [g for day in response.json().get('dates', []) for g in day.get('games', [])]
-            schedules.extend(_cached_history(('schedule', year), 180 if year==now.year else 86400, load_year))
     games = []; snapshots = {}
     for snapshot in package['games']:
         try:
@@ -358,7 +371,6 @@ def run_mlb_prediction_pipeline(game_date=None, api_key=None, progress=None):
         return {'predictions': [], 'scheduled_games': package.get('scheduled_games', []), 'skipped': skipped, 'errors': errors,
                 'message': f'{len(package.get("scheduled_games", []))} upcoming games found; see game information coverage for forecast exclusions.'}
     columns = model['model_bundle']['columns']
-    logs = _cached_history('player_warehouse', 180, storage.load_mlb_player_history)
     if set(columns)&set(BULLPEN_FEATURES):
         update('Connecting verified bullpen workload...')
         completion, details = collect_bullpen_completion_times(games, schedules, 'mlb_accuracy_results')
@@ -419,7 +431,9 @@ def run_mlb_prediction_pipeline(game_date=None, api_key=None, progress=None):
     predictions.sort(key=lambda r: (-r['Winner probability'], r['start_time'], r['game_id']))
     all_eligible_predictions = list(predictions)
     predictions = predictions[:10]
-    update('Generating player-prop estimates from current lines and prior player games...')
+    if on_team_predictions:
+        on_team_predictions(predictions)
+    update('Team forecasts ready. Collecting player props in parallel...')
     try:
         from dual_agent.sports_player_prop_predictions import generate_player_prop_picks
         prop_games = [{'game_id': r['game_id'], 'start_time': r['start_time'], 'home_team': r['Home'], 'away_team': r['Away']} for r in all_eligible_predictions]
@@ -465,3 +479,29 @@ def fetch_live_consensus(games, api_key):
                         books[book['key']] = (1/h)/(1/h+1/a)
         probabilities.append(float(np.median(list(books.values()))) if len(books)>=2 else np.nan)
     return probabilities
+
+
+def run_mlb_prediction_pipeline(game_date=None, api_key=None, progress=None, on_team_predictions=None):
+    """Reuse completed pregame results for three minutes, retaining source times."""
+    import copy
+    now = pd.Timestamp.now(tz='UTC')
+    date_key = str(game_date or now.tz_convert('America/Chicago').date())
+    key = ('completed_predictions', date_key, hashlib.sha256((api_key or '').encode()).hexdigest())
+    with _CACHE_LOCK:
+        cached = _HISTORY_CACHE.get(key)
+        reused = bool(cached and time.monotonic()-cached[0]<180)
+    if reused and progress:
+        progress('Using predictions collected within the last three minutes...')
+    result = copy.deepcopy(_cached_history(key, 180, lambda: _generate_mlb_predictions(game_date, api_key, progress, on_team_predictions)))
+    now = pd.Timestamp.now(tz='UTC')
+    def eligible(row):
+        return pd.Timestamp(row['start_time'])>now and now-pd.Timestamp(row['Captured UTC'])<=pd.Timedelta(minutes=15)
+    if 'all_predictions' in result:
+        result['all_predictions'] = [r for r in result['all_predictions'] if eligible(r)]
+        result['predictions'] = sorted(result['all_predictions'], key=lambda r:-r['Winner probability'])[:10]
+    else:
+        result['predictions'] = [r for r in result.get('predictions', []) if eligible(r)]
+    if result.get('player_props'):
+        result['player_props']['picks'] = [r for r in result['player_props'].get('picks', []) if eligible(r)]
+    result['reused_recent_predictions'] = reused
+    return result
