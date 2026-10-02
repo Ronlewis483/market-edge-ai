@@ -649,6 +649,12 @@ def render_league_prediction_results(
                                 f"## {predicted_team}"
                             )
 
+                            if game.get("input_status"):
+                                st.caption(game["input_status"])
+                                if game.get("input_notes"):
+                                    st.warning(" · ".join(game["input_notes"]))
+                                    st.caption("Early forecast uses saved training medians for missing player inputs. Wait for updated inputs before treating it as a recommended pick.")
+
                             st.progress(
                                 max(
                                     0.0,
@@ -909,14 +915,18 @@ def render_mlb_prediction_center(location):
         if rows:
             winners = pd.DataFrame([{"home_team": r["Home"], "away_team": r["Away"], "predicted_team": r["Predicted winner"],
                 "confidence": r["Winner probability"], "home_win_probability": r["Home win probability"],
-                "away_win_probability": 1-r["Home win probability"], "commence_time": r["start_time"]} for r in rows])
+                "away_win_probability": 1-r["Home win probability"], "commence_time": r["start_time"],
+                "input_status": r.get("Input status"), "input_notes": r.get("Input notes", [])} for r in rows])
             render_league_prediction_results("MLB", "⚾", {"predictions": winners, "opportunities": None})
             st.caption("Picks are saved before first pitch. Confidence reflects the saved model; the 70% accuracy goal is not established.")
         else:
-            st.info("No fresh upcoming predictions. Generate again to collect current game information.")
+            st.info(result.get("message", "No fresh upcoming predictions. Generate again to collect current game information."))
+            if result.get("scheduled_games"):
+                st.dataframe(pd.DataFrame(result["scheduled_games"]), use_container_width=True, hide_index=True)
         render_player_prop_picks("MLB", result)
         with st.expander("Game information coverage"):
             st.json({"skipped_games": result.get("skipped", []), "source_updates": result.get("errors", []),
+                     "scheduled_games_found": len(result.get("scheduled_games", [])), "games_scored": len(result.get("all_predictions", [])),
                      "missing_inputs": [{"game_id": r["game_id"], "features": r["Missing model inputs"]} for r in rows]})
 
 
