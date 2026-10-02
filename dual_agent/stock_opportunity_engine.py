@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 import requests
 
-ENGINE_VERSION = 1
+ENGINE_VERSION = 2
 DEFAULT_SYMBOLS = ['AAPL','MSFT','NVDA','AMZN','META','GOOGL','TSLA','AVGO','AMD','JPM','LLY','XOM']
 STRATEGIES = {'hour': ['Trend + VWAP', 'Range breakout', 'VWAP reclaim'],
               'hold': ['Long-term momentum', '63-day breakout', 'Trend pullback']}
@@ -81,8 +81,8 @@ def indicators(frame, horizon):
         prev_vwap = g.groupby('session').session_vwap.shift()
         high = g.groupby('session').high.transform(lambda v:v.shift().rolling(20,min_periods=20).max())
         rising = g['slow'] > g.groupby('session').slow.shift(3)
-        g[STRATEGIES['hour'][0]] = (c>g.fast)&(g.fast>g.slow)&(c>g.session_vwap)&rising&(g.volume>g.volume_mean)
-        g[STRATEGIES['hour'][1]] = (c>high)&(c>g.session_vwap)&(g.volume>g.volume_mean)
+        g[STRATEGIES['hour'][0]] = (c>g.fast)&(g.fast>g.slow)&(c>g.session_vwap)&rising&(g.volume>.8*g.volume_mean)
+        g[STRATEGIES['hour'][1]] = (c>high)&(c>g.session_vwap)&(g.volume>.8*g.volume_mean)
         g[STRATEGIES['hour'][2]] = (prev_close<=prev_vwap)&(c>g.session_vwap)&rising
     else:
         g['ma50'] = c.rolling(50).mean();g['ma200'] = c.rolling(200).mean()
@@ -91,7 +91,7 @@ def indicators(frame, horizon):
         trend = (c>g.ma200)&(g.ma50>g.ma200)
         g[STRATEGIES['hold'][0]] = trend&(c.pct_change(63)>0)
         g[STRATEGIES['hold'][1]] = trend&(c>g.high.shift().rolling(63).max())
-        g[STRATEGIES['hold'][2]] = trend&(rsi<45)&(rsi>30)
+        g[STRATEGIES['hold'][2]] = trend&(rsi<50)&(rsi>25)
     return g
 
 
@@ -148,13 +148,13 @@ def select_strategy(frames, horizon):
             chosen.extend(historical_trades(g,strategy,horizon,split,'selection'))
             held.extend(historical_trades(g,strategy,horizon,split,'verification'))
         selection[strategy]=summarize(chosen);verification[strategy]=summarize(held)
-    candidates=[s for s in STRATEGIES[horizon] if selection[s]['trades']>=30]
-    if not candidates:return {'qualified':False,'reason':'No strategy has 30 completed selection-period trades.'}
+    candidates=[s for s in STRATEGIES[horizon] if selection[s]['trades']>=25]
+    if not candidates:return {'qualified':False,'reason':'No strategy has 25 completed selection-period trades.'}
     winner=max(candidates,key=lambda s:selection[s]['mean_net_return'])
     holdout=verification[winner]
-    passed=holdout['trades']>=10 and holdout['mean_net_return'] is not None and holdout['mean_net_return']>0 and selection[winner]['mean_net_return']>0
+    passed=holdout['trades']>=8 and holdout['mean_net_return'] is not None and holdout['mean_net_return']>0 and selection[winner]['mean_net_return']>0
     return {'qualified':passed,'strategy':winner,'selection':selection[winner],'verification':holdout,
-            'split_utc':split.isoformat(), 'reason':None if passed else 'The selected strategy did not pass the separate recent-period profitability check.',
+            'split_utc':split.isoformat(), 'reason':None if passed else ('The selected strategy needs at least 8 recent-period trades.' if holdout['trades']<8 else 'The selected strategy did not show a positive average return after estimated costs in both historical periods.'),
             'cost_assumption_bps':10 if horizon=='hour' else 20}
 
 
@@ -178,17 +178,17 @@ def opportunities(raw, quotes, clock, horizon, now=None):
         except (KeyError,ValueError,TypeError):continue
         if pd.isna(stamp) or stamp>now or now-stamp>pd.Timedelta(seconds=90) or not 0<bid<=ask:continue
         spread=(ask-bid)/((ask+bid)/2)
-        if spread>.003 or ask<5:continue
+        if spread>.005 or ask<5:continue
         if horizon=='hour' and now-pd.Timestamp(row.timestamp)>pd.Timedelta(minutes=12):continue
         if horizon=='hold' and now-pd.Timestamp(row.timestamp)>pd.Timedelta(days=5):continue
-        if horizon=='hour' and float(row.volume)*float(row.close)<100000:continue
+        if horizon=='hour' and float(row.volume)*float(row.close)<50000:continue
         atr=float(row.atr)
         if not np.isfinite(atr) or atr<=0:continue
         # Don't chase a price far from the latest completed signal bar.
         if abs(ask/float(row.close)-1)>(.01 if horizon=='hour' else .05):continue
         split=pd.Timestamp(evidence['split_utc'])
         sample=summarize(historical_trades(g,strategy,horizon,split,'verification'))
-        if sample['trades']<3 or sample['mean_net_return'] is None or sample['mean_net_return']<=0:continue
+        if sample['trades']<2 or sample['mean_net_return'] is None or sample['mean_net_return']<=0:continue
         picks={'symbol':symbol,'strategy':strategy,'entry_reference':ask,'spread_pct':spread,
                'quote_time':stamp.isoformat(),'signal_time':pd.Timestamp(row.timestamp).isoformat(),
                'historical_mean_net_return':sample['mean_net_return'],'historical_win_rate':sample['win_rate'],
