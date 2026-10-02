@@ -126,7 +126,7 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
     groups = {}
     for q in quotes:
         groups.setdefault((q['event_id'],q['player'],q['market'],q['line']), []).append(q)
-    history_by_name = {}; identities = {}
+    history_by_name = {}; identities = {}; mlb_histories = {}
     if league=='NBA':
         if not nba_key:
             return {'picks':[], 'message':'NBA prop estimates need BALLDONTLIE_API_KEY and access to player game stats.', 'errors':errors}
@@ -150,6 +150,13 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
                     person=player.get('person', {})
                     if person.get('id') in allowed:
                         identities[(int(gid),name_key(person.get('fullName')))] = (int(person['id']), person['id'] in team.get('battingOrder', []), person['id'] in team.get('pitchers', [])[:1])
+        wanted = {identity[0] for identity in identities.values()}
+        player_ids = pd.to_numeric(player_logs.player_id, errors='coerce')
+        subset = player_logs.loc[player_ids.isin(wanted)].copy()
+        subset['player_id'] = player_ids.loc[subset.index]
+        subset['prior_start'] = pd.to_datetime(subset.start_time, utc=True, errors='coerce')
+        subset['game_id'] = pd.to_numeric(subset.game_id, errors='coerce')
+        mlb_histories = {int(pid): frame for pid,frame in subset.groupby('player_id')}
     picks = []
     for (_,player,market,line), group in groups.items():
         first = group[0]; start = pd.Timestamp(first['start_time'])
@@ -162,10 +169,10 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
         else:
             identity = identities.get((int(first['game_id']),name_key(player)))
             if not identity or (market=='batter_hits' and not identity[1]) or (market=='pitcher_strikeouts' and not identity[2]): continue
-            logs = player_logs[pd.to_numeric(player_logs.player_id, errors='coerce')==identity[0]].copy()
-            logs['prior_start'] = pd.to_datetime(logs.start_time, utc=True, errors='coerce')
+            logs = mlb_histories.get(identity[0])
+            if logs is None: continue
             cutoff = min(start,pd.Timestamp(first['capture_time']))-pd.Timedelta(hours=48)
-            logs = logs[(logs.prior_start<cutoff)&(pd.to_numeric(logs.game_id, errors='coerce')!=int(first['game_id']))]
+            logs = logs[(logs.prior_start<cutoff)&(logs.game_id!=int(first['game_id']))]
             if market=='pitcher_strikeouts': logs = logs[pd.to_numeric(logs.games_started, errors='coerce')>0]
             else: logs = logs[pd.to_numeric(logs.plate_appearances, errors='coerce')>0]
             logs = logs.sort_values('prior_start').drop_duplicates('game_id', keep='last')
