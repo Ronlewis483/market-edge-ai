@@ -12,8 +12,25 @@ import numpy as np
 import pandas as pd
 import requests
 
-MARKETS = {'MLB': {'batter_hits': ('Hits', 'hits'), 'pitcher_strikeouts': ('Strikeouts', 'pitcher_strikeouts')},
-           'NBA': {'player_points': ('Points', 'pts'), 'player_rebounds': ('Rebounds', 'reb'), 'player_assists': ('Assists', 'ast')}}
+MARKETS = {'MLB': {
+    'batter_hits': ('Hits', 'hits'),
+    'batter_home_runs': ('Home runs', 'batting_home_runs'),
+    'batter_total_bases': ('Total bases', 'total_bases'),
+    'batter_rbis': ('RBIs', 'rbi'),
+    'batter_runs_scored': ('Runs scored', 'batting_runs'),
+    'batter_hits_runs_rbis': ('Hits + runs + RBIs', 'hits_runs_rbis'),
+    'batter_singles': ('Singles', 'singles'),
+    'batter_doubles': ('Doubles', 'doubles'),
+    'batter_triples': ('Triples', 'triples'),
+    'batter_walks': ('Batter walks', 'batting_walks'),
+    'batter_strikeouts': ('Batter strikeouts', 'batting_strikeouts'),
+    'batter_stolen_bases': ('Stolen bases', 'stolen_bases'),
+    'pitcher_strikeouts': ('Pitcher strikeouts', 'pitcher_strikeouts'),
+    'pitcher_hits_allowed': ('Hits allowed', 'pitcher_hits'),
+    'pitcher_walks': ('Pitcher walks', 'pitcher_walks'),
+    'pitcher_earned_runs': ('Earned runs allowed', 'earned_runs'),
+    'pitcher_outs': ('Outs recorded', 'pitching_outs')},
+    'NBA': {'player_points': ('Points', 'pts'), 'player_rebounds': ('Rebounds', 'reb'), 'player_assists': ('Assists', 'ast')}}
 
 
 def name_key(value):
@@ -28,7 +45,7 @@ def estimate_prop(values, line, side, market_probability):
     decisions = len(values)-pushes
     if len(values) < 10 or decisions < 10:
         return None
-    # Ten pseudo-observations keep short runs of wins from dominating the ranking.
+    # Preserve the existing short-sample shrinkage and eligibility criteria.
     chance = (wins+10*market_probability)/(decisions+10)
     return {'Estimated chance': float(chance), 'Projected stat': float(values.mean()),
             'Prior games': len(values), 'Historical wins': wins, 'Historical pushes': pushes,
@@ -42,7 +59,7 @@ def _get(url, key, params=None, balldontlie=False):
     return response.json()
 
 
-MLB_PROP_MATCH_VERSION = 2
+MLB_PROP_MATCH_VERSION = 3
 
 
 def mlb_team_key(value):
@@ -266,6 +283,13 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
         subset['player_id'] = player_ids.loc[subset.index]
         subset['prior_start'] = pd.to_datetime(subset.start_time, utc=True, errors='coerce')
         subset['game_id'] = pd.to_numeric(subset.game_id, errors='coerce')
+        # Missing components stay unknown, rather than becoming fabricated zeros.
+        def number(column):
+            return pd.to_numeric(subset[column], errors='coerce') if column in subset else pd.Series(np.nan, index=subset.index)
+        singles = number('hits')-number('doubles')-number('triples')-number('batting_home_runs')
+        subset['singles'] = singles.where(singles >= 0)
+        subset['total_bases'] = subset['singles']+2*number('doubles')+3*number('triples')+4*number('batting_home_runs')
+        subset['hits_runs_rbis'] = number('hits')+number('batting_runs')+number('rbi')
         mlb_histories = {int(pid): frame for pid,frame in subset.groupby('player_id')}
     picks = []; exclusions = []
     def excluded(first, player, market, line, reason):
@@ -287,19 +311,23 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
             if not identity:
                 excluded(first, player, market, line, 'No unique player identity found in this game feed.')
                 continue
-            if (market=='batter_hits' and not identity[1]) or (market=='pitcher_strikeouts' and not identity[2]):
+            pitching_market = market.startswith('pitcher_')
+            if (not pitching_market and not identity[1]) or (pitching_market and not identity[2]):
                 excluded(first, player, market, line, 'Player is outside the posted lineup or is not a recorded/probable starter.')
                 continue
-            participation = identity[3] if market=='batter_hits' else identity[4]
+            participation = identity[4] if pitching_market else identity[3]
             logs = mlb_histories.get(identity[0])
             if logs is None:
                 excluded(first, player, market, line, 'No saved prior appearances for this player.')
                 continue
             cutoff = min(start,pd.Timestamp(first['capture_time']))-pd.Timedelta(hours=48)
             logs = logs[(logs.prior_start<cutoff)&(logs.game_id!=int(first['game_id']))]
-            if market=='pitcher_strikeouts': logs = logs[pd.to_numeric(logs.games_started, errors='coerce')>0]
+            if pitching_market: logs = logs[pd.to_numeric(logs.games_started, errors='coerce')>0]
             else: logs = logs[pd.to_numeric(logs.plate_appearances, errors='coerce')>0]
             logs = logs.sort_values('prior_start').drop_duplicates('game_id', keep='last')
+            if stat not in logs:
+                excluded(first, player, market, line, 'Saved history is missing the statistics for this market.')
+                continue
             values = pd.to_numeric(logs[stat], errors='coerce').tolist()
         values = [float(v) for v in values if v is not None and np.isfinite(float(v))]
         if league == 'MLB':
