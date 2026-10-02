@@ -1016,12 +1016,6 @@ def render_mlb_prediction_center(location):
             if result.get("scheduled_games"):
                 st.dataframe(pd.DataFrame(result["scheduled_games"]), use_container_width=True, hide_index=True)
         render_player_prop_picks("MLB", result)
-        with st.expander("Game information coverage"):
-            st.json({"skipped_games": result.get("skipped", []), "source_updates": result.get("errors", []),
-                     "scheduled_games_found": len(result.get("scheduled_games", [])), "games_scored": len(result.get("all_predictions", [])),
-                     "pipeline_version": result.get("pipeline_version"),
-                     "loading_seconds": result.get("stage_timings_seconds", {}),
-                     "missing_inputs": [{"game_id": r["game_id"], "features": r["Missing model inputs"]} for r in rows]})
 
 
 if page == "🏠 Home":
