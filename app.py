@@ -1864,18 +1864,12 @@ if page == "🏈 NFL":
 
         market = st.selectbox(
             "What type of bet are you interested in?",
-            [
-                "Game Winner",
-                "Player Points",
-                "Player Rebounds",
-                "Player Assists",
-                "Player Passing Yards",
-                "Player Rushing Yards",
-                "Player Receiving Yards",
-                "Game Total Points",
-                "Point Spread",
-                "Other",
-            ],
+            ["Game Winner", "Player Passing Yards", "Player Rushing Yards",
+             "Player Receiving Yards", "Player Receptions", "Player Passing Touchdowns",
+             "Player Anytime Touchdown", "Player Rushing + Receiving Yards",
+             "Player Passing Completions", "Player Interceptions Thrown",
+             "Game Total Points", "Point Spread", "Other"],
+            key="nfl_betting_market",
         )
 
         st.divider()
@@ -1917,11 +1911,38 @@ if page == "🏈 NFL":
             )
 
             if selected_prop_market is None:
-
-                st.info(
-                    "Select a supported NFL player prop "
-                    "market to view available forecasts."
-                )
+                if market == "Game Winner":
+                    nfl_picks = (st.session_state.get("nfl_prediction_pipeline_result") or {}).get("predictions")
+                    if nfl_picks is not None and not pd.DataFrame(nfl_picks).empty:
+                        choices = pd.DataFrame(nfl_picks).to_dict("records")
+                        now = pd.Timestamp.now(tz="UTC")
+                        choices = [r for r in choices if pd.to_datetime(r.get("commence_time"), utc=True, errors="coerce") > now]
+                        if choices:
+                            selected_pick = st.selectbox("Choose an NFL winner to record", range(len(choices)),
+                                format_func=lambda i: f"{choices[i]['away_team']} @ {choices[i]['home_team']} — {choices[i]['predicted_team']}",
+                                key="nfl_winner_to_record")
+                            if st.button("Record this NFL bet", key="nfl_record_winner", type="primary"):
+                                pick = choices[selected_pick]
+                                st.session_state["bet_builder_mode"] = "Single"
+                                st.session_state["single_sport"] = "NFL"
+                                st.session_state["single_market"] = "Game Winner"
+                                st.session_state["single_team"] = pick["predicted_team"]
+                                st.session_state["single_player"] = ""
+                                st.session_state["single_description"] = f"{pick['predicted_team']} moneyline — {pick['away_team']} @ {pick['home_team']}"
+                                st.session_state["single_direction"] = "Moneyline"
+                                st.session_state["single_line"] = 0.0
+                                st.session_state["main_navigation"] = "🎟️ My Bets"
+                                st.rerun()
+                        else:
+                            st.info("Generate NFL predictions above to get upcoming game winners.")
+                    else:
+                        st.info("Generate NFL predictions above to view game winners, then record your bet here or in My Bets.")
+                else:
+                    st.info("Record this market through My Bets. Player forecasts are available for the listed NFL prop markets.")
+                if st.button("Open NFL bet entry", key="nfl_open_bet_entry"):
+                    st.session_state["single_sport"] = "NFL"
+                    st.session_state["main_navigation"] = "🎟️ My Bets"
+                    st.rerun()
 
             else:
 
@@ -1978,7 +1999,7 @@ if page == "🏈 NFL":
                         reverse=True
                     )
 
-                    for forecast in matching_forecasts:
+                    for forecast_index, forecast in enumerate(matching_forecasts):
 
                         player_name = forecast["player"]
                         game_name = forecast["game"]
@@ -2091,6 +2112,20 @@ if page == "🏈 NFL":
                                 "Forecast generated: "
                                 f"{forecast['generated_at']}"
                             )
+                            if st.button("Record this player prop", key=f"nfl_record_prop_{forecast_index}"):
+                                st.session_state["bet_builder_mode"] = "Single"
+                                st.session_state["single_sport"] = "NFL"
+                                st.session_state["single_market"] = {"Passing yards": "Passing Yards", "Rushing yards": "Rushing Yards",
+                                    "Receiving yards": "Receiving Yards", "Receptions": "Receptions",
+                                    "Anytime touchdown": "Anytime Touchdown"}.get(selected_prop_market, "Other")
+                                st.session_state["single_player"] = player_name
+                                st.session_state["single_team"] = ""
+                                st.session_state["single_description"] = f"{player_name} {prop_side} {prop_line:g} {selected_prop_market} — {game_name}"
+                                st.session_state["single_direction"] = prop_side if prop_side in ["Over", "Under", "Yes", "No"] else "Other"
+                                st.session_state["single_line"] = float(prop_line)
+                                st.session_state["main_navigation"] = "🎟️ My Bets"
+                                st.rerun()
+
 
         else:
 
@@ -2102,48 +2137,7 @@ if page == "🏈 NFL":
                 "separately."
             )
 
-        # Prediction area
-
-        st.subheader("Today's Betting Opportunities")
-
-        st.info(
-            f"Selected sport: {sport}\n\n"
-            f"Selected betting market: {market}"
-        )
-
-        st.write(
-            "Your available predictions and betting "
-            "opportunities will appear here."
-        )
-
-        st.caption(
-            "Predictions are estimates, not guaranteed outcomes. "
-            "Historical performance and current odds should be "
-            "reviewed before placing a wager."
-        )
-
-        st.divider()
-
-        # Strategy section
-
-        st.subheader("Strategy Performance")
-
-        st.write(
-            "Track how different betting strategies "
-            "perform over time."
-        )
-
-        st.info(
-            "Strategy performance will appear here "
-            "after your betting history is connected."
-        )
-
-    if show_bets:
-        st.subheader("My Bets")
-        st.info("Open My Bets in the sidebar to record wagers and update results.")
-        if st.button("Open My Bets", key="sports_open_bets"):
-            st.session_state["main_navigation"] = "🎟️ My Bets"
-            st.rerun()
+    # The NFL My Bets tab renders the shared bet builder below.
 
     if show_performance:
         st.subheader("Model Performance")
@@ -2887,7 +2881,7 @@ if page == "🏀 NBA":
         # ==========================================
 
 
-elif page == "🎟️ My Bets":
+elif page == "🎟️ My Bets" or (page == "🏈 NFL" and show_bets):
 
     st.title("My Bets")
     st.write(
