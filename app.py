@@ -824,7 +824,7 @@ def render_player_prop_picks(league, result):
         if not picks:
             st.info(props.get("message", "Generate predictions to collect available player-prop lines."))
         else:
-            st.caption("Historical hit-rate estimates with sportsbook shrinkage. These estimates are not calibrated win probabilities.")
+            st.caption("Ranked by estimated confidence after eligibility checks: fresh lines from at least two sportsbooks, verified player identity and at least 10 non-push prior appearances. Provisional participation is labeled." if league == "MLB" else "Historical hit-rate estimates with sportsbook shrinkage. These estimates are not calibrated win probabilities.")
             for offset in range(0, len(picks), 2):
                 for column, pick in zip(st.columns(2), picks[offset:offset+2]):
                     with column:
@@ -838,7 +838,7 @@ def render_player_prop_picks(league, result):
                                 st.caption(pick["Participation status"])
                                 if pick["Participation status"] != "Confirmed lineup" and pick["Participation status"] != "Recorded starter":
                                     st.warning("Participation is provisional. Recheck the lineup or starter before using this pick.")
-                            st.metric("Estimated chance · excludes pushes", f"{pick['Estimated chance']:.1%}")
+                            st.metric("Confidence · excludes pushes", f"{pick['Estimated chance']:.1%}")
                             st.progress(min(1.0, max(0.0, pick["Estimated chance"])))
                             st.caption(f"Projection {pick['Projected stat']:.1f} · {pick['Prior games']} prior appearances · {pick['Books']} books")
                             st.caption(f"Historical wins: {pick['Historical wins']} · pushes: {pick['Historical pushes']}")
@@ -933,10 +933,10 @@ def load_mlb_prediction_pipeline():
     if "run_mlb_prediction_pipeline" not in definitions or "render_mlb_prediction_center" in definitions:
         raise RuntimeError("dual_agent/mlb_prediction_pipeline.py contains the wrong code. Replace it with the supplied pipeline file; app.py belongs only in the repository root.")
     pipeline = importlib.import_module("dual_agent.mlb_prediction_pipeline")
-    if getattr(pipeline, "MLB_PIPELINE_VERSION", None) != 10:
+    if getattr(pipeline, "MLB_PIPELINE_VERSION", None) != 11:
         importlib.invalidate_caches()
         pipeline = importlib.reload(pipeline)
-    if getattr(pipeline, "MLB_PIPELINE_VERSION", None) != 10:
+    if getattr(pipeline, "MLB_PIPELINE_VERSION", None) != 11:
         raise RuntimeError("Deploy the matching dual_agent/mlb_prediction_pipeline.py from this update. The running MLB module is older than the seven-day forecast fix.")
     return pipeline
 
@@ -961,6 +961,7 @@ def nfl_prediction_features():
     return features
 
 
+@st.fragment(run_every="180s")
 def render_mlb_prediction_center(location):
     st.subheader("⚾ MLB Prediction Center")
     st.caption("Current lineups, starters, team form and available game conditions feed the saved matchup equation.")
@@ -983,7 +984,13 @@ def render_mlb_prediction_center(location):
             "input_status": r.get("Input status"), "input_notes": r.get("Input notes", [])} for r in rows])
         with team_cards.container():
             render_league_prediction_results("MLB", "⚾", {"predictions": winners, "opportunities": None})
-    if st.button("⚡ Generate MLB Predictions", key=location + "_generate", type="primary", use_container_width=True):
+    generated = st.button("⚡ Generate MLB Predictions", key=location + "_generate", type="primary", use_container_width=True)
+    previous = st.session_state.get("mlb_live_pipeline_result")
+    checked_at = pd.to_datetime(st.session_state.get("mlb_last_refresh_attempt"), utc=True, errors="coerce")
+    refresh_due = bool(previous and (pd.isna(checked_at) or pd.Timestamp.now(tz="UTC")-checked_at >= pd.Timedelta(seconds=180)))
+    st.caption("After generation, lineups, starters and available props refresh every three minutes while this screen stays open.")
+    if generated or refresh_due:
+        st.session_state["mlb_last_refresh_attempt"] = pd.Timestamp.now(tz="UTC").isoformat()
         try:
             import os
             pipeline = load_mlb_prediction_pipeline()
@@ -994,14 +1001,14 @@ def render_mlb_prediction_center(location):
                 except Exception:
                     odds_key = None
             status = st.empty()
-            result = pipeline.run_mlb_prediction_pipeline(api_key=odds_key, progress=status.info, on_team_predictions=show_team_cards)
+            result = pipeline.run_mlb_prediction_pipeline(api_key=odds_key, progress=status.info, on_team_predictions=show_team_cards, force_refresh=True)
             result["pipeline_version"] = pipeline.MLB_PIPELINE_VERSION
             st.session_state["mlb_live_pipeline_result"] = result
             status.success(result["message"])
         except Exception as exc:
             st.error("MLB prediction pipeline stopped: " + str(exc))
     result = st.session_state.get("mlb_live_pipeline_result")
-    if result and result.get("pipeline_version") != 10:
+    if result and result.get("pipeline_version") != 11:
         st.session_state.pop("mlb_live_pipeline_result", None)
         result = None
         st.info("The MLB pipeline was updated. Generate again to search the upcoming seven-day schedule.")
@@ -1016,6 +1023,9 @@ def render_mlb_prediction_center(location):
             if result.get("scheduled_games"):
                 st.dataframe(pd.DataFrame(result["scheduled_games"]), use_container_width=True, hide_index=True)
         render_player_prop_picks("MLB", result)
+        last_capture = pd.to_datetime(result.get("created_at"), utc=True, errors="coerce")
+        if pd.notna(last_capture):
+            st.caption("Last successful refresh: " + last_capture.tz_convert("America/Chicago").strftime("%b %d · %-I:%M %p CT"))
 
 
 if page == "🏠 Home":
