@@ -7,10 +7,10 @@ import numpy as np
 import pandas as pd
 import requests
 
-ENGINE_VERSION = 6
+ENGINE_VERSION = 7
 DEFAULT_SYMBOLS = ['AAPL','MSFT','NVDA','AMZN','META','GOOGL','TSLA','AVGO','AMD','JPM','LLY','XOM']
-STRATEGIES = {'hour': ['Trend + VWAP', 'Range breakout', 'VWAP reclaim'],
-              'hold': ['Long-term momentum', '63-day breakout', 'Trend pullback']}
+STRATEGIES = {'hour': ['Trend + VWAP', 'Range breakout', 'VWAP reclaim', 'EMA pullback', 'Opening range breakout', 'Momentum continuation', 'RSI recovery', 'Bollinger recovery'],
+              'hold': ['Long-term momentum', '63-day breakout', 'Trend pullback', '50-day reclaim', '20-day breakout']}
 
 
 # Shared request pacing across workers in this process.
@@ -109,6 +109,23 @@ def indicators(frame, horizon):
         g[STRATEGIES['hour'][0]] = (c>g.fast)&(g.fast>g.slow)&(c>g.session_vwap)&rising&(g.volume>.8*g.volume_mean)
         g[STRATEGIES['hour'][1]] = (c>high)&(c>g.session_vwap)&(g.volume>.8*g.volume_mean)
         g[STRATEGIES['hour'][2]] = (prev_close<=prev_vwap)&(c>g.session_vwap)&rising
+        previous_fast=g.groupby('session').fast.shift()
+        g['EMA pullback']=(prev_close<=previous_fast)&(c>g.fast)&(g.fast>g.slow)&(c>g.session_vwap)
+        minute=g.timestamp.dt.tz_convert('America/New_York').dt.hour*60+g.timestamp.dt.tz_convert('America/New_York').dt.minute
+        opening=g.high.where(minute<600).groupby(day).cummax().groupby(day).ffill()
+        g['Opening range breakout']=(minute>=600)&(c>opening)&(prev_close<=opening)&(c>g.session_vwap)
+        prior_three=g.groupby('session').close.shift(3)
+        g['Momentum continuation']=(c>prior_three)&(g.fast>g.slow)&rising&(c>g.session_vwap)&(g.volume>.8*g.volume_mean)
+        delta=g.groupby('session').close.diff()
+        gains=delta.clip(lower=0).groupby(day).transform(lambda v:v.ewm(alpha=1/14,adjust=False).mean())
+        losses=(-delta.clip(upper=0)).groupby(day).transform(lambda v:v.ewm(alpha=1/14,adjust=False).mean())
+        rsi=100-100/(1+gains/losses.replace(0,np.nan))
+        previous_rsi=rsi.groupby(day).shift()
+        g['RSI recovery']=(previous_rsi<35)&(rsi>=35)&rising
+        mean=g.groupby('session').close.transform(lambda v:v.rolling(20).mean())
+        std=g.groupby('session').close.transform(lambda v:v.rolling(20).std())
+        lower=mean-2*std
+        g['Bollinger recovery']=(prev_close<lower.groupby(day).shift())&(c>=lower)&rising
     else:
         g['ma50'] = c.rolling(50).mean();g['ma200'] = c.rolling(200).mean()
         change = c.diff(); gain=change.clip(lower=0).ewm(alpha=1/14,adjust=False).mean(); loss=(-change.clip(upper=0)).ewm(alpha=1/14,adjust=False).mean()
@@ -117,6 +134,8 @@ def indicators(frame, horizon):
         g[STRATEGIES['hold'][0]] = trend&(c.pct_change(63)>0)
         g[STRATEGIES['hold'][1]] = trend&(c>g.high.shift().rolling(63).max())
         g[STRATEGIES['hold'][2]] = trend&(rsi<50)&(rsi>25)
+        g['50-day reclaim']=(c>g.ma200)&(prior<=g.ma50.shift())&(c>g.ma50)
+        g['20-day breakout']=trend&(c>g.high.shift().rolling(20).max())
     return g
 
 
@@ -173,17 +192,20 @@ def select_strategy(frames, horizon):
             chosen.extend(historical_trades(g,strategy,horizon,split,'selection'))
             held.extend(historical_trades(g,strategy,horizon,split,'verification'))
         selection[strategy]=summarize(chosen);verification[strategy]=summarize(held)
-    candidates=[s for s in STRATEGIES[horizon] if selection[s]['trades']>=25]
-    if not candidates:return {'qualified':False,'reason':'No strategy has 25 completed selection-period trades.'}
-    winner=max(candidates,key=lambda s:selection[s]['mean_net_return'])
-    holdout=verification[winner]
-    passed=holdout['trades']>=8 and holdout['mean_net_return'] is not None and holdout['mean_net_return']>0 and selection[winner]['mean_net_return']>0
-    return {'qualified':passed,'strategy':winner,'selection':selection[winner],'verification':holdout,
-            'split_utc':split.isoformat(), 'reason':None if passed else ('The selected strategy needs at least 8 recent-period trades.' if holdout['trades']<8 else 'The selected strategy did not show a positive average return after estimated costs in both historical periods.'),
-            'cost_assumption_bps':10 if horizon=='hour' else 20}
+    checked=[]
+    for strategy in STRATEGIES[horizon]:
+        chosen=selection[strategy];held=verification[strategy]
+        passed=(chosen['trades']>=25 and held['trades']>=8 and
+                chosen['mean_net_return'] is not None and chosen['mean_net_return']>0 and
+                held['mean_net_return'] is not None and held['mean_net_return']>0)
+        checked.append({'qualified':passed,'strategy':strategy,'selection':chosen,'verification':held,
+                        'split_utc':split.isoformat(),'cost_assumption_bps':10 if horizon=='hour' else 20})
+    qualifying=[item for item in checked if item['qualified']]
+    return {'qualified':bool(qualifying),'strategies':checked,'qualified_strategies':qualifying,
+            'reason':None if qualifying else 'None of the independently evaluated strategies passed the history and positive net-return checks.'}
 
 
-def opportunities(raw, quotes, clock, horizon, now=None, prepared_frames=None, prepared_evidence=None):
+def _single_opportunities(raw, quotes, clock, horizon, now=None, prepared_frames=None, prepared_evidence=None):
     now=pd.Timestamp(now or pd.Timestamp.now(tz='UTC'))
     frames=prepared_frames if prepared_frames is not None else {symbol:indicators(g,horizon) for symbol,g in raw.groupby('symbol')}
     evidence=prepared_evidence if prepared_evidence is not None else select_strategy(frames,horizon)
@@ -227,6 +249,24 @@ def opportunities(raw, quotes, clock, horizon, now=None, prepared_frames=None, p
     result['picks'].sort(key=lambda p:(-p['rank_score'],-p['verification_trades'],p['symbol']))
     result['picks']=result['picks'][:5]
     result['message']='Candidates ranked by observed mean net return in the separate verification period.' if result['picks'] else 'No current setup passes the signal, history, quote and liquidity checks.'
+    return result
+
+
+def opportunities(raw,quotes,clock,horizon,now=None,prepared_frames=None,prepared_evidence=None):
+    frames=prepared_frames if prepared_frames is not None else {symbol:indicators(g,horizon) for symbol,g in raw.groupby('symbol')}
+    evidence=prepared_evidence if prepared_evidence is not None else select_strategy(frames,horizon)
+    result={'picks':[],'strategy_evidence':evidence,'horizon':horizon,'warnings':[]}
+    if not evidence.get('qualified'):
+        result['message']=evidence['reason'];return result
+    groups=[_single_opportunities(raw,quotes,clock,horizon,now,frames,item) for item in evidence['qualified_strategies']]
+    picks=sorted([pick for group in groups for pick in group['picks']],key=lambda p:(-p['rank_score'],-p['verification_trades'],p['symbol'],p['strategy']))
+    seen=set()
+    for pick in picks:
+        if pick['symbol'] in seen:continue
+        seen.add(pick['symbol']);result['picks'].append(pick)
+        if len(result['picks'])==5:break
+    result['message']='Candidates ranked across independently qualifying strategies.' if result['picks'] else groups[0]['message']
+    result['as_of']=pd.Timestamp(now or pd.Timestamp.now(tz='UTC')).isoformat()
     return result
 
 
@@ -349,7 +389,8 @@ def scan_market(key, secret, feed, trading_url, cache):
         eligible,coverage=screen[1],screen[2]
     coverage=dict(coverage)
     snapshots=coverage.pop('snapshot_data')
-    candidates=shortlist(eligible,snapshots,40)
+    limit=cache.get('candidate_limit',40)
+    candidates=shortlist(eligible,snapshots,limit)
     coverage['detailed_candidates']=len(candidates)
     results={}
     for horizon in ['hour','hold']:
@@ -370,4 +411,5 @@ def scan_market(key, secret, feed, trading_url, cache):
         # Publish each section when ready, without waiting for the other horizon.
         cache['partial_result']={'closed':False,'results':dict(results),'coverage':dict(coverage),
                                  'as_of':pd.Timestamp.now(tz='UTC').isoformat(),'seconds':time.monotonic()-started}
+    cache['candidate_limit']=min(limit+40,120) if any(not r['picks'] for r in results.values()) else 40
     return cache['partial_result']
