@@ -70,7 +70,7 @@ def market_worker(_key, _secret, feed, url, version, credential_identity):
     return {'pool':ThreadPoolExecutor(max_workers=1), 'cache':{}}
 
 
-@st.fragment(run_every='60s')
+@st.fragment(run_every='10s')
 def render_stock_opportunities():
     st.title('📈 Stock Opportunities')
     st.caption('Automatic research candidates · regular-session long positions · no orders are submitted.')
@@ -89,7 +89,7 @@ def render_stock_opportunities():
         return
     url=setting('ALPACA_TRADING_URL','https://paper-api.alpaca.markets').rstrip('/')
     st.caption('Scanning all active exchange-listed U.S. equities available through Alpaca, including ETFs. No preset symbol list.')
-    st.caption('Stocks priced below $5 or with less than $1 million of previous-session dollar volume on your feed are excluded before strategy evaluation.')
+    st.caption('Stocks priced below five dollars or with less than one million dollars of previous-session dollar volume on your feed are excluded before strategy evaluation.')
     import hashlib
     identity=hashlib.sha256((key+'|'+secret).encode()).hexdigest()
     state=market_worker(key,secret,feed,url,engine.ENGINE_VERSION,identity)
@@ -101,13 +101,28 @@ def render_stock_opportunities():
             state['error']=str(exc)
         state['future']=None
     import time
-    if state.get('future') is None and time.monotonic()-state.get('submitted',-1000)>=60:
+    busy=state.get('future') is not None
+    requested=st.button('🔎 Scan stocks now', key='scan_full_stock_market', type='primary', disabled=busy)
+    if state.get('future') is None and (requested or time.monotonic()-state.get('submitted',-1000)>=60):
         state['submitted']=time.monotonic()
         state['future']=state['pool'].submit(engine.scan_market,key,secret,feed,url,state['cache'])
+    if state.get('future') is not None:
+        progress=state['cache'].get('progress',{'text':'Starting market scan','done':0,'total':0})
+        elapsed=int(time.monotonic()-state['submitted'])
+        st.write('**'+progress['text']+f'** · {elapsed//60}m {elapsed%60}s elapsed')
+        if progress['total']:
+            st.progress(min(progress['done']/progress['total'],1.0),text=f"{progress['done']:,} of {progress['total']:,} eligible stocks in this stage")
+        st.caption('A scan is already running. The button becomes available when it finishes; results update automatically.')
     if state.get('error'):st.error('Market scan could not complete: '+state['error'])
     saved=state.get('result')
     if not saved:
-        st.info('Scanning the full market in the background. This screen stays responsive; results appear automatically when the first scan finishes.')
+        hour,weekly=st.columns(2)
+        with hour:
+            st.subheader('⚡ Day-trade suggestions')
+            st.info('Preparing the first scan. Qualifying day trades will appear here.')
+        with weekly:
+            st.subheader('🌱 Buy-and-hold suggestions')
+            st.info('Preparing the first scan. Qualifying longer-term candidates will appear here.')
         return
     coverage=saved['coverage']
     checked=pd.Timestamp(saved['as_of'])
@@ -131,4 +146,4 @@ def render_stock_opportunities():
                 with st.expander('Stocks with unavailable history'):
                     for failure in failures:st.write(', '.join(failure['symbols'])+': '+failure['reason'])
     if state.get('future') is not None:st.caption('The next full-market scan is running in the background.')
-    st.caption('Updates appear every minute while this screen is open. The worker can finish a started scan after navigation, but this is not a scheduled service when the app is shut down. First-time full-market history loading can take several minutes.')
+    st.caption('Scan status updates every ten seconds; new scans start at most once a minute while this screen is open. The worker can finish a started scan after navigation, but this is not a scheduled service when the app is shut down. First-time full-market history loading can take several minutes.')
