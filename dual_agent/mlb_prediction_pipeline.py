@@ -5,6 +5,9 @@ No fitting, historical replay, accuracy comparisons, or synthetic outcomes.
 import hashlib
 import json
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import RLock
+import time
 
 import numpy as np
 import pandas as pd
@@ -12,10 +15,69 @@ import requests
 from scipy.stats import skellam
 
 ACTIVE_MODEL_PATH = 'mlb/live_matchup/active.json'
+_HISTORY_CACHE = {}
+_CACHE_LOCK = RLock()
 CORE = ['home_field', 'offense_runs_per_game', 'opponent_runs_allowed',
         'offense_recent_run_difference', 'lineup_ops', 'lineup_obp', 'lineup_slg',
         'opposing_starter_era', 'opposing_starter_whip', 'opposing_starter_k9',
         'opposing_starter_bb9', 'lineup_ops_x_opposing_starter_whip']
+
+
+def _cached_history(key, seconds, loader):
+    """Cache reusable history only; fresh decision feeds and odds are never reused."""
+    with _CACHE_LOCK:
+        cached = _HISTORY_CACHE.get(key)
+        if cached and time.monotonic()-cached[0]<seconds:
+            return cached[1]
+    value = loader()
+    with _CACHE_LOCK:
+        _HISTORY_CACHE[key] = (time.monotonic(), value)
+    return value
+
+
+def collect_prediction_inputs(dates, now, research, update):
+    """One range schedule, bounded parallel feeds, then eligible-game updates.
+
+    Core player rates already live in the feed. Do not fetch each roster player's
+    profile and duplicate stat pages before checking whether a lineup exists.
+    """
+    response = requests.get('https://statsapi.mlb.com/api/v1/schedule', params={
+        'sportId': 1, 'startDate': str(min(dates)), 'endDate': str(max(dates))}, timeout=20)
+    response.raise_for_status()
+    scheduled = {int(g['gamePk']):g for day in response.json().get('dates', []) for g in day.get('games', [])
+                 if g.get('status', {}).get('abstractGameState')=='Preview'
+                 and now<pd.to_datetime(g['gameDate'], utc=True)<=now+pd.Timedelta(days=7)}
+    package = {'games': [], 'errors': [], 'skipped': [], 'game_date': str(min(dates)),
+               'snapshot_time': now.isoformat(), 'capture_mode': 'prediction_button', 'source': 'MLB Stats API'}
+    def collect(g):
+        snapshot = research.fetch_mlb_pregame_game_snapshot(int(g['gamePk']), timeout=15)
+        box = snapshot.get('raw_feed', {}).get('liveData', {}).get('boxscore', {}).get('teams', {})
+        if any(len(box.get(side, {}).get('battingOrder', []))!=9 or not box.get(side, {}).get('pitchers') for side in ['home','away']):
+            return None, {'game_id': g['gamePk'], 'reason': 'Upcoming game found; recorded lineup or starter not available yet.'}
+        if snapshot.get('status', {}).get('abstractGameState')!='Preview' or pd.to_datetime(snapshot['start_time'], utc=True)<=pd.Timestamp.now(tz='UTC'):
+            return None, {'game_id': g['gamePk'], 'reason': 'Game started or changed status.'}
+        snapshot['schedule'] = {'start_time': g['gameDate'], 'season_id': g.get('season'), 'venue_id': g.get('venue', {}).get('id')}
+        with requests.Session() as session:
+            snapshot = research._attach_mlb_current_information(snapshot, session, {}, timeout=10)
+        finished = pd.Timestamp.now(tz='UTC')
+        snapshot['capture_finished_at'] = finished.isoformat()
+        snapshot['eligible_pregame_capture'] = finished<pd.to_datetime(snapshot['start_time'], utc=True)
+        return snapshot, None
+    update(f'Checking {len(scheduled)} upcoming games; collecting eligible lineups in parallel...')
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        pending = {pool.submit(collect,g):g for g in scheduled.values()}
+        for count, future in enumerate(as_completed(pending), 1):
+            try:
+                snapshot, skipped = future.result()
+                if skipped: package['skipped'].append(skipped)
+                if snapshot:
+                    package['games'].append(snapshot)
+                    package['errors'].extend(snapshot.get('current_information', {}).get('errors', []))
+            except Exception as exc:
+                package['errors'].append({'game_id': pending[future]['gamePk'], 'error': str(exc)})
+            update(f'Checked {count}/{len(scheduled)} upcoming games; {len(package["games"])} have recorded lineups.')
+    package['games'].sort(key=lambda g:(g['start_time'],g['game_id']))
+    return package
 
 
 def validate_model(model):
@@ -259,16 +321,7 @@ def run_mlb_prediction_pipeline(game_date=None, api_key=None, progress=None):
     if automatic:
         end_date = (now+pd.Timedelta(days=7)).tz_convert('America/Chicago').date()
         dates = [date.date() for date in pd.date_range(game_date, end_date, freq='D')]
-    package = {'games': [], 'errors': [], 'skipped': [], 'game_date': str(game_date)}
-    for date in dates:
-        slate = research.fetch_mlb_daily_slate(date) if automatic else None
-        ids = None
-        if slate is not None:
-            times = pd.to_datetime(slate['start_time'], utc=True, errors='coerce') if not slate.empty else pd.Series(dtype='datetime64[ns, UTC]')
-            ids = slate.loc[(times>now)&(times<=now+pd.Timedelta(days=7)), 'game_id'].tolist() if not slate.empty else []
-            if not ids: continue
-        captured = research.collect_mlb_upcoming_game_information(date, game_ids=ids) if automatic else research.collect_mlb_upcoming_game_information(date)
-        for key in ['games', 'errors', 'skipped']: package[key].extend(captured.get(key, []))
+    package = collect_prediction_inputs(dates, now, research, update)
     errors = list(package.get('errors', [])); skipped = list(package.get('skipped', []))
     saved_capture = storage.save_mlb_pregame_intelligence(package, snapshot_date=str(game_date))
     if not saved_capture.get('success'):
@@ -280,9 +333,11 @@ def run_mlb_prediction_pipeline(game_date=None, api_key=None, progress=None):
     first_year = min([int(g['season']) for g in model.get('retained_feature_rows', [])] or [2024])
     with requests.Session() as session:
         for year in range(first_year, pd.Timestamp(game_date).year+1):
-            response = session.get('https://statsapi.mlb.com/api/v1/schedule', params={'sportId': 1, 'startDate': f'{year}-03-01', 'endDate': f'{year}-12-31', 'gameType': 'R'}, timeout=30)
-            response.raise_for_status()
-            schedules.extend(g for day in response.json().get('dates', []) for g in day.get('games', []))
+            def load_year(year=year):
+                response = session.get('https://statsapi.mlb.com/api/v1/schedule', params={'sportId': 1, 'startDate': f'{year}-03-01', 'endDate': f'{year}-12-31', 'gameType': 'R'}, timeout=20)
+                response.raise_for_status()
+                return [g for day in response.json().get('dates', []) for g in day.get('games', [])]
+            schedules.extend(_cached_history(('schedule', year), 180 if year==now.year else 86400, load_year))
     games = []; snapshots = {}
     for snapshot in package['games']:
         try:
@@ -292,7 +347,7 @@ def run_mlb_prediction_pipeline(game_date=None, api_key=None, progress=None):
     if not games:
         return {'predictions': [], 'skipped': skipped, 'errors': errors, 'message': 'No games have a fresh recorded lineup, starter and required player rates.'}
     columns = model['model_bundle']['columns']
-    logs = storage.load_mlb_player_history()
+    logs = _cached_history('player_warehouse', 180, storage.load_mlb_player_history)
     if set(columns)&set(BULLPEN_FEATURES):
         update('Connecting verified bullpen workload...')
         completion, details = collect_bullpen_completion_times(games, schedules, 'mlb_accuracy_results')
