@@ -878,7 +878,18 @@ def run_nba_prediction_with_props(progress_callback=None):
 
 
 def load_mlb_prediction_pipeline():
+    import ast
     import importlib
+    from pathlib import Path
+    # Validate the file before import: importing misplaced app.py code creates
+    # a second set of Streamlit widgets before a module-version check can run.
+    spec = importlib.util.find_spec("dual_agent.mlb_prediction_pipeline")
+    if spec is None or not spec.origin:
+        raise RuntimeError("Add the supplied mlb_prediction_pipeline.py inside dual_agent/.")
+    tree = ast.parse(Path(spec.origin).read_text(encoding="utf-8"))
+    definitions = {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
+    if "run_mlb_prediction_pipeline" not in definitions or "render_mlb_prediction_center" in definitions:
+        raise RuntimeError("dual_agent/mlb_prediction_pipeline.py contains the wrong code. Replace it with the supplied pipeline file; app.py belongs only in the repository root.")
     pipeline = importlib.import_module("dual_agent.mlb_prediction_pipeline")
     if getattr(pipeline, "MLB_PIPELINE_VERSION", None) != 5:
         importlib.invalidate_caches()
@@ -886,6 +897,26 @@ def load_mlb_prediction_pipeline():
     if getattr(pipeline, "MLB_PIPELINE_VERSION", None) != 5:
         raise RuntimeError("Deploy the matching dual_agent/mlb_prediction_pipeline.py from this update. The running MLB module is older than the seven-day forecast fix.")
     return pipeline
+
+
+def nfl_prediction_features():
+    """Reuse prepared NFL features; prepare them once if this page opened first."""
+    required = {"start_time", "home_score", "away_score", "home_team", "away_team"}
+    features = st.session_state.get("nfl_feature_games")
+    if features is not None and not features.empty and required.issubset(features.columns):
+        return features
+    history = st.session_state.get("multi_nfl_games")
+    if history is None or history.empty:
+        downloaded = get_multiple_nfl_seasons(["sr:season:115087", "sr:season:127985"])
+        history = downloaded.get("games")
+        if history is None or history.empty:
+            raise ValueError("NFL historical download returned no games.")
+        st.session_state["multi_nfl_games"] = history
+    features = build_nfl_pregame_features(history)
+    if features is None or features.empty:
+        raise ValueError("NFL historical feature generation returned no data.")
+    st.session_state["nfl_feature_games"] = features
+    return features
 
 
 def render_mlb_prediction_center(location):
@@ -1585,7 +1616,16 @@ if page in ["🏈 NFL", "🏀 NBA", "⚾ MLB"]:
         if st.button("⚡ Generate NFL Predictions", key="nfl_sidebar_generate", type="primary"):
             try:
                 with st.spinner("Generating NFL predictions..."):
-                    st.session_state["nfl_prediction_pipeline_result"] = run_nfl_prediction_pipeline()
+                    result = run_nfl_prediction_pipeline(
+                        feature_games=nfl_prediction_features(),
+                        historical_accuracy=st.session_state.get("nfl_historical_accuracy"),
+                        historical_sample=st.session_state.get("nfl_historical_sample"),
+                    )
+                    st.session_state["nfl_prediction_pipeline_result"] = result
+                    for session_key, result_key in [("live_nfl_moneylines", "live_odds"),
+                        ("best_nfl_moneylines", "best_lines"), ("live_nfl_predictions", "predictions"),
+                        ("live_nfl_opportunities", "opportunities")]:
+                        st.session_state[session_key] = result.get(result_key)
             except Exception as exc:
                 st.error("NFL prediction pipeline failed: " + str(exc))
 
