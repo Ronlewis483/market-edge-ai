@@ -832,6 +832,8 @@ def render_player_prop_picks(league, result):
                             st.caption(pick["Game"])
                             st.markdown("### " + pick["Player"])
                             st.markdown(f"**{pick['Pick']} {pick['Line']:g} {pick['Market']}**")
+                            if pick.get("Event match") == "Unique same-day matchup; start times differ":
+                                st.caption("MLB and sportsbook start times differ; matched a unique same-day game.")
                             if pick.get("Participation status"):
                                 st.caption(pick["Participation status"])
                                 if pick["Participation status"] != "Confirmed lineup" and pick["Participation status"] != "Recorded starter":
@@ -898,10 +900,10 @@ def load_mlb_prediction_pipeline():
     if "run_mlb_prediction_pipeline" not in definitions or "render_mlb_prediction_center" in definitions:
         raise RuntimeError("dual_agent/mlb_prediction_pipeline.py contains the wrong code. Replace it with the supplied pipeline file; app.py belongs only in the repository root.")
     pipeline = importlib.import_module("dual_agent.mlb_prediction_pipeline")
-    if getattr(pipeline, "MLB_PIPELINE_VERSION", None) != 9:
+    if getattr(pipeline, "MLB_PIPELINE_VERSION", None) != 10:
         importlib.invalidate_caches()
         pipeline = importlib.reload(pipeline)
-    if getattr(pipeline, "MLB_PIPELINE_VERSION", None) != 9:
+    if getattr(pipeline, "MLB_PIPELINE_VERSION", None) != 10:
         raise RuntimeError("Deploy the matching dual_agent/mlb_prediction_pipeline.py from this update. The running MLB module is older than the seven-day forecast fix.")
     return pipeline
 
@@ -966,7 +968,7 @@ def render_mlb_prediction_center(location):
         except Exception as exc:
             st.error("MLB prediction pipeline stopped: " + str(exc))
     result = st.session_state.get("mlb_live_pipeline_result")
-    if result and result.get("pipeline_version") != 9:
+    if result and result.get("pipeline_version") != 10:
         st.session_state.pop("mlb_live_pipeline_result", None)
         result = None
         st.info("The MLB pipeline was updated. Generate again to search the upcoming seven-day schedule.")
