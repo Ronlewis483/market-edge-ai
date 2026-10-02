@@ -877,6 +877,17 @@ def run_nba_prediction_with_props(progress_callback=None):
     return result
 
 
+def load_mlb_prediction_pipeline():
+    import importlib
+    pipeline = importlib.import_module("dual_agent.mlb_prediction_pipeline")
+    if getattr(pipeline, "MLB_PIPELINE_VERSION", None) != 5:
+        importlib.invalidate_caches()
+        pipeline = importlib.reload(pipeline)
+    if getattr(pipeline, "MLB_PIPELINE_VERSION", None) != 5:
+        raise RuntimeError("Deploy the matching dual_agent/mlb_prediction_pipeline.py from this update. The running MLB module is older than the seven-day forecast fix.")
+    return pipeline
+
+
 def render_mlb_prediction_center(location):
     st.subheader("⚾ MLB Prediction Center")
     st.caption("Current lineups, starters, team form and available game conditions feed the saved matchup equation.")
@@ -885,8 +896,7 @@ def render_mlb_prediction_center(location):
         model_upload = st.file_uploader("Saved matchup model", type=["json"], key=location + "_model_upload")
         if model_upload is not None and st.button("Use this MLB model", key=location + "_activate"):
             try:
-                from dual_agent.mlb_prediction_pipeline import activate_model
-                activated = activate_model(__import__("json").load(model_upload))
+                activated = load_mlb_prediction_pipeline().activate_model(__import__("json").load(model_upload))
                 st.success("MLB model activated.")
                 st.session_state.pop("mlb_live_pipeline_result", None)
             except Exception as exc:
@@ -895,7 +905,7 @@ def render_mlb_prediction_center(location):
     if st.button("⚡ Generate MLB Predictions", key=location + "_generate", type="primary", use_container_width=True):
         try:
             import os
-            from dual_agent.mlb_prediction_pipeline import run_mlb_prediction_pipeline
+            pipeline = load_mlb_prediction_pipeline()
             odds_key = os.environ.get("ODDS_API_KEY") or os.environ.get("THE_ODDS_API_KEY")
             if not odds_key:
                 try:
@@ -903,12 +913,17 @@ def render_mlb_prediction_center(location):
                 except Exception:
                     odds_key = None
             status = st.empty()
-            result = run_mlb_prediction_pipeline(api_key=odds_key, progress=status.info)
+            result = pipeline.run_mlb_prediction_pipeline(api_key=odds_key, progress=status.info)
+            result["pipeline_version"] = pipeline.MLB_PIPELINE_VERSION
             st.session_state["mlb_live_pipeline_result"] = result
             status.success(result["message"])
         except Exception as exc:
             st.error("MLB prediction pipeline stopped: " + str(exc))
     result = st.session_state.get("mlb_live_pipeline_result")
+    if result and result.get("pipeline_version") != 5:
+        st.session_state.pop("mlb_live_pipeline_result", None)
+        result = None
+        st.info("The MLB pipeline was updated. Generate again to search the upcoming seven-day schedule.")
     if result:
         now = pd.Timestamp.now(tz="UTC")
         rows = [r for r in result.get("predictions", []) if pd.Timestamp(r["start_time"])>now and now-pd.Timestamp(r["Captured UTC"])<=pd.Timedelta(minutes=15)]
@@ -927,6 +942,7 @@ def render_mlb_prediction_center(location):
         with st.expander("Game information coverage"):
             st.json({"skipped_games": result.get("skipped", []), "source_updates": result.get("errors", []),
                      "scheduled_games_found": len(result.get("scheduled_games", [])), "games_scored": len(result.get("all_predictions", [])),
+                     "pipeline_version": result.get("pipeline_version"),
                      "missing_inputs": [{"game_id": r["game_id"], "features": r["Missing model inputs"]} for r in rows]})
 
 
