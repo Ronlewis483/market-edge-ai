@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 import requests
 
-ENGINE_VERSION = 4
+ENGINE_VERSION = 5
 DEFAULT_SYMBOLS = ['AAPL','MSFT','NVDA','AMZN','META','GOOGL','TSLA','AVGO','AMD','JPM','LLY','XOM']
 STRATEGIES = {'hour': ['Trend + VWAP', 'Range breakout', 'VWAP reclaim'],
               'hold': ['Long-term momentum', '63-day breakout', 'Trend pullback']}
@@ -32,11 +32,11 @@ def fetch_quotes(symbols, key, secret, feed='iex'):
         {'symbols':','.join(symbols), 'feed':feed}).get('quotes', {})
 
 
-def fetch_bars(symbols, key, secret, horizon, feed='iex', now=None):
+def fetch_bars(symbols, key, secret, horizon, feed='iex', now=None, start=None):
     now = pd.Timestamp(now or pd.Timestamp.now(tz='UTC'))
     days = 50 if horizon=='hour' else 365*6
     params = {'symbols':','.join(symbols), 'timeframe':'5Min' if horizon=='hour' else '1Day',
-        'start':(now-pd.Timedelta(days=days)).strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'start':(pd.Timestamp(start) if start is not None else now-pd.Timedelta(days=days)).strftime('%Y-%m-%dT%H:%M:%SZ'),
         'end':now.strftime('%Y-%m-%dT%H:%M:%SZ'), 'adjustment':'all', 'feed':feed,
         'sort':'asc', 'limit':10000}
     rows = []
@@ -158,10 +158,10 @@ def select_strategy(frames, horizon):
             'cost_assumption_bps':10 if horizon=='hour' else 20}
 
 
-def opportunities(raw, quotes, clock, horizon, now=None):
+def opportunities(raw, quotes, clock, horizon, now=None, prepared_frames=None, prepared_evidence=None):
     now=pd.Timestamp(now or pd.Timestamp.now(tz='UTC'))
-    frames={symbol:indicators(g,horizon) for symbol,g in raw.groupby('symbol')}
-    evidence=select_strategy(frames,horizon)
+    frames=prepared_frames if prepared_frames is not None else {symbol:indicators(g,horizon) for symbol,g in raw.groupby('symbol')}
+    evidence=prepared_evidence if prepared_evidence is not None else select_strategy(frames,horizon)
     result={'picks':[],'strategy_evidence':evidence,'as_of':now.isoformat(),'horizon':horizon,'warnings':[]}
     if not evidence.get('qualified'):
         result['message']=evidence['reason'];return result
@@ -228,11 +228,82 @@ def screen_universe(symbols, key, secret, feed):
             price=float(bar['c']); dollars=price*float(bar['v'])
         except (KeyError, TypeError, ValueError):continue
         if price>=5 and dollars>=1000000:eligible.append(symbol)
-    return eligible, {'listed':len(symbols),'snapshots':len(snapshots),'eligible':len(eligible)}
+    return eligible, {'listed':len(symbols),'snapshots':len(snapshots),'eligible':len(eligible),'snapshot_data':snapshots}
+
+
+def shortlist(eligible, snapshots, limit=40):
+    """Current-data screening, not a claim of historical strategy performance."""
+    ranks=[]
+    for symbol in eligible:
+        snap=snapshots.get(symbol) or {}
+        prev=snap.get('prevDailyBar') or {}; today=snap.get('dailyBar') or {}
+        trade=snap.get('latestTrade') or {}
+        try:
+            prior=float(prev['c']); price=float(trade.get('p') or today.get('c') or prior)
+            if price<=0 or prior<=0:continue
+            dollars=prior*float(prev['v']); move=price/prior-1
+        except (KeyError,ValueError,TypeError):continue
+        ranks.append((symbol,dollars,move))
+    # Mix liquid names with movers; include pullbacks and positive momentum.
+    liquid=sorted(ranks,key=lambda r:(-r[1],r[0]))
+    movers=sorted(ranks,key=lambda r:(-abs(r[2]),-r[1],r[0]))
+    chosen=[]
+    for i in range(max(len(liquid),len(movers))):
+        for ranking in [liquid,movers]:
+            if i<len(ranking) and ranking[i][0] not in chosen:chosen.append(ranking[i][0])
+            if len(chosen)>=limit:return chosen
+    return chosen
+
+
+def reusable_history(symbols,key,secret,horizon,feed,cache):
+    """Stable per-symbol cache; update recent bars instead of reloading all history."""
+    import os, hashlib, time
+    from pathlib import Path
+    root=Path(os.environ.get('MARKET_EDGE_STOCK_CACHE','.cache/market_edge_stock_history'))
+    root.mkdir(parents=True,exist_ok=True)
+    now=pd.Timestamp.now(tz='UTC'); frames=[]; failed=[]; pending=[]
+    for symbol in symbols:
+        token=('bars_v5',feed,horizon,symbol)
+        path=root/(hashlib.sha256((feed+'|'+horizon+'|'+symbol).encode()).hexdigest()+'.json.gz')
+        old=cache.get(token)
+        if old is None and path.exists():
+            try:
+                data=pd.read_json(path,orient='table',compression='gzip')
+                old=(path.stat().st_mtime,data)
+                cache[token]=old
+            except Exception:old=None
+        # Refresh complete adjusted history daily; within the day fetch only overlap.
+        fresh_day=old is not None and pd.Timestamp(old[0],unit='s',tz='UTC').tz_convert('America/New_York').date()==now.tz_convert('America/New_York').date()
+        if fresh_day and horizon=='hold':frames.append(old[1]);continue
+        if fresh_day and time.time()-old[0]<300:frames.append(old[1]);continue
+        pending.append((symbol,token,path,old if fresh_day else None))
+    for i in range(0,len(pending),10):
+        batch=pending[i:i+10]
+        update=all(item[3] is not None for item in batch)
+        start=now-pd.Timedelta(days=2 if horizon=='hour' else 7) if update else None
+        cache['progress']={'text':('Updating day-trade bars' if update else 'Loading day-trade history') if horizon=='hour' else 'Loading buy-and-hold history','done':len(frames),'total':len(symbols)}
+        try:
+            fetched=fetch_bars([b[0] for b in batch],key,secret,horizon,feed,now,start)
+            for symbol,token,path,old in batch:
+                data=fetched[fetched.symbol==symbol].copy()
+                if data.empty and old is None:
+                    failed.append({'symbols':[symbol],'reason':'No usable completed bars returned.'});continue
+                if old is not None:
+                    data=pd.concat([old[1],data],ignore_index=True).drop_duplicates(['symbol','timestamp'],keep='last')
+                minimum=now-pd.Timedelta(days=50 if horizon=='hour' else 365*6)
+                data=data[data.timestamp>=minimum].sort_values('timestamp').reset_index(drop=True)
+                cache[token]=(time.time(),data);frames.append(data)
+                try:
+                    temporary=path.with_suffix('.tmp.gz')
+                    data.to_json(temporary,orient='table',compression='gzip')
+                    temporary.replace(path)
+                except OSError:
+                    cache['cache_warning']='Local history could not be saved; this process still reuses its memory cache.'
+        except Exception as exc:failed.append({'symbols':[b[0] for b in batch],'reason':str(exc)})
+    return (pd.concat(frames,ignore_index=True) if frames else pd.DataFrame()),failed
 
 
 def scan_market(key, secret, feed, trading_url, cache):
-    """Background-safe scan; cache is private to a single sequential worker."""
     import time
     started=time.monotonic()
     cache['progress']={'text':'Loading the active stock list','done':0,'total':0}
@@ -243,38 +314,28 @@ def scan_market(key, secret, feed, trading_url, cache):
     clock=fetch_clock(key,secret,trading_url)
     if not clock.get('is_open'):
         return {'closed':True,'coverage':{'listed':len(symbols)},'as_of':pd.Timestamp.now(tz='UTC').isoformat()}
-    cache['progress']={'text':f'Checking prices and liquidity across {len(symbols):,} symbols','done':0,'total':0}
+    cache['progress']={'text':f'Screening current data for {len(symbols):,} stocks','done':0,'total':0}
     eligible,coverage=screen_universe(symbols,key,secret,feed)
-    results={}; histories={}
+    snapshots=coverage.pop('snapshot_data')
+    candidates=shortlist(eligible,snapshots,40)
+    coverage['detailed_candidates']=len(candidates)
+    results={}
     for horizon in ['hour','hold']:
-        frames=[]; failed=[]
-        for i in range(0,len(eligible),10):
-            cache['progress']={'text':('Loading day-trade history' if horizon=='hour' else 'Loading buy-and-hold history'),'done':i,'total':len(eligible)}
-            batch=tuple(eligible[i:i+10]); token=(horizon,batch)
-            cached=cache.get(token); ttl=300 if horizon=='hour' else 3600
-            try:
-                if not cached or time.monotonic()-cached[0]>ttl:
-                    cached=(time.monotonic(),fetch_bars(batch,key,secret,horizon,feed))
-                    cache[token]=cached
-                frames.append(cached[1])
-            except Exception as exc:
-                failed.append({'symbols':list(batch),'reason':str(exc)})
-        if not frames:
-            results[horizon]={'picks':[],'strategy_evidence':{},'message':'No usable history was returned for the eligible stocks.'}
+        raw,failed=reusable_history(candidates,key,secret,horizon,feed,cache)
+        if raw.empty:
+            result={'picks':[],'strategy_evidence':{},'message':'No usable history was returned for the screened candidates.'}
         else:
-            raw=pd.concat(frames,ignore_index=True)
-            histories[horizon]=raw
-            results[horizon]={'picks':[],'strategy_evidence':{},'history_symbols':raw.symbol.nunique()}
-        results[horizon]['failed_batches']=failed
-    for horizon,raw in histories.items():
-        cache['progress']={'text':('Evaluating day-trade strategies' if horizon=='hour' else 'Evaluating buy-and-hold strategies'),'done':len(eligible),'total':len(eligible)}
-        quotes={}
-        present=sorted(raw.symbol.unique())
-        for i in range(0,len(present),100):
-            quotes.update(fetch_quotes(present[i:i+100],key,secret,feed))
-        clock=fetch_clock(key,secret,trading_url)
-        metadata=results[horizon]
-        results[horizon]=opportunities(raw,quotes,clock,horizon)
-        results[horizon].update(history_symbols=len(present),failed_batches=metadata['failed_batches'])
-    return {'closed':False,'results':results,'coverage':coverage,
-            'as_of':pd.Timestamp.now(tz='UTC').isoformat(),'seconds':time.monotonic()-started}
+            cache['progress']={'text':('Evaluating day-trade strategies' if horizon=='hour' else 'Evaluating buy-and-hold strategies'),'done':len(candidates),'total':len(candidates)}
+            # Evaluate history first; read fresh quotes only after strategy selection.
+            frames={symbol:indicators(g,horizon) for symbol,g in raw.groupby('symbol')}
+            evidence=select_strategy(frames,horizon)
+            quotes=fetch_quotes(sorted(frames),key,secret,feed) if evidence.get('qualified') else {}
+            clock=fetch_clock(key,secret,trading_url)
+            result=opportunities(raw,quotes,clock,horizon,prepared_frames=frames,prepared_evidence=evidence)
+            result['history_symbols']=len(frames)
+        result['failed_batches']=failed
+        results[horizon]=result
+        # Publish each section when ready, without waiting for the other horizon.
+        cache['partial_result']={'closed':False,'results':dict(results),'coverage':dict(coverage),
+                                 'as_of':pd.Timestamp.now(tz='UTC').isoformat(),'seconds':time.monotonic()-started}
+    return cache['partial_result']
