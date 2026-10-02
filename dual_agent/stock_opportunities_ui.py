@@ -54,14 +54,15 @@ def render_result(result, horizon):
                 for pick in result['picks'][1:]:render_card(pick,horizon)
     else:
         st.info(result['message'])
-    if evidence.get('strategy'):
-        held=evidence['verification']
-        with st.expander('Why this strategy was selected'):
-            st.write('**'+evidence['strategy']+'** ranked first by average net return in the earlier selection period.')
-            if held['mean_net_return'] is not None:
-                st.write(f"Separate recent period: {held['trades']} completed trades, average {held['mean_net_return']:+.2%} after estimated costs.")
-            st.caption(f"Compared {len(engine.STRATEGIES[horizon])} strategies in the scanned symbol list. Estimated round-trip cost: {evidence['cost_assumption_bps']} basis points. Positions may overlap across symbols; this is not a portfolio return.")
-            st.caption('This comparison uses currently listed symbols and does not establish the most profitable strategy across the entire market.')
+    if evidence.get('strategies'):
+        with st.expander('Strategies checked'):
+            st.write(f"{len(evidence['strategies'])} strategies evaluated independently; {len(evidence['qualified_strategies'])} passed the historical checks.")
+            for item in evidence['strategies']:
+                held=item['verification']
+                value=held['mean_net_return']
+                average=f"{value:+.2%}" if value is not None else 'not available'
+                st.write('**'+item['strategy']+'** · '+('Passed' if item['qualified'] else 'Waiting for sufficient positive evidence')+f" · {held['trades']} recent-period trades · average net return {average}")
+            st.caption('These are historical estimates after fixed costs, not proof of future profitability. Comparing more strategies increases the risk of finding a result by chance; the recent-period checks are screening evidence, not an untouched final validation.')
 
 
 @st.cache_resource(show_spinner=False)
@@ -154,4 +155,4 @@ def render_stock_opportunities():
                 with st.expander('Stocks with unavailable history'):
                     for failure in failures:st.write(', '.join(failure['symbols'])+': '+failure['reason'])
     if state.get('future') is not None:st.caption('The next full-market scan is running in the background.')
-    st.caption('Scan status updates every ten seconds; fresh quotes are checked about once a minute, and the full-market screen is reused for five minutes. The worker can finish a started scan after navigation, but this is not a scheduled service when the app is shut down. Detailed history is loaded for up to 40 candidates selected from the full-market screen. Saved history is reused; intraday updates fetch only recent bars. Local saved files may be lost when the hosting environment resets.')
+    st.caption('Scan status updates every ten seconds; fresh quotes are checked about once a minute, and the full-market screen is reused for five minutes. The worker can finish a started scan after navigation, but this is not a scheduled service when the app is shut down. Detailed evaluation starts with 40 candidates and expands on subsequent scans to 80, then 120 when either section has no qualifying picks. Saved history is reused; intraday updates fetch only recent bars. Local saved files may be lost when the hosting environment resets.')
