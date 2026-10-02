@@ -1232,48 +1232,23 @@ def load_mlb_player_history():
             _load_mlb_player_history_manifest()
         )
 
-        for chunk in manifest.get(
-            "chunks",
-            [],
-        ):
-
-            chunk_path = chunk.get(
-                "path"
-            )
-
+        # Independent immutable chunks can download concurrently. Preserve manifest
+        # order so duplicate-resolution behavior remains unchanged.
+        from concurrent.futures import ThreadPoolExecutor
+        def load_chunk(chunk):
+            chunk_path = chunk.get("path")
             if not chunk_path:
-                continue
-
+                return None
             try:
-
-                file_bytes = (
-                    client.storage
-                    .from_(MLB_STORAGE_BUCKET)
-                    .download(
-                        chunk_path
-                    )
-                )
-
-                if not file_bytes:
-                    continue
-
-                chunk_logs = pd.read_csv(
-                    io.BytesIO(file_bytes)
-                )
-
-                if not chunk_logs.empty:
-                    history_frames.append(
-                        chunk_logs
-                    )
-
+                file_bytes = client.storage.from_(MLB_STORAGE_BUCKET).download(chunk_path)
+                return pd.read_csv(io.BytesIO(file_bytes)) if file_bytes else None
             except Exception as exc:
-
-                print(
-                    "MLB player-history "
-                    "chunk load failed:",
-                    chunk_path,
-                    exc,
-                )
+                print("MLB player-history chunk load failed:", chunk_path, exc)
+                return None
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            for chunk_logs in pool.map(load_chunk, manifest.get("chunks", [])):
+                if chunk_logs is not None and not chunk_logs.empty:
+                    history_frames.append(chunk_logs)
 
         if not history_frames:
             return pd.DataFrame()
