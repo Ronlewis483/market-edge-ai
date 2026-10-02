@@ -48,17 +48,18 @@ def fetch_prop_quotes(league, games, odds_key):
     events = _get(base+'/events', odds_key, {'apiKey': odds_key})
     now = pd.Timestamp.now(tz='UTC'); quotes = []; errors = []
     from dual_agent.mlb_historical_odds import team
-    for game in games:
+    def collect(game):
+        quotes = []; errors = []
         start = pd.to_datetime(game.get('start_time') or game.get('commence_time'), utc=True)
-        if not now<start<=now+pd.Timedelta(days=7): continue
+        if not now<start<=now+pd.Timedelta(days=7): return quotes, errors
         matched = [event for event in events if team(event.get('home_team'))==team(game['home_team']) and team(event.get('away_team'))==team(game['away_team']) and abs(pd.to_datetime(event['commence_time'], utc=True)-start)<=pd.Timedelta(minutes=15)]
         if len(matched)!=1:
-            errors.append('No unique prop event match for '+game['away_team']+' at '+game['home_team']); continue
+            errors.append('No unique prop event match for '+game['away_team']+' at '+game['home_team']); return quotes, errors
         event = matched[0]
         try:
             payload = _get(base+'/events/'+event['id']+'/odds', odds_key, {'apiKey': odds_key, 'regions': 'us', 'markets': ','.join(MARKETS[league]), 'oddsFormat': 'decimal'})
         except RuntimeError as exc:
-            errors.append(str(exc)); continue
+            errors.append(str(exc)); return quotes, errors
         stamp = pd.Timestamp.now(tz='UTC')
         for book in payload.get('bookmakers', []):
             for market in book.get('markets', []):
@@ -80,6 +81,11 @@ def fetch_prop_quotes(league, games, odds_key):
                                    'book':book.get('key'), 'updated_at':updated.isoformat(), 'event_id':event['id'],
                                    'home_team':game['home_team'],'away_team':game['away_team'],'start_time':start.isoformat(),
                                    'game_id':game.get('game_id'), 'capture_time':stamp.isoformat()})
+        return quotes, errors
+    # Separate HTTP requests; bounded concurrency also preserves slate order.
+    with ThreadPoolExecutor(max_workers=4 if league == 'MLB' else 1) as pool:
+        for game_quotes, game_errors in pool.map(collect, games):
+            quotes.extend(game_quotes); errors.extend(game_errors)
     return quotes, errors
 
 
