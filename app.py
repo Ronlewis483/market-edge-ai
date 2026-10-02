@@ -383,10 +383,10 @@ def render_league_prediction_results(
     if league_name in ("NBA", "MLB"):
         now = pd.Timestamp.now(tz="UTC")
         times = pd.to_datetime(predictions["commence_time"], utc=True, errors="coerce")
-        predictions = predictions.loc[(times>now)&(times<=now+pd.Timedelta(hours=24))]
+        predictions = predictions.loc[(times>now)&(times<=now+pd.Timedelta(days=7))]
         predictions = predictions.sort_values("confidence", ascending=False).head(10).copy()
         if predictions.empty:
-            st.info(f"No upcoming {league_name} picks in the next 24 hours.")
+            st.info(f"No upcoming {league_name} picks in the next seven days.")
             return
     prediction_count = len(predictions)
 
@@ -843,7 +843,7 @@ def run_nba_prediction_with_props(progress_callback=None):
     if predictions is not None and not predictions.empty:
         predictions = predictions.copy()
         times = pd.to_datetime(predictions["commence_time"], utc=True, errors="coerce")
-        eligible_predictions = predictions.loc[(times>now)&(times<=now+pd.Timedelta(hours=24))].sort_values("confidence", ascending=False)
+        eligible_predictions = predictions.loc[(times>now)&(times<=now+pd.Timedelta(days=7))].sort_values("confidence", ascending=False)
         predictions = eligible_predictions.head(10)
         result["predictions"] = predictions
         try:
@@ -867,7 +867,7 @@ def run_nba_prediction_with_props(progress_callback=None):
         except Exception:
             result["player_props"].setdefault("errors", []).append("Unable to save this NBA prediction snapshot.")
     else:
-        result["player_props"] = {"picks": [], "message": "No eligible NBA games in the next 24 hours.", "errors": []}
+        result["player_props"] = {"picks": [], "message": "No eligible NBA games in the next seven days.", "errors": []}
     return result
 
 
@@ -885,7 +885,7 @@ def render_mlb_prediction_center(location):
                 st.session_state.pop("mlb_live_pipeline_result", None)
             except Exception as exc:
                 st.error("Unable to activate MLB model: " + str(exc))
-    st.caption("Automatically ranks up to 10 team winners and 10 player props for games in the next 24 hours.")
+    st.caption("Automatically ranks up to 10 team winners and 10 player props for games in the next seven days.")
     if st.button("⚡ Generate MLB Predictions", key=location + "_generate", type="primary", use_container_width=True):
         try:
             import os
