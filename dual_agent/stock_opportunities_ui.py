@@ -114,7 +114,8 @@ def render_stock_opportunities():
             st.progress(min(progress['done']/progress['total'],1.0),text=f"{progress['done']:,} of {progress['total']:,} eligible stocks in this stage")
         st.caption('A scan is already running. The button becomes available when it finishes; results update automatically.')
     if state.get('error'):st.error('Market scan could not complete: '+state['error'])
-    saved=state.get('result')
+    available=[r for r in [state['cache'].get('partial_result'),state.get('result')] if r]
+    saved=max(available,key=lambda r:r['as_of']) if available else None
     if not saved:
         hour,weekly=st.columns(2)
         with hour:
@@ -126,7 +127,7 @@ def render_stock_opportunities():
         return
     coverage=saved['coverage']
     checked=pd.Timestamp(saved['as_of'])
-    st.caption(f"{coverage['listed']:,} listed symbols screened · {coverage.get('eligible',0):,} pass the price and liquidity filter · completed "+checked.tz_convert('America/Chicago').strftime('%-I:%M:%S %p CT'))
+    st.caption(f"{coverage['listed']:,} listed symbols screened · {coverage.get('eligible',0):,} liquid candidates · {coverage.get('detailed_candidates',0):,} shortlisted for detailed strategy evaluation · updated "+checked.tz_convert('America/Chicago').strftime('%-I:%M:%S %p CT'))
     if feed=='iex':st.caption('IEX is one exchange. Stocks without sufficient coverage on that feed cannot qualify.')
     if saved['closed']:
         st.info('Market closed. Fresh entry candidates will be scanned during the regular session.');return
@@ -135,7 +136,9 @@ def render_stock_opportunities():
     for column,horizon,title in [(hour,'hour','⚡ Best qualifying setup for the next hour'),(weekly,'hold','🌱 Buy-and-hold candidate this week')]:
         with column:
             st.subheader(title)
-            result=saved['results'][horizon]
+            result=saved['results'].get(horizon)
+            if result is None:
+                st.info('This section is still being prepared. It will appear as soon as it is ready.');continue
             if stale:
                 st.info('Refreshing the market scan. Previous entry quotes have expired.')
             else:
@@ -146,4 +149,4 @@ def render_stock_opportunities():
                 with st.expander('Stocks with unavailable history'):
                     for failure in failures:st.write(', '.join(failure['symbols'])+': '+failure['reason'])
     if state.get('future') is not None:st.caption('The next full-market scan is running in the background.')
-    st.caption('Scan status updates every ten seconds; new scans start at most once a minute while this screen is open. The worker can finish a started scan after navigation, but this is not a scheduled service when the app is shut down. First-time full-market history loading can take several minutes.')
+    st.caption('Scan status updates every ten seconds; new scans start at most once a minute while this screen is open. The worker can finish a started scan after navigation, but this is not a scheduled service when the app is shut down. Detailed history is loaded for up to 40 candidates selected from the full-market screen. Saved history is reused; intraday updates fetch only recent bars. Local saved files may be lost when the hosting environment resets.')
