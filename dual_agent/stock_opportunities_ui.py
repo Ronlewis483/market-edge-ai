@@ -43,6 +43,10 @@ def render_card(pick, horizon, top=False):
 
 def render_result(result, horizon):
     evidence=result['strategy_evidence']
+    result=dict(result)
+    result['picks']=[p for p in result['picks'] if pd.Timestamp.now(tz='UTC')-pd.Timestamp(p['quote_time'])<=pd.Timedelta(seconds=90)]
+    if not result['picks'] and result.get('message','').startswith('Candidates ranked'):
+        result['message']='Entry quotes expired while the full scan completed. Waiting for the next update.'
     if result['picks']:
         render_card(result['picks'][0],horizon,True)
         if len(result['picks'])>1:
@@ -58,6 +62,12 @@ def render_result(result, horizon):
                 st.write(f"Separate recent period: {held['trades']} completed trades, average {held['mean_net_return']:+.2%} after estimated costs.")
             st.caption(f"Compared {len(engine.STRATEGIES[horizon])} strategies in the scanned symbol list. Estimated round-trip cost: {evidence['cost_assumption_bps']} basis points. Positions may overlap across symbols; this is not a portfolio return.")
             st.caption('This comparison uses currently listed symbols and does not establish the most profitable strategy across the entire market.')
+
+
+@st.cache_resource(show_spinner=False)
+def market_worker(_key, _secret, feed, url, version, credential_identity):
+    from concurrent.futures import ThreadPoolExecutor
+    return {'pool':ThreadPoolExecutor(max_workers=1), 'cache':{}}
 
 
 @st.fragment(run_every='60s')
@@ -78,36 +88,47 @@ def render_stock_opportunities():
         st.error('Choose iex or sip for ALPACA_DATA_FEED. Delayed quotes are excluded from these live entry candidates.')
         return
     url=setting('ALPACA_TRADING_URL','https://paper-api.alpaca.markets').rstrip('/')
-    with st.expander('Scan settings'):
-        text=st.text_input('Symbols to scan',','.join(engine.DEFAULT_SYMBOLS),key='automatic_stock_symbols')
-        st.caption('Hourly setup: up to 60 minutes. Weekly review: buy-and-hold candidates evaluated over 63 trading sessions.')
-    symbols=tuple(sorted({s.strip().upper() for s in text.split(',') if s.strip()}))
-    if not symbols or len(symbols)>30 or any(not s.replace('.','').replace('-','').isalnum() for s in symbols):
-        st.error('Enter between 1 and 30 valid stock symbols.');return
-    try:
-        with st.spinner('Reading current market conditions…'):
-            quotes,clock=current_data(symbols,key,secret,feed,url)
-        checked=pd.Timestamp.now(tz='UTC')
-        clock_time=pd.to_datetime(clock.get('timestamp'),utc=True,errors='coerce')
-        if pd.isna(clock_time) or abs(checked-clock_time)>pd.Timedelta(seconds=90):
-            st.warning('The market clock is stale. Waiting for a fresh check.');return
-        st.caption(('Market open' if clock.get('is_open') else 'Market closed')+' · '+checked.tz_convert('America/Chicago').strftime('%b %d · %-I:%M %p CT')+' · '+feed.upper()+' feed')
-        if feed=='iex':st.caption('IEX covers one exchange; its prices and volumes differ from consolidated market data.')
-        hour,weekly=st.columns(2)
-        for column,horizon,title in [(hour,'hour','⚡ Best setup for the next hour'),(weekly,'hold','🌱 Buy-and-hold candidate this week')]:
-            with column:
-                st.subheader(title)
-                if not clock.get('is_open'):
-                    st.info('Market closed. Fresh entry candidates will appear during the regular session.');continue
-                try:
-                    with st.spinner('Preparing '+('intraday' if horizon=='hour' else 'longer-term')+' history and strategy evidence…'):
-                        raw=history(symbols,key,secret,horizon,feed)
-                        # History can take time on first load: re-read quotes before ranking.
-                        quotes,clock=current_data(symbols,key,secret,feed,url)
-                        result=engine.opportunities(raw,quotes,clock,horizon)
-                    render_result(result,horizon)
-                except Exception as exc:
-                    st.error('Unable to prepare this view: '+str(exc))
-        st.caption('Checks refresh every minute while this screen is open. History is cached for five minutes. First-time history preparation takes longer than a cached visit.')
-    except Exception as exc:
-        st.error('Market data connection failed: '+str(exc))
+    st.caption('Scanning all active exchange-listed U.S. equities available through Alpaca, including ETFs. No preset symbol list.')
+    st.caption('Stocks priced below $5 or with less than $1 million of previous-session dollar volume on your feed are excluded before strategy evaluation.')
+    import hashlib
+    identity=hashlib.sha256((key+'|'+secret).encode()).hexdigest()
+    state=market_worker(key,secret,feed,url,engine.ENGINE_VERSION,identity)
+    future=state.get('future')
+    if future is not None and future.done():
+        try:
+            state['result']=future.result();state.pop('error',None)
+        except Exception as exc:
+            state['error']=str(exc)
+        state['future']=None
+    import time
+    if state.get('future') is None and time.monotonic()-state.get('submitted',-1000)>=60:
+        state['submitted']=time.monotonic()
+        state['future']=state['pool'].submit(engine.scan_market,key,secret,feed,url,state['cache'])
+    if state.get('error'):st.error('Market scan could not complete: '+state['error'])
+    saved=state.get('result')
+    if not saved:
+        st.info('Scanning the full market in the background. This screen stays responsive; results appear automatically when the first scan finishes.')
+        return
+    coverage=saved['coverage']
+    checked=pd.Timestamp(saved['as_of'])
+    st.caption(f"{coverage['listed']:,} listed symbols screened · {coverage.get('eligible',0):,} pass the price and liquidity filter · completed "+checked.tz_convert('America/Chicago').strftime('%-I:%M:%S %p CT'))
+    if feed=='iex':st.caption('IEX is one exchange. Stocks without sufficient coverage on that feed cannot qualify.')
+    if saved['closed']:
+        st.info('Market closed. Fresh entry candidates will be scanned during the regular session.');return
+    stale=pd.Timestamp.now(tz='UTC')-checked>pd.Timedelta(seconds=90)
+    hour,weekly=st.columns(2)
+    for column,horizon,title in [(hour,'hour','⚡ Best qualifying setup for the next hour'),(weekly,'hold','🌱 Buy-and-hold candidate this week')]:
+        with column:
+            st.subheader(title)
+            result=saved['results'][horizon]
+            if stale:
+                st.info('Refreshing the market scan. Previous entry quotes have expired.')
+            else:
+                render_result(result,horizon)
+            failures=result.get('failed_batches',[])
+            if failures:
+                st.caption(f"History unavailable for {sum(len(x['symbols']) for x in failures)} symbols; this scan has partial coverage.")
+                with st.expander('Stocks with unavailable history'):
+                    for failure in failures:st.write(', '.join(failure['symbols'])+': '+failure['reason'])
+    if state.get('future') is not None:st.caption('The next full-market scan is running in the background.')
+    st.caption('Updates appear every minute while this screen is open. The worker can finish a started scan after navigation, but this is not a scheduled service when the app is shut down. First-time full-market history loading can take several minutes.')
