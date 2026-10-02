@@ -42,25 +42,95 @@ def _get(url, key, params=None, balldontlie=False):
     return response.json()
 
 
+MLB_PROP_MATCH_VERSION = 2
+
+
+def mlb_team_key(value):
+    key = name_key(value)
+    return {'ladodgers': 'losangelesdodgers', 'laangels': 'losangelesangels',
+            'oaklandathletics': 'athletics', 'sacramentoathletics': 'athletics',
+            'clevelandindians': 'clevelandguardians'}.get(key, key)
+
+
+def match_mlb_prop_events(games, events, now):
+    """One-to-one matching; allow changed times only for a unique same-day game."""
+    valid = {}
+    for event in events:
+        stamp = pd.to_datetime(event.get('commence_time'), utc=True, errors='coerce')
+        if event.get('id') and pd.notna(stamp) and stamp > now:
+            valid[str(event['id'])] = (event, stamp)
+    prepared = []
+    for game in games:
+        start = pd.to_datetime(game.get('start_time') or game.get('commence_time'), utc=True, errors='coerce')
+        if pd.notna(start) and now < start <= now+pd.Timedelta(days=7):
+            prepared.append((game, start, mlb_team_key(game['home_team']), mlb_team_key(game['away_team'])))
+    proposed = []; diagnostics = []
+    for game, start, home, away in prepared:
+        details = {'Game': game['away_team']+' @ '+game['home_team'],
+                   'MLB start UTC': start.isoformat(), 'Odds events returned': len(valid)}
+        pair = [(event, stamp) for event, stamp in valid.values()
+                if mlb_team_key(event.get('home_team')) == home and mlb_team_key(event.get('away_team')) == away]
+        strict = [(e,t) for e,t in pair if abs(t-start) <= pd.Timedelta(minutes=15)]
+        if len(strict) == 1:
+            event, stamp = strict[0]; method = 'Teams and start within 15 minutes'
+        elif len(strict) > 1:
+            diagnostics.append(dict(details, Reason='Multiple sportsbook events match this start time.')); continue
+        else:
+            day = start.tz_convert('America/Chicago').date()
+            same_day = [(e,t) for e,t in pair if t.tz_convert('America/Chicago').date() == day]
+            same_games = [g for g,t,h,a in prepared if h==home and a==away and t.tz_convert('America/Chicago').date()==day]
+            if len(same_day)==1 and len(same_games)==1 and abs(same_day[0][1]-start)<=pd.Timedelta(hours=3):
+                event, stamp = same_day[0]; method = 'Unique same-day matchup; start times differ'
+            else:
+                reversed_pair = any(mlb_team_key(e.get('home_team'))==away and mlb_team_key(e.get('away_team'))==home for e,t in valid.values())
+                reason = ('No event returned for these teams and home/away order.' if not pair else
+                          'Start-time mismatch or multiple same-day games; automatic match withheld.')
+                if not pair and reversed_pair: reason = 'Odds feed has the opposite home/away order; automatic match withheld.'
+                diagnostics.append(dict(details, Reason=reason, **{'Odds starts UTC': [t.isoformat() for e,t in pair]})); continue
+        proposed.append((game, event, dict(details, **{'Odds start UTC':stamp.isoformat(), 'Match':method})))
+    counts = {}
+    for game,event,details in proposed: counts[event['id']] = counts.get(event['id'],0)+1
+    matched = {}; notes = {}
+    for game,event,details in proposed:
+        gid = int(game['game_id'])
+        if counts[event['id']] != 1:
+            diagnostics.append(dict(details, Reason='One sportsbook event would map to multiple MLB games.')); continue
+        matched[gid] = event; notes[gid] = details
+    return matched, notes, diagnostics
+
+
 def fetch_prop_quotes(league, games, odds_key):
     sport = 'baseball_mlb' if league=='MLB' else 'basketball_nba'
     base = 'https://api.the-odds-api.com/v4/sports/'+sport
-    events = _get(base+'/events', odds_key, {'apiKey': odds_key})
     now = pd.Timestamp.now(tz='UTC'); quotes = []; errors = []
+    params = {'apiKey': odds_key}
+    if league == 'MLB':
+        params.update(dateFormat='iso', commenceTimeFrom=now.strftime('%Y-%m-%dT%H:%M:%SZ'),
+                      commenceTimeTo=(now+pd.Timedelta(days=7,hours=3)).strftime('%Y-%m-%dT%H:%M:%SZ'))
+    events = _get(base+'/events', odds_key, params)
+    matches = {}; match_notes = {}
+    if league == 'MLB':
+        matches, match_notes, errors = match_mlb_prop_events(games, events, now)
     from dual_agent.mlb_historical_odds import team
     def collect(game):
         quotes = []; errors = []
         start = pd.to_datetime(game.get('start_time') or game.get('commence_time'), utc=True)
         if not now<start<=now+pd.Timedelta(days=7): return quotes, errors
-        matched = [event for event in events if team(event.get('home_team'))==team(game['home_team']) and team(event.get('away_team'))==team(game['away_team']) and abs(pd.to_datetime(event['commence_time'], utc=True)-start)<=pd.Timedelta(minutes=15)]
-        if len(matched)!=1:
-            errors.append('No unique prop event match for '+game['away_team']+' at '+game['home_team']); return quotes, errors
-        event = matched[0]
+        if league == 'MLB':
+            event = matches.get(int(game['game_id']))
+            if event is None: return quotes, errors
+        else:
+            matched = [event for event in events if team(event.get('home_team'))==team(game['home_team']) and team(event.get('away_team'))==team(game['away_team']) and abs(pd.to_datetime(event['commence_time'], utc=True)-start)<=pd.Timedelta(minutes=15)]
+            if len(matched)!=1:
+                errors.append('No unique prop event match for '+game['away_team']+' at '+game['home_team']); return quotes, errors
+            event = matched[0]
         try:
             payload = _get(base+'/events/'+event['id']+'/odds', odds_key, {'apiKey': odds_key, 'regions': 'us', 'markets': ','.join(MARKETS[league]), 'oddsFormat': 'decimal'})
         except RuntimeError as exc:
             errors.append(str(exc)); return quotes, errors
         stamp = pd.Timestamp.now(tz='UTC')
+        if league == 'MLB' and not payload.get('bookmakers'):
+            errors.append({'Game':game['away_team']+' @ '+game['home_team'], 'Reason':'Event matched, but no sportsbook prop lines were returned.'})
         for book in payload.get('bookmakers', []):
             for market in book.get('markets', []):
                 key = market.get('key')
@@ -80,7 +150,8 @@ def fetch_prop_quotes(league, games, odds_key):
                     quotes.append({'player':player,'line':line,'market':key,'over_probability':over/(over+under),
                                    'book':book.get('key'), 'updated_at':updated.isoformat(), 'event_id':event['id'],
                                    'home_team':game['home_team'],'away_team':game['away_team'],'start_time':start.isoformat(),
-                                   'game_id':game.get('game_id'), 'capture_time':stamp.isoformat()})
+                                   'game_id':game.get('game_id'), 'capture_time':stamp.isoformat(),
+                                   **({'Event match':match_notes[int(game['game_id'])]['Match']} if league=='MLB' else {})})
         return quotes, errors
     # Separate HTTP requests; bounded concurrency also preserves slate order.
     with ThreadPoolExecutor(max_workers=4 if league == 'MLB' else 1) as pool:
@@ -242,7 +313,7 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
                 picks.append({'Player':player,'Market':MARKETS[league][market][0],'Pick':side,'Line':line,
                               'Market chance':market_p,'Books':len(unique),'Game':first['away_team']+' @ '+first['home_team'],
                               'start_time':first['start_time'],'Captured UTC':first['capture_time'],
-                              **({'Participation status': participation} if league=='MLB' else {}), **estimate})
+                              **({'Participation status': participation, 'Event match': first.get('Event match')} if league=='MLB' else {}), **estimate})
     # One side of one line per player/market/game; avoid ranking duplicate books or alternatives.
     picks.sort(key=lambda r:(-r['Estimated chance'],-r['Prior games'],r['Player']))
     seen=set(); chosen=[]
