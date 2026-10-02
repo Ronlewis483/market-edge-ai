@@ -50,7 +50,7 @@ def fetch_prop_quotes(league, games, odds_key):
     from dual_agent.mlb_historical_odds import team
     for game in games:
         start = pd.to_datetime(game.get('start_time') or game.get('commence_time'), utc=True)
-        if not now<start<=now+pd.Timedelta(hours=24): continue
+        if not now<start<=now+pd.Timedelta(days=7): continue
         matched = [event for event in events if team(event.get('home_team'))==team(game['home_team']) and team(event.get('away_team'))==team(game['away_team']) and abs(pd.to_datetime(event['commence_time'], utc=True)-start)<=pd.Timedelta(minutes=15)]
         if len(matched)!=1:
             errors.append('No unique prop event match for '+game['away_team']+' at '+game['home_team']); continue
