@@ -67,7 +67,6 @@ from dual_agent.nfl_accuracy_audit import (
 )
 
 from dual_agent.nfl_prediction_pipeline import (
-    nfl_week_rows,
     run_nfl_prediction_pipeline,
 )
 
@@ -942,6 +941,28 @@ def load_mlb_prediction_pipeline():
     if getattr(pipeline, "MLB_PIPELINE_VERSION", None) != 11:
         raise RuntimeError("Deploy the matching dual_agent/mlb_prediction_pipeline.py from this update. The running MLB module is older than the seven-day forecast fix.")
     return pipeline
+
+
+def nfl_week_rows(rows, now=None):
+    """Keep unstarted games in the next seven days, one row per matchup."""
+    if rows is None:
+        return None
+    frame = rows.copy() if isinstance(rows, pd.DataFrame) else pd.DataFrame(rows)
+    if frame.empty:
+        return frame
+    if "commence_time" not in frame:
+        return frame.iloc[:0].copy()
+    current = pd.Timestamp.now(tz="UTC") if now is None else pd.Timestamp(now)
+    current = current.tz_localize("UTC") if current.tzinfo is None else current.tz_convert("UTC")
+    kickoff = pd.to_datetime(frame["commence_time"], utc=True, errors="coerce")
+    frame = frame.loc[(kickoff > current) & (kickoff <= current + pd.Timedelta(days=7))].copy()
+    frame["commence_time"] = kickoff.loc[frame.index]
+    if "confidence" in frame:
+        frame = frame.sort_values("confidence", ascending=False, kind="stable")
+    identity = [c for c in ("home_team", "away_team", "commence_time") if c in frame]
+    if len(identity) == 3:
+        frame = frame.drop_duplicates(identity, keep="first")
+    return frame.reset_index(drop=True)
 
 
 def nfl_prediction_features():
