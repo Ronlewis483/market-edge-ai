@@ -28,8 +28,20 @@ def cached_player_history(seasons):
 
 
 
+def rank_player_props(predictions):
+    """Display ordering only; does not alter the prediction engine."""
+    ranked=predictions.copy()
+    for column in ['prediction_score','historical_support']:
+        ranked[column]=pd.to_numeric(ranked[column],errors='coerce')
+    ranked=ranked.dropna(subset=['prediction_score','historical_support'])
+    ranked=ranked.sort_values(['prediction_score','historical_support'],ascending=[False,False],kind='stable')
+    identity=[name for name in ['event_id','player','market','model_pick','line'] if name in ranked]
+    if identity:ranked=ranked.drop_duplicates(identity,keep='first')
+    return ranked.head(10)
+
+
 def render_nfl_player_props():
-    st.header('🏈 NFL Player Props Research')
+    st.header('🏈 NFL Player Prop Picks')
     st.caption('Independent module. Historical frequencies are not calibrated predictions or betting recommendations.')
     key=st.secrets.get('ODDS_API_KEY','')
     if not key:
@@ -181,252 +193,31 @@ def render_nfl_player_props():
             "player-prop forecasts."
         )
 
-        high_props = auto_prop_predictions.loc[
-            auto_prop_predictions[
-                "historical_support"
-            ] >= 0.70
-        ]
-
-        moderate_props = auto_prop_predictions.loc[
-            (
-                auto_prop_predictions[
-                    "historical_support"
-                ] >= 0.58
-            )
-            &
-            (
-                auto_prop_predictions[
-                    "historical_support"
-                ] < 0.70
-            )
-        ]
-
-        close_props = auto_prop_predictions.loc[
-            auto_prop_predictions[
-                "historical_support"
-            ] < 0.58
-        ]
-
-        st.markdown(
-            "## 🏈 Top 10 NFL Player Prop Predictions"
-        )
-
-        st.caption(
-            "Each player is ranked by their strongest "
-            "model-supported prop."
-        )
-
-        player_groups = []
-
-        for (
-            event_id,
-            player,
-        ), player_props in (
-            auto_prop_predictions
-            .groupby(
-                [
-                    "event_id",
-                    "player",
-                ],
-                sort=False,
-            )
-        ):
-
-            player_props = (
-                player_props
-                .sort_values(
-                    "prediction_score",
-                    ascending=False,
-                )
-                .copy()
-            )
-
-            best_prop = player_props.iloc[0]
-
-            player_groups.append(
-                (
-                    int(
-                        best_prop[
-                            "player_rank"
-                        ]
-                    ),
-                    player,
-                    player_props,
-                )
-            )
-
-        player_groups.sort(
-            key=lambda item: item[0]
-        )
-
-        # ======================================================
-        # TWO COMPACT PLAYER CARDS PER ROW
-        # ======================================================
-
-        for row_start in range(
-            0,
-            len(player_groups),
-            2,
-        ):
-
-            left_col, right_col = st.columns(
-                2,
-                gap="medium",
-            )
-
-            row_items = player_groups[
-                row_start:
-                row_start + 2
-            ]
-
-            for column, (
-                player_rank,
-                player,
-                player_props,
-            ) in zip(
-                [left_col, right_col],
-                row_items,
-            ):
-
-                with column:
-
-                    best_prop = (
-                        player_props.iloc[0]
-                    )
-
-                    if (
-                        best_prop["model_pick"]
-                        in ["YES", "NO"]
-                    ):
-                        pick_text = (
-                            best_prop[
-                                "model_pick"
-                            ]
-                        )
-                    else:
-                        pick_text = (
-                            f"{best_prop['model_pick']} "
-                            f"{best_prop['line']:g}"
-                        )
-
-                    score = (
-                        float(
-                            best_prop[
-                                "prediction_score"
-                            ]
-                        )
-                        * 100
-                    )
-
-                    # ------------------------------------------
-                    # COMPACT PLAYER CARD
-                    # ------------------------------------------
-
-                    with st.container(
-                        border=True
-                    ):
-
-                        st.markdown(
-                            f"#### #{player_rank} "
-                            f"{player}"
-                        )
-
-                        st.caption(
-                            f"{best_prop['away_team']} "
-                            f"@ "
-                            f"{best_prop['home_team']}"
-                        )
-
-                        st.markdown(
-                            f"**⭐ {best_prop['market']}**"
-                        )
-
-                        st.markdown(
-                            f"### {pick_text}"
-                        )
-
-                        info_left, info_right = (
-                            st.columns(2)
-                        )
-
-                        with info_left:
-                            st.caption(
-                                "PROJECTION"
-                            )
-                            st.markdown(
-                                f"**"
-                                f"{best_prop['projected_value']:.1f}"
-                                f"**"
-                            )
-
-                        with info_right:
-                            st.caption(
-                                "HISTORICAL SUPPORT"
-                            )
-                            st.markdown(
-                                f"**"
-                                f"{best_prop['historical_support']:.0%}"
-                                f"**"
-                            )
-
-                        st.caption(
-                            f"Model Rank Score: "
-                            f"{score:.0f}/100"
-                        )
-
-                        other_props = (
-                            player_props.iloc[1:]
-                        )
-
-                        if not other_props.empty:
-
-                            with st.expander(
-                                "View other qualified props"
-                            ):
-
-                                for _, prop in (
-                                    other_props.iterrows()
-                                ):
-
-                                    if (
-                                        prop[
-                                            "model_pick"
-                                        ]
-                                        in [
-                                            "YES",
-                                            "NO",
-                                        ]
-                                    ):
-                                        prop_pick = (
-                                            prop[
-                                                "model_pick"
-                                            ]
-                                        )
-
-                                    else:
-                                        prop_pick = (
-                                            f"{prop['model_pick']} "
-                                            f"{prop['line']:g}"
-                                        )
-
-                                    st.markdown(
-                                        f"**"
-                                        f"{prop['market']}"
-                                        f" — "
-                                        f"{prop_pick}"
-                                        f"**"
-                                    )
-
-                                    st.caption(
-                                        f"Projection: "
-                                        f"{prop['projected_value']:.1f}"
-                                        f"  •  "
-                                        f"Support: "
-                                        f"{prop['historical_support']:.0%}"
-                                        f"  •  "
-                                        f"Rank: "
-                                        f"{prop['prediction_score'] * 100:.0f}/100"
-                                    )
+        st.markdown("## 🏈 Top 10 NFL Player Props · Strongest First")
+        st.caption("Ranked across players and markets by the engine’s existing model ranking score. Historical support is an estimate, not a calibrated win probability.")
+        ranked=rank_player_props(auto_prop_predictions)
+        for rank,(_,prop) in enumerate(ranked.iterrows(),1):
+            with st.container(border=True):
+                st.markdown(f"### #{rank} · {prop['player']}")
+                st.caption(f"{prop.get('away_team','')} @ {prop.get('home_team','')}")
+                side=str(prop['model_pick'])
+                pick=side if side in ['YES','NO'] else f"{side} {float(prop['line']):g}"
+                st.write('**'+str(prop['market'])+' · '+pick+'**')
+                left,right=st.columns(2)
+                left.metric('Model ranking score',f"{float(prop['prediction_score'])*100:.1f}/100")
+                right.metric('Estimated historical support',f"{float(prop['historical_support']):.1%}")
+                st.caption(f"Projection: {float(prop['projected_value']):.1f} · historical sample: {int(prop.get('sample_size',0))} games")
+                if st.button('Record this player prop',key=f"nfl_ranked_prop_record_{rank}"):
+                    st.session_state['bet_builder_mode']='Single'
+                    st.session_state['single_sport']='NFL'
+                    st.session_state['single_market']={'Passing yards':'Passing Yards','Rushing yards':'Rushing Yards','Receiving yards':'Receiving Yards','Receptions':'Receptions','Anytime touchdown':'Anytime Touchdown'}.get(prop['market'],'Other')
+                    st.session_state['single_player']=str(prop['player'])
+                    st.session_state['single_team']=''
+                    st.session_state['single_direction']={'OVER':'Over','UNDER':'Under','YES':'Yes','NO':'No'}.get(side.upper(),'Other')
+                    st.session_state['single_line']=float(prop['line'])
+                    st.session_state['single_description']=f"{prop['player']} {pick} {prop['market']} — {prop.get('away_team','')} @ {prop.get('home_team','')}"
+                    st.session_state['main_navigation']='🎟️ My Bets'
+                    st.rerun()
     elif isinstance(
         auto_prop_predictions,
         pd.DataFrame,
