@@ -4872,65 +4872,66 @@ def render_research_lab():
 # NFL PLAYER PROP V1 VS V2A VS V2B BENCHMARK
 # ==========================================
 
-st.divider()
+if page == "🏈 NFL":
+    st.divider()
 
-st.subheader(
-    "🏈 NFL Player Prop V1 vs V2A vs V2B Benchmark"
-)
+    st.subheader(
+        "🏈 NFL Player Prop V1 vs V2A vs V2B Benchmark"
+    )
 
-st.caption(
-    "Leakage-safe historical comparison of the mean baseline, "
-    "recency-weighted model, and opponent matchup-adjusted model."
-)
+    st.caption(
+        "Leakage-safe historical comparison of the mean baseline, "
+        "recency-weighted model, and opponent matchup-adjusted model."
+    )
 
-st.info(
-    "V2B adds opponent defensive context to V2A. "
-    "Lower MAE and RMSE are better. "
-    "Bias closer to zero is better."
-)
+    st.info(
+        "V2B adds opponent defensive context to V2A. "
+        "Lower MAE and RMSE are better. "
+        "Bias closer to zero is better."
+    )
 
-if st.button(
-    "Run NFL Player Prop V2B Benchmark",
-    key="run_nfl_prop_v2b_benchmark",
-):
-
-    with st.spinner(
-        "Running V1 vs V2A vs V2B walk-forward benchmark..."
+    if st.button(
+        "Run NFL Player Prop V2B Benchmark",
+        key="run_nfl_prop_v2b_benchmark",
     ):
 
-        current_nfl_season = pd.Timestamp.now().year
+        with st.spinner(
+            "Running V1 vs V2A vs V2B walk-forward benchmark..."
+        ):
 
-        prop_history_v2b = load_player_history(
-            [
-                current_nfl_season - 2,
-                current_nfl_season - 1,
-                current_nfl_season,
-            ]
-        )
+            current_nfl_season = pd.Timestamp.now().year
 
-        v2b_benchmark = (
-            compare_v1_v2a_v2b_walkforward(
-                history=prop_history_v2b,
-                window=12,
-                min_games=6,
-                decay=0.88,
+            prop_history_v2b = load_player_history(
+                [
+                    current_nfl_season - 2,
+                    current_nfl_season - 1,
+                    current_nfl_season,
+                ]
             )
-        )
 
-        st.session_state[
-            "nfl_prop_v2b_benchmark"
-        ] = v2b_benchmark
+            v2b_benchmark = (
+                compare_v1_v2a_v2b_walkforward(
+                    history=prop_history_v2b,
+                    window=12,
+                    min_games=6,
+                    decay=0.88,
+                )
+            )
 
-        st.success(
-            "NFL Player Prop V2B benchmark completed."
-        )
+            st.session_state[
+                "nfl_prop_v2b_benchmark"
+            ] = v2b_benchmark
+
+            st.success(
+                "NFL Player Prop V2B benchmark completed."
+            )
 
 
-v2b_benchmark = st.session_state.get(
-    "nfl_prop_v2b_benchmark"
-)
+    v2b_benchmark = st.session_state.get(
+        "nfl_prop_v2b_benchmark"
+    )
 
-if v2b_benchmark:
+if page == "🏈 NFL" and st.session_state.get("nfl_prop_v2b_benchmark"):
 
     v1 = v2b_benchmark.get("v1")
     v2a = v2b_benchmark.get("v2a")
@@ -7406,106 +7407,107 @@ if v2b_benchmark:
 # NFL ACCURACY AUDIT DASHBOARD
 # =================================================
 
-st.markdown("---")
+if page == "🏈 NFL":
+    st.markdown("---")
 
-st.header("NFL Prediction Accuracy Audit")
+    st.header("NFL Prediction Accuracy Audit")
 
-st.caption(
-    "Historical out-of-sample model evaluation"
-)
-
-if st.button(
-    "Run NFL Accuracy Audit",
-    key="run_nfl_accuracy_audit",
-):
-
-    walkforward = st.session_state.get(
-        "nfl_walkforward_result"
+    st.caption(
+        "Historical out-of-sample model evaluation"
     )
 
-    if walkforward is None:
-        st.warning(
-            "Run the NFL walk-forward model first."
+    if st.button(
+        "Run NFL Accuracy Audit",
+        key="run_nfl_accuracy_audit",
+    ):
+
+        walkforward = st.session_state.get(
+            "nfl_walkforward_result"
         )
 
-    else:
-
-        try:
-
-            if isinstance(walkforward, dict):
-
-                predictions = walkforward.get(
-                    "predictions"
-                )
-
-            else:
-
-                predictions = walkforward
-
-            if predictions is None:
-
-                raise ValueError(
-                    "Walk-forward predictions are missing."
-                )
-
-            audit_df = pd.DataFrame(
-                predictions
-            ).copy()
-
-            # Normalize probability column.
-
-            if (
-                "probability" not in audit_df.columns
-                and "home_win_probability"
-                in audit_df.columns
-            ):
-
-                audit_df["probability"] = (
-                    audit_df["home_win_probability"]
-                )
-
-            # Normalize actual outcome column.
-
-            if (
-                "actual" not in audit_df.columns
-                and "home_win" in audit_df.columns
-            ):
-
-                audit_df["actual"] = (
-                    audit_df["home_win"]
-                )
-
-            # Never audit unfinished games.
-
-            audit_df = audit_df.dropna(
-                subset=["probability", "actual"]
+        if walkforward is None:
+            st.warning(
+                "Run the NFL walk-forward model first."
             )
 
-            audit = run_nfl_accuracy_audit(
-                audit_df,
-                min_samples=30,
-            )
+        else:
 
-            st.session_state[
-                "nfl_accuracy_audit"
-            ] = audit
+            try:
 
-        except Exception as e:
+                if isinstance(walkforward, dict):
 
-            st.error(
-                f"NFL accuracy audit failed: {e}"
-            )
+                    predictions = walkforward.get(
+                        "predictions"
+                    )
+
+                else:
+
+                    predictions = walkforward
+
+                if predictions is None:
+
+                    raise ValueError(
+                        "Walk-forward predictions are missing."
+                    )
+
+                audit_df = pd.DataFrame(
+                    predictions
+                ).copy()
+
+                # Normalize probability column.
+
+                if (
+                    "probability" not in audit_df.columns
+                    and "home_win_probability"
+                    in audit_df.columns
+                ):
+
+                    audit_df["probability"] = (
+                        audit_df["home_win_probability"]
+                    )
+
+                # Normalize actual outcome column.
+
+                if (
+                    "actual" not in audit_df.columns
+                    and "home_win" in audit_df.columns
+                ):
+
+                    audit_df["actual"] = (
+                        audit_df["home_win"]
+                    )
+
+                # Never audit unfinished games.
+
+                audit_df = audit_df.dropna(
+                    subset=["probability", "actual"]
+                )
+
+                audit = run_nfl_accuracy_audit(
+                    audit_df,
+                    min_samples=30,
+                )
+
+                st.session_state[
+                    "nfl_accuracy_audit"
+                ] = audit
+
+            except Exception as e:
+
+                st.error(
+                    f"NFL accuracy audit failed: {e}"
+                )
 
 
-# =================================================
-# DISPLAY AUDIT RESULTS
-# =================================================
+    # =================================================
+    # DISPLAY AUDIT RESULTS
+    # =================================================
 
-audit = st.session_state.get(
-    "nfl_accuracy_audit"
-)
+    audit = st.session_state.get(
+        "nfl_accuracy_audit"
+    )
 
-if audit is not None:
+if page == "🏈 NFL" and st.session_state.get("nfl_accuracy_audit") is not None:
 
     overall = audit["overall"]
 
