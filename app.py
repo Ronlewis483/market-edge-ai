@@ -380,6 +380,14 @@ def render_league_prediction_results(
         )
         return
 
+    if league_name in ("NBA", "MLB"):
+        now = pd.Timestamp.now(tz="UTC")
+        times = pd.to_datetime(predictions["commence_time"], utc=True, errors="coerce")
+        predictions = predictions.loc[(times>now)&(times<=now+pd.Timedelta(hours=24))]
+        predictions = predictions.sort_values("confidence", ascending=False).head(10).copy()
+        if predictions.empty:
+            st.info(f"No upcoming {league_name} picks in the next 24 hours.")
+            return
     prediction_count = len(predictions)
 
     # ============================================
@@ -387,9 +395,9 @@ def render_league_prediction_results(
     # ============================================
 
     with st.expander(
-        f"{league_icon} Upcoming {league_name} Game Predictions "
+        f"{league_icon} Strongest {league_name} Team Picks "
         f"({prediction_count})",
-        expanded=False,
+        expanded=league_name in ("NBA", "MLB"),
     ):
         st.caption(
             "Model-generated win probabilities for upcoming games."
@@ -790,6 +798,79 @@ with st.sidebar:
 default=clean_symbols(DEFAULT_UNIVERSE)
 
 
+def prediction_api_key(name, alternate=None):
+    import os
+    value = os.environ.get(name) or (os.environ.get(alternate) if alternate else None)
+    if value:
+        return value
+    try:
+        return st.secrets.get(name) or (st.secrets.get(alternate) if alternate else None)
+    except Exception:
+        return None
+
+
+def render_player_prop_picks(league, result):
+    props = (result or {}).get("player_props", {})
+    now = pd.Timestamp.now(tz="UTC")
+    picks = [r for r in props.get("picks", []) if pd.Timestamp(r["start_time"])>now and now-pd.Timestamp(r["Captured UTC"])<=pd.Timedelta(minutes=15)]
+    picks = sorted(picks, key=lambda r: -r["Estimated chance"])[:10]
+    with st.expander(f"🎯 Strongest {league} Player Prop Picks ({len(picks)})", expanded=True):
+        if not picks:
+            st.info(props.get("message", "Generate predictions to collect available player-prop lines."))
+        else:
+            st.caption("Historical hit-rate estimates with sportsbook shrinkage. These estimates are not calibrated win probabilities.")
+            for offset in range(0, len(picks), 2):
+                for column, pick in zip(st.columns(2), picks[offset:offset+2]):
+                    with column:
+                        with st.container(border=True):
+                            st.caption(pick["Game"])
+                            st.markdown("### " + pick["Player"])
+                            st.markdown(f"**{pick['Pick']} {pick['Line']:g} {pick['Market']}**")
+                            st.metric("Estimated chance · excludes pushes", f"{pick['Estimated chance']:.1%}")
+                            st.progress(min(1.0, max(0.0, pick["Estimated chance"])))
+                            st.caption(f"Projection {pick['Projected stat']:.1f} · {pick['Prior games']} prior appearances · {pick['Books']} books")
+                            st.caption(f"Historical wins: {pick['Historical wins']} · pushes: {pick['Historical pushes']}")
+            st.caption(props.get("note", "Player participation is required; availability is not confirmed by an offered line."))
+        if props.get("errors"):
+            with st.expander("Player-prop data coverage"):
+                st.write(props["errors"])
+
+
+def run_nba_prediction_with_props(progress_callback=None):
+    result = run_nba_prediction_pipeline(progress_callback=progress_callback)
+    now = pd.Timestamp.now(tz="UTC")
+    predictions = result.get("predictions")
+    if predictions is not None and not predictions.empty:
+        predictions = predictions.copy()
+        times = pd.to_datetime(predictions["commence_time"], utc=True, errors="coerce")
+        eligible_predictions = predictions.loc[(times>now)&(times<=now+pd.Timedelta(hours=24))].sort_values("confidence", ascending=False)
+        predictions = eligible_predictions.head(10)
+        result["predictions"] = predictions
+        try:
+            from dual_agent.sports_player_prop_predictions import generate_player_prop_picks
+            result["player_props"] = generate_player_prop_picks("NBA", eligible_predictions.to_dict("records"),
+                prediction_api_key("ODDS_API_KEY", "THE_ODDS_API_KEY"), nba_key=prediction_api_key("BALLDONTLIE_API_KEY"))
+        except Exception:
+            result["player_props"] = {"picks": [], "message": "Player-prop data unavailable. Team predictions are preserved.", "errors": []}
+        try:
+            import dual_agent.supabase_db as storage
+            ready = storage.ensure_market_edge_storage_bucket()
+            if not ready.get("success"):
+                raise RuntimeError("Prediction storage unavailable")
+            saved_at = pd.Timestamp.now(tz="UTC")
+            props = result["player_props"]
+            props["picks"] = [r for r in props.get("picks", []) if pd.Timestamp(r["start_time"])>saved_at and saved_at-pd.Timestamp(r["Captured UTC"])<=pd.Timedelta(minutes=15)]
+            payload = {"created_at": saved_at.isoformat(), "predictions": predictions.to_dict("records"), "player_props": props}
+            path = "nba/generated_picks/" + saved_at.strftime("%Y%m%dT%H%M%S%fZ") + ".json"
+            storage.get_supabase_client().storage.from_(storage.MLB_STORAGE_BUCKET).upload(path,
+                __import__("json").dumps(storage._json_safe(payload), allow_nan=False).encode(), {"content-type": "application/json", "upsert": "false"})
+        except Exception:
+            result["player_props"].setdefault("errors", []).append("Unable to save this NBA prediction snapshot.")
+    else:
+        result["player_props"] = {"picks": [], "message": "No eligible NBA games in the next 24 hours.", "errors": []}
+    return result
+
+
 def render_mlb_prediction_center(location):
     st.subheader("⚾ MLB Prediction Center")
     st.caption("Current lineups, starters, team form and available game conditions feed the saved matchup equation.")
@@ -804,7 +885,7 @@ def render_mlb_prediction_center(location):
                 st.session_state.pop("mlb_live_pipeline_result", None)
             except Exception as exc:
                 st.error("Unable to activate MLB model: " + str(exc))
-    game_date = st.date_input("MLB game date", value=pd.Timestamp.now(tz="America/Chicago").date(), key=location + "_date")
+    st.caption("Automatically ranks up to 10 team winners and 10 player props for games in the next 24 hours.")
     if st.button("⚡ Generate MLB Predictions", key=location + "_generate", type="primary", use_container_width=True):
         try:
             import os
@@ -816,20 +897,24 @@ def render_mlb_prediction_center(location):
                 except Exception:
                     odds_key = None
             status = st.empty()
-            result = run_mlb_prediction_pipeline(game_date, api_key=odds_key, progress=status.info)
+            result = run_mlb_prediction_pipeline(api_key=odds_key, progress=status.info)
             st.session_state["mlb_live_pipeline_result"] = result
             status.success(result["message"])
         except Exception as exc:
             st.error("MLB prediction pipeline stopped: " + str(exc))
     result = st.session_state.get("mlb_live_pipeline_result")
-    if result and result.get("game_date") == str(game_date):
+    if result:
         now = pd.Timestamp.now(tz="UTC")
         rows = [r for r in result.get("predictions", []) if pd.Timestamp(r["start_time"])>now and now-pd.Timestamp(r["Captured UTC"])<=pd.Timedelta(minutes=15)]
         if rows:
-            st.dataframe(pd.DataFrame(rows).drop(columns=["Missing model inputs"]), use_container_width=True, hide_index=True)
+            winners = pd.DataFrame([{"home_team": r["Home"], "away_team": r["Away"], "predicted_team": r["Predicted winner"],
+                "confidence": r["Winner probability"], "home_win_probability": r["Home win probability"],
+                "away_win_probability": 1-r["Home win probability"], "commence_time": r["start_time"]} for r in rows])
+            render_league_prediction_results("MLB", "⚾", {"predictions": winners, "opportunities": None})
             st.caption("Picks are saved before first pitch. Confidence reflects the saved model; the 70% accuracy goal is not established.")
         else:
             st.info("No fresh upcoming predictions. Generate again to collect current game information.")
+        render_player_prop_picks("MLB", result)
         with st.expander("Game information coverage"):
             st.json({"skipped_games": result.get("skipped", []), "source_updates": result.get("errors", []),
                      "missing_inputs": [{"game_id": r["game_id"], "features": r["Missing model inputs"]} for r in rows]})
@@ -1530,7 +1615,7 @@ if page in ["🏈 NFL", "🏀 NBA", "⚾ MLB"]:
                     )
 
                 nba_result = (
-                    run_nba_prediction_pipeline(
+                    run_nba_prediction_with_props(
                         progress_callback=update_nba_status,
                     )
                 )
@@ -1561,6 +1646,7 @@ if page in ["🏈 NFL", "🏀 NBA", "⚾ MLB"]:
             league_icon="🏀",
             pipeline_result=nba_result,
         )
+        render_player_prop_picks("NBA", nba_result)
 
     # ========================================
     # MLB
@@ -1605,7 +1691,7 @@ if page == "🏠 Home":
                 )
     
             nba_pipeline_result = (
-                run_nba_prediction_pipeline(
+                run_nba_prediction_with_props(
                     progress_callback=update_nba_status,
                 )
             )
@@ -1635,424 +1721,10 @@ nba_pipeline_result = st.session_state.get(
 )
 
 if page == "🏠 Home" and nba_pipeline_result is not None:
+    render_league_prediction_results("NBA", "🏀", nba_pipeline_result)
+    render_player_prop_picks("NBA", nba_pipeline_result)
 
-    nba_predictions = nba_pipeline_result.get(
-        "predictions"
-    )
 
-    nba_opportunities = nba_pipeline_result.get(
-        "opportunities"
-    )
-
-    if (
-        nba_predictions is not None
-        and not nba_predictions.empty
-    ):
-
-        nba_prediction_count = len(
-            nba_predictions
-        )
-
-        with st.expander(
-            f"🏀 Upcoming NBA Game Predictions "
-            f"({nba_prediction_count})",
-            expanded=False,
-        ):
-
-            st.caption(
-                "Model-generated win probabilities "
-                "for upcoming NBA games."
-            )
-
-            # ====================================
-            # SUMMARY
-            # ====================================
-
-            nba_high_count = int(
-                (
-                    nba_predictions["confidence"]
-                    >= 0.70
-                ).sum()
-            )
-
-            nba_moderate_count = int(
-                (
-                    (
-                        nba_predictions["confidence"]
-                        >= 0.58
-                    )
-                    & (
-                        nba_predictions["confidence"]
-                        < 0.70
-                    )
-                ).sum()
-            )
-
-            nba_close_count = int(
-                (
-                    nba_predictions["confidence"]
-                    < 0.58
-                ).sum()
-            )
-
-            (
-                nba_summary_1,
-                nba_summary_2,
-                nba_summary_3,
-                nba_summary_4,
-            ) = st.columns(4)
-
-            nba_summary_1.metric(
-                "Games",
-                nba_prediction_count,
-            )
-
-            nba_summary_2.metric(
-                "High Confidence",
-                nba_high_count,
-            )
-
-            nba_summary_3.metric(
-                "Moderate",
-                nba_moderate_count,
-            )
-
-            nba_summary_4.metric(
-                "Close Matchups",
-                nba_close_count,
-            )
-
-            st.markdown("")
-
-            # ====================================
-            # MOST FAVORABLE → LEAST FAVORABLE
-            # ====================================
-
-            sorted_nba_predictions = (
-                nba_predictions
-                .sort_values(
-                    by="confidence",
-                    ascending=False,
-                )
-                .reset_index(drop=True)
-            )
-
-            nba_confidence_groups = [
-                (
-                    "🔥 HIGH CONFIDENCE PICKS",
-                    "The model's strongest NBA "
-                    "win-probability predictions.",
-                    sorted_nba_predictions[
-                        sorted_nba_predictions[
-                            "confidence"
-                        ] >= 0.70
-                    ],
-                ),
-                (
-                    "⚡ MODERATE CONFIDENCE",
-                    "The model has a meaningful "
-                    "preference, but with less separation.",
-                    sorted_nba_predictions[
-                        (
-                            sorted_nba_predictions[
-                                "confidence"
-                            ] >= 0.58
-                        )
-                        & (
-                            sorted_nba_predictions[
-                                "confidence"
-                            ] < 0.70
-                        )
-                    ],
-                ),
-                (
-                    "⚖️ CLOSE MATCHUPS",
-                    "NBA games where the model sees "
-                    "relatively little separation.",
-                    sorted_nba_predictions[
-                        sorted_nba_predictions[
-                            "confidence"
-                        ] < 0.58
-                    ],
-                ),
-            ]
-
-            for (
-                group_title,
-                group_description,
-                group_predictions,
-            ) in nba_confidence_groups:
-
-                if group_predictions.empty:
-                    continue
-
-                st.markdown("---")
-
-                st.markdown(
-                    f"### {group_title}"
-                )
-
-                st.caption(
-                    group_description
-                )
-
-                group_records = (
-                    group_predictions.to_dict(
-                        "records"
-                    )
-                )
-
-                for index in range(
-                    0,
-                    len(group_records),
-                    2,
-                ):
-
-                    card_columns = st.columns(2)
-
-                    games_in_row = (
-                        group_records[
-                            index:index + 2
-                        ]
-                    )
-
-                    for column, game in zip(
-                        card_columns,
-                        games_in_row,
-                    ):
-
-                        with column:
-
-                            home_team = game[
-                                "home_team"
-                            ]
-
-                            away_team = game[
-                                "away_team"
-                            ]
-
-                            predicted_team = game[
-                                "predicted_team"
-                            ]
-
-                            confidence = float(
-                                game["confidence"]
-                            )
-
-                            home_probability = float(
-                                game[
-                                    "home_win_probability"
-                                ]
-                            )
-
-                            away_probability = float(
-                                game[
-                                    "away_win_probability"
-                                ]
-                            )
-
-                            # ========================
-                            # GAME TIME
-                            # ========================
-
-                            game_time = pd.to_datetime(
-                                game["commence_time"],
-                                utc=True,
-                                errors="coerce",
-                            )
-
-                            if pd.notna(game_time):
-
-                                central_time = (
-                                    game_time.tz_convert(
-                                        "America/Chicago"
-                                    )
-                                )
-
-                                game_time_text = (
-                                    central_time.strftime(
-                                        "%a • %I:%M %p CT"
-                                    )
-                                    .replace(
-                                        " 0",
-                                        " ",
-                                    )
-                                    .upper()
-                                )
-
-                            else:
-
-                                game_time_text = (
-                                    "TIME TBD"
-                                )
-
-                            # ========================
-                            # CONFIDENCE
-                            # ========================
-
-                            if confidence >= 0.70:
-
-                                confidence_label = (
-                                    "HIGH CONFIDENCE"
-                                )
-
-                                confidence_icon = "🔥"
-
-                            elif confidence >= 0.58:
-
-                                confidence_label = (
-                                    "MODERATE"
-                                )
-
-                                confidence_icon = "⚡"
-
-                            else:
-
-                                confidence_label = (
-                                    "CLOSE MATCHUP"
-                                )
-
-                                confidence_icon = "⚖️"
-
-                            # ========================
-                            # NBA CARD
-                            # ========================
-
-                            with st.container(
-                                border=True
-                            ):
-
-                                st.caption(
-                                    game_time_text
-                                )
-
-                                st.markdown(
-                                    f"#### {away_team} "
-                                    f"@ {home_team}"
-                                )
-
-                                st.markdown(
-                                    "##### 🏆 MODEL PICK"
-                                )
-
-                                st.markdown(
-                                    f"## {predicted_team}"
-                                )
-
-                                st.progress(
-                                    max(
-                                        0.0,
-                                        min(
-                                            1.0,
-                                            confidence,
-                                        ),
-                                    )
-                                )
-
-                                (
-                                    probability_col1,
-                                    probability_col2,
-                                ) = st.columns(2)
-
-                                probability_col1.metric(
-                                    away_team,
-                                    f"{away_probability:.1%}",
-                                )
-
-                                probability_col2.metric(
-                                    home_team,
-                                    f"{home_probability:.1%}",
-                                )
-
-                                st.markdown(
-                                    f"**{confidence_icon} "
-                                    f"{confidence_label}** "
-                                    f"• {confidence:.1%}"
-                                )
-
-                                with st.expander(
-                                    "View model details"
-                                ):
-
-                                    training_games = (
-                                        game.get(
-                                            "training_games"
-                                        )
-                                    )
-
-                                    st.write(
-                                        "**Predicted winner:** "
-                                        f"{predicted_team}"
-                                    )
-
-                                    st.write(
-                                        "**Model confidence:** "
-                                        f"{confidence:.1%}"
-                                    )
-
-                                    st.write(
-                                        "**Home win probability:** "
-                                        f"{home_probability:.1%}"
-                                    )
-
-                                    st.write(
-                                        "**Away win probability:** "
-                                        f"{away_probability:.1%}"
-                                    )
-
-                                    if (
-                                        training_games
-                                        is not None
-                                    ):
-
-                                        st.write(
-                                            "**Historical training "
-                                            "games:** "
-                                            f"{training_games}"
-                                        )
-
-            st.markdown("---")
-
-            st.caption(
-                "Predictions are ordered from highest "
-                "to lowest model confidence within each "
-                "section. Confidence represents estimated "
-                "win probability and does not by itself "
-                "indicate betting value."
-            )
-
-            # ====================================
-            # NBA MARKET OPPORTUNITIES
-            # ====================================
-
-            if (
-                nba_opportunities is not None
-                and not nba_opportunities.empty
-            ):
-
-                with st.expander(
-                    "💰 NBA Market Opportunities",
-                    expanded=False,
-                ):
-
-                    st.caption(
-                        "Model-vs-market analysis sorted "
-                        "by expected ROI and model edge."
-                    )
-
-                    st.dataframe(
-                        nba_opportunities,
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-
-
-# ==========================================
-# SPORTS CENTER — DASHBOARD NAVIGATION
-# ==========================================
-
-    
-    
 if page == "🏈 NFL":
     sports_tab = st.radio(
         "Sports Center Navigation",
@@ -2456,691 +2128,692 @@ if page == "📈 Stocks":
 
 
 if page == "🏀 NBA":
+    with st.expander("Advanced NBA matchup tools", expanded=False):
 
-    # ============================================
-    # NBA PREDICTION CENTER
-    # ============================================
+        # ============================================
+        # NBA PREDICTION CENTER
+        # ============================================
 
-    if page == "🏀 NBA":
+        if page == "🏀 NBA":
 
-        st.divider()
-        st.subheader("🏀 NBA Prediction Center")
+            st.divider()
+            st.subheader("🏀 NBA Prediction Center")
 
-        st.caption(
-            "NBA game predictions, sportsbook comparison, "
-            "and potential wager payouts."
+            st.caption(
+                "NBA game predictions, sportsbook comparison, "
+                "and potential wager payouts."
+            )
+
+            NBA_TEAMS = [
+            "Atlanta Hawks",
+            "Boston Celtics",
+            "Brooklyn Nets",
+            "Charlotte Hornets",
+            "Chicago Bulls",
+            "Cleveland Cavaliers",
+            "Dallas Mavericks",
+            "Denver Nuggets",
+            "Detroit Pistons",
+            "Golden State Warriors",
+            "Houston Rockets",
+            "Indiana Pacers",
+            "Los Angeles Clippers",
+            "Los Angeles Lakers",
+            "Memphis Grizzlies",
+            "Miami Heat",
+            "Milwaukee Bucks",
+            "Minnesota Timberwolves",
+            "New Orleans Pelicans",
+            "New York Knicks",
+            "Oklahoma City Thunder",
+            "Orlando Magic",
+            "Philadelphia 76ers",
+            "Phoenix Suns",
+            "Portland Trail Blazers",
+            "Sacramento Kings",
+            "San Antonio Spurs",
+            "Toronto Raptors",
+            "Utah Jazz",
+            "Washington Wizards",
+        ]
+
+        nba_home = st.selectbox(
+            "Home Team",
+            NBA_TEAMS,
+            index=None,
+            placeholder="Select the home team",
+            key="nba_home_team",
         )
 
-        NBA_TEAMS = [
-        "Atlanta Hawks",
-        "Boston Celtics",
-        "Brooklyn Nets",
-        "Charlotte Hornets",
-        "Chicago Bulls",
-        "Cleveland Cavaliers",
-        "Dallas Mavericks",
-        "Denver Nuggets",
-        "Detroit Pistons",
-        "Golden State Warriors",
-        "Houston Rockets",
-        "Indiana Pacers",
-        "Los Angeles Clippers",
-        "Los Angeles Lakers",
-        "Memphis Grizzlies",
-        "Miami Heat",
-        "Milwaukee Bucks",
-        "Minnesota Timberwolves",
-        "New Orleans Pelicans",
-        "New York Knicks",
-        "Oklahoma City Thunder",
-        "Orlando Magic",
-        "Philadelphia 76ers",
-        "Phoenix Suns",
-        "Portland Trail Blazers",
-        "Sacramento Kings",
-        "San Antonio Spurs",
-        "Toronto Raptors",
-        "Utah Jazz",
-        "Washington Wizards",
-    ]
+        nba_away = st.selectbox(
+            "Away Team",
+            NBA_TEAMS,
+            index=None,
+            placeholder="Select the away team",
+            key="nba_away_team",
+        )
 
-    nba_home = st.selectbox(
-        "Home Team",
-        NBA_TEAMS,
-        index=None,
-        placeholder="Select the home team",
-        key="nba_home_team",
-    )
+        if nba_home and nba_away:
+            if nba_home == nba_away:
+                st.error(
+                    "The home and away teams must be different."
+                )
+            else:
+                st.info(
+                    f"Selected Matchup: {nba_away} at {nba_home}"
+                )
 
-    nba_away = st.selectbox(
-        "Away Team",
-        NBA_TEAMS,
-        index=None,
-        placeholder="Select the away team",
-        key="nba_away_team",
-    )
+        nba_wager = st.number_input(
+            "Wager Amount ($)",
+            min_value=1.0,
+            value=100.0,
+            step=10.0,
+            key="nba_wager"
+        )
 
-    if nba_home and nba_away:
-        if nba_home == nba_away:
-            st.error(
-                "The home and away teams must be different."
-            )
-        else:
-            st.info(
-                f"Selected Matchup: {nba_away} at {nba_home}"
-            )
-
-    nba_wager = st.number_input(
-        "Wager Amount ($)",
-        min_value=1.0,
-        value=100.0,
-        step=10.0,
-        key="nba_wager"
-    )
-
-    nba_odds = st.number_input(
-        "American Odds",
-        value=-110,
-        step=5,
-        key="nba_odds"
-    )
+        nba_odds = st.number_input(
+            "American Odds",
+            value=-110,
+            step=5,
+            key="nba_odds"
+        )
 
     
     
-    # ==========================================
-    # NBA GAME DATE
-    # ==========================================
+        # ==========================================
+        # NBA GAME DATE
+        # ==========================================
 
-    nba_game_date = st.date_input(
-        "NBA Game Date",
-        value="today",
-        key="nba_game_date",
-    )
-
-    # ==========================================
-    # HISTORICAL NBA DATA
-    # ==========================================
-
-    @st.cache_data(ttl=86400, show_spinner=False)
-    def load_nba_prediction_history(seasons):
-
-        games, summary, requests = (
-            get_multiple_historical_seasons(
-                list(seasons)
-            )
+        nba_game_date = st.date_input(
+            "NBA Game Date",
+            value="today",
+            key="nba_game_date",
         )
 
-        return games
+        # ==========================================
+        # HISTORICAL NBA DATA
+        # ==========================================
 
-    # ==========================================
-    # GENERATE NBA PREDICTION
-    # ==========================================
+        @st.cache_data(ttl=86400, show_spinner=False)
+        def load_nba_prediction_history(seasons):
 
-    if st.button(
-        "Generate NBA Prediction",
-        key="generate_nba_prediction",
-    ):
-
-        if not nba_home or not nba_away:
-
-            st.warning(
-                "Please select both NBA teams."
+            games, summary, requests = (
+                get_multiple_historical_seasons(
+                    list(seasons)
+                )
             )
 
-        elif nba_home == nba_away:
+            return games
 
-            st.warning(
-                "Home and away teams must be different."
-            )
+        # ==========================================
+        # GENERATE NBA PREDICTION
+        # ==========================================
 
-        elif abs(nba_odds) < 100:
+        if st.button(
+            "Generate NBA Prediction",
+            key="generate_nba_prediction",
+        ):
 
-            st.warning(
-                "Enter valid American odds, "
-                "such as -110 or +150."
-            )
-
-        else:
-
-            try:
-
-                with st.spinner(
-                    "Loading NBA history and "
-                    "generating your prediction..."
-                ):
-
-                    # ----------------------------------
-                    # 1. Convert NBA team names
-                    # ----------------------------------
-
-                    home_code = (
-                        normalize_nba_team_name(
-                            nba_home
-                        )
-                    )
-
-                    away_code = (
-                        normalize_nba_team_name(
-                            nba_away
-                        )
-                    )
-
-                    if not home_code or not away_code:
-                        raise ValueError(
-                            "Unable to identify one "
-                            "of the selected NBA teams."
-                        )
-
-                    # ----------------------------------
-                    # 2. Load historical NBA games
-                    # ----------------------------------
-
-                    game_year = nba_game_date.year
-
-                    # NBA seasons cross calendar years.
-                    # September-December belongs to
-                    # the season starting that year.
-
-                    season_year = (
-                        game_year
-                        if nba_game_date.month >= 9
-                        else game_year - 1
-                    )
-
-                    seasons = tuple(
-                        range(
-                            season_year - 3,
-                            season_year + 1,
-                        )
-                    )
-
-                    historical_games = (
-                        load_nba_prediction_history(
-                            seasons
-                        )
-                    )
-
-                    # ----------------------------------
-                    # 3. Exclude games on or after
-                    #    the selected prediction date
-                    # ----------------------------------
-
-                    historical_games = (
-                        historical_games[
-                            pd.to_datetime(
-                                historical_games[
-                                    "game_date"
-                                ]
-                            )
-                            < pd.Timestamp(
-                                nba_game_date
-                            )
-                        ].copy()
-                    )
-
-                    if historical_games.empty:
-                        raise ValueError(
-                            "No historical NBA games "
-                            "were available before "
-                            "the selected date."
-                        )
-
-                    # ----------------------------------
-                    # 4. Prepare historical data
-                    # ----------------------------------
-
-                    prepared_games = (
-                        prepare_balldontlie_games_for_research(
-                            historical_games
-                        )
-                    )
-
-                    feature_games = (
-                        build_balldontlie_pregame_features(
-                            prepared_games
-                        )
-                    )
-
-                    # ----------------------------------
-                    # 5. Build future matchup features
-                    # ----------------------------------
-
-                    matchup_features = (
-                        build_balldontlie_future_matchup_features(
-                            prepared_games,
-                            home_code,
-                            away_code,
-                            nba_game_date,
-                        )
-                    )
-
-                    # ----------------------------------
-                    # 6. Run the actual NBA model
-                    # ----------------------------------
-
-                    prediction = (
-                        predict_balldontlie_matchup(
-                            feature_games,
-                            matchup_features,
-                        )
-                    )
-
-                # ==================================
-                # DISPLAY NBA PREDICTION RESULTS
-                # ==================================
-
-                st.success(
-                    "NBA prediction generated successfully!"
-                )
-
-                st.subheader(
-                    f"{nba_away} at {nba_home}"
-                )
-
-                st.caption(
-                    f"Game date: {nba_game_date}"
-                )
-
-                home_probability = prediction[
-                    "home_win_probability"
-                ]
-
-                away_probability = prediction[
-                    "away_win_probability"
-                ]
-
-                predicted_side = prediction[
-                    "predicted_side"
-                ]
-
-                predicted_team = (
-                    nba_home
-                    if predicted_side == "HOME"
-                    else nba_away
-                )
-
-                st.markdown(
-                    "### Model Prediction"
-                )
-
-                st.write(
-                    f"**Predicted winner: "
-                    f"{predicted_team}**"
-                )
-
-                col1, col2 = st.columns(2)
-
-                with col1:
-
-                    st.metric(
-                        nba_home,
-                        f"{home_probability:.1%}",
-                    )
-
-                with col2:
-
-                    st.metric(
-                        nba_away,
-                        f"{away_probability:.1%}",
-                    )
-
-                st.metric(
-                    "Model Confidence",
-                    f"{prediction['confidence']:.1%}",
-                )
-
-                st.caption(
-                    "Model confidence is an estimated "
-                    "probability, not a verified "
-                    "historical win rate."
-                )
-
-                st.write(
-                    "Historical training games:",
-                    prediction["training_games"],
-                )
-
-                # ==================================
-                # SPORTSBOOK COMPARISON
-                # ==================================
-
-                st.divider()
-
-                st.subheader(
-                    "Sportsbook Comparison"
-                )
-
-                betting_side = st.selectbox(
-                    "Which team do these odds apply to?",
-                    [nba_home, nba_away],
-                    key="nba_betting_side",
-                )
-
-                selected_probability = (
-                    home_probability
-                    if betting_side == nba_home
-                    else away_probability
-                )
-
-                if nba_odds > 0:
-
-                    implied_probability = (
-                        100 / (nba_odds + 100)
-                    )
-
-                    potential_profit = (
-                        nba_wager * nba_odds / 100
-                    )
-
-                else:
-
-                    implied_probability = (
-                        abs(nba_odds)
-                        / (abs(nba_odds) + 100)
-                    )
-
-                    potential_profit = (
-                        nba_wager
-                        * 100 / abs(nba_odds)
-                    )
-
-                estimated_edge = (
-                    selected_probability
-                    - implied_probability
-                )
-
-                total_payout = (
-                    nba_wager + potential_profit
-                )
-
-                col1, col2 = st.columns(2)
-
-                with col1:
-
-                    st.metric(
-                        "Model Win Probability",
-                        f"{selected_probability:.1%}",
-                    )
-
-                with col2:
-
-                    st.metric(
-                        "Sportsbook Implied Probability",
-                        f"{implied_probability:.1%}",
-                    )
-
-                st.metric(
-                    "Model vs. Sportsbook Difference",
-                    f"{estimated_edge:+.1%}",
-                )
-
-                st.caption(
-                    "This difference compares the "
-                    "model estimate with the implied "
-                    "probability of the entered odds. "
-                    "It is not a validated betting edge."
-                )
-
-                # ==================================
-                # POTENTIAL PAYOUT
-                # ==================================
-
-                st.divider()
-
-                st.subheader(
-                    "Potential Wager Payout"
-                )
-
-                col1, col2, col3 = st.columns(3)
-
-                with col1:
-
-                    st.metric(
-                        "Wager",
-                        f"${nba_wager:,.2f}",
-                    )
-
-                with col2:
-
-                    st.metric(
-                        "Potential Profit",
-                        f"${potential_profit:,.2f}",
-                    )
-
-                with col3:
-
-                    st.metric(
-                        "Total Payout",
-                        f"${total_payout:,.2f}",
-                    )
-
-                st.caption(
-                    "Total payout includes your "
-                    "original wager. This assumes "
-                    "the selected bet wins."
-                )
+            if not nba_home or not nba_away:
 
                 st.warning(
-                    "Model validation status: "
-                    "Not verified for live betting. "
-                    "Review out-of-sample accuracy "
-                    "and calibration before relying "
-                    "on these probabilities."
+                    "Please select both NBA teams."
                 )
 
-            except Exception as e:
+            elif nba_home == nba_away:
 
-                st.error(
-                    "NBA prediction could not be generated."
+                st.warning(
+                    "Home and away teams must be different."
                 )
 
-                st.error(
-                    f"Error details: {e}"
-                )
+            elif abs(nba_odds) < 100:
 
-    
-    # ==========================================
-    # NBA LIVE MODEL HISTORICAL VALIDATION
-    # ==========================================
-
-    st.divider()
-    st.subheader("🏀 NBA Live Model Validation")
-
-    st.caption(
-        "Test the NBA prediction model against "
-        "completed historical games."
-    )
-
-    
-    nba_test_count = st.selectbox(
-        "Number of historical games to test",
-        options=[25, 50, 100, 250, 500, 1000],
-        index=4,
-        key="nba_live_validation_count",
-    )
-
-    if st.button(
-        "Run NBA Live Model Validation",
-        key="run_nba_live_validation",
-    ):
-
-        try:
-            from dual_agent import nba_research
-
-            if not hasattr(
-                nba_research,
-                "validate_live_nba_model",
-            ):
-                st.error(
-                    "The live-model validation function "
-                    "is missing from nba_research.py. "
-                    "Confirm it is committed to main."
+                st.warning(
+                    "Enter valid American odds, "
+                    "such as -110 or +150."
                 )
 
             else:
-                with st.spinner(
-                    "Loading NBA history and "
-                    "running historical validation..."
-                ):
 
-                    current_year = pd.Timestamp.now().year
+                try:
 
-                    seasons = tuple(
-                        range(
-                            current_year - 4,
-                            current_year + 1,
+                    with st.spinner(
+                        "Loading NBA history and "
+                        "generating your prediction..."
+                    ):
+
+                        # ----------------------------------
+                        # 1. Convert NBA team names
+                        # ----------------------------------
+
+                        home_code = (
+                            normalize_nba_team_name(
+                                nba_home
+                            )
                         )
+
+                        away_code = (
+                            normalize_nba_team_name(
+                                nba_away
+                            )
+                        )
+
+                        if not home_code or not away_code:
+                            raise ValueError(
+                                "Unable to identify one "
+                                "of the selected NBA teams."
+                            )
+
+                        # ----------------------------------
+                        # 2. Load historical NBA games
+                        # ----------------------------------
+
+                        game_year = nba_game_date.year
+
+                        # NBA seasons cross calendar years.
+                        # September-December belongs to
+                        # the season starting that year.
+
+                        season_year = (
+                            game_year
+                            if nba_game_date.month >= 9
+                            else game_year - 1
+                        )
+
+                        seasons = tuple(
+                            range(
+                                season_year - 3,
+                                season_year + 1,
+                            )
+                        )
+
+                        historical_games = (
+                            load_nba_prediction_history(
+                                seasons
+                            )
+                        )
+
+                        # ----------------------------------
+                        # 3. Exclude games on or after
+                        #    the selected prediction date
+                        # ----------------------------------
+
+                        historical_games = (
+                            historical_games[
+                                pd.to_datetime(
+                                    historical_games[
+                                        "game_date"
+                                    ]
+                                )
+                                < pd.Timestamp(
+                                    nba_game_date
+                                )
+                            ].copy()
+                        )
+
+                        if historical_games.empty:
+                            raise ValueError(
+                                "No historical NBA games "
+                                "were available before "
+                                "the selected date."
+                            )
+
+                        # ----------------------------------
+                        # 4. Prepare historical data
+                        # ----------------------------------
+
+                        prepared_games = (
+                            prepare_balldontlie_games_for_research(
+                                historical_games
+                            )
+                        )
+
+                        feature_games = (
+                            build_balldontlie_pregame_features(
+                                prepared_games
+                            )
+                        )
+
+                        # ----------------------------------
+                        # 5. Build future matchup features
+                        # ----------------------------------
+
+                        matchup_features = (
+                            build_balldontlie_future_matchup_features(
+                                prepared_games,
+                                home_code,
+                                away_code,
+                                nba_game_date,
+                            )
+                        )
+
+                        # ----------------------------------
+                        # 6. Run the actual NBA model
+                        # ----------------------------------
+
+                        prediction = (
+                            predict_balldontlie_matchup(
+                                feature_games,
+                                matchup_features,
+                            )
+                        )
+
+                    # ==================================
+                    # DISPLAY NBA PREDICTION RESULTS
+                    # ==================================
+
+                    st.success(
+                        "NBA prediction generated successfully!"
                     )
 
-                    historical_games = (
-                        load_nba_prediction_history(
-                            seasons
-                        )
+                    st.subheader(
+                        f"{nba_away} at {nba_home}"
                     )
 
-                    prepared_games = (
-                        prepare_balldontlie_games_for_research(
-                            historical_games
-                        )
+                    st.caption(
+                        f"Game date: {nba_game_date}"
                     )
 
-                    feature_games = (
-                        build_balldontlie_pregame_features(
-                            prepared_games
-                        )
+                    home_probability = prediction[
+                        "home_win_probability"
+                    ]
+
+                    away_probability = prediction[
+                        "away_win_probability"
+                    ]
+
+                    predicted_side = prediction[
+                        "predicted_side"
+                    ]
+
+                    predicted_team = (
+                        nba_home
+                        if predicted_side == "HOME"
+                        else nba_away
                     )
 
-                    results = (
-                        nba_research.validate_live_nba_model(
-                            historical_games=prepared_games,
-                            feature_games=feature_games,
-                            minimum_training_games=500,
-                            test_games=nba_test_count,
-                        )
+                    st.markdown(
+                        "### Model Prediction"
                     )
 
-                    st.session_state[
-                        "nba_live_validation_results"
-                    ] = results
+                    st.write(
+                        f"**Predicted winner: "
+                        f"{predicted_team}**"
+                    )
 
-                st.success(
-                    "NBA historical validation completed!"
-                )
+                    col1, col2 = st.columns(2)
 
-        except Exception as validation_error:
+                    with col1:
 
-            st.error(
-                "NBA historical validation failed."
-            )
+                        st.metric(
+                            nba_home,
+                            f"{home_probability:.1%}",
+                        )
 
-            st.exception(validation_error)
+                    with col2:
 
-    # ==========================================
-    # DISPLAY HISTORICAL VALIDATION RESULTS
-    # ==========================================
+                        st.metric(
+                            nba_away,
+                            f"{away_probability:.1%}",
+                        )
 
-    if (
-        "nba_live_validation_results"
-        in st.session_state
-    ):
+                    st.metric(
+                        "Model Confidence",
+                        f"{prediction['confidence']:.1%}",
+                    )
 
-        results = st.session_state[
-            "nba_live_validation_results"
-        ]
+                    st.caption(
+                        "Model confidence is an estimated "
+                        "probability, not a verified "
+                        "historical win rate."
+                    )
 
-        st.subheader("Historical Model Performance")
+                    st.write(
+                        "Historical training games:",
+                        prediction["training_games"],
+                    )
 
-        col1, col2, col3 = st.columns(3)
+                    # ==================================
+                    # SPORTSBOOK COMPARISON
+                    # ==================================
 
-        with col1:
-            st.metric(
-                "Games Tested",
-                results["games_tested"],
-            )
+                    st.divider()
 
-        with col2:
-            st.metric(
-                "Prediction Accuracy",
-                f'{results["accuracy"]:.1%}',
-            )
+                    st.subheader(
+                        "Sportsbook Comparison"
+                    )
 
-        with col3:
-            st.metric(
-                "Brier Score",
-                f'{results["brier_score"]:.4f}',
-            )
+                    betting_side = st.selectbox(
+                        "Which team do these odds apply to?",
+                        [nba_home, nba_away],
+                        key="nba_betting_side",
+                    )
 
-        st.metric(
-            "Log Loss",
-            f'{results["log_loss"]:.4f}',
+                    selected_probability = (
+                        home_probability
+                        if betting_side == nba_home
+                        else away_probability
+                    )
+
+                    if nba_odds > 0:
+
+                        implied_probability = (
+                            100 / (nba_odds + 100)
+                        )
+
+                        potential_profit = (
+                            nba_wager * nba_odds / 100
+                        )
+
+                    else:
+
+                        implied_probability = (
+                            abs(nba_odds)
+                            / (abs(nba_odds) + 100)
+                        )
+
+                        potential_profit = (
+                            nba_wager
+                            * 100 / abs(nba_odds)
+                        )
+
+                    estimated_edge = (
+                        selected_probability
+                        - implied_probability
+                    )
+
+                    total_payout = (
+                        nba_wager + potential_profit
+                    )
+
+                    col1, col2 = st.columns(2)
+
+                    with col1:
+
+                        st.metric(
+                            "Model Win Probability",
+                            f"{selected_probability:.1%}",
+                        )
+
+                    with col2:
+
+                        st.metric(
+                            "Sportsbook Implied Probability",
+                            f"{implied_probability:.1%}",
+                        )
+
+                    st.metric(
+                        "Model vs. Sportsbook Difference",
+                        f"{estimated_edge:+.1%}",
+                    )
+
+                    st.caption(
+                        "This difference compares the "
+                        "model estimate with the implied "
+                        "probability of the entered odds. "
+                        "It is not a validated betting edge."
+                    )
+
+                    # ==================================
+                    # POTENTIAL PAYOUT
+                    # ==================================
+
+                    st.divider()
+
+                    st.subheader(
+                        "Potential Wager Payout"
+                    )
+
+                    col1, col2, col3 = st.columns(3)
+
+                    with col1:
+
+                        st.metric(
+                            "Wager",
+                            f"${nba_wager:,.2f}",
+                        )
+
+                    with col2:
+
+                        st.metric(
+                            "Potential Profit",
+                            f"${potential_profit:,.2f}",
+                        )
+
+                    with col3:
+
+                        st.metric(
+                            "Total Payout",
+                            f"${total_payout:,.2f}",
+                        )
+
+                    st.caption(
+                        "Total payout includes your "
+                        "original wager. This assumes "
+                        "the selected bet wins."
+                    )
+
+                    st.warning(
+                        "Model validation status: "
+                        "Not verified for live betting. "
+                        "Review out-of-sample accuracy "
+                        "and calibration before relying "
+                        "on these probabilities."
+                    )
+
+                except Exception as e:
+
+                    st.error(
+                        "NBA prediction could not be generated."
+                    )
+
+                    st.error(
+                        f"Error details: {e}"
+                    )
+
+    
+        # ==========================================
+        # NBA LIVE MODEL HISTORICAL VALIDATION
+        # ==========================================
+
+        st.divider()
+        st.subheader("🏀 NBA Live Model Validation")
+
+        st.caption(
+            "Test the NBA prediction model against "
+            "completed historical games."
         )
 
-        st.metric(
-            "Games Skipped",
-            results["games_skipped"],
+    
+        nba_test_count = st.selectbox(
+            "Number of historical games to test",
+            options=[25, 50, 100, 250, 500, 1000],
+            index=4,
+            key="nba_live_validation_count",
         )
 
-        st.subheader("Accuracy by Confidence Range")
-
-        st.dataframe(
-            results["confidence"],
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        with st.expander(
-            "View Individual Historical Predictions"
+        if st.button(
+            "Run NBA Live Model Validation",
+            key="run_nba_live_validation",
         ):
 
-        
-            # ==========================================
-            # NBA PICK CONFIDENCE ANALYSIS
-            # ==========================================
-    
-            st.subheader("🏀 NBA Pick Confidence Analysis")
-    
             try:
-                from dual_agent.nba_research import (
-                    analyze_nba_pick_confidence,
+                from dual_agent import nba_research
+
+                if not hasattr(
+                    nba_research,
+                    "validate_live_nba_model",
+                ):
+                    st.error(
+                        "The live-model validation function "
+                        "is missing from nba_research.py. "
+                        "Confirm it is committed to main."
+                    )
+
+                else:
+                    with st.spinner(
+                        "Loading NBA history and "
+                        "running historical validation..."
+                    ):
+
+                        current_year = pd.Timestamp.now().year
+
+                        seasons = tuple(
+                            range(
+                                current_year - 4,
+                                current_year + 1,
+                            )
+                        )
+
+                        historical_games = (
+                            load_nba_prediction_history(
+                                seasons
+                            )
+                        )
+
+                        prepared_games = (
+                            prepare_balldontlie_games_for_research(
+                                historical_games
+                            )
+                        )
+
+                        feature_games = (
+                            build_balldontlie_pregame_features(
+                                prepared_games
+                            )
+                        )
+
+                        results = (
+                            nba_research.validate_live_nba_model(
+                                historical_games=prepared_games,
+                                feature_games=feature_games,
+                                minimum_training_games=500,
+                                test_games=nba_test_count,
+                            )
+                        )
+
+                        st.session_state[
+                            "nba_live_validation_results"
+                        ] = results
+
+                    st.success(
+                        "NBA historical validation completed!"
+                    )
+
+            except Exception as validation_error:
+
+                st.error(
+                    "NBA historical validation failed."
                 )
-    
-                historical_predictions = results["predictions"]
-    
-                confidence_results = analyze_nba_pick_confidence(
-                    historical_predictions
+
+                st.exception(validation_error)
+
+        # ==========================================
+        # DISPLAY HISTORICAL VALIDATION RESULTS
+        # ==========================================
+
+        if (
+            "nba_live_validation_results"
+            in st.session_state
+        ):
+
+            results = st.session_state[
+                "nba_live_validation_results"
+            ]
+
+            st.subheader("Historical Model Performance")
+
+            col1, col2, col3 = st.columns(3)
+
+            with col1:
+                st.metric(
+                    "Games Tested",
+                    results["games_tested"],
                 )
+
+            with col2:
+                st.metric(
+                    "Prediction Accuracy",
+                    f'{results["accuracy"]:.1%}',
+                )
+
+            with col3:
+                st.metric(
+                    "Brier Score",
+                    f'{results["brier_score"]:.4f}',
+                )
+
+            st.metric(
+                "Log Loss",
+                f'{results["log_loss"]:.4f}',
+            )
+
+            st.metric(
+                "Games Skipped",
+                results["games_skipped"],
+            )
+
+            st.subheader("Accuracy by Confidence Range")
+
+            st.dataframe(
+                results["confidence"],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            with st.expander(
+                "View Individual Historical Predictions"
+            ):
+
+        
+                # ==========================================
+                # NBA PICK CONFIDENCE ANALYSIS
+                # ==========================================
     
+                st.subheader("🏀 NBA Pick Confidence Analysis")
+    
+                try:
+                    from dual_agent.nba_research import (
+                        analyze_nba_pick_confidence,
+                    )
+    
+                    historical_predictions = results["predictions"]
+    
+                    confidence_results = analyze_nba_pick_confidence(
+                        historical_predictions
+                    )
+    
+                    st.dataframe(
+                        confidence_results,
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+    
+                except Exception as confidence_error:
+                    st.warning(
+                        "NBA confidence analysis could not run."
+                    )
+                    st.exception(confidence_error)
+
+            
                 st.dataframe(
-                    confidence_results,
+                    results["predictions"],
                     use_container_width=True,
                     hide_index=True,
                 )
-    
-            except Exception as confidence_error:
-                st.warning(
-                    "NBA confidence analysis could not run."
+
+            with st.expander(
+                "View Skipped Games"
+            ):
+                st.dataframe(
+                    results["skipped_games"],
+                    use_container_width=True,
+                    hide_index=True,
                 )
-                st.exception(confidence_error)
 
-            
-            st.dataframe(
-                results["predictions"],
-                use_container_width=True,
-                hide_index=True,
-            )
-
-        with st.expander(
-            "View Skipped Games"
-        ):
-            st.dataframe(
-                results["skipped_games"],
-                use_container_width=True,
-                hide_index=True,
-            )
-
-    # ==========================================
-    # END NBA LIVE MODEL VALIDATION
-    # ==========================================
+        # ==========================================
+        # END NBA LIVE MODEL VALIDATION
+        # ==========================================
 
 
 elif page == "🎟️ My Bets":
