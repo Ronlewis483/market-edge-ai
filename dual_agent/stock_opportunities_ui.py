@@ -33,6 +33,12 @@ def render_card(pick, horizon, top=False):
         st.caption(f"{pick['verification_trades']} separate-period trades · historical win rate {pick['historical_win_rate']:.0%}")
         st.write('**Planned hold:** '+pick['holding_period'])
         if horizon=='hour':
+            if 'evidence_score' in pick:
+                st.write(f"**Evidence ranking score:** {pick['evidence_score']:.0%} · {pick['evidence_label']}")
+                st.caption('Ranks historical win evidence with a penalty for small samples. This is not a predicted probability of profit.')
+            earlier=pick.get('strategy_earlier_net_return')
+            if earlier is not None and earlier<=0:
+                st.caption(f"This strategy averaged {earlier:+.2%} in the older period; its recent-period average was positive.")
             st.write(f"**Stop reference:** ${pick['stop_reference']:,.2f}")
             exit_time=pd.Timestamp(pick['exit_time']).tz_convert('America/Chicago')
             st.write('**Time exit:** '+exit_time.strftime('%-I:%M %p CT'))
@@ -54,6 +60,31 @@ def render_result(result, horizon):
                 for pick in result['picks'][1:]:render_card(pick,horizon)
     else:
         st.info(result['message'])
+    if horizon=='hour':
+        from collections import Counter
+        with st.expander('Why day trades are waiting',expanded=not bool(result['picks'])):
+            st.write('**'+result['message']+'**')
+            checked=evidence.get('strategies',[])
+            if checked:
+                passed=sum(bool(item['qualified']) for item in checked)
+                st.write(f"{passed} of {len(checked)} strategies passed the historical checks.")
+                if not passed:
+                    reasons=Counter()
+                    for item in checked:
+                        a=item['selection'];b=item['verification']
+                        if a['trades']<25:reasons['Insufficient earlier-period trades']+=1
+                        elif horizon!='hour' and (a['mean_net_return'] is None or a['mean_net_return']<=0):reasons['Earlier-period average return was not positive after costs']+=1
+                        elif b['trades']<8:reasons['Insufficient recent-period trades']+=1
+                        else:reasons['Recent-period average return was not positive after costs']+=1
+                    for reason,count in reasons.items():st.write(f"• {count} strategies: {reason}")
+            exclusions=result.get('exclusions',[])
+            counts=Counter(item['reason'] for item in exclusions)
+            for reason,count in counts.most_common():st.write(f"• {count} stock/strategy checks: {reason}")
+            if exclusions:
+                st.caption('Each count represents the first blocking rule for one stock and strategy; a stock can appear under several strategies.')
+                st.caption('Individual examples (up to 30):')
+                for item in exclusions[:30]:st.write(item['symbol']+' · '+item['strategy']+' · '+item['reason'])
+            st.caption('Day trades currently cover long positions with up to a one-hour hold. These messages distinguish historical rejection, missing entry signals and live-data problems.')
     if evidence.get('strategies'):
         with st.expander('Strategies checked'):
             st.write(f"{len(evidence['strategies'])} strategies evaluated independently; {len(evidence['qualified_strategies'])} passed the historical checks.")
@@ -62,6 +93,7 @@ def render_result(result, horizon):
                 value=held['mean_net_return']
                 average=f"{value:+.2%}" if value is not None else 'not available'
                 st.write('**'+item['strategy']+'** · '+('Passed' if item['qualified'] else 'Waiting for sufficient positive evidence')+f" · {held['trades']} recent-period trades · average net return {average}")
+            if horizon=='hour':st.caption('Day trades require any positive recent average net return after costs, at least 25 older-period trades and 8 recent-period trades. Negative older-period returns are disclosed rather than blocking a strategy.')
             st.caption('These are historical estimates after fixed costs, not proof of future profitability. Comparing more strategies increases the risk of finding a result by chance; the recent-period checks are screening evidence, not an untouched final validation.')
 
 
