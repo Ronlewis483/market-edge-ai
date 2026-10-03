@@ -375,6 +375,8 @@ def render_league_prediction_results(
 
     predictions = pipeline_result.get("predictions")
     opportunities = pipeline_result.get("opportunities")
+    if league_name == "NFL":
+        predictions = retain_nfl_picks(predictions, "nfl_saved_team_cards")
 
     if predictions is None or predictions.empty:
         st.info(
@@ -943,6 +945,86 @@ def load_mlb_prediction_pipeline():
     return pipeline
 
 
+@st.cache_data(ttl=180, show_spinner=False)
+def cached_nfl_pick_statuses(api_key):
+    """Check completion, never infer final status from elapsed time."""
+    if not api_key:
+        return []
+    try:
+        response = requests.get(
+            "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/scores",
+            params={"apiKey": api_key, "daysFrom": 3, "dateFormat": "iso"},
+            timeout=8,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        return payload if isinstance(payload, list) else []
+    except (requests.RequestException, ValueError):
+        return []
+
+
+def nfl_pick_identity(row, time_column):
+    kickoff = pd.to_datetime(row.get(time_column), utc=True, errors="coerce")
+    if pd.isna(kickoff):
+        return None
+    return (str(row.get("home_team", "")).strip(),
+            str(row.get("away_team", "")).strip(), kickoff.isoformat())
+
+
+def merge_nfl_saved_picks(previous, fresh, time_column, identity_columns, statuses, now, completed=()):
+    """Freeze existing started picks; update future picks and retire confirmed finals."""
+    now = pd.Timestamp(now)
+    now = now.tz_localize("UTC") if now.tzinfo is None else now.tz_convert("UTC")
+    final_games = set(completed)
+    status_by_game = {}
+    for status in statuses:
+        game = nfl_pick_identity(status, "commence_time")
+        if game is not None:
+            status_by_game[game] = status
+            if status.get("completed") is True:
+                final_games.add(game)
+    def records(value):
+        return value.to_dict("records") if isinstance(value, pd.DataFrame) else []
+    saved = {}
+    # Existing started predictions take priority over a regenerated prediction.
+    for row in records(previous) + records(fresh):
+        game = nfl_pick_identity(row, time_column)
+        if game is None or game in final_games:
+            continue
+        kickoff = pd.Timestamp(game[2])
+        if kickoff > now + pd.Timedelta(days=7):
+            continue
+        identity = game + tuple(str(row.get(c, "")) for c in identity_columns)
+        if identity in saved and kickoff <= now:
+            continue
+        row = dict(row)
+        status = status_by_game.get(game, {})
+        row["pick_game_status"] = (
+            "Upcoming" if kickoff > now else
+            "In progress · saved pregame pick" if status.get("scores") else
+            "Started · awaiting game status · saved pregame pick"
+        )
+        saved[identity] = row
+    return pd.DataFrame(saved.values()), final_games
+
+
+def retain_nfl_picks(rows, archive_key, time_column="commence_time", identity_columns=(), now=None):
+    current = pd.Timestamp.now(tz="UTC") if now is None else pd.Timestamp(now)
+    previous = st.session_state.get(archive_key)
+    needs_status = False
+    for frame in (previous, rows):
+        if isinstance(frame, pd.DataFrame) and time_column in frame:
+            times = pd.to_datetime(frame[time_column], utc=True, errors="coerce")
+            needs_status = needs_status or bool((times <= current).any())
+    statuses = cached_nfl_pick_statuses(st.secrets.get("ODDS_API_KEY", st.secrets.get("THE_ODDS_API_KEY", ""))) if needs_status else []
+    final_key = archive_key + "_completed"
+    visible, completed = merge_nfl_saved_picks(previous, rows, time_column, identity_columns,
+        statuses, current, st.session_state.get(final_key, set()))
+    st.session_state[archive_key] = visible
+    st.session_state[final_key] = completed
+    return visible
+
+
 def nfl_week_rows(rows, now=None):
     """Keep unstarted games in the next seven days, one row per matchup."""
     if rows is None:
@@ -1203,6 +1285,8 @@ if page == "🏠 Home":
                     )
                 )
     
+                retain_nfl_picks(st.session_state.get("nfl_prediction_pipeline_result", {}).get("predictions"), "nfl_saved_team_cards")
+                retain_nfl_picks(nfl_pipeline_result.get("predictions"), "nfl_saved_team_cards")
                 st.session_state[
                     "nfl_prediction_pipeline_result"
                 ] = nfl_pipeline_result
@@ -1252,7 +1336,7 @@ if page == "🏠 Home":
     
     if nfl_pipeline_result is not None:
     
-        predictions = nfl_week_rows(nfl_pipeline_result.get("predictions"))
+        predictions = retain_nfl_picks(nfl_pipeline_result.get("predictions"), "nfl_saved_team_cards")
     
         opportunities = nfl_pipeline_result.get(
             "opportunities"
@@ -1430,6 +1514,7 @@ if page == "🏠 Home":
                                 "away_team"
                             ]
 
+                            st.caption(game.get("pick_game_status", "Upcoming"))
                             predicted_team = game[
                                 "predicted_team"
                             ]
@@ -1689,6 +1774,8 @@ if page in ["🏈 NFL", "🏀 NBA", "⚾ MLB"]:
                         historical_accuracy=st.session_state.get("nfl_historical_accuracy"),
                         historical_sample=st.session_state.get("nfl_historical_sample"),
                     )
+                    retain_nfl_picks(st.session_state.get("nfl_prediction_pipeline_result", {}).get("predictions"), "nfl_saved_team_cards")
+                    retain_nfl_picks(result.get("predictions"), "nfl_saved_team_cards")
                     st.session_state["nfl_prediction_pipeline_result"] = result
                     for session_key, result_key in [("live_nfl_moneylines", "live_odds"),
                         ("best_nfl_moneylines", "best_lines"), ("live_nfl_predictions", "predictions"),
@@ -8582,7 +8669,7 @@ if page == "🏈 NFL" and st.session_state.get("nfl_accuracy_audit") is not None
     # DISPLAY LIVE PREDICTIONS
     # ------------------------------------------------------------
 
-    live_predictions = nfl_week_rows(st.session_state.get("nfl_live_predictions"))
+    live_predictions = retain_nfl_picks(st.session_state.get("nfl_live_predictions"), "nfl_saved_research_cards")
 
     
     if (
