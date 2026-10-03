@@ -589,7 +589,7 @@ def render_league_prediction_results(
 
                             game_time_text = (
                                 central_time.strftime(
-                                    "%a • %I:%M %p CT"
+                                    "%b %d, %Y • %I:%M %p CT"
                                 )
                                 .replace(
                                     " 0",
@@ -831,6 +831,9 @@ def render_player_prop_picks(league, result):
                     with column:
                         with st.container(border=True):
                             st.caption(pick["Game"])
+                            pick_time = pd.to_datetime(pick.get("start_time"), utc=True, errors="coerce")
+                            if pd.notna(pick_time):
+                                st.caption(pick_time.tz_convert("America/Chicago").strftime("%b %d, %Y · %I:%M %p CT"))
                             st.caption(pick.get("pick_game_status", "Upcoming"))
                             st.markdown("### " + pick["Player"])
                             st.markdown(f"**{pick['Pick']} {pick['Line']:g} {pick['Market']}**")
@@ -851,7 +854,7 @@ def render_player_prop_picks(league, result):
                 st.caption("These games or players were left out of the prop picks. Here's why.")
                 def friendly_time(value):
                     stamp = pd.to_datetime(value, utc=True, errors="coerce")
-                    return stamp.tz_convert("America/Chicago").strftime("%a, %b %d · %-I:%M %p CT") if pd.notna(stamp) else None
+                    return stamp.tz_convert("America/Chicago").strftime("%b %d, %Y · %-I:%M %p CT") if pd.notna(stamp) else None
                 for offset in range(0, len(issues), 2):
                     for column, issue in zip(st.columns(2), issues[offset:offset+2]):
                         with column:
@@ -1633,7 +1636,7 @@ if page == "🏠 Home":
 
                                 game_time_text = (
                                     central_time.strftime(
-                                        "%a • %I:%M %p CT"
+                                        "%b %d, %Y • %I:%M %p CT"
                                     )
                                     .replace(
                                         " 0",
@@ -8378,7 +8381,7 @@ if page == "🏈 NFL" and st.session_state.get("nfl_accuracy_audit") is not None
                     game_time_display = (
                         game_time.tz_convert(
                             ZoneInfo("America/Chicago")
-                        ).strftime("%a, %b %d · %I:%M %p CT")
+                        ).strftime("%b %d, %Y · %I:%M %p CT")
                     )
                 else:
                     game_time_display = "Time unavailable"
