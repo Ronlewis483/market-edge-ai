@@ -378,6 +378,8 @@ def render_league_prediction_results(
     if league_name == "NFL":
         predictions = retain_nfl_picks(predictions, "nfl_saved_team_cards")
 
+    if league_name in ("NBA", "MLB"):
+        predictions = retain_sport_picks(league_name, predictions)
     if predictions is None or predictions.empty:
         st.info(
             f"No upcoming {league_name} predictions are currently available."
@@ -385,12 +387,8 @@ def render_league_prediction_results(
         return
 
     if league_name in ("NBA", "MLB"):
-        now = pd.Timestamp.now(tz="UTC")
-        times = pd.to_datetime(predictions["commence_time"], utc=True, errors="coerce")
-        predictions = predictions.loc[(times>now)&(times<=now+pd.Timedelta(days=7))]
-        predictions = predictions.sort_values("confidence", ascending=False).head(10).copy()
         if predictions.empty:
-            st.info(f"No upcoming {league_name} picks in the next seven days.")
+            st.info(f"No upcoming or active {league_name} picks available.")
             return
     prediction_count = len(predictions)
 
@@ -822,8 +820,7 @@ def prediction_api_key(name, alternate=None):
 def render_player_prop_picks(league, result):
     props = (result or {}).get("player_props", {})
     now = pd.Timestamp.now(tz="UTC")
-    picks = [r for r in props.get("picks", []) if pd.Timestamp(r["start_time"])>now and now-pd.Timestamp(r["Captured UTC"])<=pd.Timedelta(minutes=15)]
-    picks = sorted(picks, key=lambda r: -r["Estimated chance"])[:10]
+    picks = retain_sport_picks(league, props.get("picks", []), kind="props").to_dict("records")
     with st.expander(f"🎯 Strongest {league} Player Prop Picks ({len(picks)})", expanded=True):
         if not picks:
             st.info(props.get("message", "Generate predictions to collect available player-prop lines."))
@@ -834,6 +831,7 @@ def render_player_prop_picks(league, result):
                     with column:
                         with st.container(border=True):
                             st.caption(pick["Game"])
+                            st.caption(pick.get("pick_game_status", "Upcoming"))
                             st.markdown("### " + pick["Player"])
                             st.markdown(f"**{pick['Pick']} {pick['Line']:g} {pick['Market']}**")
                             if pick.get("Event match") == "Unique same-day matchup; start times differ":
@@ -889,6 +887,9 @@ def render_player_prop_picks(league, result):
 
 
 def run_nba_prediction_with_props(progress_callback=None):
+    previous = st.session_state.get("nba_prediction_pipeline_result") or {}
+    retain_sport_picks("NBA", previous.get("predictions"))
+    retain_sport_picks("NBA", previous.get("player_props", {}).get("picks", []), kind="props")
     result = run_nba_prediction_pipeline(progress_callback=progress_callback)
     now = pd.Timestamp.now(tz="UTC")
     predictions = result.get("predictions")
@@ -1025,6 +1026,71 @@ def retain_nfl_picks(rows, archive_key, time_column="commence_time", identity_co
     return visible
 
 
+@st.cache_data(ttl=180, show_spinner=False)
+def cached_sport_pick_statuses(sport, api_key):
+    if not api_key:
+        return []
+    try:
+        response = requests.get(
+            f"https://api.the-odds-api.com/v4/sports/{sport}/scores",
+            params={"apiKey": api_key, "daysFrom": 3, "dateFormat": "iso"}, timeout=8,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        return payload if isinstance(payload, list) else []
+    except (requests.RequestException, ValueError):
+        return []
+
+
+def retain_sport_picks(league, rows, kind="teams", now=None):
+    """Keep saved pregame cards through kickoff; retire only confirmed finals."""
+    current = pd.Timestamp.now(tz="UTC") if now is None else pd.Timestamp(now)
+    frame = rows.copy() if isinstance(rows, pd.DataFrame) else pd.DataFrame(rows or [])
+    if not frame.empty:
+        if "commence_time" not in frame and "start_time" in frame:
+            frame["commence_time"] = frame["start_time"]
+        if "home_team" not in frame:
+            if "Home" in frame:
+                frame["home_team"] = frame["Home"]
+                frame["away_team"] = frame["Away"]
+            elif "Game" in frame:
+                teams = frame["Game"].astype(str).str.split(" @ ", n=1, expand=True)
+                if teams.shape[1] == 2:
+                    frame["away_team"], frame["home_team"] = teams[0], teams[1]
+        if "Captured UTC" in frame:
+            kickoff = pd.to_datetime(frame["commence_time"], utc=True, errors="coerce")
+            captured = pd.to_datetime(frame["Captured UTC"], utc=True, errors="coerce")
+            # A stale line is retained only as an existing pregame pick, never a new recommendation.
+            frame = frame.loc[(kickoff <= current) | ((captured <= current) & (current-captured <= pd.Timedelta(minutes=15)))].copy()
+    archive_key = f"{league.lower()}_saved_{kind}_cards"
+    previous = st.session_state.get(archive_key)
+    if isinstance(previous, pd.DataFrame) and "Captured UTC" in previous:
+        kickoff = pd.to_datetime(previous["commence_time"], utc=True, errors="coerce")
+        captured = pd.to_datetime(previous["Captured UTC"], utc=True, errors="coerce")
+        previous = previous.loc[(kickoff <= current) | ((captured <= current) & (current-captured <= pd.Timedelta(minutes=15)))].copy()
+    started = any(isinstance(f, pd.DataFrame) and "commence_time" in f and
+        bool((pd.to_datetime(f["commence_time"], utc=True, errors="coerce") <= current).any())
+        for f in (previous, frame))
+    sport = {"MLB": "baseball_mlb", "NBA": "basketball_nba"}[league]
+    statuses = cached_sport_pick_statuses(sport, prediction_api_key("ODDS_API_KEY", "THE_ODDS_API_KEY")) if started else []
+    columns = ("Player", "Market", "Pick", "Line") if kind == "props" else ()
+    done_key = archive_key + "_completed"
+    visible, completed = merge_nfl_saved_picks(previous, frame, "commence_time", columns,
+        statuses, current, st.session_state.get(done_key, set()))
+    st.session_state[archive_key] = visible
+    st.session_state[done_key] = completed
+    if visible.empty:
+        return visible
+    kickoff = pd.to_datetime(visible["commence_time"], utc=True, errors="coerce")
+    live = visible.loc[kickoff <= current]
+    future = visible.loc[kickoff > current]
+    score = next((c for c in ("Estimated chance", "confidence", "Winner probability") if c in future), None)
+    if score:
+        future = future.sort_values(score, ascending=False, kind="stable")
+    # Saved live cards cannot be displaced by the next batch of upcoming top-ten picks.
+    return pd.concat([live, future.head(10)], ignore_index=True)
+
+
 def nfl_week_rows(rows, now=None):
     """Keep unstarted games in the next seven days, one row per matchup."""
     if rows is None:
@@ -1084,14 +1150,26 @@ def render_mlb_prediction_center(location):
     st.caption("Automatically ranks up to 10 team winners and 10 player props for games in the next seven days.")
     team_cards = st.empty()
     def show_team_cards(rows):
-        winners = pd.DataFrame([{ "home_team": r["Home"], "away_team": r["Away"], "predicted_team": r["Predicted winner"],
-            "confidence": r["Winner probability"], "home_win_probability": r["Home win probability"],
-            "away_win_probability": 1-r["Home win probability"], "commence_time": r["start_time"],
-            "input_status": r.get("Input status"), "input_notes": r.get("Input notes", [])} for r in rows])
+        winners = pd.DataFrame([{
+            "home_team": r.get("Home", r.get("home_team")),
+            "away_team": r.get("Away", r.get("away_team")),
+            "predicted_team": r.get("Predicted winner", r.get("predicted_team")),
+            "confidence": r.get("Winner probability", r.get("confidence")),
+            "home_win_probability": r.get("Home win probability", r.get("home_win_probability")),
+            "away_win_probability": r.get("away_win_probability", 1-r.get("Home win probability", r.get("home_win_probability", .5))),
+            "commence_time": r.get("start_time", r.get("commence_time")),
+            "input_status": r.get("Input status", r.get("input_status")),
+            "input_notes": r.get("Input notes", r.get("input_notes", [])),
+            "pick_game_status": r.get("pick_game_status", "Upcoming"),
+            "Captured UTC": r.get("Captured UTC"),
+        } for r in rows])
         with team_cards.container():
             render_league_prediction_results("MLB", "⚾", {"predictions": winners, "opportunities": None})
     generated = st.button("⚡ Generate MLB Predictions", key=location + "_generate", type="primary", use_container_width=True)
     previous = st.session_state.get("mlb_live_pipeline_result")
+    if previous:
+        retain_sport_picks("MLB", previous.get("predictions", []))
+        retain_sport_picks("MLB", previous.get("player_props", {}).get("picks", []), kind="props")
     checked_at = pd.to_datetime(st.session_state.get("mlb_last_refresh_attempt"), utc=True, errors="coerce")
     refresh_due = bool(previous and (pd.isna(checked_at) or pd.Timestamp.now(tz="UTC")-checked_at >= pd.Timedelta(seconds=180)))
     st.caption("After generation, lineups, starters and available props refresh every three minutes while this screen stays open.")
@@ -1120,7 +1198,7 @@ def render_mlb_prediction_center(location):
         st.info("The MLB pipeline was updated. Generate again to search the upcoming seven-day schedule.")
     if result:
         now = pd.Timestamp.now(tz="UTC")
-        rows = [r for r in result.get("predictions", []) if pd.Timestamp(r["start_time"])>now and now-pd.Timestamp(r["Captured UTC"])<=pd.Timedelta(minutes=15)]
+        rows = retain_sport_picks("MLB", result.get("predictions", [])).to_dict("records")
         if rows:
             show_team_cards(rows)
             st.caption("Picks are saved before first pitch. Confidence reflects the saved model; the 70% accuracy goal is not established.")
@@ -1609,6 +1687,8 @@ if page == "🏠 Home":
                                 st.caption(
                                     game_time_text
                                 )
+                                if game.get("pick_game_status"):
+                                    st.caption(game["pick_game_status"])
 
                                 st.markdown(
                                     f"#### {away_team} "
