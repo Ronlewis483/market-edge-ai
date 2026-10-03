@@ -28,6 +28,86 @@ def cached_player_history(seasons):
 
 
 
+@st.cache_data(ttl=180, show_spinner=False)
+def cached_nfl_pick_statuses(api_key):
+    """Check completion, never infer final status from elapsed time."""
+    if not api_key:
+        return []
+    try:
+        response = requests.get(
+            "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/scores",
+            params={"apiKey": api_key, "daysFrom": 3, "dateFormat": "iso"},
+            timeout=8,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        return payload if isinstance(payload, list) else []
+    except (requests.RequestException, ValueError):
+        return []
+
+
+def nfl_pick_identity(row, time_column):
+    kickoff = pd.to_datetime(row.get(time_column), utc=True, errors="coerce")
+    if pd.isna(kickoff):
+        return None
+    return (str(row.get("home_team", "")).strip(),
+            str(row.get("away_team", "")).strip(), kickoff.isoformat())
+
+
+def merge_nfl_saved_picks(previous, fresh, time_column, identity_columns, statuses, now, completed=()):
+    """Freeze existing started picks; update future picks and retire confirmed finals."""
+    now = pd.Timestamp(now)
+    now = now.tz_localize("UTC") if now.tzinfo is None else now.tz_convert("UTC")
+    final_games = set(completed)
+    status_by_game = {}
+    for status in statuses:
+        game = nfl_pick_identity(status, "commence_time")
+        if game is not None:
+            status_by_game[game] = status
+            if status.get("completed") is True:
+                final_games.add(game)
+    def records(value):
+        return value.to_dict("records") if isinstance(value, pd.DataFrame) else []
+    saved = {}
+    # Existing started predictions take priority over a regenerated prediction.
+    for row in records(previous) + records(fresh):
+        game = nfl_pick_identity(row, time_column)
+        if game is None or game in final_games:
+            continue
+        kickoff = pd.Timestamp(game[2])
+        if kickoff > now + pd.Timedelta(days=7):
+            continue
+        identity = game + tuple(str(row.get(c, "")) for c in identity_columns)
+        if identity in saved and kickoff <= now:
+            continue
+        row = dict(row)
+        status = status_by_game.get(game, {})
+        row["pick_game_status"] = (
+            "Upcoming" if kickoff > now else
+            "In progress · saved pregame pick" if status.get("scores") else
+            "Started · awaiting game status · saved pregame pick"
+        )
+        saved[identity] = row
+    return pd.DataFrame(saved.values()), final_games
+
+
+def retain_nfl_picks(rows, archive_key, time_column="commence_time", identity_columns=(), now=None):
+    current = pd.Timestamp.now(tz="UTC") if now is None else pd.Timestamp(now)
+    previous = st.session_state.get(archive_key)
+    needs_status = False
+    for frame in (previous, rows):
+        if isinstance(frame, pd.DataFrame) and time_column in frame:
+            times = pd.to_datetime(frame[time_column], utc=True, errors="coerce")
+            needs_status = needs_status or bool((times <= current).any())
+    statuses = cached_nfl_pick_statuses(st.secrets.get("ODDS_API_KEY", st.secrets.get("THE_ODDS_API_KEY", ""))) if needs_status else []
+    final_key = archive_key + "_completed"
+    visible, completed = merge_nfl_saved_picks(previous, rows, time_column, identity_columns,
+        statuses, current, st.session_state.get(final_key, set()))
+    st.session_state[archive_key] = visible
+    st.session_state[final_key] = completed
+    return visible
+
+
 def rank_player_props(predictions):
     """Display ordering only; does not alter the prediction engine."""
     ranked=predictions.copy()
@@ -72,6 +152,7 @@ def render_nfl_player_props():
         "player-prop forecasts automatically."
     )
 
+    retain_nfl_picks(st.session_state.get("nfl_auto_prop_predictions"), "nfl_saved_prop_cards", "game_time", ("player", "market", "model_pick", "line"))
     if st.button(
         "⚡ Generate Top 10 NFL Player Props · Next 7 Days",
         key="generate_today_nfl_prop_predictions",
@@ -174,10 +255,8 @@ def render_nfl_player_props():
             )
 
     auto_prop_predictions=st.session_state.get('nfl_auto_prop_predictions') if st.session_state.get('nfl_prop_scan_scope')=='next_7_days_v1' else None
-    if isinstance(auto_prop_predictions,pd.DataFrame) and not auto_prop_predictions.empty and 'game_time' in auto_prop_predictions:
-        kickoff=pd.to_datetime(auto_prop_predictions['game_time'],utc=True,errors='coerce')
-        now=pd.Timestamp.now(tz='UTC')
-        auto_prop_predictions=auto_prop_predictions.loc[(kickoff>now)&(kickoff<=now+pd.Timedelta(days=7))].copy()
+    if auto_prop_predictions is not None or "nfl_saved_prop_cards" in st.session_state:
+        auto_prop_predictions = retain_nfl_picks(auto_prop_predictions, "nfl_saved_prop_cards", "game_time", ("player", "market", "model_pick", "line"))
     if auto_prop_predictions is None:
         st.info('Press Generate Top 10 to scan the next seven days. Ranked cards appear here; no game or player selection is required.')
     issues=st.session_state.get('nfl_week_prop_scan_issues',[])
@@ -199,11 +278,16 @@ def render_nfl_player_props():
 
         st.markdown("## 🏈 Top 10 NFL Player Props · Strongest First")
         st.caption("Ranked across players and markets by the engine’s existing model ranking score. Historical support is an estimate, not a calibrated win probability.")
-        ranked=rank_player_props(auto_prop_predictions)
+        kickoff = pd.to_datetime(auto_prop_predictions["game_time"], utc=True, errors="coerce")
+        started = auto_prop_predictions.loc[kickoff <= pd.Timestamp.now(tz="UTC")]
+        future = auto_prop_predictions.loc[kickoff > pd.Timestamp.now(tz="UTC")]
+        ranked = pd.concat([started, rank_player_props(future)], ignore_index=True)
+        st.caption("Saved picks for games in progress stay visible alongside the top upcoming picks until confirmed final.")
         for rank,(_,prop) in enumerate(ranked.iterrows(),1):
             with st.container(border=True):
                 st.markdown(f"### #{rank} · {prop['player']}")
                 st.caption(f"{prop.get('away_team','')} @ {prop.get('home_team','')}")
+                st.caption(prop.get("pick_game_status", "Upcoming"))
                 side=str(prop['model_pick'])
                 pick=side if side in ['YES','NO'] else f"{side} {float(prop['line']):g}"
                 st.write('**'+str(prop['market'])+' · '+pick+'**')
@@ -211,7 +295,7 @@ def render_nfl_player_props():
                 left.metric('Model ranking score',f"{float(prop['prediction_score'])*100:.1f}/100")
                 right.metric('Estimated historical support',f"{float(prop['historical_support']):.1%}")
                 st.caption(f"Projection: {float(prop['projected_value']):.1f} · historical sample: {int(prop.get('sample_size',0))} games")
-                if st.button('Record this player prop',key=f"nfl_ranked_prop_record_{rank}"):
+                if st.button('Record this player prop',key=f"nfl_ranked_prop_record_{rank}", disabled=pd.to_datetime(prop.get('game_time'),utc=True)<=pd.Timestamp.now(tz='UTC')):
                     st.session_state['bet_builder_mode']='Single'
                     st.session_state['single_sport']='NFL'
                     st.session_state['single_market']={'Passing yards':'Passing Yards','Rushing yards':'Rushing Yards','Receiving yards':'Receiving Yards','Receptions':'Receptions','Anytime touchdown':'Anytime Touchdown'}.get(prop['market'],'Other')
