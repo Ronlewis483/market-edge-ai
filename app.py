@@ -349,10 +349,59 @@ label:has(input:checked) p {
     font-weight: 700;
 }
 
+
+/* Presentation polish: keep native controls and all labels accessible. */
+:root { --me-panel: #121e31; --me-border: #2a3b55; --me-muted: #b6c4d8; }
+.stApp { background: radial-gradient(ellipse at top right, #152a43 0, #0b1220 42%); }
+.block-container { padding-top: 1.6rem; max-width: 1440px; }
+h1 { font-size: 2.05rem !important; line-height: 1.2 !important; }
+h2 { font-size: 1.55rem !important; line-height: 1.3 !important; }
+h3 { font-size: 1.18rem !important; line-height: 1.4 !important; }
+[data-testid="stCaptionContainer"] p { color: var(--me-muted) !important; line-height: 1.5; }
+section[data-testid="stSidebar"] { background: #101b2d; }
+section[data-testid="stSidebar"] .stButton > button { justify-content: flex-start; min-height: 44px; border-radius: 9px; background: transparent; border-color: transparent; }
+section[data-testid="stSidebar"] .stButton > button[kind="primary"] { background: #133d60; border: 1px solid #328ec4; border-left: 3px solid #54c5fa; }
+section[data-testid="stSidebar"] [data-testid="stCaptionContainer"] { margin-top: .55rem; }
+.stButton > button { transition: border-color .12s ease, background .12s ease; }
+.stButton > button[kind="primary"] { background: #0369a1; border: 1px solid #3199cf; box-shadow: 0 4px 16px #0003; }
+.stButton > button[kind="primary"]:hover { background: #075985; color: #fff; border-color: #7dd3fc; }
+button:focus-visible, input:focus-visible, summary:focus-visible { outline: 2px solid #7dd3fc !important; outline-offset: 3px; }
+[data-testid="stVerticalBlockBorderWrapper"] { border-color: var(--me-border) !important; border-radius: 14px !important; background: #101b2bcc; }
+[data-testid="stMetric"] { padding: 14px 16px; border-radius: 12px; background: #16243a; }
+[data-testid="stMetricLabel"] { color: #c1cee0; }
+[data-testid="stMetricValue"] { font-size: 1.75rem; }
+[data-testid="stExpander"] { border-radius: 11px; background: #101b2b; }
+[data-testid="stExpander"] summary { min-height: 46px; color: #e7effc; font-weight: 600; }
+[data-baseweb="tab-list"] { gap: .5rem; border-bottom: 1px solid var(--me-border); }
+[data-baseweb="tab"] { color: #c4d1e4; font-weight: 600; padding: .7rem 1rem; }
+[data-baseweb="tab"][aria-selected="true"] { color: #7dd3fc; background: #183650; border-radius: 8px 8px 0 0; }
+[data-testid="stAlert"] { border-radius: 10px; }
+hr { margin: 1.1rem 0; opacity: .7; }
+.me-confidence { display: inline-flex; align-items: center; gap: .7rem; font-size: .78rem; font-weight: 700; letter-spacing: .035em; padding: .45rem .7rem; border: 1px solid; border-radius: 8px; margin: .25rem 0 .7rem; }
+.me-confidence span { font-size: .9rem; letter-spacing: 0; }
+.me-strong { color: #9ce9c3; background: #113b31; border-color: #296b55; }
+.me-moderate { color: #a9daff; background: #173754; border-color: #2c638c; }
+.me-close { color: #f5d78d; background: #3b3020; border-color: #74603a; }
+@media (max-width: 760px) {
+ .block-container { padding: 1.1rem .9rem 2rem; }
+ h1 { font-size: 1.7rem !important; }
+ h2 { font-size: 1.3rem !important; }
+ [data-testid="stMetric"] { padding: 10px; }
+ [data-testid="stMetricValue"] { font-size: 1.35rem; }
+ .me-confidence { font-size: .7rem; gap: .4rem; }
+}
+@media (prefers-reduced-motion: reduce) { .stButton > button { transition: none; } }
+
     </style>
     """,
     unsafe_allow_html=True,
 )
+
+def render_confidence_badge(label, confidence):
+    from html import escape
+    tone = "strong" if confidence >= .70 else "moderate" if confidence >= .58 else "close"
+    st.markdown(f'<div class="me-confidence me-{tone}">{escape(label)} <span>{confidence:.1%}</span></div>', unsafe_allow_html=True)
+
 
 def render_league_prediction_results(
     league_name,
@@ -399,7 +448,7 @@ def render_league_prediction_results(
     with st.expander(
         f"{league_icon} Strongest {league_name} Team Picks "
         f"({prediction_count})",
-        expanded=league_name in ("NBA", "MLB"),
+        expanded=True,
     ):
         st.caption(
             "Model-generated win probabilities for upcoming games."
@@ -682,11 +731,7 @@ def render_league_prediction_results(
                                 f"{home_probability:.1%}",
                             )
 
-                            st.markdown(
-                                f"**{confidence_icon} "
-                                f"{confidence_label}** "
-                                f"• {confidence:.1%}"
-                            )
+                            render_confidence_badge(confidence_label, confidence)
 
                             with st.expander(
                                 "View model details"
@@ -759,51 +804,52 @@ def render_league_prediction_results(
                 hide_index=True,
             )
 
-st.title("📊 Market Edge AI — V5")
-
-# Supabase database connection test
-with st.expander("Database Connection Status"):
-    if st.button("Test Supabase Connection"):
-        success, message = test_connection()
-
-        
-        if success:
-            st.success(message)
-        else:
-            st.error("Database connection failed.")
-            st.error(f"Error details: {message}")
-            
-st.caption("Persistent validated model • lightweight daily inference • research/paper mode")
+# Connection diagnostics live in Research Lab below the sidebar routing.
 
 
 # ==========================================
 # MARKET EDGE AI — NAVIGATION V2
 # ==========================================
 
+def select_main_page(destination):
+    st.session_state["main_navigation"] = destination
+
+
 with st.sidebar:
-
     st.markdown("## ⚡ MARKET EDGE AI")
-    st.caption("Sports Intelligence & Trading")
-
-    st.divider()
-
-    
-    navigation_options = [
-        "🏠 Home", "🏈 NFL", "🏀 NBA", "⚾ MLB", "📈 Stocks",
-        "🎟️ My Bets", "📊 Performance", "🧪 Research Lab",
+    st.caption("Your sports & market dashboard")
+    navigation_groups = [
+        ("START", ["🏠 Home"]),
+        ("SPORTS", ["🏈 NFL", "🏀 NBA", "⚾ MLB"]),
+        ("MARKETS", ["📈 Stocks"]),
+        ("WORKSPACE", ["🎟️ My Bets", "📊 Performance", "🧪 Research Lab"]),
     ]
+    navigation_options = [item for _, items in navigation_groups for item in items]
     if st.session_state.get("main_navigation") not in navigation_options:
         st.session_state["main_navigation"] = "🏠 Home"
-    for destination in navigation_options:
-        if st.button(destination, key="nav_" + destination, use_container_width=True,
-                     type="primary" if st.session_state["main_navigation"] == destination else "secondary"):
-            st.session_state["main_navigation"] = destination
+    for group, destinations in navigation_groups:
+        st.caption(group)
+        for destination in destinations:
+            st.button(destination, key="nav_" + destination, use_container_width=True,
+                type="primary" if st.session_state["main_navigation"] == destination else "secondary",
+                on_click=select_main_page, args=(destination,))
     page = st.session_state["main_navigation"]
-
     st.divider()
+    st.caption("Calendar dates & game times shown in Central time")
 
-    st.caption("MARKET EDGE AI V5")
-    st.success("System Online")
+if page == "🧪 Research Lab":
+    with st.expander("Database Connection Status"):
+        if st.button("Test Supabase Connection"):
+            success, message = test_connection()
+
+
+            if success:
+                st.success(message)
+            else:
+                st.error("Database connection failed.")
+                st.error(f"Error details: {message}")
+
+
 
 default=clean_symbols(DEFAULT_UNIVERSE)
 
@@ -1278,7 +1324,7 @@ def render_mlb_prediction_center(location):
             attached = dict(st.session_state.get("mlb_live_pipeline_result") or {})
             attached.update(predictions=winners, opportunities=None)
             render_league_prediction_results("MLB", "⚾", attached)
-    generated = st.button("⚡ Generate MLB Predictions", key=location + "_generate", type="primary", use_container_width=True)
+    generated = st.button("⚾ Generate MLB Predictions · Next 7 Days", key=location + "_generate", type="primary", use_container_width=True)
     previous = st.session_state.get("mlb_live_pipeline_result")
     if previous:
         retain_sport_picks("MLB", previous.get("predictions", []))
@@ -1332,11 +1378,11 @@ def render_mlb_prediction_center(location):
 
 if page == "🏠 Home":
 
-    st.title("🏈 Sports Betting Center")
+    st.title("Your prediction hub")
 
     st.write(
-        "Find opportunities, review predictions, "
-        "and track your betting performance."
+        "Generate the next seven days of picks. Review winners, spreads and "
+        "player props together, then track your results in My Bets."
     )
 
 # ============================================
@@ -1357,7 +1403,7 @@ if page == "🏠 Home":
     )
     
     if st.button(
-        "⚡ Generate NFL Predictions · Next 7 Days",
+        "🏈 Generate NFL Predictions · Next 7 Days",
         key="generate_nfl_predictions_one_click",
         type="primary",
         use_container_width=True,
@@ -1552,7 +1598,7 @@ if page == "🏠 Home":
         with st.expander(
             f"🏈 Upcoming NFL Game Predictions "
             f"({prediction_count})",
-            expanded=False,
+            expanded=True,
         ):
 
             st.caption(
@@ -1710,7 +1756,6 @@ if page == "🏠 Home":
                                 "away_team"
                             ]
 
-                            st.caption(game.get("pick_game_status", "Upcoming"))
                             predicted_team = game[
                                 "predicted_team"
                             ]
@@ -1846,11 +1891,7 @@ if page == "🏠 Home":
                                     f"{home_probability:.1%}",
                                 )
 
-                                st.markdown(
-                                    f"**{confidence_icon} "
-                                    f"{confidence_label}** "
-                                    f"• {confidence:.1%}"
-                                )
+                                render_confidence_badge(confidence_label, confidence)
 
                                 with st.expander(
                                     "View model details"
@@ -1966,7 +2007,7 @@ if page in ["🏈 NFL", "🏀 NBA", "⚾ MLB"]:
             "model-vs-market opportunities."
         )
 
-        if st.button("⚡ Generate NFL Predictions", key="nfl_sidebar_generate", type="primary"):
+        if st.button("🏈 Generate NFL Predictions · Next 7 Days", key="nfl_sidebar_generate", type="primary"):
             try:
                 with st.spinner("Generating NFL predictions..."):
                     result = run_nfl_prediction_with_addons(
@@ -2012,7 +2053,7 @@ if page in ["🏈 NFL", "🏀 NBA", "⚾ MLB"]:
         )
 
         if st.button(
-            "⚡ Generate NBA Predictions",
+            "🏀 Generate NBA Predictions · Next 7 Days",
             key="sports_center_generate_nba",
             type="primary",
             use_container_width=True,
@@ -2081,15 +2122,16 @@ if page in ["🏈 NFL", "🏀 NBA", "⚾ MLB"]:
 if page == "🏠 Home":
 
     st.divider()
+    st.subheader("🏀 NBA Prediction Center")
     
     
     st.caption(
-        "Generate upcoming NBA game predictions and "
-        "analyze model-vs-market opportunities."
+        "Rank NBA games in the next seven days and review "
+        "player props beneath each matching game."
     )
     
     if st.button(
-        "⚡ Generate NBA Predictions",
+        "🏀 Generate NBA Predictions · Next 7 Days",
         key="generate_nba_predictions_one_click",
         type="primary",
         use_container_width=True,
