@@ -397,6 +397,33 @@ hr { margin: 1.1rem 0; opacity: .7; }
     unsafe_allow_html=True,
 )
 
+def prediction_date_groups(predictions, now=None):
+    """Today's eligible picks first; top ten from other upcoming dates, no overlap."""
+    if predictions is None or predictions.empty:
+        return []
+    current = pd.Timestamp.now(tz="UTC") if now is None else pd.Timestamp(now)
+    current = current.tz_localize("UTC") if current.tzinfo is None else current.tz_convert("UTC")
+    times = pd.to_datetime(predictions["commence_time"], utc=True, errors="coerce")
+    dates = times.dt.tz_convert("America/Chicago").dt.date
+    today = current.tz_convert("America/Chicago").date()
+    ranked = predictions.sort_values("confidence", ascending=False, kind="stable")
+    today_rows = ranked.loc[dates.loc[ranked.index] == today]
+    upcoming = ranked.loc[(dates.loc[ranked.index] != today) & (times.loc[ranked.index] > current) & (times.loc[ranked.index] <= current+pd.Timedelta(days=7))].head(10)
+    ongoing = ranked.loc[(dates.loc[ranked.index] != today) & (times.loc[ranked.index] <= current)]
+    return [
+        ("📅 TODAY'S PICKS · " + today.strftime("%b %d, %Y"), "Today's games, strongest picks first. Saved picks stay visible while games are in progress.", today_rows),
+        ("⭐ TOP 10 UPCOMING PICKS", "Strongest picks from the rest of the next seven days. Today's picks are shown above and are not repeated.", upcoming),
+        ("🔴 EARLIER GAMES STILL IN PROGRESS", "Saved original predictions awaiting a confirmed final.", ongoing),
+    ]
+
+
+def visible_prediction_rows(predictions):
+    if predictions is None or predictions.empty:
+        return predictions
+    groups = prediction_date_groups(predictions)
+    return pd.concat([rows for _, _, rows in groups], ignore_index=True)
+
+
 def render_confidence_badge(label, confidence):
     from html import escape
     tone = "strong" if confidence >= .70 else "moderate" if confidence >= .58 else "close"
@@ -422,13 +449,14 @@ def render_league_prediction_results(
     if pipeline_result is None:
         return
 
-    predictions = pipeline_result.get("predictions")
+    predictions = pipeline_result.get("all_predictions", pipeline_result.get("predictions"))
     opportunities = pipeline_result.get("opportunities")
     if league_name == "NFL":
         predictions = retain_nfl_picks(predictions, "nfl_saved_team_cards")
 
     if league_name in ("NBA", "MLB"):
-        predictions = retain_sport_picks(league_name, predictions)
+        predictions = retain_sport_picks(league_name, predictions, limit=None)
+    predictions = visible_prediction_rows(predictions)
     if predictions is None or predictions.empty:
         st.info(
             f"No upcoming {league_name} predictions are currently available."
@@ -511,36 +539,7 @@ def render_league_prediction_results(
             ascending=False,
         ).reset_index(drop=True)
 
-        confidence_groups = [
-            (
-                "🔥 HIGH CONFIDENCE PICKS",
-                "The model's strongest win-probability predictions.",
-                sorted_predictions[
-                    sorted_predictions["confidence"] >= 0.70
-                ],
-            ),
-            (
-                "⚡ MODERATE CONFIDENCE",
-                "The model has a meaningful preference, "
-                "but with less separation.",
-                sorted_predictions[
-                    (
-                        sorted_predictions["confidence"] >= 0.58
-                    )
-                    & (
-                        sorted_predictions["confidence"] < 0.70
-                    )
-                ],
-            ),
-            (
-                "⚖️ CLOSE MATCHUPS",
-                "Games where the model sees relatively "
-                "little separation.",
-                sorted_predictions[
-                    sorted_predictions["confidence"] < 0.58
-                ],
-            ),
-        ]
+        confidence_groups = prediction_date_groups(sorted_predictions)
 
         # ========================================
         # GAME CARDS
@@ -773,8 +772,8 @@ def render_league_prediction_results(
         st.markdown("---")
 
         st.caption(
-            "Predictions are ordered from highest to lowest "
-            "model confidence within each section. Confidence "
+            "Today’s picks appear first; the remaining upcoming picks are ranked by "
+            "model confidence. Confidence "
             "represents estimated win probability and does not "
             "by itself indicate betting value."
         )
@@ -948,6 +947,7 @@ def run_nba_prediction_with_props(progress_callback=None):
         predictions = predictions.copy()
         times = pd.to_datetime(predictions["commence_time"], utc=True, errors="coerce")
         eligible_predictions = predictions.loc[(times>now)&(times<=now+pd.Timedelta(days=7))].sort_values("confidence", ascending=False)
+        result["all_predictions"] = eligible_predictions.copy()
         predictions = eligible_predictions.head(10)
         result["predictions"] = predictions
         try:
@@ -1322,12 +1322,12 @@ def render_mlb_prediction_center(location):
         } for r in rows])
         with team_cards.container():
             attached = dict(st.session_state.get("mlb_live_pipeline_result") or {})
-            attached.update(predictions=winners, opportunities=None)
+            attached.update(predictions=winners, all_predictions=winners, opportunities=None)
             render_league_prediction_results("MLB", "⚾", attached)
     generated = st.button("⚾ Generate MLB Predictions · Next 7 Days", key=location + "_generate", type="primary", use_container_width=True)
     previous = st.session_state.get("mlb_live_pipeline_result")
     if previous:
-        retain_sport_picks("MLB", previous.get("predictions", []))
+        retain_sport_picks("MLB", previous.get("all_predictions", previous.get("predictions", [])), limit=None)
         remember_game_addons("MLB", previous)
     checked_at = pd.to_datetime(st.session_state.get("mlb_last_refresh_attempt"), utc=True, errors="coerce")
     refresh_due = bool(previous and (pd.isna(checked_at) or pd.Timestamp.now(tz="UTC")-checked_at >= pd.Timedelta(seconds=180)))
@@ -1362,7 +1362,7 @@ def render_mlb_prediction_center(location):
         st.info("The MLB pipeline was updated. Generate again to search the upcoming seven-day schedule.")
     if result:
         now = pd.Timestamp.now(tz="UTC")
-        rows = retain_sport_picks("MLB", result.get("predictions", [])).to_dict("records")
+        rows = retain_sport_picks("MLB", result.get("all_predictions", result.get("predictions", [])), limit=None).to_dict("records")
         if rows:
             show_team_cards(rows)
             st.caption("Picks are saved before first pitch. Confidence reflects the saved model; the 70% accuracy goal is not established.")
@@ -1578,7 +1578,7 @@ if page == "🏠 Home":
     
     if nfl_pipeline_result is not None:
     
-        predictions = retain_nfl_picks(nfl_pipeline_result.get("predictions"), "nfl_saved_team_cards")
+        predictions = visible_prediction_rows(retain_nfl_picks(nfl_pipeline_result.get("predictions"), "nfl_saved_team_cards"))
     
         opportunities = nfl_pipeline_result.get(
             "opportunities"
@@ -1675,34 +1675,7 @@ if page == "🏠 Home":
                 ascending=False,
             ).reset_index(drop=True)
 
-            confidence_groups = [
-                (
-                    "🔥 HIGH CONFIDENCE PICKS",
-                    "The model's strongest win-probability predictions.",
-                    sorted_predictions[
-                        sorted_predictions["confidence"] >= 0.70
-                    ],
-                ),
-                (
-                    "⚡ MODERATE CONFIDENCE",
-                    "The model has a meaningful preference, but with less separation.",
-                    sorted_predictions[
-                        (
-                            sorted_predictions["confidence"] >= 0.58
-                        )
-                        & (
-                            sorted_predictions["confidence"] < 0.70
-                        )
-                    ],
-                ),
-                (
-                    "⚖️ CLOSE MATCHUPS",
-                    "Games where the model sees relatively little separation.",
-                    sorted_predictions[
-                        sorted_predictions["confidence"] < 0.58
-                    ],
-                ),
-            ]
+            confidence_groups = prediction_date_groups(sorted_predictions)
 
             for (
                 group_title,
@@ -1939,8 +1912,8 @@ if page == "🏠 Home":
             st.markdown("---")
 
             st.caption(
-                "Predictions are ordered from highest to lowest "
-                "model confidence within each section. Confidence "
+                "Today’s picks appear first; the remaining upcoming picks are ranked by "
+                "model confidence. Confidence "
                 "represents estimated win probability and does not "
                 "by itself indicate betting value."
             )
