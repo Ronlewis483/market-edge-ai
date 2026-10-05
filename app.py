@@ -723,6 +723,8 @@ def render_league_prediction_results(
                                         f"{training_games}"
                                     )
 
+                            render_game_addons(league_name, game, pipeline_result)
+
         st.markdown("---")
 
         st.caption(
@@ -1045,7 +1047,7 @@ def cached_sport_pick_statuses(sport, api_key):
         return []
 
 
-def retain_sport_picks(league, rows, kind="teams", now=None):
+def retain_sport_picks(league, rows, kind="teams", now=None, limit=10):
     """Keep saved pregame cards through kickoff; retire only confirmed finals."""
     current = pd.Timestamp.now(tz="UTC") if now is None else pd.Timestamp(now)
     frame = rows.copy() if isinstance(rows, pd.DataFrame) else pd.DataFrame(rows or [])
@@ -1091,7 +1093,7 @@ def retain_sport_picks(league, rows, kind="teams", now=None):
     if score:
         future = future.sort_values(score, ascending=False, kind="stable")
     # Saved live cards cannot be displaced by the next batch of upcoming top-ten picks.
-    return pd.concat([live, future.head(10)], ignore_index=True)
+    return pd.concat([live, future if limit is None else future.head(limit)], ignore_index=True)
 
 
 def nfl_week_rows(rows, now=None):
@@ -1114,6 +1116,111 @@ def nfl_week_rows(rows, now=None):
     if len(identity) == 3:
         frame = frame.drop_duplicates(identity, keep="first")
     return frame.reset_index(drop=True)
+
+
+def run_nfl_prediction_with_addons(feature_games, historical_accuracy=None, historical_sample=None):
+    previous = st.session_state.get("nfl_prediction_pipeline_result") or {}
+    remember_game_addons("NFL", previous)
+    result = run_nfl_prediction_pipeline(feature_games=feature_games,
+        historical_accuracy=historical_accuracy, historical_sample=historical_sample)
+    try:
+        from dual_agent.game_prediction_addons import enhance_result
+        result = enhance_result("NFL", result, prediction_api_key("ODDS_API_KEY", "THE_ODDS_API_KEY"), feature_games)
+        st.session_state["nfl_auto_prop_predictions"] = result.get("nfl_player_props", pd.DataFrame())
+        st.session_state["nfl_prop_scan_scope"] = "next_7_days_v1"
+    except ImportError:
+        result["prop_issues"] = ["Deploy dual_agent/game_prediction_addons.py to enable automatic props and spreads."]
+    remember_game_addons("NFL", result)
+    return result
+
+
+def remember_game_addons(league, result):
+    """Seed frozen pregame attachments before a rescan replaces the result."""
+    if league == "NFL":
+        retain_nfl_picks(result.get("nfl_player_props"), "nfl_saved_prop_cards", "game_time", ("player", "market", "model_pick", "line"))
+        spread_rows = pd.DataFrame(result.get("spreads", {}).get("picks", []))
+        retain_nfl_picks(spread_rows, "nfl_saved_spread_cards")
+    else:
+        props = result.get("player_props", {})
+        retain_sport_picks(league, props.get("game_picks", props.get("picks", [])), kind="props", limit=None)
+        if league == "MLB":
+            retain_sport_picks(league, result.get("spreads", {}).get("picks", []), kind="spreads", limit=None)
+
+
+def render_game_addons(league, game, result):
+    """Place independently estimated spreads and eligible props inside their game."""
+    if league not in ("NFL", "MLB", "NBA"):
+        return
+    try:
+        from dual_agent.game_prediction_addons import matching_game_rows
+    except ImportError:
+        st.caption("Deploy game_prediction_addons.py to show this game's spreads and props.")
+        return
+    remember_game_addons(league, result or {})
+    spread_key = "nfl_saved_spread_cards" if league == "NFL" else "mlb_saved_spreads_cards"
+    if league in ("NFL", "MLB"):
+        spreads = matching_game_rows(game, st.session_state.get(spread_key))
+        with st.expander("📏 Spread prediction" if league == "NFL" else "📏 Run-line prediction", expanded=False):
+            if spreads:
+                spread = spreads[0]
+                kickoff = pd.to_datetime(spread["commence_time"], utc=True, errors="coerce")
+                captured = pd.to_datetime(spread.get("captured_at"), utc=True, errors="coerce")
+                current = pd.Timestamp.now(tz="UTC")
+                fresh = pd.notna(captured) and pd.Timedelta(0) <= current-captured <= pd.Timedelta(minutes=30)
+                if kickoff <= current or fresh:
+                    st.markdown(f"**{spread['spread_team']} {spread['spread_line']:+g}**")
+                    st.metric("Estimated cover chance · excludes pushes", f"{spread['cover_chance']:.1%}")
+                    st.caption(f"Push chance {spread['push_chance']:.1%} · {spread['books']} sportsbooks at this line")
+                    st.caption(f"Projected home margin: {spread['projected_home_margin']:+.1f}")
+                    st.caption("New spread estimate; accuracy is not established. " + spread["method"] + ".")
+                else:
+                    st.info("Spread line is stale. Generate again for a fresh estimate.")
+            else:
+                reasons = (result or {}).get("spreads", {}).get("issues", [])
+                text = next((r for r in reasons if str(game.get("away_team", "")) in r and str(game.get("home_team", "")) in r), None)
+                st.info(text or (reasons[0] if reasons and len(reasons)==1 else "No eligible spread estimate: two fresh matching books and complete model inputs are required."))
+    props_key = "nfl_saved_prop_cards" if league == "NFL" else f"{league.lower()}_saved_props_cards"
+    props = matching_game_rows(game, st.session_state.get(props_key))
+    score = "prediction_score" if league == "NFL" else "Estimated chance"
+    props = sorted(props, key=lambda row: -float(row.get(score, 0)))[:10]
+    with st.expander(f"🎯 Player props for this game ({len(props)})", expanded=False):
+        if not props:
+            issues = (result or {}).get("prop_issues", []) if league == "NFL" else (result or {}).get("player_props", {}).get("errors", [])
+            st.info("No eligible player props for this matchup yet. Offered lines and the existing history and sportsbook guards are still required.")
+            if issues and league == "NFL":
+                matching = [issue for issue in issues if str(game.get("home_team", "")) in issue and str(game.get("away_team", "")) in issue]
+                for issue in matching or issues[:1]:
+                    st.caption(str(issue))
+        for rank, prop in enumerate(props, 1):
+            with st.container(border=True):
+                if league == "NFL":
+                    side = str(prop["model_pick"])
+                    pick = side if side in ("YES", "NO") else f"{side} {float(prop['line']):g}"
+                    st.markdown(f"**#{rank} · {prop['player']} · {pick} {prop['market']}**")
+                    st.caption(f"Model ranking score {float(prop['prediction_score'])*100:.1f}/100 · historical support {float(prop['historical_support']):.1%}")
+                    st.caption(f"Projection {float(prop['projected_value']):.1f} · {int(prop.get('sample_size', 0))} prior games")
+                    # Keep the existing manual bet-record workflow available.
+                    import hashlib
+                    identity = "|".join(str(prop.get(c, "")) for c in ("event_id", "game_time", "player", "market", "model_pick", "line"))
+                    button_key = "attached_nfl_prop_" + hashlib.sha256(identity.encode()).hexdigest()[:20]
+                    kickoff = pd.to_datetime(prop.get("game_time"), utc=True, errors="coerce")
+                    if st.button("Record this player prop", key=button_key, disabled=pd.isna(kickoff) or kickoff <= pd.Timestamp.now(tz="UTC")):
+                        st.session_state.update({"bet_builder_mode": "Single", "single_sport": "NFL",
+                            "single_market": {"Passing yards":"Passing Yards", "Rushing yards":"Rushing Yards", "Receiving yards":"Receiving Yards", "Receptions":"Receptions", "Anytime touchdown":"Anytime Touchdown"}.get(prop["market"], "Other"),
+                            "single_player": str(prop["player"]), "single_team": "", "single_direction": {"OVER":"Over", "UNDER":"Under", "YES":"Yes", "NO":"No"}.get(side.upper(), "Other"),
+                            "single_line": float(prop["line"]), "single_description": f"{prop['player']} {pick} {prop['market']} — {prop.get('away_team', '')} @ {prop.get('home_team', '')}", "main_navigation": "🎟️ My Bets"})
+                        st.rerun()
+                else:
+                    st.markdown(f"**#{rank} · {prop['Player']} · {prop['Pick']} {prop['Line']:g} {prop['Market']}**")
+                    st.caption(f"Estimated chance {prop['Estimated chance']:.1%} · projection {prop['Projected stat']:.1f} · {prop['Prior games']} prior appearances · {prop['Books']} books")
+                    participation = prop.get("Participation status")
+                    if participation:
+                        st.caption(participation)
+                        if participation not in ("Confirmed lineup", "Recorded starter"):
+                            st.warning("Provisional participation—recheck the lineup or starter.")
+                st.caption(prop.get("pick_game_status", "Upcoming"))
+        if props:
+            st.caption("Ordered from strongest to weakest within this game. Prop estimates and ranking scores are not calibrated future probabilities.")
 
 
 def nfl_prediction_features():
@@ -1154,6 +1261,7 @@ def render_mlb_prediction_center(location):
     team_cards = st.empty()
     def show_team_cards(rows):
         winners = pd.DataFrame([{
+            **r,
             "home_team": r.get("Home", r.get("home_team")),
             "away_team": r.get("Away", r.get("away_team")),
             "predicted_team": r.get("Predicted winner", r.get("predicted_team")),
@@ -1167,12 +1275,14 @@ def render_mlb_prediction_center(location):
             "Captured UTC": r.get("Captured UTC"),
         } for r in rows])
         with team_cards.container():
-            render_league_prediction_results("MLB", "⚾", {"predictions": winners, "opportunities": None})
+            attached = dict(st.session_state.get("mlb_live_pipeline_result") or {})
+            attached.update(predictions=winners, opportunities=None)
+            render_league_prediction_results("MLB", "⚾", attached)
     generated = st.button("⚡ Generate MLB Predictions", key=location + "_generate", type="primary", use_container_width=True)
     previous = st.session_state.get("mlb_live_pipeline_result")
     if previous:
         retain_sport_picks("MLB", previous.get("predictions", []))
-        retain_sport_picks("MLB", previous.get("player_props", {}).get("picks", []), kind="props")
+        remember_game_addons("MLB", previous)
     checked_at = pd.to_datetime(st.session_state.get("mlb_last_refresh_attempt"), utc=True, errors="coerce")
     refresh_due = bool(previous and (pd.isna(checked_at) or pd.Timestamp.now(tz="UTC")-checked_at >= pd.Timedelta(seconds=180)))
     st.caption("After generation, lineups, starters and available props refresh every three minutes while this screen stays open.")
@@ -1189,6 +1299,11 @@ def render_mlb_prediction_center(location):
                     odds_key = None
             status = st.empty()
             result = pipeline.run_mlb_prediction_pipeline(api_key=odds_key, progress=status.info, on_team_predictions=show_team_cards, force_refresh=True)
+            try:
+                from dual_agent.game_prediction_addons import enhance_result
+                result = enhance_result("MLB", result, odds_key)
+            except ImportError:
+                result["spreads"] = {"picks": [], "issues": ["Deploy dual_agent/game_prediction_addons.py for run-line predictions."]}
             result["pipeline_version"] = pipeline.MLB_PIPELINE_VERSION
             st.session_state["mlb_live_pipeline_result"] = result
             status.success(result["message"])
@@ -1209,7 +1324,7 @@ def render_mlb_prediction_center(location):
             st.info(result.get("message", "No fresh upcoming predictions. Generate again to collect current game information."))
             if result.get("scheduled_games"):
                 st.dataframe(pd.DataFrame(result["scheduled_games"]), use_container_width=True, hide_index=True)
-        render_player_prop_picks("MLB", result)
+        st.caption("Player props and run-line estimates are attached to their matching game cards.")
         last_capture = pd.to_datetime(result.get("created_at"), utc=True, errors="coerce")
         if pd.notna(last_capture):
             st.caption("Last successful refresh: " + last_capture.tz_convert("America/Chicago").strftime("%b %d · %-I:%M %p CT"))
@@ -1355,7 +1470,7 @@ if page == "🏠 Home":
             ):
     
                 nfl_pipeline_result = (
-                    run_nfl_prediction_pipeline(
+                    run_nfl_prediction_with_addons(
                         feature_games=feature_games,
                         historical_accuracy=st.session_state.get(
                             "nfl_historical_accuracy"
@@ -1778,6 +1893,8 @@ if page == "🏠 Home":
                                             f"{training_games}"
                                         )
 
+                                render_game_addons("NFL", game, nfl_pipeline_result)
+
             st.markdown("---")
 
             st.caption(
@@ -1819,7 +1936,7 @@ if page == "🏠 Home":
 # ============================================
 
 if page == "🏠 Home":
-    render_nfl_player_props()
+    st.caption("NFL props and spread estimates load with the game predictions and appear inside each game card.")
 
 
 # ============================================
@@ -1852,7 +1969,7 @@ if page in ["🏈 NFL", "🏀 NBA", "⚾ MLB"]:
         if st.button("⚡ Generate NFL Predictions", key="nfl_sidebar_generate", type="primary"):
             try:
                 with st.spinner("Generating NFL predictions..."):
-                    result = run_nfl_prediction_pipeline(
+                    result = run_nfl_prediction_with_addons(
                         feature_games=nfl_prediction_features(),
                         historical_accuracy=st.session_state.get("nfl_historical_accuracy"),
                         historical_sample=st.session_state.get("nfl_historical_sample"),
@@ -1877,11 +1994,7 @@ if page in ["🏈 NFL", "🏀 NBA", "⚾ MLB"]:
             pipeline_result=nfl_result,
         )
 
-        with st.expander(
-            "🎯 NFL Player Prop Predictions",
-            expanded=False,
-        ):
-            render_nfl_player_props()
+        st.caption("Player props load automatically inside their matching game cards.")
 
     # ========================================
     # NBA
@@ -1950,7 +2063,7 @@ if page in ["🏈 NFL", "🏀 NBA", "⚾ MLB"]:
             league_icon="🏀",
             pipeline_result=nba_result,
         )
-        render_player_prop_picks("NBA", nba_result)
+        # NBA props are attached to matching game cards.
 
     # ========================================
     # MLB
@@ -2026,7 +2139,7 @@ nba_pipeline_result = st.session_state.get(
 
 if page == "🏠 Home" and nba_pipeline_result is not None:
     render_league_prediction_results("NBA", "🏀", nba_pipeline_result)
-    render_player_prop_picks("NBA", nba_pipeline_result)
+    # NBA props are attached to matching game cards.
 
 
 if page == "🏈 NFL":
@@ -2080,7 +2193,7 @@ if page == "🏈 NFL":
 
 
     if show_today:
-        render_nfl_player_props()
+        st.caption("Use Generate NFL Predictions above for winners, spreads and automatic player props.")
         st.divider()
         st.subheader("Today's Picks")
 
