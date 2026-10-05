@@ -248,7 +248,7 @@ def automatic_nfl_props(predictions, key):
 def enhance_result(league, result, key, history=None):
     """Failures in add-ons never discard working winner predictions."""
     result = dict(result)
-    predictions = result.get('predictions')
+    predictions = result.get('all_predictions', result.get('predictions'))
     if not records(predictions):
         return result
     try:
