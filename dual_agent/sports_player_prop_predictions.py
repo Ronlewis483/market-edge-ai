@@ -349,6 +349,6 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
         key=(pick['Game'],pick['start_time'],pick['Player'],pick['Market'])
         if key not in seen:
             seen.add(key);chosen.append(pick)
-        if len(chosen)==10:break
-    return {'picks':chosen,'errors':errors, **({'exclusions': exclusions, 'quoted_candidates':len(groups)} if league=='MLB' else {}), 'message':f'{len(chosen)} player-prop estimates ranked from actual lines and prior appearances.',
+        # Retain eligible picks for every matchup; the global list stays top ten.
+    return {'picks':chosen[:10],'game_picks':chosen,'errors':errors, **({'exclusions': exclusions, 'quoted_candidates':len(groups)} if league=='MLB' else {}), 'message':f'{len(chosen)} player-prop estimates ranked from actual lines and prior appearances.',
             'note':'Estimated chance is conditional on no push and player participation. Estimates are not calibrated; no availability or injury clearance is implied.'}
