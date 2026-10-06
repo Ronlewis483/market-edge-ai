@@ -1229,13 +1229,13 @@ def render_game_addons(league, game, result):
                  or len(p.get("sportsbook_offers", [])) >= 1]
     score = "historical_support" if league == "NFL" else "Estimated chance"
     value_key = "estimated_return_per_unit" if league == "NFL" else "Estimated return per unit"
-    props = [p for p in props if float(p.get(score, 0)) >= .65 and float(p.get(value_key, 0)) > 0]
-    props = sorted(props, key=lambda row: (-float(row[value_key]), -float(row.get(score, 0))))[:10]
+    props = [p for p in props if float(p.get(score, 0)) >= .65]
+    props = sorted(props, key=lambda row: (-float(row.get(score, 0)), -float(row[value_key])))[:10]
     with st.expander(f"🎯 Player props for this game ({len(props)})", expanded=False):
         st.caption("Minimum 65% estimated cover chance · exact bet offered by a sportsbook")
         if not props:
             issues = (result or {}).get("prop_issues", []) if league == "NFL" else (result or {}).get("player_props", {}).get("errors", [])
-            st.info("No eligible player props for this matchup yet. A listed exact bet, at least 65% estimated cover chance, positive estimated return and usable history are required.")
+            st.info("No eligible player props for this matchup yet. A listed exact bet, at least 65% estimated cover chance, usable history are required.")
             if issues and league == "NFL":
                 matching = [issue for issue in issues if str(game.get("home_team", "")) in issue and str(game.get("away_team", "")) in issue]
                 for issue in matching or issues[:1]:
