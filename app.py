@@ -1226,13 +1226,16 @@ def render_game_addons(league, game, result):
     if league == "NFL":
         current = pd.Timestamp.now(tz="UTC")
         props = [p for p in props if pd.to_datetime(p.get("game_time"), utc=True, errors="coerce") <= current
-                 or len(p.get("sportsbook_offers", [])) >= 2]
-    score = "prediction_score" if league == "NFL" else "Estimated chance"
-    props = sorted(props, key=lambda row: -float(row.get(score, 0)))[:10]
+                 or len(p.get("sportsbook_offers", [])) >= 1]
+    score = "historical_support" if league == "NFL" else "Estimated chance"
+    value_key = "estimated_return_per_unit" if league == "NFL" else "Estimated return per unit"
+    props = [p for p in props if float(p.get(score, 0)) >= .65 and float(p.get(value_key, 0)) > 0]
+    props = sorted(props, key=lambda row: (-float(row[value_key]), -float(row.get(score, 0))))[:10]
     with st.expander(f"🎯 Player props for this game ({len(props)})", expanded=False):
+        st.caption("Minimum 65% estimated cover chance · exact bet offered by a sportsbook")
         if not props:
             issues = (result or {}).get("prop_issues", []) if league == "NFL" else (result or {}).get("player_props", {}).get("errors", [])
-            st.info("No eligible player props for this matchup yet. Offered lines and the existing history and sportsbook guards are still required.")
+            st.info("No eligible player props for this matchup yet. A listed exact bet, at least 65% estimated cover chance, positive estimated return and usable history are required.")
             if issues and league == "NFL":
                 matching = [issue for issue in issues if str(game.get("home_team", "")) in issue and str(game.get("away_team", "")) in issue]
                 for issue in matching or issues[:1]:
@@ -1245,7 +1248,12 @@ def render_game_addons(league, game, result):
                     st.markdown(f"**#{rank} · {prop['player']} · {pick} {prop['market']}**")
                     st.caption(f"Model ranking score {float(prop['prediction_score'])*100:.1f}/100 · historical support {float(prop['historical_support']):.1%}")
                     st.caption(f"Projection {float(prop['projected_value']):.1f} · {int(prop.get('sample_size', 0))} prior games")
+                    st.caption(f"Estimated cover chance {float(prop['historical_support']):.1%} · historical estimate, not calibrated")
+                    if prop.get("best_sportsbook"):
+                        st.caption(f"Best available odds: {prop['best_sportsbook']} · {float(prop['best_american_odds']):+g}")
                     offers = prop.get("sportsbook_offers", [])
+                    if len(offers) == 1:
+                        st.caption("Single-book listing · no cross-book confirmation")
                     if offers:
                         st.caption("Offered at: " + ", ".join(str(o['bookmaker_key']) + " (" + format(float(o['american_odds']), '+g') + ")" for o in offers))
                     # Keep the existing manual bet-record workflow available.
@@ -1262,6 +1270,8 @@ def render_game_addons(league, game, result):
                 else:
                     st.markdown(f"**#{rank} · {prop['Player']} · {prop['Pick']} {prop['Line']:g} {prop['Market']}**")
                     st.caption(f"Estimated chance {prop['Estimated chance']:.1%} · projection {prop['Projected stat']:.1f} · {prop['Prior games']} prior appearances · {prop['Books']} books")
+                    if prop.get("Best sportsbook"):
+                        st.caption(f"Best available odds: {prop['Best sportsbook']} · decimal odds {float(prop['Best decimal odds']):.2f}")
                     participation = prop.get("Participation status")
                     if participation:
                         st.caption(participation)
