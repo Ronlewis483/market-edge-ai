@@ -397,9 +397,12 @@ def run_nfl_player_prop_prediction_pipeline(
     )
 
     if consensus_props.empty:
-        return pd.DataFrame()
+        empty = pd.DataFrame()
+        empty.attrs['reason'] = 'Offered lines were returned, but none had a usable side, price and quote updated within 30 minutes.'
+        return empty
 
     rows = []
+    exclusions = {'insufficient_history': 0, 'unoffered_direction': 0, 'below_65_percent': 0}
 
     for _, prop in (
         consensus_props.iterrows()
@@ -452,6 +455,7 @@ def run_nfl_player_prop_prediction_pipeline(
         )
 
         if games.empty:
+            exclusions['insufficient_history'] += 1
             continue
 
         values = (
@@ -468,11 +472,13 @@ def run_nfl_player_prop_prediction_pipeline(
         )
 
         if estimate is None:
+            exclusions['insufficient_history'] += 1
             continue
 
         # A model direction is actionable only if books actually sell that bet.
         offered = prop['offered_sides'].get(estimate['model_pick'], [])
         if not offered:
+            exclusions['unoffered_direction'] += 1
             continue
 
         # Avoid displaying extremely weak
@@ -483,6 +489,7 @@ def run_nfl_player_prop_prediction_pipeline(
             ]
             < 0.65
         ):
+            exclusions['below_65_percent'] += 1
             continue
 
         if (
@@ -501,6 +508,12 @@ def run_nfl_player_prop_prediction_pipeline(
             return 1 + price/100 if price > 0 else 1 + 100/abs(price)
         best_offer = max(offered, key=decimal_price)
         best_decimal = decimal_price(best_offer)
+        push_chance = 0.0 if market == 'Anytime touchdown' else float(np.mean(values == float(line)))
+        expected_return = (1-push_chance) * (estimate['historical_support'] * best_decimal - 1)
+        # Value breaks probability ties; it does not veto a qualifying offered bet.
+        if not np.isfinite(expected_return):
+            continue
+
 
 
         if score >= 0.70:
@@ -574,7 +587,9 @@ def run_nfl_player_prop_prediction_pipeline(
                 "best_american_odds": best_offer['american_odds'],
                 "best_decimal_odds": best_decimal,
                 "estimated_cover_chance": estimate['historical_support'],
-                "estimated_return_per_unit": estimate['historical_support'] * best_decimal - 1,
+                "estimated_return_per_unit": expected_return,
+                "estimated_push_chance": push_chance,
+                "break_even_cover_chance": 1/best_decimal,
                 "availability_checked_at": current_time.isoformat(),
                 "confidence_group":
                     confidence_group,
@@ -586,6 +601,7 @@ def run_nfl_player_prop_prediction_pipeline(
     )
 
     if results.empty:
+        results.attrs['exclusions'] = exclusions
         return results
 
         # ----------------------------------------------------------
@@ -597,7 +613,7 @@ def run_nfl_player_prop_prediction_pipeline(
         .sort_values(
             [
                 "historical_support",
-                "best_decimal_odds",
+                "estimated_return_per_unit",
                 "sample_size",
             ],
             ascending=[
@@ -629,7 +645,7 @@ def run_nfl_player_prop_prediction_pipeline(
         .sort_values(
             [
                 "historical_support",
-                "best_decimal_odds",
+                "estimated_return_per_unit",
                 "sample_size",
             ],
             ascending=[
@@ -693,7 +709,7 @@ def run_nfl_player_prop_prediction_pipeline(
             [
                 "player_rank",
                 "historical_support",
-                "best_decimal_odds",
+                "estimated_return_per_unit",
                 "sample_size",
             ],
             ascending=[
@@ -733,15 +749,15 @@ def run_nfl_player_prop_prediction_pipeline(
     )
 
     # ----------------------------------------------------------
-    # FINAL ORDER: compare all bet types using the same cover estimate.
+    # FINAL ORDER: rank cover chance across all bet types, with value breaking ties.
     # Player grouping must not put a weaker yards bet above a stronger NO TD bet.
     top_player_props = top_player_props.sort_values(
-        ['historical_support', 'best_decimal_odds', 'sample_size'],
+        ['historical_support', 'estimated_return_per_unit', 'sample_size'],
         ascending=[False, False, False], kind='stable',
     ).reset_index(drop=True)
     top_player_props['prop_rank'] = range(1, len(top_player_props) + 1)
     top_player_props['selection_reason'] = (
-        'Ranked by estimated cover chance, then actual offered payout; '
+        'Ranked by estimated cover chance, then listed-odds value;  '
         'minimum 65%, exact recommended side listed at a sportsbook.'
     )
 
