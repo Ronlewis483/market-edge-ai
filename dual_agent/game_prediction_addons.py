@@ -239,6 +239,15 @@ def automatic_nfl_props(predictions, key):
                 window=12, max_results=200, horizon_days=7)
             if not props.empty:
                 forecasts.append(props)
+            else:
+                event = next((e for e in selected if e['id'] == event_id), {})
+                counts = props.attrs.get('exclusions', {})
+                reason = props.attrs.get('reason') or (
+                    f"No qualifying offered bets: {counts.get('below_65_percent', 0)} below 65%, "
+                    f"{counts.get('unoffered_direction', 0)} model sides not offered, "
+                    f"{counts.get('insufficient_history', 0)} with insufficient usable history."
+                )
+                issues.append(f"{event.get('away_team')} @ {event.get('home_team')}: {reason}")
         except Exception as exc:
             event = next((e for e in selected if e['id'] == event_id), {})
             issues.append(f"{event.get('away_team')} @ {event.get('home_team')}: prop model unavailable ({type(exc).__name__}).")
