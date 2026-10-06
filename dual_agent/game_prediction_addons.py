@@ -211,6 +211,8 @@ def automatic_nfl_props(predictions, key):
     selected = [event for event in upcoming_week_events(cached_events(key), now)
                 if len(matching_game_rows(event, predicted)) == 1]
     frames, issues = [], []
+    if not selected:
+        return pd.DataFrame(), ['No upcoming sportsbook events matched the generated game cards. No player-prop requests were made.']
     def load(event):
         data, _ = cached_props(key, event['id'], tuple(MARKETS.values()))
         return normalize_props(data)
@@ -229,6 +231,9 @@ def automatic_nfl_props(predictions, key):
     if not frames:
         return pd.DataFrame(), issues
     history = cached_player_history((2025, 2026))
+    if history is None or len(history) == 0:
+        return pd.DataFrame(), [f"{e.get('away_team')} @ {e.get('home_team')}: sportsbook props were found, but NFL player history is empty. Check the player-history data source." for e in selected]
+
     # The existing pipeline selects its top players internally. Run that same
     # equation per event so the slate-wide player limit cannot starve a game.
     forecasts = []
@@ -242,11 +247,17 @@ def automatic_nfl_props(predictions, key):
             else:
                 event = next((e for e in selected if e['id'] == event_id), {})
                 counts = props.attrs.get('exclusions', {})
+                known_markets = set(MARKETS.values())
+                unsupported = sorted(set(group['market_key'].dropna()) - known_markets) if 'market_key' in group else ['missing market_key']
+
                 reason = props.attrs.get('reason') or (
                     f"No qualifying offered bets: {counts.get('below_65_percent', 0)} below 65%, "
                     f"{counts.get('unoffered_direction', 0)} model sides not offered, "
                     f"{counts.get('insufficient_history', 0)} with insufficient usable history."
                 )
+                if unsupported:
+                    reason += ' Unsupported market keys: ' + ', '.join(unsupported)
+                reason += f" Feed returned {len(group)} listings for {group['player'].nunique() if 'player' in group else 0} players."
                 issues.append(f"{event.get('away_team')} @ {event.get('home_team')}: {reason}")
         except Exception as exc:
             event = next((e for e in selected if e['id'] == event_id), {})
