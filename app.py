@@ -1223,6 +1223,10 @@ def render_game_addons(league, game, result):
                 st.info(text or (reasons[0] if reasons and len(reasons)==1 else "No eligible spread estimate: two fresh matching books and complete model inputs are required."))
     props_key = "nfl_saved_prop_cards" if league == "NFL" else f"{league.lower()}_saved_props_cards"
     props = matching_game_rows(game, st.session_state.get(props_key))
+    if league == "NFL":
+        current = pd.Timestamp.now(tz="UTC")
+        props = [p for p in props if pd.to_datetime(p.get("game_time"), utc=True, errors="coerce") <= current
+                 or len(p.get("sportsbook_offers", [])) >= 2]
     score = "prediction_score" if league == "NFL" else "Estimated chance"
     props = sorted(props, key=lambda row: -float(row.get(score, 0)))[:10]
     with st.expander(f"🎯 Player props for this game ({len(props)})", expanded=False):
@@ -1241,6 +1245,9 @@ def render_game_addons(league, game, result):
                     st.markdown(f"**#{rank} · {prop['player']} · {pick} {prop['market']}**")
                     st.caption(f"Model ranking score {float(prop['prediction_score'])*100:.1f}/100 · historical support {float(prop['historical_support']):.1%}")
                     st.caption(f"Projection {float(prop['projected_value']):.1f} · {int(prop.get('sample_size', 0))} prior games")
+                    offers = prop.get("sportsbook_offers", [])
+                    if offers:
+                        st.caption("Offered at: " + ", ".join(str(o['bookmaker_key']) + " (" + format(float(o['american_odds']), '+g') + ")" for o in offers))
                     # Keep the existing manual bet-record workflow available.
                     import hashlib
                     identity = "|".join(str(prop.get(c, "")) for c in ("event_id", "game_time", "player", "market", "model_pick", "line"))
