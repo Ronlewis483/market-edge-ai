@@ -398,22 +398,18 @@ hr { margin: 1.1rem 0; opacity: .7; }
 )
 
 def prediction_date_groups(predictions, now=None):
-    """Today's eligible picks first; top ten from other upcoming dates, no overlap."""
+    """Rank the full visible slate: strongest ten first, then every remaining pick."""
     if predictions is None or predictions.empty:
         return []
     current = pd.Timestamp.now(tz="UTC") if now is None else pd.Timestamp(now)
     current = current.tz_localize("UTC") if current.tzinfo is None else current.tz_convert("UTC")
     times = pd.to_datetime(predictions["commence_time"], utc=True, errors="coerce")
-    dates = times.dt.tz_convert("America/Chicago").dt.date
-    today = current.tz_convert("America/Chicago").date()
-    ranked = predictions.sort_values("confidence", ascending=False, kind="stable")
-    today_rows = ranked.loc[dates.loc[ranked.index] == today]
-    upcoming = ranked.loc[(dates.loc[ranked.index] != today) & (times.loc[ranked.index] > current) & (times.loc[ranked.index] <= current+pd.Timedelta(days=7))].head(10)
-    ongoing = ranked.loc[(dates.loc[ranked.index] != today) & (times.loc[ranked.index] <= current)]
+    # Retention already removes confirmed finals. Keep saved active games as well.
+    visible = predictions.loc[times.notna() & (times <= current + pd.Timedelta(days=7))]
+    ranked = visible.sort_values("confidence", ascending=False, kind="stable")
     return [
-        ("📅 TODAY'S PICKS · " + today.strftime("%b %d, %Y"), "Today's games, strongest picks first. Saved picks stay visible while games are in progress.", today_rows),
-        ("⭐ TOP 10 UPCOMING PICKS", "Strongest picks from the rest of the next seven days. Today's picks are shown above and are not repeated.", upcoming),
-        ("🔴 EARLIER GAMES STILL IN PROGRESS", "Saved original predictions awaiting a confirmed final.", ongoing),
+        ("⭐ TOP 10 STRONGEST PICKS", "The highest-confidence predictions across the league's seven-day slate, ranked strongest first. Saved active picks remain visible until final.", ranked.iloc[:10]),
+        ("🏟️ ALL REMAINING GAME PICKS", "Every other available prediction, ranked by confidence. Games above are not repeated.", ranked.iloc[10:]),
     ]
 
 
