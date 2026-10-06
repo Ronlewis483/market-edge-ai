@@ -343,12 +343,16 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
                 if not available:
                     continue
                 best = max(available, key=lambda q:q[price_key])
+                push_chance = estimate['Historical pushes']/estimate['Prior games']
+                expected_return = (1-push_chance)*(estimate['Estimated chance']*best[price_key]-1)
+                if not np.isfinite(expected_return):
+                    continue
                 picks.append({'Player':player,'Market':MARKETS[league][market][0],'Pick':side,'Line':line,
-                              'Market chance':market_p,'Best sportsbook':best['book'],'Best decimal odds':best[price_key], 'Estimated return per unit':estimate['Estimated chance']*best[price_key]-1,'Books':len(unique),'Game':first['away_team']+' @ '+first['home_team'],
+                              'Market chance':market_p,'Best sportsbook':best['book'],'Best decimal odds':best[price_key], 'Estimated return per unit':expected_return,'Break-even cover chance':1/best[price_key],'Estimated push chance':push_chance,'Books':len(unique),'Game':first['away_team']+' @ '+first['home_team'],
                               'start_time':first['start_time'],'Captured UTC':first['capture_time'],
                               **({'Participation status': participation, 'Event match': first.get('Event match')} if league=='MLB' else {}), **estimate})
     # One side of one line per player/market/game; avoid ranking duplicate books or alternatives.
-    picks.sort(key=lambda r:(-r['Estimated chance'],-r['Best decimal odds'],-r['Prior games'],r['Player']))
+    picks.sort(key=lambda r:(-r['Estimated chance'],-r['Estimated return per unit'],-r['Prior games'],r['Player']))
     seen=set(); chosen=[]
     for pick in picks:
         key=(pick['Game'],pick['start_time'],pick['Player'],pick['Market'])
