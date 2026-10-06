@@ -165,7 +165,7 @@ def fetch_prop_quotes(league, games, odds_key):
                     if set(sides)!= {'Over','Under'}: continue
                     over = 1/sides['Over']; under = 1/sides['Under']
                     quotes.append({'player':player,'line':line,'market':key,'over_probability':over/(over+under),
-                                   'book':book.get('key'), 'updated_at':updated.isoformat(), 'event_id':event['id'],
+                                   'over_decimal_odds':sides['Over'], 'under_decimal_odds':sides['Under'], 'book':book.get('key'), 'updated_at':updated.isoformat(), 'event_id':event['id'],
                                    'home_team':game['home_team'],'away_team':game['away_team'],'start_time':start.isoformat(),
                                    'game_id':game.get('game_id'), 'capture_time':stamp.isoformat(),
                                    **({'Event match':match_notes[int(game['game_id'])]['Match']} if league=='MLB' else {})})
@@ -298,8 +298,8 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
     for (_,player,market,line), group in groups.items():
         first = group[0]; start = pd.Timestamp(first['start_time'])
         unique = {q['book']:q for q in group if q['book']}
-        if len(unique)<2:
-            if league == 'MLB': excluded(first, player, market, line, 'Fewer than two books offer this same two-sided line.')
+        if not unique:
+            if league == 'MLB': excluded(first, player, market, line, 'No sportsbook offers this two-sided line.')
             continue
         participation = None
         probability = float(np.median([q['over_probability'] for q in unique.values()]))
@@ -337,13 +337,18 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
                 continue
         for side,market_p in [('Over',probability),('Under',1-probability)]:
             estimate = estimate_prop(values,line,side,market_p)
-            if estimate:
+            if estimate and estimate['Estimated chance'] >= .65:
+                price_key = 'over_decimal_odds' if side == 'Over' else 'under_decimal_odds'
+                available = [q for q in unique.values() if q.get(price_key, 0) > 1]
+                if not available:
+                    continue
+                best = max(available, key=lambda q:q[price_key])
                 picks.append({'Player':player,'Market':MARKETS[league][market][0],'Pick':side,'Line':line,
-                              'Market chance':market_p,'Books':len(unique),'Game':first['away_team']+' @ '+first['home_team'],
+                              'Market chance':market_p,'Best sportsbook':best['book'],'Best decimal odds':best[price_key], 'Estimated return per unit':estimate['Estimated chance']*best[price_key]-1,'Books':len(unique),'Game':first['away_team']+' @ '+first['home_team'],
                               'start_time':first['start_time'],'Captured UTC':first['capture_time'],
                               **({'Participation status': participation, 'Event match': first.get('Event match')} if league=='MLB' else {}), **estimate})
     # One side of one line per player/market/game; avoid ranking duplicate books or alternatives.
-    picks.sort(key=lambda r:(-r['Estimated chance'],-r['Prior games'],r['Player']))
+    picks.sort(key=lambda r:(-r['Estimated chance'],-r['Best decimal odds'],-r['Prior games'],r['Player']))
     seen=set(); chosen=[]
     for pick in picks:
         key=(pick['Game'],pick['start_time'],pick['Player'],pick['Market'])
