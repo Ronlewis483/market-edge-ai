@@ -301,88 +301,41 @@ def _estimate_prop(
     }
 
 
-def _select_consensus_props(
-    prop_lines,
-):
-    """
-    Reduce sportsbook duplicates to one representative
-    line per game / player / market.
-
-    Median sportsbook line is used as the consensus line.
-    """
-
-    required_columns = [
-        "event_id",
-        "game_time",
-        "home_team",
-        "away_team",
-        "player",
-        "market_key",
-        "line",
-    ]
-
-    available = [
-        column
-        for column in required_columns
-        if column in prop_lines.columns
-    ]
-
-    if len(available) != len(
-        required_columns
-    ):
+def _select_consensus_props(prop_lines):
+    """Select a real, fresh offered line; never synthesize median handicaps."""
+    keys = ['event_id', 'game_time', 'home_team', 'away_team', 'player', 'market_key']
+    required = keys + ['line', 'side', 'bookmaker_key', 'american_odds', 'last_update']
+    if any(c not in prop_lines for c in required):
         return pd.DataFrame()
-
-    props = prop_lines[
-        required_columns
-    ].copy()
-
-    props["line"] = pd.to_numeric(
-        props["line"],
-        errors="coerce",
-    )
-
-    props = props.dropna(
-        subset=[
-            "event_id",
-            "game_time",
-            "player",
-            "market_key",
-            "line",
-        ]
-    )
-
-    if props.empty:
-        return props
-
-    group_columns = [
-        "event_id",
-        "game_time",
-        "home_team",
-        "away_team",
-        "player",
-        "market_key",
-    ]
-
-    consensus = (
-        props
-        .groupby(
-            group_columns,
-            as_index=False,
-            dropna=False,
-        )
-        .agg(
-            line=(
-                "line",
-                "median",
-            ),
-            sportsbook_line_count=(
-                "line",
-                "count",
-            ),
-        )
-    )
-
-    return consensus
+    props = prop_lines[required].copy()
+    props['line'] = pd.to_numeric(props['line'], errors='coerce')
+    props['american_odds'] = pd.to_numeric(props['american_odds'], errors='coerce')
+    props['side'] = props['side'].astype(str).str.upper()
+    updated = pd.to_datetime(props['last_update'], utc=True, errors='coerce')
+    age = pd.Timestamp.now(tz='UTC') - updated
+    props = props.loc[age.between(pd.Timedelta(0), pd.Timedelta(minutes=30))
+        & props['side'].isin(['OVER','UNDER','YES','NO'])
+        & np.isfinite(props['line']) & np.isfinite(props['american_odds'])
+        & (props['american_odds'].abs() >= 100)].dropna(subset=keys+['bookmaker_key'])
+    props = props.loc[props.bookmaker_key.astype(str).str.strip().ne('')]
+    rows = []
+    for identity, candidates in props.groupby(keys, dropna=False):
+        lines = []
+        for line, offers in candidates.groupby('line'):
+            sides = {}
+            for side, quotes in offers.groupby('side'):
+                quotes = quotes.drop_duplicates('bookmaker_key', keep='last')
+                if len(quotes) >= 2:
+                    sides[side] = quotes[['bookmaker_key','american_odds']].to_dict('records')
+            if sides:
+                lines.append((max(len(q) for q in sides.values()), float(line), sides))
+        if not lines:
+            continue
+        # Prefer broad market coverage, never a made-up or cherry-picked line.
+        _, line, sides = sorted(lines, key=lambda v:(-v[0], v[1]))[0]
+        rows.append(dict(zip(keys, identity), line=line,
+            sportsbook_line_count=max(len(q) for q in sides.values()), offered_sides=sides))
+    return pd.DataFrame(rows)
 
 
 def run_nfl_player_prop_prediction_pipeline(
@@ -517,6 +470,11 @@ def run_nfl_player_prop_prediction_pipeline(
         if estimate is None:
             continue
 
+        # A model direction is actionable only if books actually sell that bet.
+        offered = prop['offered_sides'].get(estimate['model_pick'], [])
+        if len(offered) < 2:
+            continue
+
         # Avoid displaying extremely weak
         # or essentially coin-flip forecasts.
         if (
@@ -604,12 +562,9 @@ def run_nfl_player_prop_prediction_pipeline(
                     ],
                 "prediction_score":
                     score,
-                "sportsbook_line_count":
-                    int(
-                        prop[
-                            "sportsbook_line_count"
-                        ]
-                    ),
+                "sportsbook_line_count": len(offered),
+                "sportsbook_offers": offered,
+                "availability_checked_at": current_time.isoformat(),
                 "confidence_group":
                     confidence_group,
             }
