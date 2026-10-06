@@ -16,6 +16,22 @@ MARKETS = {
  'Passing completions':'player_pass_completions',
  'Interceptions thrown':'player_pass_interceptions',
 }
+MARKETS.update({
+ 'Passing attempts':'player_pass_attempts', 'Rushing attempts':'player_rush_attempts',
+ 'Rushing touchdowns':'player_rush_tds', 'Receiving touchdowns':'player_reception_tds',
+ 'Passing + rushing yards':'player_pass_rush_yds',
+ 'Passing + rushing + receiving yards':'player_pass_rush_reception_yds',
+ 'Passing + rushing + receiving touchdowns':'player_pass_rush_reception_tds',
+ 'Rushing + receiving touchdowns':'player_rush_reception_tds',
+ 'Field goals':'player_field_goals', 'Extra points':'player_pats',
+ 'Kicking points':'player_kicking_points',
+ 'Longest completion':'player_pass_longest_completion',
+ 'Longest rush':'player_rush_longest', 'Longest reception':'player_reception_longest',
+ 'Sacks':'player_sacks', 'Solo tackles':'player_solo_tackles',
+ 'Assisted tackles':'player_assists', 'Tackles + assists':'player_tackles_assists',
+ 'Defensive interceptions':'player_defensive_interceptions',
+})
+
 COUNT = {'Receptions','Passing touchdowns','Passing completions','Interceptions thrown'}
 REQUIRED = {'player','market','game_time','value'}
 
@@ -46,7 +62,7 @@ def normalize_props(event):
                 rows.append({'event_id':event.get('id'), 'game_time':event.get('commence_time'),
                   'home_team':event.get('home_team'), 'away_team':event.get('away_team'),
                   'bookmaker':book.get('title'), 'bookmaker_key':book.get('key'),
-                  'market_key':market.get('key'), 'player':player, 'side':side,
+                  'market_key':str(market.get('key','')).removesuffix('_alternate'), 'player':player, 'side':side,
                   'line':float(point) if point is not None else 0.5,
                   'american_odds':outcome.get('price'), 'last_update':market.get('last_update')})
     return pd.DataFrame(rows)
