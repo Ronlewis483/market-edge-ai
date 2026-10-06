@@ -325,16 +325,16 @@ def _select_consensus_props(prop_lines):
             sides = {}
             for side, quotes in offers.groupby('side'):
                 quotes = quotes.drop_duplicates('bookmaker_key', keep='last')
-                if len(quotes) >= 2:
+                if len(quotes) >= 1:
                     sides[side] = quotes[['bookmaker_key','american_odds']].to_dict('records')
             if sides:
                 lines.append((max(len(q) for q in sides.values()), float(line), sides))
         if not lines:
             continue
-        # Prefer broad market coverage, never a made-up or cherry-picked line.
-        _, line, sides = sorted(lines, key=lambda v:(-v[0], v[1]))[0]
-        rows.append(dict(zip(keys, identity), line=line,
-            sportsbook_line_count=max(len(q) for q in sides.values()), offered_sides=sides))
+        # Score each real offered line; ranking later retains one per market.
+        for _, line, sides in sorted(lines, key=lambda v:(-v[0], v[1])):
+            rows.append(dict(zip(keys, identity), line=line,
+                sportsbook_line_count=max(len(q) for q in sides.values()), offered_sides=sides))
     return pd.DataFrame(rows)
 
 
@@ -472,7 +472,7 @@ def run_nfl_player_prop_prediction_pipeline(
 
         # A model direction is actionable only if books actually sell that bet.
         offered = prop['offered_sides'].get(estimate['model_pick'], [])
-        if len(offered) < 2:
+        if not offered:
             continue
 
         # Avoid displaying extremely weak
@@ -481,7 +481,7 @@ def run_nfl_player_prop_prediction_pipeline(
             estimate[
                 "historical_support"
             ]
-            < 0.55
+            < 0.65
         ):
             continue
 
@@ -496,6 +496,12 @@ def run_nfl_player_prop_prediction_pipeline(
         score = estimate[
             "prediction_score"
         ]
+        def decimal_price(offer):
+            price = float(offer['american_odds'])
+            return 1 + price/100 if price > 0 else 1 + 100/abs(price)
+        best_offer = max(offered, key=decimal_price)
+        best_decimal = decimal_price(best_offer)
+
 
         if score >= 0.70:
             confidence_group = (
@@ -564,6 +570,11 @@ def run_nfl_player_prop_prediction_pipeline(
                     score,
                 "sportsbook_line_count": len(offered),
                 "sportsbook_offers": offered,
+                "best_sportsbook": best_offer['bookmaker_key'],
+                "best_american_odds": best_offer['american_odds'],
+                "best_decimal_odds": best_decimal,
+                "estimated_cover_chance": estimate['historical_support'],
+                "estimated_return_per_unit": estimate['historical_support'] * best_decimal - 1,
                 "availability_checked_at": current_time.isoformat(),
                 "confidence_group":
                     confidence_group,
@@ -585,8 +596,8 @@ def run_nfl_player_prop_prediction_pipeline(
         results
         .sort_values(
             [
-                "prediction_score",
                 "historical_support",
+                "best_decimal_odds",
                 "sample_size",
             ],
             ascending=[
@@ -617,8 +628,8 @@ def run_nfl_player_prop_prediction_pipeline(
         results
         .sort_values(
             [
-                "prediction_score",
                 "historical_support",
+                "best_decimal_odds",
                 "sample_size",
             ],
             ascending=[
@@ -681,8 +692,8 @@ def run_nfl_player_prop_prediction_pipeline(
         .sort_values(
             [
                 "player_rank",
-                "prediction_score",
                 "historical_support",
+                "best_decimal_odds",
                 "sample_size",
             ],
             ascending=[
@@ -722,27 +733,16 @@ def run_nfl_player_prop_prediction_pipeline(
     )
 
     # ----------------------------------------------------------
-    # FINAL ORDER
-    #
-    # Player #1 first, then all of that player's props.
-    # Player #2 next, etc.
-    # ----------------------------------------------------------
-
-    top_player_props = (
-        top_player_props
-        .sort_values(
-            [
-                "player_rank",
-                "is_best_prop",
-                "prediction_score",
-            ],
-            ascending=[
-                True,
-                False,
-                False,
-            ],
-        )
-        .reset_index(drop=True)
+    # FINAL ORDER: compare all bet types using the same cover estimate.
+    # Player grouping must not put a weaker yards bet above a stronger NO TD bet.
+    top_player_props = top_player_props.sort_values(
+        ['historical_support', 'best_decimal_odds', 'sample_size'],
+        ascending=[False, False, False], kind='stable',
+    ).reset_index(drop=True)
+    top_player_props['prop_rank'] = range(1, len(top_player_props) + 1)
+    top_player_props['selection_reason'] = (
+        'Ranked by estimated cover chance, then actual offered payout; '
+        'minimum 65%, exact recommended side listed at a sportsbook.'
     )
 
     return top_player_props
