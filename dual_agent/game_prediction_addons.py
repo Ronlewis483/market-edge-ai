@@ -206,6 +206,16 @@ def automatic_nfl_props(predictions, key):
     from dual_agent.nfl_player_props_ui import cached_events, cached_props, cached_player_history, upcoming_week_events
     from dual_agent.nfl_player_props import MARKETS, normalize_props
     from dual_agent.nfl_player_prop_prediction_pipeline import run_nfl_player_prop_prediction_pipeline
+    import streamlit as st
+    @st.cache_data(ttl=300, show_spinner=False)
+    def available_player_markets(api_key, event_id):
+        response = requests.get(f'https://api.the-odds-api.com/v4/sports/americanfootball_nfl/events/{event_id}/markets',
+            params={'apiKey':api_key,'regions':'us','dateFormat':'iso'}, timeout=20)
+        if response.status_code != 200:
+            raise ValueError(f'Market discovery HTTP {response.status_code}')
+        payload = response.json()
+        return sorted({m['key'] for b in payload.get('bookmakers',[]) for m in b.get('markets',[])
+                       if str(m.get('key','')).startswith('player_')})
     now = pd.Timestamp.now(tz='UTC')
     predicted = records(predictions)
     selected = [event for event in upcoming_week_events(cached_events(key), now)
@@ -214,14 +224,27 @@ def automatic_nfl_props(predictions, key):
     if not selected:
         return pd.DataFrame(), ['No upcoming sportsbook events matched the generated game cards. No player-prop requests were made.']
     def load(event):
-        data, _ = cached_props(key, event['id'], tuple(MARKETS.values()))
-        return normalize_props(data)
+        notes = []
+        try:
+            market_keys = available_player_markets(key, event['id'])
+        except Exception:
+            market_keys = sorted(MARKETS.values())
+            notes.append('Market discovery unavailable; requested all configured categories instead.')
+        unsupported = [k for k in market_keys if k.removesuffix('_alternate') not in set(MARKETS.values())]
+        if unsupported:
+            notes.append('Listed markets awaiting a matching history/scoring model: ' + ', '.join(unsupported))
+        frames = []
+        for start in range(0, len(market_keys), 10):
+            data, _ = cached_props(key, event['id'], tuple(market_keys[start:start+10]))
+            frames.append(normalize_props(data))
+        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(), notes
     with ThreadPoolExecutor(max_workers=4) as pool:
         pending = {pool.submit(load, event): event for event in selected}
         for future in as_completed(pending):
             event = pending[future]
             try:
-                frame = future.result()
+                frame, notes = future.result()
+                issues.extend(f"{event.get('away_team')} @ {event.get('home_team')}: {note}" for note in notes)
                 if not frame.empty:
                     frames.append(frame)
                 else:
