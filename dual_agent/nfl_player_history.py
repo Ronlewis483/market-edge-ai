@@ -14,6 +14,22 @@ STAT_COLUMNS = {
     'Interceptions thrown': ('interceptions', 'passing_interceptions'),
 }
 
+STAT_COLUMNS.update({
+ 'Passing attempts': ('attempts','passing_attempts'),
+ 'Rushing attempts': ('carries','rushing_attempts'),
+ 'Rushing touchdowns': ('rushing_tds','rushing_touchdowns'),
+ 'Receiving touchdowns': ('receiving_tds','receiving_touchdowns'),
+ 'Field goals': ('fg_made','field_goals_made'),
+ 'Extra points': ('pat_made','extra_points_made'),
+ 'Longest completion': ('passing_long','longest_completion'),
+ 'Longest rush': ('rushing_long','longest_rush'),
+ 'Longest reception': ('receiving_long','longest_reception'),
+ 'Sacks': ('def_sacks','sacks'),
+ 'Solo tackles': ('def_tackles_solo','solo_tackles'),
+ 'Assisted tackles': ('def_tackles_with_assist','assisted_tackles'),
+ 'Defensive interceptions': ('def_interceptions','defensive_interceptions'),
+})
+
 
 def _column(frame, *candidates):
     return next(
@@ -214,6 +230,28 @@ def load_player_history(seasons):
                     }
                 )
             )
+
+    combinations = {
+        'Passing + rushing yards': [('passing_yards',), ('rushing_yards',)],
+        'Passing + rushing + receiving yards': [('passing_yards',), ('rushing_yards',), ('receiving_yards',)],
+        'Passing + rushing + receiving touchdowns': [('passing_tds','passing_touchdowns'), ('rushing_tds','rushing_touchdowns'), ('receiving_tds','receiving_touchdowns')],
+        'Rushing + receiving touchdowns': [('rushing_tds','rushing_touchdowns'), ('receiving_tds','receiving_touchdowns')],
+        'Tackles + assists': [('def_tackles_solo','solo_tackles'), ('def_tackles_with_assist','assisted_tackles')],
+    }
+    for label, components in combinations.items():
+        columns = [_column(stats, *aliases) for aliases in components]
+        if all(columns):
+            frame = stats[['player','team','opponent','is_home','game_time']].copy()
+            frame['market'] = label
+            frame['value'] = sum(pd.to_numeric(stats[c], errors='coerce') for c in columns)
+            records.append(frame)
+    fg = _column(stats, 'fg_made','field_goals_made')
+    pat = _column(stats, 'pat_made','extra_points_made')
+    if fg and pat:
+        frame = stats[['player','team','opponent','is_home','game_time']].copy()
+        frame['market'] = 'Kicking points'
+        frame['value'] = 3*pd.to_numeric(stats[fg], errors='coerce') + pd.to_numeric(stats[pat], errors='coerce')
+        records.append(frame)
 
     # Combined rushing + receiving yards.
     rush = _column(
