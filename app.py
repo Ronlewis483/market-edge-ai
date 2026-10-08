@@ -1207,6 +1207,17 @@ def remember_game_addons(league, result):
             retain_sport_picks(league, result.get("spreads", {}).get("picks", []), kind="spreads", limit=None)
 
 
+def prop_outcome_sentence(player, market, side, line, chance):
+    """Explain the exact direction without treating an unlisted opposite as a bet."""
+    side = str(side).upper()
+    if str(market).lower() == 'anytime touchdown':
+        outcome = 'will score a touchdown' if side == 'YES' else 'will NOT score a touchdown'
+    else:
+        direction = {'OVER': 'OVER', 'UNDER': 'UNDER', 'YES': 'meet', 'NO': 'not meet'}.get(side, side)
+        outcome = f"will finish {direction} {float(line):g} {str(market).lower()}"
+    return f"Estimated {float(chance):.0%} chance {player} {outcome}."
+
+
 def render_game_addons(league, game, result):
     """Place independently estimated spreads and eligible props inside their game."""
     if league not in ("NFL", "MLB", "NBA"):
@@ -1279,17 +1290,26 @@ def render_game_addons(league, game, result):
                     side = str(prop["model_pick"])
                     pick = side if side in ("YES", "NO") else f"{side} {float(prop['line']):g}"
                     st.markdown(f"**#{rank} · {prop['player']} · {pick} {prop['market']}**")
-                    st.caption(f"Model ranking score {float(prop['prediction_score'])*100:.1f}/100 · historical support {float(prop['historical_support']):.1%}")
+                    st.markdown(prop_outcome_sentence(prop["player"], prop["market"], side, prop["line"], prop["historical_support"]))
                     st.caption(f"Projection {float(prop['projected_value']):.1f} · {int(prop.get('sample_size', 0))} prior games")
                     st.caption(f"Estimated cover chance {float(prop['historical_support']):.1%} · historical estimate, not calibrated")
                     if prop.get("best_sportsbook"):
                         st.caption(f"Best available odds: {prop['best_sportsbook']} · {float(prop['best_american_odds']):+g}")
                     offers = prop.get("sportsbook_offers", [])
                     if len(offers) == 1:
-                        st.caption("Single-book listing · no cross-book confirmation")
+                        st.caption("Available at one sportsbook · meets our listing requirement")
                     if offers:
                         st.caption("Offered at: " + ", ".join(str(o['bookmaker_key']) + " (" + format(float(o['american_odds']), '+g') + ")" for o in offers))
                     st.caption("Positive estimated value at the best listed odds · ranks by cover chance, then value. Estimates are not calibrated.")
+                    comparisons = prop.get('outcome_comparison', [])
+                    if isinstance(comparisons, list) and comparisons:
+                        with st.expander('Compare both outcomes'):
+                            for outcome in comparisons:
+                                st.write(prop_outcome_sentence(prop['player'], prop['market'], outcome['side'], prop['line'], outcome['chance']))
+                                if outcome.get('listed'):
+                                    st.caption(f"{outcome['book']} · {float(outcome['american_odds']):+g} · {outcome['reason']}")
+                                else:
+                                    st.caption('Forecast only · no matching sportsbook bet found')
                     # Keep the existing manual bet-record workflow available.
                     import hashlib
                     identity = "|".join(str(prop.get(c, "")) for c in ("event_id", "game_time", "player", "market", "model_pick", "line"))
@@ -1303,6 +1323,7 @@ def render_game_addons(league, game, result):
                         st.rerun()
                 else:
                     st.markdown(f"**#{rank} · {prop['Player']} · {prop['Pick']} {prop['Line']:g} {prop['Market']}**")
+                    st.markdown(prop_outcome_sentence(prop['Player'], prop['Market'], prop['Pick'], prop['Line'], prop['Estimated chance']))
                     st.caption(f"Estimated chance {prop['Estimated chance']:.1%} · projection {prop['Projected stat']:.1f} · {prop['Prior games']} prior appearances · {prop['Books']} books")
                     if prop.get("Best sportsbook"):
                         st.caption(f"Best available odds: {prop['Best sportsbook']} · odds {decimal_to_american_label(float(prop['Best decimal odds']))}")
