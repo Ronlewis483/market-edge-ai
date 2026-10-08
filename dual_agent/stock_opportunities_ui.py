@@ -97,6 +97,50 @@ def render_result(result, horizon):
             st.caption('These are historical estimates after fixed costs, not proof of future profitability. Comparing more strategies increases the risk of finding a result by chance; the recent-period checks are screening evidence, not an untouched final validation.')
 
 
+def render_daytrading(results,forex_config):
+    st.subheader('⚡ Top 10 Day Trades · Options + Forex')
+    st.caption('Ranked by sample-adjusted historical win evidence. Scores are not calibrated probabilities and do not establish equivalent risk across markets.')
+    now=pd.Timestamp.now(tz='UTC');picks=[]
+    for market in ['options','forex']:
+        result=results.get(market)
+        if result is None:
+            st.info(market.title()+' scan is being prepared.');continue
+        for pick in result.get('picks',[]):
+            stamp=pd.Timestamp(pick['quote_time'])
+            if stamp<=now and now-stamp<=pd.Timedelta(seconds=90) and pd.Timestamp(pick['exit_time'])>now:picks.append(pick)
+        with st.expander(market.title()+' scan status'):
+            st.write(result['message'])
+            st.caption(str(result.get('contracts_checked',result.get('pairs_checked',0)))+' contracts or pairs assessed.')
+            for reason in result.get('exclusions',[])[:20]:st.write(reason)
+    if not forex_config.get('token') or not forex_config.get('account'):
+        with st.expander('Connect forex data · OANDA'):
+            st.write('Add an OANDA v20 account ID and API token to Streamlit Secrets. Use practice for a demo account, or live for a live account. No orders are submitted.')
+            st.code('OANDA_API_TOKEN = "your token"\nOANDA_ACCOUNT_ID = "your account ID"\nOANDA_ENVIRONMENT = "practice"',language='toml')
+    picks=sorted(picks,key=lambda p:(-p['evidence_score'],-p['verification_trades'],p['spread_pct']))
+    seen=set();ranked=[]
+    for pick in picks:
+        identity=(pick['market'],pick['symbol'])
+        if identity in seen:continue
+        seen.add(identity);ranked.append(pick)
+        if len(ranked)==10:break
+    if not ranked:st.info('No fresh qualifying options or forex candidates yet. Scan status above shows what is pending or excluded.')
+    for index,pick in enumerate(ranked,1):
+        with st.container(border=True):
+            st.markdown(f"### #{index} · {pick['market']} · {pick['symbol']}")
+            st.write('**Strategy:** '+pick['strategy'])
+            if pick['market']=='Options':
+                st.write(f"Buy {pick['type']} · strike ${pick['strike']:,.2f} · expiry {pick['expiration']}")
+                st.write(f"Premium ${pick['entry_reference']:.2f} · standard 100-share contract cost approximately ${pick['contract_cost_reference']:.2f}")
+                st.caption('This screen assumes a standard contract multiplier; confirm contract specifications before acting. Long-option loss can reach the full premium. Historical option costs use current spread plus 0.5% friction, not recorded historical quotes.')
+            else:
+                st.write(pick['direction']+' · entry reference '+f"{pick['entry_reference']:.5f}")
+                st.caption('Returns are unleveraged price returns with historical bid/ask spreads and an additional 0.02% round-trip cost assumption. Position size, margin and financing are not modeled.')
+            st.write(f"**Evidence ranking score:** {pick['evidence_score']:.0%} · {pick['verification_trades']} recent historical trades")
+            st.write(f"Historical average net return: {pick['historical_mean_net_return']:+.2%} · observed win rate {pick['historical_win_rate']:.0%}")
+            st.write(f"Stop reference: {pick['stop_reference']:.5f} · time exit: "+pd.Timestamp(pick['exit_time']).tz_convert('America/Chicago').strftime('%-I:%M %p CT'))
+            st.caption('Quote '+pd.Timestamp(pick['quote_time']).tz_convert('America/Chicago').strftime('%-I:%M:%S %p CT')+f" · spread {pick['spread_pct']:.2%}")
+
+
 @st.cache_resource(show_spinner=False)
 def market_worker(_key, _secret, feed, url, version, credential_identity):
     from concurrent.futures import ThreadPoolExecutor
@@ -105,8 +149,8 @@ def market_worker(_key, _secret, feed, url, version, credential_identity):
 
 @st.fragment(run_every='10s')
 def render_stock_opportunities():
-    st.title('📈 Stock Opportunities')
-    st.caption('Automatic research candidates · regular-session long positions · no orders are submitted.')
+    st.title('📈 Trading Opportunities')
+    st.caption('Automatic stock, options and forex research · no orders are submitted.')
     key=setting('ALPACA_API_KEY') or setting('APCA_API_KEY_ID')
     secret=setting('ALPACA_SECRET_KEY') or setting('ALPACA_API_SECRET') or setting('APCA_API_SECRET_KEY')
     if not key or not secret:
@@ -116,15 +160,19 @@ def render_stock_opportunities():
             st.code('ALPACA_API_KEY = "your key"\nALPACA_SECRET_KEY = "your secret"\nALPACA_DATA_FEED = "iex"\nALPACA_TRADING_URL = "https://paper-api.alpaca.markets"', language='toml')
             st.caption('Use the live API URL if your credentials belong to a live account. Keys are used for reading market data and the market clock only.')
         return
-    feed=setting('ALPACA_DATA_FEED','iex')
+    feed=st.selectbox('Stock market data feed',['sip','iex'],key='paid_stock_data_feed')
     if feed not in ['iex','sip']:
         st.error('Choose iex or sip for ALPACA_DATA_FEED. Delayed quotes are excluded from these live entry candidates.')
         return
     url=setting('ALPACA_TRADING_URL','https://paper-api.alpaca.markets').rstrip('/')
+    from dual_agent.stock_intraday_outlook import render_intraday_outlook
+    render_intraday_outlook(key, secret, feed, url)
+    st.divider()
     st.caption('Scanning all active exchange-listed U.S. equities available through Alpaca, including ETFs. No preset symbol list.')
     st.caption('Stocks priced below five dollars or with less than one million dollars of previous-session dollar volume on your feed are excluded before strategy evaluation.')
     import hashlib
-    identity=hashlib.sha256((key+'|'+secret).encode()).hexdigest()
+    forex_config={'token':setting('OANDA_API_TOKEN'),'account':setting('OANDA_ACCOUNT_ID'),'environment':setting('OANDA_ENVIRONMENT','practice')}
+    identity=hashlib.sha256((key+'|'+secret+'|'+str(forex_config)).encode()).hexdigest()
     state=market_worker(key,secret,feed,url,engine.ENGINE_VERSION,identity)
     future=state.get('future')
     if future is not None and future.done():
@@ -143,7 +191,7 @@ def render_stock_opportunities():
     if not cooling and state.get('future') is None and (requested or time.monotonic()-state.get('submitted',-1000)>=60):
         state.pop('error',None)
         state['submitted']=time.monotonic()
-        state['future']=state['pool'].submit(engine.scan_market,key,secret,feed,url,state['cache'])
+        state['future']=state['pool'].submit(engine.scan_market,key,secret,feed,url,state['cache'],forex_config)
     if state.get('future') is not None:
         progress=state['cache'].get('progress',{'text':'Starting market scan','done':0,'total':0})
         elapsed=int(time.monotonic()-state['submitted'])
@@ -170,8 +218,9 @@ def render_stock_opportunities():
     if saved['closed']:
         st.info('Market closed. Fresh entry candidates will be scanned during the regular session.');return
     stale=pd.Timestamp.now(tz='UTC')-checked>pd.Timedelta(seconds=90)
+    render_daytrading(saved['results'],forex_config)
     hour,weekly=st.columns(2)
-    for column,horizon,title in [(hour,'hour','⚡ Best qualifying setup for the next hour'),(weekly,'hold','🌱 Buy-and-hold candidate this week')]:
+    for column,horizon,title in [(hour,'hour','📈 Stock-only intraday candidates'),(weekly,'hold','🌱 Buy-and-hold candidate this week')]:
         with column:
             st.subheader(title)
             result=saved['results'].get(horizon)
