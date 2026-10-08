@@ -15,7 +15,7 @@ import requests
 from scipy.stats import skellam
 
 ACTIVE_MODEL_PATH = 'mlb/live_matchup/active.json'
-MLB_PIPELINE_VERSION = 12
+MLB_PIPELINE_VERSION = 13
 _HISTORY_CACHE = {}
 _CACHE_LOCK = RLock()
 CORE = ['home_field', 'offense_runs_per_game', 'opponent_runs_allowed',
@@ -340,6 +340,54 @@ def score_live_games(model, games, market=None):
             for i, g in enumerate(games)]
 
 
+def attach_pitcher_forecasts(predictions, logs, offered_forecasts=None):
+    """Show every identified starter independently of the betting shortlist."""
+    for game in predictions:
+        context = game.get('game_context', {})
+        cutoff = min(pd.Timestamp(game['start_time']), pd.Timestamp(game['Captured UTC']))-pd.Timedelta(hours=48)
+        for team in context.get('teams', {}).values():
+            pid = team.get('starter_id')
+            team['pitcher_forecasts'] = []
+            team['pitcher_projections'] = []
+            if pid is None:
+                team['pitcher_forecast_note'] = 'Starter identity is not available yet.'
+                continue
+            eligible = pd.DataFrame()
+            if logs is not None and not logs.empty and all(c in logs for c in ['player_id','games_started','start_time','game_id']):
+                eligible = logs.loc[(pd.to_numeric(logs.player_id, errors='coerce')==pid)
+                    & (pd.to_numeric(logs.games_started, errors='coerce')>0)
+                    & (pd.to_datetime(logs.start_time, utc=True, errors='coerce')<cutoff)
+                    & (pd.to_numeric(logs.game_id, errors='coerce')!=game['game_id'])].copy()
+                eligible['prior_time'] = pd.to_datetime(eligible.start_time, utc=True, errors='coerce')
+                eligible = eligible.sort_values('prior_time').drop_duplicates('game_id', keep='last').tail(30)
+            for label, column in [('Strikeouts','pitcher_strikeouts'),('Outs recorded','pitching_outs'),
+                                  ('Hits allowed','pitcher_hits'),('Walks','pitcher_walks'),('Total pitches','pitches'),
+                                  ('Runs allowed','pitcher_runs_allowed'),('Earned runs allowed','earned_runs')]:
+                if column in eligible:
+                    values = pd.to_numeric(eligible[column], errors='coerce').replace([np.inf,-np.inf],np.nan).dropna()
+                    if not values.empty:
+                        team['pitcher_projections'].append({'Market':label, 'Projected stat':float(values.mean()), 'Prior games':len(values)})
+            if 'pitching_outs' in eligible:
+                outs = pd.to_numeric(eligible.pitching_outs, errors='coerce').replace([np.inf,-np.inf],np.nan)
+                valid_outs = outs.dropna()
+                if not valid_outs.empty:
+                    team['pitcher_projections'].append({'Market':'Innings pitched', 'Projected stat':float(valid_outs.mean()/3), 'Prior games':len(valid_outs)})
+                if 'earned_runs' in eligible:
+                    earned = pd.to_numeric(eligible.earned_runs, errors='coerce').replace([np.inf,-np.inf],np.nan)
+                    usable = outs.notna() & earned.notna() & (outs>0)
+                    if usable.any():
+                        team['pitcher_projections'].append({'Market':'Projected game ERA',
+                            'Projected stat':float(27*earned[usable].sum()/outs[usable].sum()), 'Prior games':int(usable.sum())})
+            candidates = [r for r in (offered_forecasts or []) if r['game_id']==game['game_id'] and r['player_id']==pid]
+            candidates.sort(key=lambda r:(-r['Estimated chance'], -r['Best decimal odds']))
+            seen = set()
+            for candidate in candidates:
+                if candidate['Market'] not in seen:
+                    seen.add(candidate['Market']); team['pitcher_forecasts'].append(candidate)
+            team['pitcher_forecast_note'] = ('Historical projection from prior starts; not an established accuracy rate.'
+                if team['pitcher_projections'] else 'No usable saved prior starts. Projection and cover percentage are unavailable.')
+
+
 def _generate_mlb_predictions(game_date=None, api_key=None, progress=None, on_team_predictions=None):
     from dual_agent import mlb_research as research, supabase_db as storage
     from dual_agent.mlb_matchup_elo import attach_elo
@@ -482,11 +530,12 @@ def _generate_mlb_predictions(game_date=None, api_key=None, progress=None, on_te
             pid = pitchers[0] if pitchers else probable.get('id')
             def player_name(pid):
                 return players.get('ID'+str(pid), {}).get('person', {}).get('fullName') or ('Player '+str(pid))
-            context['teams'][side] = {'starter': player_name(pid) if pitchers else probable.get('fullName'),
+            context['teams'][side] = {'starter_id': int(pid) if pid else None, 'starter': player_name(pid) if pitchers else probable.get('fullName'),
                 'starter_status': 'Recorded starter' if pitchers else 'Probable starter' if pid else 'Unannounced',
                 'lineup_confirmed': len(order)==9 and len(set(order))==9,
                 'lineup': [player_name(pid) for pid in order]}
         row['game_context'] = context
+    attach_pitcher_forecasts(predictions, logs)
     now = pd.Timestamp.now(tz='UTC')
     predictions = [r for r in predictions if pd.Timestamp(r['start_time'])>now and now-pd.Timestamp(r['Captured UTC'])<=pd.Timedelta(minutes=15)]
     predictions.sort(key=lambda r: (-r['Winner probability'], r['start_time'], r['game_id']))
@@ -499,9 +548,9 @@ def _generate_mlb_predictions(game_date=None, api_key=None, progress=None, on_te
     try:
         import importlib
         prop_module = importlib.import_module('dual_agent.sports_player_prop_predictions')
-        if getattr(prop_module, 'MLB_PROP_MATCH_VERSION', None) != 4:
+        if getattr(prop_module, 'MLB_PROP_MATCH_VERSION', None) != 5:
             prop_module = importlib.reload(prop_module)
-        if getattr(prop_module, 'MLB_PROP_MATCH_VERSION', None) != 4:
+        if getattr(prop_module, 'MLB_PROP_MATCH_VERSION', None) != 5:
             raise RuntimeError('Install the matching sports_player_prop_predictions.py update.')
         generate_player_prop_picks = prop_module.generate_player_prop_picks
         prop_games = [{'game_id': r['game_id'], 'start_time': r['start_time'], 'home_team': r['Home'], 'away_team': r['Away']} for r in all_eligible_predictions]
@@ -509,6 +558,7 @@ def _generate_mlb_predictions(game_date=None, api_key=None, progress=None, on_te
     except Exception as exc:
         props = {'picks': [], 'errors': [{'stage': 'MLB prop generation', 'error_type': type(exc).__name__}],
                  'message': 'MLB player-prop generation failed ('+type(exc).__name__+'). See player-prop data coverage.'}
+    attach_pitcher_forecasts(all_eligible_predictions, logs, props.get('pitcher_forecasts', []))
     now = pd.Timestamp.now(tz='UTC')
     predictions = [r for r in predictions if pd.Timestamp(r['start_time'])>now and now-pd.Timestamp(r['Captured UTC'])<=pd.Timedelta(minutes=15)]
     props['game_picks'] = [r for r in props.get('game_picks', []) if pd.Timestamp(r['start_time'])>now and now-pd.Timestamp(r['Captured UTC'])<=pd.Timedelta(minutes=15)]
