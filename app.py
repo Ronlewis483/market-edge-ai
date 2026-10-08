@@ -436,6 +436,7 @@ def render_prediction_workspace(league, predictions, result):
     from html import escape
     import hashlib
     if league == 'NFL':
+        render_nfl_enrichment_status()
         render_nfl_freshness_monitor()
         if result.get('context_issue'):st.warning(result['context_issue'])
         if result.get('qb_forecast_issue'):st.warning(result['qb_forecast_issue'])
@@ -1105,12 +1106,16 @@ def nfl_week_rows(rows, now=None):
     return frame.reset_index(drop=True)
 
 
-def run_nfl_prediction_with_addons(feature_games, historical_accuracy=None, historical_sample=None):
-    feature_games = nfl_prediction_features()
-    previous = st.session_state.get("nfl_prediction_pipeline_result") or {}
-    remember_game_addons("NFL", previous)
-    result = run_nfl_prediction_pipeline(feature_games=feature_games,
-        historical_accuracy=historical_accuracy, historical_sample=historical_sample)
+@st.cache_resource(show_spinner=False)
+def nfl_enrichment_pool():
+    from concurrent.futures import ThreadPoolExecutor
+    return ThreadPoolExecutor(max_workers=2)
+
+
+def enrich_nfl_result(result, feature_games, odds_key):
+    """Run external enrichment without reading or writing session state."""
+    import copy
+    result = copy.deepcopy(result)
     try:
         from dual_agent.nfl_live_context import attach_context
         result['predictions'] = attach_context(result.get('predictions'), result.get('live_odds'))
@@ -1118,12 +1123,53 @@ def run_nfl_prediction_with_addons(feature_games, historical_accuracy=None, hist
         result['context_issue'] = 'NFL context retrieval unavailable (' + type(exc).__name__ + ')'
     try:
         from dual_agent.game_prediction_addons import enhance_result
-        result = enhance_result("NFL", result, prediction_api_key("ODDS_API_KEY", "THE_ODDS_API_KEY"), feature_games)
-        st.session_state["nfl_auto_prop_predictions"] = result.get("nfl_player_props", pd.DataFrame())
-        st.session_state["nfl_prop_scan_scope"] = "next_7_days_v1"
-    except ImportError:
-        result["prop_issues"] = ["Deploy dual_agent/game_prediction_addons.py to enable automatic props and spreads."]
-    remember_game_addons("NFL", result)
+        result = enhance_result("NFL", result, odds_key, feature_games)
+    except Exception as exc:
+        result['prop_issues'] = ['NFL add-ons unavailable ('+type(exc).__name__+'); winner predictions are preserved.']
+    result['enrichment_pending'] = False
+    return result
+
+
+@st.fragment(run_every='3s')
+def render_nfl_enrichment_status():
+    future = st.session_state.get('nfl_enrichment_future')
+    if future is None:return
+    if not future.done():
+        st.info('Winner predictions are ready. Loading QB forecasts, player props, injuries and weather in the background…')
+        return
+    try:
+        result = future.result()
+        st.session_state['nfl_prediction_pipeline_result'] = result
+        st.session_state['nfl_auto_prop_predictions'] = result.get('nfl_player_props', pd.DataFrame())
+        st.session_state['live_nfl_predictions'] = result.get('predictions')
+        st.session_state['nfl_prop_scan_scope'] = 'next_7_days_v1'
+        remember_game_addons('NFL', result)
+    except Exception as exc:
+        result = st.session_state.get('nfl_prediction_pipeline_result') or {}
+        result['enrichment_pending'] = False
+        result['context_issue'] = 'Background NFL inputs unavailable ('+type(exc).__name__+'); winner predictions are preserved.'
+        st.session_state['nfl_prediction_pipeline_result'] = result
+    st.session_state.pop('nfl_enrichment_future', None)
+    st.rerun(scope='app')
+
+
+def run_nfl_prediction_with_addons(feature_games, historical_accuracy=None, historical_sample=None):
+    pending = st.session_state.get('nfl_enrichment_future')
+    if pending is not None and not pending.done():
+        return st.session_state.get('nfl_prediction_pipeline_result') or {}
+    feature_games = nfl_prediction_features()
+    previous = st.session_state.get("nfl_prediction_pipeline_result") or {}
+    remember_game_addons("NFL", previous)
+    result = run_nfl_prediction_pipeline(feature_games=feature_games,
+        historical_accuracy=historical_accuracy, historical_sample=historical_sample)
+    predictions = result.get('predictions')
+    if predictions is None or len(predictions) == 0:
+        result['enrichment_pending'] = False
+        return result
+    result['enrichment_pending'] = True
+    st.session_state['nfl_prediction_pipeline_result'] = result
+    odds_key = prediction_api_key("ODDS_API_KEY", "THE_ODDS_API_KEY")
+    st.session_state['nfl_enrichment_future'] = nfl_enrichment_pool().submit(enrich_nfl_result, result, feature_games, odds_key)
     return result
 
 
@@ -1293,7 +1339,7 @@ def render_nfl_game_context(game):
     context = game.get('game_context')
     with st.expander('Quarterbacks, injuries & game conditions', expanded=True):
         if not isinstance(context,dict):
-            st.info('Generate fresh NFL predictions to retrieve current game context.')
+            st.info('Loading current quarterback and game context…' if st.session_state.get('nfl_enrichment_future') is not None else 'Generate fresh NFL predictions to retrieve current game context.')
             return
         st.caption('Context fetched ' + str(context.get('fetched_at','Not available')))
         for side in ['away','home']:
@@ -1481,99 +1527,8 @@ if page == "🏠 Home":
             # AUTO-PREPARE NFL HISTORICAL FEATURES
             # ============================================
 
-            required_nfl_feature_columns = {
-                "start_time",
-                "home_score",
-                "away_score",
-                "home_team",
-                "away_team",
-            }
+            feature_games = nfl_prediction_features()
 
-            feature_schema_is_stale = (
-                feature_games is not None
-                and hasattr(feature_games, "columns")
-                and not required_nfl_feature_columns.issubset(
-                    set(feature_games.columns)
-                )
-            )
-
-            if (
-                feature_games is None
-                or (
-                    hasattr(feature_games, "empty")
-                    and feature_games.empty
-                )
-                or feature_schema_is_stale
-            ):
-                with st.spinner(
-                    "Preparing NFL historical data automatically..."
-                ):
-                    season_ids = [
-                        "sr:season:115087",
-                        "sr:season:127985",
-                    ]
-
-                    multi_nfl = get_multiple_nfl_seasons(
-                        season_ids
-                    )
-
-                    historical_games = multi_nfl["games"]
-
-                    if (
-                        historical_games is None
-                        or historical_games.empty
-                    ):
-                        raise ValueError(
-                            "NFL historical download returned no games."
-                        )
-
-                    st.session_state[
-                        "multi_nfl_games"
-                    ] = historical_games
-
-                    feature_games = build_nfl_pregame_features(
-                        historical_games
-                    )
-
-                    if feature_games.empty:
-                        raise ValueError(
-                            "NFL historical feature generation "
-                            "returned no data."
-                        )
-
-                    st.session_state[
-                        "nfl_feature_games"
-                    ] = feature_games
-
-                    nfl_validation = run_nfl_walkforward_model(
-                        feature_games
-                    )
-
-                    st.session_state[
-                        "nfl_walkforward_result"
-                    ] = nfl_validation
-
-                    historical_predictions = (
-                        nfl_validation.get("predictions")
-                    )
-
-                    if historical_predictions is not None:
-                        st.session_state[
-                            "nfl_historical_predictions"
-                        ] = historical_predictions
-
-                    st.session_state[
-                        "nfl_historical_accuracy"
-                    ] = nfl_validation.get(
-                        "accuracy"
-                    )
-
-                    st.session_state[
-                        "nfl_historical_sample"
-                    ] = nfl_validation.get(
-                        "prediction_count"
-                    )
-    
             with st.spinner(
                 "Generating NFL predictions and analyzing markets..."
             ):
