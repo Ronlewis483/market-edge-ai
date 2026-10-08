@@ -303,12 +303,18 @@ def automatic_nfl_props(predictions, key):
         unsupported = [k for k in market_keys if k.removesuffix('_alternate') not in set(MARKETS.values())]
         if unsupported:
             notes.append('Listed markets awaiting a matching history/scoring model: ' + ', '.join(unsupported))
+        # Fetch only markets we can score; discovery notes retain unsupported categories.
+        supported = [k for k in market_keys if k.removesuffix('_alternate') in set(MARKETS.values())]
+        jobs = [quote_pool.submit(cached_props, key, event['id'], tuple(supported[start:start+10]))
+                for start in range(0,len(supported),10)]
         frames = []
-        for start in range(0, len(market_keys), 10):
-            data, _ = cached_props(key, event['id'], tuple(market_keys[start:start+10]))
+        for job in jobs:
+            data, _ = job.result()
             frames.append(normalize_props(data))
         return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(), notes
-    with ThreadPoolExecutor(max_workers=4) as pool:
+    # Quote batches share one bounded pool across the entire slate.
+    with ThreadPoolExecutor(max_workers=6) as quote_pool, ThreadPoolExecutor(max_workers=4) as pool:
+        history_job = pool.submit(cached_player_history, (2025,2026))
         pending = {pool.submit(load, event): event for event in selected}
         for future in as_completed(pending):
             event = pending[future]
@@ -323,7 +329,7 @@ def automatic_nfl_props(predictions, key):
                 issues.append(f"{event.get('away_team')} @ {event.get('home_team')}: prop feed unavailable ({type(exc).__name__}).")
     if not frames:
         return pd.DataFrame(), issues
-    history = cached_player_history((2025, 2026))
+    history = history_job.result()
     if history is None or len(history) == 0:
         return pd.DataFrame(), [f"{e.get('away_team')} @ {e.get('home_team')}: sportsbook props were found, but NFL player history is empty. Check the player-history data source." for e in selected]
 
