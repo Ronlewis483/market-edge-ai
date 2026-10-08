@@ -435,6 +435,9 @@ def render_prediction_workspace(league, predictions, result):
     """Interactive game selector with a dedicated panel for the selected game's bets."""
     from html import escape
     import hashlib
+    if league == 'NFL':
+        render_nfl_freshness_monitor()
+        if result.get('context_issue'):st.warning(result['context_issue'])
     st.markdown(f'<div class="me-workspace-header"><div class="me-eyebrow">PREDICTION WORKSPACE · {escape(league)}</div><h2>Find your next pick</h2><p>Select a game. Compare its winner, spread and strongest player props.</p></div>', unsafe_allow_html=True)
     controls = st.columns([2, 2, 3])
     with controls[0]:
@@ -505,6 +508,8 @@ def render_prediction_workspace(league, predictions, result):
                 st.write('Away win chance:', f"{float(game.get('away_win_probability',0)):.1%}")
                 if game.get('training_games') is not None:
                     st.write('Historical training games:', game['training_games'])
+            if league == 'NFL':
+                render_nfl_game_context(game)
             render_game_addons(league, game, result)
 
 
@@ -1015,10 +1020,16 @@ def nfl_week_rows(rows, now=None):
 
 
 def run_nfl_prediction_with_addons(feature_games, historical_accuracy=None, historical_sample=None):
+    feature_games = nfl_prediction_features()
     previous = st.session_state.get("nfl_prediction_pipeline_result") or {}
     remember_game_addons("NFL", previous)
     result = run_nfl_prediction_pipeline(feature_games=feature_games,
         historical_accuracy=historical_accuracy, historical_sample=historical_sample)
+    try:
+        from dual_agent.nfl_live_context import attach_context
+        result['predictions'] = attach_context(result.get('predictions'), result.get('live_odds'))
+    except Exception as exc:
+        result['context_issue'] = 'NFL context retrieval unavailable (' + type(exc).__name__ + ')'
     try:
         from dual_agent.game_prediction_addons import enhance_result
         result = enhance_result("NFL", result, prediction_api_key("ODDS_API_KEY", "THE_ODDS_API_KEY"), feature_games)
@@ -1144,23 +1155,78 @@ def render_game_addons(league, game, result):
 
 
 def nfl_prediction_features():
-    """Reuse prepared NFL features; prepare them once if this page opened first."""
-    required = {"start_time", "home_score", "away_score", "home_team", "away_team"}
-    features = st.session_state.get("nfl_feature_games")
-    if features is not None and not features.empty and required.issubset(features.columns):
-        return features
-    history = st.session_state.get("multi_nfl_games")
-    if history is None or history.empty:
-        downloaded = get_multiple_nfl_seasons(["sr:season:115087", "sr:season:127985"])
-        history = downloaded.get("games")
-        if history is None or history.empty:
-            raise ValueError("NFL historical download returned no games.")
-        st.session_state["multi_nfl_games"] = history
-    features = build_nfl_pregame_features(history)
-    if features is None or features.empty:
-        raise ValueError("NFL historical feature generation returned no data.")
-    st.session_state["nfl_feature_games"] = features
-    return features
+    """Rebuild from refreshed final results; session history is never the authority."""
+    from dual_agent.nfl_live_context import fresh_schedule, completed_history
+    schedule, fetched = fresh_schedule()
+    history = completed_history(schedule)
+    if history.empty:
+        raise ValueError('Current NFL completed-game history unavailable; stale features were not silently reused.')
+    signature = pd.util.hash_pandas_object(history[['game_id','home_score','away_score']],index=False).sum().item()
+    if st.session_state.get('nfl_history_signature') != signature or st.session_state.get('nfl_live_feature_games') is None:
+        features = build_nfl_pregame_features(history)
+        if features is None or features.empty:
+            raise ValueError('Fresh NFL completed results produced no usable features.')
+        st.session_state['nfl_live_feature_games'] = features
+        st.session_state['nfl_feature_games'] = features
+        st.session_state['multi_nfl_games'] = history
+        st.session_state['nfl_history_signature'] = signature
+    st.session_state['nfl_history_fetched_at'] = fetched
+    st.session_state['nfl_latest_completed_game'] = history.start_time.max().isoformat()
+    return st.session_state['nfl_live_feature_games']
+
+
+@st.fragment(run_every='180s')
+def render_nfl_freshness_monitor():
+    try:
+        nfl_prediction_features()
+        stamp = pd.Timestamp(st.session_state['nfl_history_fetched_at']).tz_convert('America/Chicago')
+        latest = pd.Timestamp(st.session_state['nfl_latest_completed_game']).tz_convert('America/Chicago')
+        st.caption(f"History checked {stamp.strftime('%b %d · %I:%M %p CT')} · latest completed game {latest.strftime('%b %d, %Y')} · checks every 3 minutes while this page is open")
+    except Exception as exc:
+        st.warning('NFL history refresh unavailable: ' + str(exc))
+
+
+def render_nfl_game_context(game):
+    context = game.get('game_context')
+    with st.expander('Quarterbacks, injuries & game conditions', expanded=True):
+        if not isinstance(context,dict):
+            st.info('Generate fresh NFL predictions to retrieve current game context.')
+            return
+        st.caption('Context fetched ' + str(context.get('fetched_at','Not available')))
+        for side in ['away','home']:
+            team = context.get(side,{})
+            st.markdown('**' + str(team.get('team',game.get(side+'_team','Team'))) + '**')
+            qb=team.get('qb')
+            if qb:
+                st.write(f"Expected QB: **{qb['name']}**")
+                st.caption(f"Injury: {qb['injury_status']} · Practice: {qb['practice_status']}")
+                st.caption(qb['designation'] + ' · depth chart ' + str(team.get('depth_updated_at','Not verified')))
+                if qb.get('report_updated_at'):st.caption('QB report updated ' + qb['report_updated_at'])
+            else:
+                st.warning('Expected starting QB not verified from the retrieved depth chart.')
+            with st.expander('Injury & practice report · ' + str(team.get('team',side))):
+                reports=team.get('injuries',[])
+                if reports:st.dataframe(pd.DataFrame(reports).drop(columns=['gsis_id'],errors='ignore'),hide_index=True,use_container_width=True)
+                else:st.caption('No current-week report returned. This does not establish that the team is healthy.')
+            with st.expander('Depth chart · ' + str(team.get('team',side))):
+                if team.get('depth'):st.dataframe(pd.DataFrame(team['depth']),hide_index=True,use_container_width=True)
+                else:st.caption('Current depth chart unavailable.')
+        weather=context.get('weather',{})
+        if weather.get('source'):
+            st.markdown('**Kickoff weather · ' + str(weather['venue']) + '**')
+            st.caption(f"{weather['temperature_f']}°F · wind {weather['wind_mph']} mph · rain chance {weather['rain_chance']}%")
+            st.caption(weather['source'] + ' · ' + weather['fetched_at'])
+            st.caption('Roof type: ' + str(weather['roof_type']) + ' · ' + weather['roof_status'] + '. Outdoor forecast may not affect an enclosed field.')
+        market=context.get('market',{})
+        if market.get('books'):
+            st.markdown('**Sportsbook comparison · margin removed**')
+            st.caption(f"{game['home_team']}: {market['home_probability']:.1%} · {game['away_team']}: {market['away_probability']:.1%}")
+            st.caption(f"Model–market gap: {market['gap']*100:.1f} percentage points · {len(market['books'])} books")
+            st.dataframe(pd.DataFrame(market['books'])[['sportsbook','home_moneyline','away_moneyline']],hide_index=True,use_container_width=True)
+        elif market.get('issue'):st.caption(market['issue'])
+        for issue in dict.fromkeys(context.get('issues',[])):st.warning(issue)
+        st.caption(context.get('probability_use',''))
+
 
 
 @st.fragment(run_every="180s")
