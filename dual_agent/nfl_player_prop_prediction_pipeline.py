@@ -11,6 +11,8 @@ This module does not execute wagers.
 
 import re
 
+NFL_PROP_VALUE_VERSION = 1
+
 import numpy as np
 import pandas as pd
 
@@ -100,6 +102,7 @@ def _estimate_prop(
     values,
     line,
     market,
+    side=None,
 ):
     """
     Produce a ranked prop forecast.
@@ -231,6 +234,13 @@ def _estimate_prop(
             1.0,
         )
 
+    if side is not None:
+        valid_sides = {'YES','NO'} if market == 'Anytime touchdown' else {'OVER','UNDER'}
+        if side not in valid_sides:
+            return None
+        model_pick = side
+        support = over_support if side in {'YES','OVER'} else under_support
+
     sample_reliability = min(
         sample_size / 12.0,
         1.0,
@@ -344,6 +354,7 @@ def run_nfl_player_prop_prediction_pipeline(
     window=12,
     max_results=20,
     horizon_days=1,
+    retain_all_qualified=False,
 ):
     """
     Generate and rank future player-prop forecasts within the requested horizon.
@@ -402,7 +413,7 @@ def run_nfl_player_prop_prediction_pipeline(
         return empty
 
     rows = []
-    exclusions = {'insufficient_history': 0, 'unoffered_direction': 0, 'below_65_percent': 0}
+    exclusions = {'insufficient_history': 0, 'unoffered_direction': 0, 'below_65_percent': 0, 'nonpositive_value': 0}
 
     for _, prop in (
         consensus_props.iterrows()
@@ -465,136 +476,142 @@ def run_nfl_player_prop_prediction_pipeline(
             )
         )
 
-        estimate = _estimate_prop(
-            values=values,
-            line=float(line),
-            market=market,
-        )
+        valid_sides = {'YES','NO'} if market == 'Anytime touchdown' else {'OVER','UNDER'}
+        for offered_side in prop['offered_sides']:
+            if offered_side not in valid_sides:
+                continue
+            estimate = _estimate_prop(
+                values=values,
+                line=float(line),
+                market=market,
+                side=offered_side,
+            )
 
-        if estimate is None:
-            exclusions['insufficient_history'] += 1
-            continue
+            if estimate is None:
+                exclusions['insufficient_history'] += 1
+                continue
 
-        # A model direction is actionable only if books actually sell that bet.
-        offered = prop['offered_sides'].get(estimate['model_pick'], [])
-        if not offered:
-            exclusions['unoffered_direction'] += 1
-            continue
+            # A model direction is actionable only if books actually sell that bet.
+            offered = prop['offered_sides'].get(estimate['model_pick'], [])
+            if not offered:
+                exclusions['unoffered_direction'] += 1
+                continue
 
-        # Avoid displaying extremely weak
-        # or essentially coin-flip forecasts.
-        if (
-            estimate[
-                "historical_support"
+            # Avoid displaying extremely weak
+            # or essentially coin-flip forecasts.
+            if (
+                estimate[
+                    "historical_support"
+                ]
+                < 0.65
+            ):
+                exclusions['below_65_percent'] += 1
+                continue
+
+            if (
+                estimate[
+                    "model_pick"
+                ]
+                == "PASS"
+            ):
+                continue
+
+            score = estimate[
+                "prediction_score"
             ]
-            < 0.65
-        ):
-            exclusions['below_65_percent'] += 1
-            continue
-
-        if (
-            estimate[
-                "model_pick"
-            ]
-            == "PASS"
-        ):
-            continue
-
-        score = estimate[
-            "prediction_score"
-        ]
-        def decimal_price(offer):
-            price = float(offer['american_odds'])
-            return 1 + price/100 if price > 0 else 1 + 100/abs(price)
-        best_offer = max(offered, key=decimal_price)
-        best_decimal = decimal_price(best_offer)
-        push_chance = 0.0 if market == 'Anytime touchdown' else float(np.mean(values == float(line)))
-        expected_return = (1-push_chance) * (estimate['historical_support'] * best_decimal - 1)
-        # Value breaks probability ties; it does not veto a qualifying offered bet.
-        if not np.isfinite(expected_return):
-            continue
+            def decimal_price(offer):
+                price = float(offer['american_odds'])
+                return 1 + price/100 if price > 0 else 1 + 100/abs(price)
+            best_offer = max(offered, key=decimal_price)
+            best_decimal = decimal_price(best_offer)
+            push_chance = 0.0 if market == 'Anytime touchdown' else float(np.mean(values == float(line)))
+            expected_return = (1-push_chance) * (estimate['historical_support'] * best_decimal - 1)
+            # A listed bet must offer positive estimated value at its best actual price.
+            if not np.isfinite(expected_return) or expected_return <= 0:
+                exclusions['nonpositive_value'] += 1
+                continue
 
 
 
-        if score >= 0.70:
-            confidence_group = (
-                "HIGH CONFIDENCE"
+            if score >= 0.70:
+                confidence_group = (
+                    "HIGH CONFIDENCE"
+                )
+
+            elif score >= 0.60:
+                confidence_group = (
+                    "MODERATE"
+                )
+
+            else:
+                confidence_group = (
+                    "CLOSE / PASS"
+                )
+
+            rows.append(
+                {
+                    "event_id":
+                        prop["event_id"],
+                    "game_time":
+                        kickoff,
+                    "away_team":
+                        prop["away_team"],
+                    "home_team":
+                        prop["home_team"],
+                    "player":
+                        prop["player"],
+                    "market":
+                        market,
+                    "line":
+                        float(line),
+                    "model_pick":
+                        estimate[
+                            "model_pick"
+                        ],
+                    "projected_value":
+                        estimate[
+                            "projection"
+                        ],
+                    "historical_support":
+                        estimate[
+                            "historical_support"
+                        ],
+                    "over_support":
+                        estimate[
+                            "over_support"
+                        ],
+                    "under_support":
+                        estimate[
+                            "under_support"
+                        ],
+                    "sample_size":
+                        estimate[
+                            "sample_size"
+                        ],
+                    "line_edge":
+                        estimate[
+                            "line_edge"
+                        ],
+                    "consistency":
+                        estimate[
+                            "consistency"
+                        ],
+                    "prediction_score":
+                        score,
+                    "sportsbook_line_count": len(offered),
+                    "sportsbook_offers": offered,
+                    "best_sportsbook": best_offer['bookmaker_key'],
+                    "best_american_odds": best_offer['american_odds'],
+                    "best_decimal_odds": best_decimal,
+                    "estimated_cover_chance": estimate['historical_support'],
+                    "estimated_return_per_unit": expected_return,
+                    "estimated_push_chance": push_chance,
+                    "break_even_cover_chance": 1/best_decimal,
+                    "availability_checked_at": current_time.isoformat(),
+                    "confidence_group":
+                        confidence_group,
+                }
             )
-
-        elif score >= 0.60:
-            confidence_group = (
-                "MODERATE"
-            )
-
-        else:
-            confidence_group = (
-                "CLOSE / PASS"
-            )
-
-        rows.append(
-            {
-                "event_id":
-                    prop["event_id"],
-                "game_time":
-                    kickoff,
-                "away_team":
-                    prop["away_team"],
-                "home_team":
-                    prop["home_team"],
-                "player":
-                    prop["player"],
-                "market":
-                    market,
-                "line":
-                    float(line),
-                "model_pick":
-                    estimate[
-                        "model_pick"
-                    ],
-                "projected_value":
-                    estimate[
-                        "projection"
-                    ],
-                "historical_support":
-                    estimate[
-                        "historical_support"
-                    ],
-                "over_support":
-                    estimate[
-                        "over_support"
-                    ],
-                "under_support":
-                    estimate[
-                        "under_support"
-                    ],
-                "sample_size":
-                    estimate[
-                        "sample_size"
-                    ],
-                "line_edge":
-                    estimate[
-                        "line_edge"
-                    ],
-                "consistency":
-                    estimate[
-                        "consistency"
-                    ],
-                "prediction_score":
-                    score,
-                "sportsbook_line_count": len(offered),
-                "sportsbook_offers": offered,
-                "best_sportsbook": best_offer['bookmaker_key'],
-                "best_american_odds": best_offer['american_odds'],
-                "best_decimal_odds": best_decimal,
-                "estimated_cover_chance": estimate['historical_support'],
-                "estimated_return_per_unit": expected_return,
-                "estimated_push_chance": push_chance,
-                "break_even_cover_chance": 1/best_decimal,
-                "availability_checked_at": current_time.isoformat(),
-                "confidence_group":
-                    confidence_group,
-            }
-        )
 
     results = pd.DataFrame(
         rows
@@ -639,6 +656,17 @@ def run_nfl_player_prop_prediction_pipeline(
     # A player can only occupy ONE Top-10 position.
     # Their strongest individual prop determines their rank.
     # ----------------------------------------------------------
+
+    if retain_all_qualified:
+        # Preserve every qualifying market for per-game UI filters before display caps.
+        all_props = results.head(max_results).copy().reset_index(drop=True)
+        all_props['prop_rank'] = range(1,len(all_props)+1)
+        all_props['is_best_prop'] = all_props.groupby(['event_id','player']).cumcount()==0
+        identities = list(zip(all_props.event_id,all_props.player))
+        ranks = {identity:i+1 for i,identity in enumerate(dict.fromkeys(identities))}
+        all_props['player_rank'] = [ranks[identity] for identity in identities]
+        all_props['selection_reason'] = 'Minimum 65% estimated cover chance and positive estimated value at an actual listed price; ranked by cover chance, then value.'
+        return all_props
 
     best_prop_per_player = (
         results
@@ -758,7 +786,7 @@ def run_nfl_player_prop_prediction_pipeline(
     top_player_props['prop_rank'] = range(1, len(top_player_props) + 1)
     top_player_props['selection_reason'] = (
         'Ranked by estimated cover chance, then listed-odds value;  '
-        'minimum 65%, exact recommended side listed at a sportsbook.'
+        'minimum 65%, positive estimated value, exact recommended side listed at a sportsbook.'
     )
 
     return top_player_props
