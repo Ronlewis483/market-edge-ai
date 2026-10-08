@@ -37,13 +37,13 @@ def name_key(value):
     return ''.join(c for c in unicodedata.normalize('NFKD', str(value)).lower() if c.isalnum())
 
 
-def estimate_prop(values, line, side, market_probability):
+def estimate_prop(values, line, side, market_probability, minimum=10):
     values = np.asarray(values, dtype=float)
     values = values[np.isfinite(values)][-30:]
     wins = int((values > line).sum()) if side == 'Over' else int((values < line).sum())
     pushes = int((values == line).sum())
     decisions = len(values)-pushes
-    if len(values) < 10 or decisions < 10:
+    if len(values) < minimum or decisions < minimum:
         return None
     # Preserve the existing short-sample shrinkage and eligibility criteria.
     chance = (wins+10*market_probability)/(decisions+10)
@@ -59,7 +59,7 @@ def _get(url, key, params=None, balldontlie=False):
     return response.json()
 
 
-MLB_PROP_MATCH_VERSION = 4
+MLB_PROP_MATCH_VERSION = 5
 
 
 def mlb_team_key(value):
@@ -292,7 +292,7 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
         subset['total_bases'] = subset['singles']+2*number('doubles')+3*number('triples')+4*number('batting_home_runs')
         subset['hits_runs_rbis'] = number('hits')+number('batting_runs')+number('rbi')
         mlb_histories = {int(pid): frame for pid,frame in subset.groupby('player_id')}
-    picks = []; exclusions = []
+    picks = []; exclusions = []; pitcher_forecasts = []
     def excluded(first, player, market, line, reason):
         exclusions.append({'Player': player, 'Market': market, 'Line': line,
             'Game': first['away_team']+' @ '+first['home_team'], 'Reason': reason})
@@ -336,7 +336,7 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
         values = [float(v) for v in values if v is not None and np.isfinite(float(v))]
         if league == 'MLB':
             sample = values[-30:]
-            if len(sample) < 10 or sum(v != line for v in sample) < 10:
+            if not pitching_market and (len(sample) < 10 or sum(v != line for v in sample) < 10):
                 excluded(first, player, market, line, f'Need 10 usable non-push appearances; found {len(sample)} appearances and {sum(v != line for v in sample)} non-push results.')
                 continue
         qualified = False
@@ -345,8 +345,21 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
             available = [q for q in unique.values() if (q.get(price_key) or 0) > 1]
             if not available:
                 continue
-            estimate = estimate_prop(values,line,side,market_p)
-            if estimate and estimate['Estimated chance'] >= .65:
+            estimate = estimate_prop(values,line,side,market_p,
+                minimum=1 if league == 'MLB' and pitching_market else 10)
+            if estimate and league == 'MLB' and pitching_market:
+                best_forecast = max(available, key=lambda q:q[price_key])
+                pitcher_forecasts.append({'game_id': int(first['game_id']), 'player_id': identity[0],
+                    'Player': player, 'Market': MARKETS[league][market][0], 'Pick': side, 'Line': line,
+                    'Best sportsbook': best_forecast['book'], 'Best decimal odds': best_forecast[price_key],
+                    'Estimated chance': estimate['Estimated chance'], 'Projected stat': estimate['Projected stat'],
+                    'Prior games': estimate['Prior games'],
+                    'Non-push games': estimate['Prior games']-estimate['Historical pushes'],
+                    'Participation status': participation,
+                    'start_time': first['start_time'], 'Captured UTC': first['capture_time'],
+                    'Estimate method': estimate['Estimate method'] if paired_probabilities else 'Prior appearances + neutral shrinkage; one-sided quote'})
+            enough_history = estimate and estimate['Prior games'] >= 10 and estimate['Prior games']-estimate['Historical pushes'] >= 10
+            if enough_history and estimate['Estimated chance'] >= .65:
                 qualified = True
                 if not paired_probabilities:
                     estimate['Estimate method'] = 'Prior 30 appearances + neutral shrinkage; one-sided sportsbook quote'
@@ -369,5 +382,5 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
         if key not in seen:
             seen.add(key);chosen.append(pick)
         # Retain eligible picks for every matchup; the global list stays top ten.
-    return {'picks':chosen[:10],'game_picks':chosen,'errors':errors, **({'exclusions': exclusions, 'quoted_candidates':len(groups)} if league=='MLB' else {}), 'message':f'{len(chosen)} player-prop estimates ranked from actual lines and prior appearances.',
+    return {'picks':chosen[:10],'game_picks':chosen,'errors':errors, **({'exclusions': exclusions, 'quoted_candidates':len(groups), 'pitcher_forecasts':pitcher_forecasts} if league=='MLB' else {}), 'message':f'{len(chosen)} player-prop estimates ranked from actual lines and prior appearances.',
             'note':'Estimated chance is conditional on no push and player participation. Estimates are not calibrated; no availability or injury clearance is implied.'}
