@@ -8,6 +8,8 @@ FEATURES = ['momentum_15', 'momentum_30', 'momentum_60', 'session_return', 'vwap
 
 
 def resolve_symbol(question, fallback):
+    if re.search(r'\b(bitcoin|btc|ethereum|eth|crypto|dogecoin|doge|solana|sol)\b', question, re.I) or str(fallback).strip().upper() in {'BTC','BTC/USD','ETH','ETH/USD','DOGE','SOL'}:
+        raise ValueError('This trend check currently covers stocks and ETFs. Bitcoin and other cryptocurrencies need a crypto data connection; no AAPL forecast was substituted.')
     explicit = re.search(r'\$([A-Za-z][A-Za-z0-9.\-]{0,9})\b', question)
     words = re.findall(r'\b[A-Z][A-Z0-9.\-]{0,9}\b', question)
     ignored = {'IS','IN','AN','A','I','THE','TODAY','UPTREND','DOWNTREND','STOCK','MIN','MINUTES','HR','HOUR','FOR','NEXT','PREDICT','VWAP','US','AM','PM'}
@@ -145,10 +147,11 @@ def render_intraday_outlook(key, secret, feed, url):
     import streamlit as st
     from dual_agent import stock_opportunity_engine as engine
     st.subheader('🔎 Ask about a stock · intraday trend')
+    st.caption('Stocks and ETFs · enter a ticker or use $TICKER in your question. Crypto is not connected yet.')
     with st.form('stock_intraday_question'):
         ticker = st.text_input('Stock ticker',value='AAPL',key='stock_intraday_ticker')
         question = st.text_input('Your question',placeholder='Is AAPL in an uptrend today? What is the next 30-minute outlook?')
-        submit = st.form_submit_button('Check trend & next hour',use_container_width=True)
+        submit = st.form_submit_button('Check trend & next hour',type='primary',use_container_width=True)
     if submit:
         # Remove the old answer before requesting another ticker; failures cannot leave a misleading old card.
         st.session_state.pop('stock_intraday_answer',None)
