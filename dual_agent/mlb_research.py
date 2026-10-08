@@ -4464,6 +4464,8 @@ def _mlb_boxscore_player_postgame_row(
             _safe_number(pitching.get("walks")),
         ),
         "pitcher_hits": _safe_number(pitching.get("hits")),
+        # Total runs include unearned runs; missing source values stay unknown.
+        "pitcher_runs_allowed": pd.to_numeric(pitching.get("runs"), errors="coerce"),
         "pitcher_home_runs": _safe_number(pitching.get("homeRuns")),
         "earned_runs": _safe_number(pitching.get("earnedRuns")),
         "pitches": _safe_number(pitching.get("numberOfPitches")),
