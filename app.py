@@ -438,6 +438,7 @@ def render_prediction_workspace(league, predictions, result):
     if league == 'NFL':
         render_nfl_freshness_monitor()
         if result.get('context_issue'):st.warning(result['context_issue'])
+        if result.get('qb_forecast_issue'):st.warning(result['qb_forecast_issue'])
     st.markdown(f'<div class="me-workspace-header"><div class="me-eyebrow">PREDICTION WORKSPACE · {escape(league)}</div><h2>Find your next pick</h2><p>Select a game. Compare its winner, spread and strongest player props.</p></div>', unsafe_allow_html=True)
     controls = st.columns([2, 2, 3])
     with controls[0]:
@@ -812,7 +813,7 @@ def render_player_prop_picks(league, result):
         if not picks:
             st.info(props.get("message", "Generate predictions to collect available player-prop lines."))
         else:
-            st.caption("Ranked by estimated confidence after eligibility checks: a fresh exact bet from at least one sportsbook, verified player identity and at least 10 non-push prior appearances. Provisional participation is labeled." if league == "MLB" else "Historical hit-rate estimates with sportsbook shrinkage. These estimates are not calibrated win probabilities.")
+            st.caption("Ranked by estimated confidence after eligibility checks: a fresh exact bet from at least one sportsbook, verified player identity and sufficient prior history: hitters need 10 appearances and 8 non-push results; qualifying pitcher bets need 10 non-push starts. Provisional participation is labeled." if league == "MLB" else "Historical hit-rate estimates with sportsbook shrinkage. These estimates are not calibrated win probabilities.")
             for offset in range(0, len(picks), 2):
                 for column, pick in zip(st.columns(2), picks[offset:offset+2]):
                     with column:
@@ -929,10 +930,10 @@ def load_mlb_prediction_pipeline():
     if "run_mlb_prediction_pipeline" not in definitions or "render_mlb_prediction_center" in definitions:
         raise RuntimeError("dual_agent/mlb_prediction_pipeline.py contains the wrong code. Replace it with the supplied pipeline file; app.py belongs only in the repository root.")
     pipeline = importlib.import_module("dual_agent.mlb_prediction_pipeline")
-    if getattr(pipeline, "MLB_PIPELINE_VERSION", None) != 13:
+    if getattr(pipeline, "MLB_PIPELINE_VERSION", None) != 14:
         importlib.invalidate_caches()
         pipeline = importlib.reload(pipeline)
-    if getattr(pipeline, "MLB_PIPELINE_VERSION", None) != 13:
+    if getattr(pipeline, "MLB_PIPELINE_VERSION", None) != 14:
         raise RuntimeError("Deploy the matching dual_agent/mlb_prediction_pipeline.py from this update. The running MLB module is older than the seven-day forecast fix.")
     return pipeline
 
@@ -1234,6 +1235,9 @@ def render_game_addons(league, game, result):
                         st.caption("Offered at: " + ", ".join(str(o['book']) + " (" + decimal_to_american_label(float(o['decimal_odds'])) + ")" for o in offers))
                     if "neutral" in str(prop.get("Estimate method", "")):
                         st.caption("One-sided listing · estimate uses prior appearances and a neutral prior; a margin-free market probability is unavailable.")
+                    decisions = int(prop.get("Non-push games", prop.get("Prior games", 0)-prop.get("Historical pushes", 0)))
+                    if league == "MLB" and decisions in (8, 9):
+                        st.caption(f"Smaller sample · {decisions} non-push results from {prop['Prior games']} prior appearances")
                     participation = prop.get("Participation status")
                     if participation:
                         st.caption(participation)
@@ -1292,6 +1296,26 @@ def render_nfl_game_context(game):
                 st.caption(f"Injury: {qb['injury_status']} · Practice: {qb['practice_status']}")
                 st.caption(qb['designation'] + ' · depth chart ' + str(team.get('depth_updated_at','Not verified')))
                 if qb.get('report_updated_at'):st.caption('QB report updated ' + qb['report_updated_at'])
+                with st.container(border=True):
+                    st.markdown('**Quarterback forecast**')
+                    forecasts = qb.get('forecasts', [])
+                    for forecast in forecasts:
+                        st.markdown(f"**{forecast['pick']} {forecast['line']:g} {forecast['market']} · {forecast['chance']:.1%} estimated cover chance**")
+                        st.caption(f"Projection {forecast['projection']:.1f} · {forecast['sample_size']} prior passing appearances · {forecast['book']} ({forecast['american_odds']:+g})")
+                        if forecast['chance'] < .65:
+                            st.caption('Below the 65% betting minimum · informational forecast only.')
+                    covered = {f['market'] for f in forecasts}
+                    projections = qb.get('projections', [])
+                    for projection in projections:
+                        if projection['market'] not in covered:
+                            st.write(f"{projection['market']}: projected {projection['projection']:.1f} · {projection['sample_size']} prior appearances")
+                    if not forecasts:
+                        st.caption('No fresh matching sportsbook cover estimate. Projections remain visible when history is available; line estimates need at least 8 usable appearances.')
+                    if not projections:
+                        st.caption('QB historical projections are unavailable. Generate again to collect the updated forecast panel.')
+                    st.caption(qb.get('forecast_note','Expected starter forecast; availability still needs verification.'))
+                    st.caption('Cover estimates exclude pushes and assume participation. Historical support is not calibrated prediction accuracy.')
+
             else:
                 st.warning('Expected starting QB not verified from the retrieved depth chart.')
             with st.expander('Injury & practice report · ' + str(team.get('team',side))):
@@ -1386,7 +1410,7 @@ def render_mlb_prediction_center(location):
         except Exception as exc:
             st.error("MLB prediction pipeline stopped: " + str(exc))
     result = st.session_state.get("mlb_live_pipeline_result")
-    if result and result.get("pipeline_version") != 13:
+    if result and result.get("pipeline_version") != 14:
         st.session_state.pop("mlb_live_pipeline_result", None)
         result = None
         st.info("The MLB pipeline was updated. Generate again to search the upcoming seven-day schedule.")
