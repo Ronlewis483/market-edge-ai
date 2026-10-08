@@ -8,8 +8,16 @@ FEATURES = ['momentum_15', 'momentum_30', 'momentum_60', 'session_return', 'vwap
 
 
 def resolve_symbol(question, fallback):
-    if re.search(r'\b(bitcoin|btc|ethereum|eth|crypto|dogecoin|doge|solana|sol)\b', question, re.I) or str(fallback).strip().upper() in {'BTC','BTC/USD','ETH','ETH/USD','DOGE','SOL'}:
-        raise ValueError('This trend check currently covers stocks and ETFs. Bitcoin and other cryptocurrencies need a crypto data connection; no AAPL forecast was substituted.')
+    # A named crypto asset in the question takes precedence over the stock field.
+    aliases = {'bitcoin':'BTC/USD', 'btc':'BTC/USD', 'ethereum':'ETH/USD', 'eth':'ETH/USD',
+               'dogecoin':'DOGE/USD', 'doge':'DOGE/USD', 'solana':'SOL/USD'}
+    matches = {pair for word, pair in aliases.items() if re.search(r'\b'+word+r'\b', question, re.I)}
+    pair = re.search(r'\b([A-Za-z]{2,10})/USD\b', question, re.I)
+    if pair:matches.add(pair.group(1).upper()+'/USD')
+    if len(matches)>1:raise ValueError('Ask about one asset at a time.')
+    if matches:return matches.pop()
+    if str(fallback).strip().lower() in aliases:return aliases[str(fallback).strip().lower()]
+    if re.fullmatch(r'[A-Za-z]{2,10}/USD', str(fallback).strip()):return str(fallback).strip().upper()
     explicit = re.search(r'\$([A-Za-z][A-Za-z0-9.\-]{0,9})\b', question)
     words = re.findall(r'\b[A-Z][A-Z0-9.\-]{0,9}\b', question)
     ignored = {'IS','IN','AN','A','I','THE','TODAY','UPTREND','DOWNTREND','STOCK','MIN','MINUTES','HR','HOUR','FOR','NEXT','PREDICT','VWAP','US','AM','PM'}
@@ -28,7 +36,7 @@ def resolve_symbol(question, fallback):
     return symbol
 
 
-def prepare_bars(raw, symbol, now):
+def prepare_bars(raw, symbol, now, crypto=False):
     data = raw.loc[raw.symbol == symbol].copy()
     data['timestamp'] = pd.to_datetime(data.timestamp, utc=True, errors='coerce')
     for column in ['open','high','low','close','volume']:
@@ -40,8 +48,9 @@ def prepare_bars(raw, symbol, now):
     data = data.loc[data.bar_end <= now]
     local = data.timestamp.dt.tz_convert('America/New_York')
     minutes = local.dt.hour*60 + local.dt.minute
-    data = data.loc[(minutes >= 570) & (minutes < 960)].copy()
-    data['session'] = data.timestamp.dt.tz_convert('America/New_York').dt.date
+    if not crypto:
+        data = data.loc[(minutes >= 570) & (minutes < 960)].copy()
+    data['session'] = data.timestamp.dt.tz_convert('America/Chicago' if crypto else 'America/New_York').dt.date
     # Never manufacture missing bars or use overnight returns as intraday momentum.
     data = data.reset_index(drop=True)
     for _, indexes in data.groupby('session').groups.items():
@@ -59,6 +68,10 @@ def prepare_bars(raw, symbol, now):
         vwap = (price*g.volume).cumsum()/cumulative_volume
         data.loc[indexes,'session_vwap'] = vwap
         data.loc[indexes,'vwap_gap'] = g.close/vwap-1
+    if crypto:
+        for period in [15,30,60]:
+            continuous = (data.timestamp-data.timestamp.shift(period//5))==pd.Timedelta(minutes=period)
+            data['momentum_'+str(period)] = (data.close/data.close.shift(period//5)-1).where(continuous)
     return data
 
 
@@ -74,18 +87,19 @@ def fifteen_minute_bars(data):
     return pd.DataFrame(rows)
 
 
-def analyze(raw, symbol, clock, now=None):
+def analyze(raw, symbol, clock=None, now=None, crypto=False):
     now = pd.Timestamp(now or pd.Timestamp.now(tz='UTC'))
-    data = prepare_bars(raw, symbol, now)
+    data = prepare_bars(raw, symbol, now, crypto)
     if data.empty:
-        raise ValueError('No completed regular-session bars are available for this stock.')
-    today = now.tz_convert('America/New_York').date()
+        raise ValueError('No completed bars are available for this asset.')
+    today = now.tz_convert('America/Chicago' if crypto else 'America/New_York').date()
     current = data.loc[data.session == today]
     latest = data.iloc[-1]
     result = {'symbol':symbol,'as_of':latest.bar_end.isoformat(),'reference_price':float(latest.close),
         'trend':'No current-session data','today_return':None,'vwap':None,'bars_15':fifteen_minute_bars(current), 'outlooks':[]}
-    is_open = bool(clock.get('is_open'))
-    close = pd.to_datetime(clock.get('next_close'), utc=True, errors='coerce')
+    clock = clock or {}
+    is_open = crypto or bool(clock.get('is_open'))
+    close = now+pd.Timedelta(days=1) if crypto else pd.to_datetime(clock.get('next_close'), utc=True, errors='coerce')
     fresh = not current.empty and pd.Timedelta(0) <= now-latest.bar_end <= pd.Timedelta(minutes=7)
     if not current.empty:
         today_change = float(latest.session_return)
@@ -110,7 +124,7 @@ def analyze(raw, symbol, clock, now=None):
         if not np.isfinite(latest[FEATURES].to_numpy(dtype=float)).all():
             output['reason'] = 'Need a full hour of continuous bars to compare intraday conditions.'; continue
         candidates = []
-        for _, group in data.groupby('session'):
+        for group in ([data] if crypto else [g for _, g in data.groupby('session')]):
             future = group.close.shift(-minutes//5)
             future_end = group.bar_end.shift(-minutes//5)
             valid = ((future_end-group.bar_end)==pd.Timedelta(minutes=minutes)) & (future_end<=latest.bar_end)
@@ -143,13 +157,32 @@ def analyze(raw, symbol, clock, now=None):
     return result
 
 
+def fetch_crypto_bars(symbol, key, secret, now=None):
+    from dual_agent import stock_opportunity_engine as engine
+    now = pd.Timestamp(now or pd.Timestamp.now(tz='UTC'))
+    params = {'symbols':symbol, 'timeframe':'5Min', 'start':(now-pd.Timedelta(days=21)).isoformat(),
+              'end':now.isoformat(), 'limit':10000, 'sort':'asc'}
+    rows = []
+    for _ in range(40):
+        payload = engine._get('https://data.alpaca.markets', '/v1beta3/crypto/us/bars', key, secret, params)
+        for bar in payload.get('bars', {}).get(symbol, []):
+            rows.append(dict(bar, symbol=symbol))
+        token = payload.get('next_page_token')
+        if not token:break
+        params['page_token'] = token
+    else:
+        raise RuntimeError('Crypto history is incomplete; no forecast generated.')
+    if not rows:raise RuntimeError('No crypto history returned for '+symbol+'. Check crypto data access and the supported trading pair.')
+    return pd.DataFrame(rows).rename(columns={'t':'timestamp','o':'open','h':'high','l':'low','c':'close','v':'volume','vw':'vwap'})
+
+
 def render_intraday_outlook(key, secret, feed, url):
     import streamlit as st
     from dual_agent import stock_opportunity_engine as engine
-    st.subheader('🔎 Ask about a stock · intraday trend')
-    st.caption('Stocks and ETFs · enter a ticker or use $TICKER in your question. Crypto is not connected yet.')
+    st.subheader('🔎 Ask about a stock or crypto · intraday trend')
+    st.caption('Enter a stock ticker or Bitcoin / BTC/USD. Crypto uses its own continuous data feed; the stock SIP/IEX setting does not apply.')
     with st.form('stock_intraday_question'):
-        ticker = st.text_input('Stock ticker',value='AAPL',key='stock_intraday_ticker')
+        ticker = st.text_input('Ticker or crypto pair',value='AAPL',key='stock_intraday_ticker')
         question = st.text_input('Your question',placeholder='Is AAPL in an uptrend today? What is the next 30-minute outlook?')
         submit = st.form_submit_button('Check trend & next hour',type='primary',use_container_width=True)
     if submit:
@@ -158,22 +191,24 @@ def render_intraday_outlook(key, secret, feed, url):
         try:
             symbol = resolve_symbol(question,ticker)
             with st.spinner('Checking '+symbol+' completed bars…'):
-                raw = engine.fetch_bars([symbol],key,secret,'hour',feed)
-                clock = engine.fetch_clock(key,secret,url)
-                answer = analyze(raw,symbol,clock)
-                answer['feed'] = feed;answer['question'] = question
+                crypto = '/' in symbol
+                raw = fetch_crypto_bars(symbol,key,secret) if crypto else engine.fetch_bars([symbol],key,secret,'hour',feed)
+                clock = {} if crypto else engine.fetch_clock(key,secret,url)
+                answer = analyze(raw,symbol,clock,crypto=crypto)
+                answer['crypto'] = crypto
+                answer['feed'] = 'Alpaca crypto US' if crypto else feed;answer['question'] = question
                 st.session_state['stock_intraday_answer'] = answer
         except Exception as exc:
-            st.error('Stock trend check could not finish: '+str(exc))
+            st.error('Trend check could not finish: '+str(exc))
     answer = st.session_state.get('stock_intraday_answer')
     if not answer:return
-    if answer.get('feed')!=feed:
+    if not answer.get('crypto') and answer.get('feed')!=feed:
         st.info('Check again to use the newly selected data feed.');return
     stamp = pd.Timestamp(answer['as_of']).tz_convert('America/Chicago')
     st.markdown('### '+answer['symbol']+' · '+answer['trend'])
     st.caption('Completed-bar reference: '+stamp.strftime('%b %d, %Y · %-I:%M %p CT')+' · '+answer['feed'].upper())
     st.metric('Reference close',f"${answer['reference_price']:,.2f}")
-    if answer['today_return'] is not None:st.caption(f"Change from regular-session open: {answer['today_return']:+.2%}")
+    if answer['today_return'] is not None:st.caption(('Change since midnight CT: ' if answer.get('crypto') else 'Change from regular-session open: ')+f"{answer['today_return']:+.2%}")
     if answer['vwap'] is not None:st.caption(f"Session VWAP: ${answer['vwap']:,.2f}")
     age = pd.Timestamp.now(tz='UTC')-pd.Timestamp(answer['as_of'])
     expired = age>pd.Timedelta(minutes=7)
