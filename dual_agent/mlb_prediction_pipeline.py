@@ -15,7 +15,7 @@ import requests
 from scipy.stats import skellam
 
 ACTIVE_MODEL_PATH = 'mlb/live_matchup/active.json'
-MLB_PIPELINE_VERSION = 11
+MLB_PIPELINE_VERSION = 12
 _HISTORY_CACHE = {}
 _CACHE_LOCK = RLock()
 CORE = ['home_field', 'offense_runs_per_game', 'opponent_runs_allowed',
@@ -331,8 +331,8 @@ def score_live_games(model, games, market=None):
              'Home win probability': float(p[i]), 'Predicted winner': g['home_team'] if p[i] >= .5 else g['away_team'],
              'Winner probability': float(max(p[i], 1-p[i])), 'Projected home runs': float(rates[i, 0]), 'Projected away runs': float(rates[i, 1]),
              'Equation': labels[i], 'Recommendation threshold': thresholds[i],
-             'Should we make the pick': bool(not g.get('input_notes') and thresholds[i] is not None and max(p[i], 1-p[i]) >= thresholds[i]),
-             'Input status': 'Early forecast — player inputs incomplete' if g.get('input_notes') else 'Recorded pregame player inputs available',
+             'Should we make the pick': bool(not g.get('input_notes') and not missing[2*i:2*i+2].any() and thresholds[i] is not None and max(p[i], 1-p[i]) >= thresholds[i]),
+             'Input status': 'Early forecast — player inputs incomplete' if g.get('input_notes') or missing[2*i:2*i+2].any() else 'Recorded pregame player inputs available',
              'Input notes': g.get('input_notes', []),
              'Market home probability': float(mp[i]) if np.isfinite(mp[i]) else None,
              'Captured UTC': pd.to_datetime(g['timecode'], format='%Y%m%d_%H%M%S', utc=True).isoformat(),
@@ -467,6 +467,26 @@ def _generate_mlb_predictions(game_date=None, api_key=None, progress=None, on_te
             errors.append({'error': 'Current odds unavailable; using the saved matchup equation.'})
     mark('Score team winners')
     predictions = score_live_games(model, games, market)
+    for row in predictions:
+        snapshot = snapshots[row['game_id']]
+        box = snapshot.get('raw_feed', {}).get('liveData', {}).get('boxscore', {}).get('teams', {})
+        context = {'captured_at': snapshot.get('capture_finished_at'), 'teams': {},
+                   'current_information': snapshot.get('current_information', {}),
+                   'model_columns': list(columns), 'equation': row['Equation'],
+                   'market_home_probability': row.get('Market home probability')}
+        for side in ['home', 'away']:
+            team = box.get(side, {}); players = team.get('players', {})
+            order = team.get('battingOrder', [])
+            probable = snapshot.get('probable_pitchers', {}).get(side, {})
+            pitchers = team.get('pitchers', [])
+            pid = pitchers[0] if pitchers else probable.get('id')
+            def player_name(pid):
+                return players.get('ID'+str(pid), {}).get('person', {}).get('fullName') or ('Player '+str(pid))
+            context['teams'][side] = {'starter': player_name(pid) if pitchers else probable.get('fullName'),
+                'starter_status': 'Recorded starter' if pitchers else 'Probable starter' if pid else 'Unannounced',
+                'lineup_confirmed': len(order)==9 and len(set(order))==9,
+                'lineup': [player_name(pid) for pid in order]}
+        row['game_context'] = context
     now = pd.Timestamp.now(tz='UTC')
     predictions = [r for r in predictions if pd.Timestamp(r['start_time'])>now and now-pd.Timestamp(r['Captured UTC'])<=pd.Timedelta(minutes=15)]
     predictions.sort(key=lambda r: (-r['Winner probability'], r['start_time'], r['game_id']))
@@ -474,14 +494,14 @@ def _generate_mlb_predictions(game_date=None, api_key=None, progress=None, on_te
     predictions = predictions[:10]
     mark('Collect player props')
     if on_team_predictions:
-        on_team_predictions(predictions)
+        on_team_predictions(all_eligible_predictions)
     update('Team forecasts ready. Collecting player props in parallel...')
     try:
         import importlib
         prop_module = importlib.import_module('dual_agent.sports_player_prop_predictions')
-        if getattr(prop_module, 'MLB_PROP_MATCH_VERSION', None) != 3:
+        if getattr(prop_module, 'MLB_PROP_MATCH_VERSION', None) != 4:
             prop_module = importlib.reload(prop_module)
-        if getattr(prop_module, 'MLB_PROP_MATCH_VERSION', None) != 3:
+        if getattr(prop_module, 'MLB_PROP_MATCH_VERSION', None) != 4:
             raise RuntimeError('Install the matching sports_player_prop_predictions.py update.')
         generate_player_prop_picks = prop_module.generate_player_prop_picks
         prop_games = [{'game_id': r['game_id'], 'start_time': r['start_time'], 'home_team': r['Home'], 'away_team': r['Away']} for r in all_eligible_predictions]
@@ -491,6 +511,7 @@ def _generate_mlb_predictions(game_date=None, api_key=None, progress=None, on_te
                  'message': 'MLB player-prop generation failed ('+type(exc).__name__+'). See player-prop data coverage.'}
     now = pd.Timestamp.now(tz='UTC')
     predictions = [r for r in predictions if pd.Timestamp(r['start_time'])>now and now-pd.Timestamp(r['Captured UTC'])<=pd.Timedelta(minutes=15)]
+    props['game_picks'] = [r for r in props.get('game_picks', []) if pd.Timestamp(r['start_time'])>now and now-pd.Timestamp(r['Captured UTC'])<=pd.Timedelta(minutes=15)]
     props['picks'] = [r for r in props.get('picks', []) if pd.Timestamp(r['start_time'])>now and now-pd.Timestamp(r['Captured UTC'])<=pd.Timedelta(minutes=15)]
     mark('Save predictions')
     result = {'stage_timings_seconds': dict(timings), 'version': 1, 'created_at': now.isoformat(), 'game_date': str(game_date),
@@ -554,6 +575,7 @@ def run_mlb_prediction_pipeline(game_date=None, api_key=None, progress=None, on_
     else:
         result['predictions'] = [r for r in result.get('predictions', []) if eligible(r)]
     if result.get('player_props'):
+        result['player_props']['game_picks'] = [r for r in result['player_props'].get('game_picks', []) if eligible(r)]
         result['player_props']['picks'] = [r for r in result['player_props'].get('picks', []) if eligible(r)]
     result['reused_recent_predictions'] = reused
     return result
