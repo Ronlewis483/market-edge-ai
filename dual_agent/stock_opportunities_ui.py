@@ -141,6 +141,15 @@ def render_daytrading(results,forex_config):
             st.caption('Quote '+pd.Timestamp(pick['quote_time']).tz_convert('America/Chicago').strftime('%-I:%M:%S %p CT')+f" · spread {pick['spread_pct']:.2%}")
 
 
+def compatible_market_scan(key, secret, feed, url, cache, forex_config):
+    """Match the installed engine signature without retrying a failed scan."""
+    import inspect
+    parameters = inspect.signature(engine.scan_market).parameters
+    if 'forex_config' in parameters:
+        return engine.scan_market(key, secret, feed, url, cache, forex_config=forex_config)
+    return engine.scan_market(key, secret, feed, url, cache)
+
+
 @st.cache_resource(show_spinner=False)
 def market_worker(_key, _secret, feed, url, version, credential_identity):
     from concurrent.futures import ThreadPoolExecutor
@@ -173,7 +182,7 @@ def render_stock_opportunities():
     import hashlib
     forex_config={'token':setting('OANDA_API_TOKEN'),'account':setting('OANDA_ACCOUNT_ID'),'environment':setting('OANDA_ENVIRONMENT','practice')}
     identity=hashlib.sha256((key+'|'+secret+'|'+str(forex_config)).encode()).hexdigest()
-    state=market_worker(key,secret,feed,url,engine.ENGINE_VERSION,identity)
+    state=market_worker(key,secret,feed,url,(engine.ENGINE_VERSION, 'scanner_ui_10'),identity)
     future=state.get('future')
     if future is not None and future.done():
         try:
@@ -181,17 +190,19 @@ def render_stock_opportunities():
         except Exception as exc:
             state['error']=str(exc)
             import time
-            state['retry_after']=time.monotonic()+120
+            state['configuration_error'] = isinstance(exc, (TypeError, AttributeError, ImportError))
+            state['retry_after'] = 0 if state['configuration_error'] else time.monotonic()+120
         state['future']=None
     import time
     busy=state.get('future') is not None
     cooling=time.monotonic()<state.get('retry_after',0)
     requested=st.button('🔎 Scan stocks now', key='scan_full_stock_market', type='primary', disabled=busy or cooling)
-    if cooling:st.info('Pausing requests to let the data connection recover. Automatic retry in '+str(max(1,int(state['retry_after']-time.monotonic())))+' seconds.')
-    if not cooling and state.get('future') is None and (requested or time.monotonic()-state.get('submitted',-1000)>=60):
+    if cooling:st.info('The last scan failed. Retrying in '+str(max(1,int(state['retry_after']-time.monotonic())))+' seconds.')
+    if not cooling and state.get('future') is None and (requested or (not state.get('configuration_error') and time.monotonic()-state.get('submitted',-1000)>=60)):
         state.pop('error',None)
+        state.pop('configuration_error',None)
         state['submitted']=time.monotonic()
-        state['future']=state['pool'].submit(engine.scan_market,key,secret,feed,url,state['cache'],forex_config)
+        state['future']=state['pool'].submit(compatible_market_scan,key,secret,feed,url,state['cache'],forex_config)
     if state.get('future') is not None:
         progress=state['cache'].get('progress',{'text':'Starting market scan','done':0,'total':0})
         elapsed=int(time.monotonic()-state['submitted'])
