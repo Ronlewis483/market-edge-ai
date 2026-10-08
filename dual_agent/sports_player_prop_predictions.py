@@ -59,7 +59,7 @@ def _get(url, key, params=None, balldontlie=False):
     return response.json()
 
 
-MLB_PROP_MATCH_VERSION = 3
+MLB_PROP_MATCH_VERSION = 4
 
 
 def mlb_team_key(value):
@@ -162,10 +162,11 @@ def fetch_prop_quotes(league, games, odds_key):
                         paired.setdefault((player,line), {})[side] = price
                     except (KeyError, TypeError, ValueError): continue
                 for (player,line), sides in paired.items():
-                    if set(sides)!= {'Over','Under'}: continue
-                    over = 1/sides['Over']; under = 1/sides['Under']
-                    quotes.append({'player':player,'line':line,'market':key,'over_probability':over/(over+under),
-                                   'over_decimal_odds':sides['Over'], 'under_decimal_odds':sides['Under'], 'book':book.get('key'), 'updated_at':updated.isoformat(), 'event_id':event['id'],
+                    if league != 'MLB' and set(sides) != {'Over','Under'}: continue
+                    over = 1/sides['Over'] if 'Over' in sides else None
+                    under = 1/sides['Under'] if 'Under' in sides else None
+                    quotes.append({'player':player,'line':line,'market':key,'over_probability':over/(over+under) if over is not None and under is not None else None,
+                                   'over_decimal_odds':sides.get('Over'), 'under_decimal_odds':sides.get('Under'), 'book':book.get('key'), 'updated_at':updated.isoformat(), 'event_id':event['id'],
                                    'home_team':game['home_team'],'away_team':game['away_team'],'start_time':start.isoformat(),
                                    'game_id':game.get('game_id'), 'capture_time':stamp.isoformat(),
                                    **({'Event match':match_notes[int(game['game_id'])]['Match']} if league=='MLB' else {})})
@@ -257,7 +258,7 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
         return {'picks':[], 'message':'Player props need the configured Odds API key.', 'errors':[]}
     quotes, errors = fetch_prop_quotes(league, games, odds_key)
     if not quotes:
-        return {'picks':[], 'message':'No fresh two-sided sportsbook player-prop lines are available for eligible upcoming games.', 'errors':errors}
+        return {'picks':[], 'message':'No fresh eligible sportsbook player-prop lines are available for upcoming games.', 'errors':errors}
     groups = {}
     for q in quotes:
         groups.setdefault((q['event_id'],q['player'],q['market'],q['line']), []).append(q)
@@ -299,10 +300,13 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
         first = group[0]; start = pd.Timestamp(first['start_time'])
         unique = {q['book']:q for q in group if q['book']}
         if not unique:
-            if league == 'MLB': excluded(first, player, market, line, 'No sportsbook offers this two-sided line.')
+            if league == 'MLB': excluded(first, player, market, line, 'No sportsbook offers this exact line.')
             continue
         participation = None
-        probability = float(np.median([q['over_probability'] for q in unique.values()]))
+        paired_probabilities = [q['over_probability'] for q in unique.values() if q.get('over_probability') is not None]
+        # A one-sided quote cannot establish a margin-free market probability.
+        # Keep the ten-observation shrinkage, using an explicit neutral prior.
+        probability = float(np.median(paired_probabilities)) if paired_probabilities else .5
         stat = MARKETS[league][market][1]
         if league=='NBA':
             values = [r.get(stat) for r in history_by_name.get(player, []) if pd.Timestamp(r['source_date'])+pd.Timedelta(hours=48)<start]
@@ -335,22 +339,28 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
             if len(sample) < 10 or sum(v != line for v in sample) < 10:
                 excluded(first, player, market, line, f'Need 10 usable non-push appearances; found {len(sample)} appearances and {sum(v != line for v in sample)} non-push results.')
                 continue
+        qualified = False
         for side,market_p in [('Over',probability),('Under',1-probability)]:
+            price_key = 'over_decimal_odds' if side == 'Over' else 'under_decimal_odds'
+            available = [q for q in unique.values() if (q.get(price_key) or 0) > 1]
+            if not available:
+                continue
             estimate = estimate_prop(values,line,side,market_p)
             if estimate and estimate['Estimated chance'] >= .65:
-                price_key = 'over_decimal_odds' if side == 'Over' else 'under_decimal_odds'
-                available = [q for q in unique.values() if q.get(price_key, 0) > 1]
-                if not available:
-                    continue
+                qualified = True
+                if not paired_probabilities:
+                    estimate['Estimate method'] = 'Prior 30 appearances + neutral shrinkage; one-sided sportsbook quote'
                 best = max(available, key=lambda q:q[price_key])
                 push_chance = estimate['Historical pushes']/estimate['Prior games']
                 expected_return = (1-push_chance)*(estimate['Estimated chance']*best[price_key]-1)
                 if not np.isfinite(expected_return):
                     continue
                 picks.append({'Player':player,'Market':MARKETS[league][market][0],'Pick':side,'Line':line,
-                              'Market chance':market_p,'Best sportsbook':best['book'],'Best decimal odds':best[price_key], 'Estimated return per unit':expected_return,'Break-even cover chance':1/best[price_key],'Estimated push chance':push_chance,'Books':len(unique),'Game':first['away_team']+' @ '+first['home_team'],
+                              'Market chance':market_p,'Best sportsbook':best['book'],'Best decimal odds':best[price_key], 'Sportsbook offers':[{'book':q['book'], 'decimal_odds':q[price_key]} for q in available], 'Estimated return per unit':expected_return,'Break-even cover chance':1/best[price_key],'Estimated push chance':push_chance,'Books':len(available),'Game':first['away_team']+' @ '+first['home_team'],
                               'start_time':first['start_time'],'Captured UTC':first['capture_time'],
                               **({'Participation status': participation, 'Event match': first.get('Event match')} if league=='MLB' else {}), **estimate})
+        if league == 'MLB' and not qualified:
+            excluded(first, player, market, line, 'No offered side meets the 65% estimated cover chance minimum.')
     # One side of one line per player/market/game; avoid ranking duplicate books or alternatives.
     picks.sort(key=lambda r:(-r['Estimated chance'],-r['Estimated return per unit'],-r['Prior games'],r['Player']))
     seen=set(); chosen=[]
