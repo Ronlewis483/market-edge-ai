@@ -311,6 +311,34 @@ def _estimate_prop(
     }
 
 
+def _compare_prop_outcomes(values, line, market, offered_sides):
+    """Score both outcomes; availability and value refer to the exact offered side."""
+    outcomes = []
+    for side in (('YES', 'NO') if market == 'Anytime touchdown' else ('OVER', 'UNDER')):
+        estimate = _estimate_prop(values, line, market, side=side)
+        if estimate is None:
+            continue
+        offers = offered_sides.get(side, [])
+        row = {'side': side, 'chance': estimate['historical_support'],
+               'listed': bool(offers), 'qualifies': False,
+               'reason': 'No matching sportsbook bet found'}
+        if offers:
+            def decimal(offer):
+                price = float(offer['american_odds'])
+                return 1 + price/100 if price > 0 else 1 + 100/abs(price)
+            best = max(offers, key=decimal)
+            push = 0.0 if market == 'Anytime touchdown' else float(np.mean(values == line))
+            value = (1-push) * (row['chance'] * decimal(best) - 1)
+            row.update(book=best['bookmaker_key'], american_odds=best['american_odds'],
+                       positive_value=bool(np.isfinite(value) and value > 0))
+            row['qualifies'] = bool(row['chance'] >= .65 and row['positive_value'])
+            row['reason'] = ('Meets recommendation criteria' if row['qualifies'] else
+                             'Below 65% estimated chance' if row['chance'] < .65 else
+                             'Price does not offer positive estimated value')
+        outcomes.append(row)
+    return outcomes
+
+
 def _select_consensus_props(prop_lines):
     """Select a real, fresh offered line; never synthesize median handicaps."""
     keys = ['event_id', 'game_time', 'home_team', 'away_team', 'player', 'market_key']
@@ -476,6 +504,7 @@ def run_nfl_player_prop_prediction_pipeline(
             )
         )
 
+        outcome_comparison = _compare_prop_outcomes(values, float(line), market, prop['offered_sides'])
         valid_sides = {'YES','NO'} if market == 'Anytime touchdown' else {'OVER','UNDER'}
         for offered_side in prop['offered_sides']:
             if offered_side not in valid_sides:
@@ -598,6 +627,7 @@ def run_nfl_player_prop_prediction_pipeline(
                         ],
                     "prediction_score":
                         score,
+                    "outcome_comparison": outcome_comparison,
                     "sportsbook_line_count": len(offered),
                     "sportsbook_offers": offered,
                     "best_sportsbook": best_offer['bookmaker_key'],
