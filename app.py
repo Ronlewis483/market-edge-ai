@@ -506,11 +506,69 @@ def render_prediction_workspace(league, predictions, result):
             with st.expander('View model details'):
                 st.write('Home win chance:', f"{float(game.get('home_win_probability',0)):.1%}")
                 st.write('Away win chance:', f"{float(game.get('away_win_probability',0)):.1%}")
+                if league == 'MLB':
+                    st.caption('Equation: ' + str(game.get('Equation', 'Saved matchup model')))
+                    missing = game.get('Missing model inputs', [])
+                    if missing:
+                        st.warning('Training medians used for: ' + ', '.join(missing))
                 if game.get('training_games') is not None:
                     st.write('Historical training games:', game['training_games'])
             if league == 'NFL':
                 render_nfl_game_context(game)
+            elif league == 'MLB':
+                render_mlb_game_context(game)
             render_game_addons(league, game, result)
+
+
+def decimal_to_american_label(price):
+    return f"{100*(price-1):+.0f}" if price >= 2 else f"{-100/(price-1):.0f}"
+
+
+def render_mlb_game_context(game):
+    context = game.get('game_context')
+    with st.expander('Game inputs · starters, lineups & conditions', expanded=True):
+        if not isinstance(context, dict):
+            st.info('Generate again to collect the current MLB game inputs.')
+            return
+        st.caption('Captured UTC: ' + str(context.get('captured_at', 'Unknown')))
+        for side in ['away', 'home']:
+            team = context.get('teams', {}).get(side, {})
+            st.markdown('**' + str(game.get(side+'_team', side.title())) + '**')
+            st.write('Starting pitcher: ' + str(team.get('starter') or 'Unannounced') + ' · ' + str(team.get('starter_status', 'Unknown')))
+            if team.get('lineup_confirmed'):
+                with st.expander('Posted batting order'):
+                    for rank, name in enumerate(team.get('lineup', []), 1):
+                        st.write(f'{rank}. {name}')
+            else:
+                st.caption('Full batting order is not posted. Provisional players are labeled on prop cards.')
+        updates = context.get('current_information', {})
+        weather = updates.get('stadium_forecast') or {}
+        venue = (updates.get('stadium_metadata') or {}).get('data', {})
+        if venue.get('name'):
+            st.write('Stadium: ' + venue['name'])
+        if weather:
+            for key, label in [('temperature_2m','Temperature'), ('wind_speed_10m','Wind'), ('precipitation_probability','Rain chance')]:
+                if weather.get(key) is not None:
+                    st.caption(f"{label}: {weather[key]} {weather.get('units', {}).get(key, '')}")
+            st.caption(str(weather.get('roof_status', 'Roof status unverified')))
+            st.caption('Outdoor stadium forecast; enclosed-field conditions may differ.')
+        else:
+            st.caption('Game-time weather is unavailable.')
+        news = [n for n in updates.get('player_news', []) if n.get('report_match')]
+        if news:
+            with st.expander('Player report mentions · availability requires verification'):
+                for item in news:
+                    st.write(str(item.get('player_name')) + ': ' + str(item.get('excerpt', '')))
+        market = context.get('market_home_probability')
+        if market is not None:
+            st.caption(f"Sportsbook comparison · home {market:.1%} / away {1-market:.1%}")
+        else:
+            st.caption('Fresh sportsbook winner comparison is unavailable.')
+        with st.expander('Inputs used by the saved equation'):
+            st.write(', '.join(context.get('model_columns', [])))
+            st.caption('Only inputs with saved coefficients affect the numerical forecast. Report mentions do not imply confirmed injury or medical clearance.')
+        for issue in updates.get('errors', []):
+            st.caption('Unavailable source: ' + str(issue.get('scope', 'Game update')))
 
 
 def render_league_prediction_results(
@@ -727,7 +785,7 @@ def render_player_prop_picks(league, result):
         if not picks:
             st.info(props.get("message", "Generate predictions to collect available player-prop lines."))
         else:
-            st.caption("Ranked by estimated confidence after eligibility checks: fresh lines from at least two sportsbooks, verified player identity and at least 10 non-push prior appearances. Provisional participation is labeled." if league == "MLB" else "Historical hit-rate estimates with sportsbook shrinkage. These estimates are not calibrated win probabilities.")
+            st.caption("Ranked by estimated confidence after eligibility checks: a fresh exact bet from at least one sportsbook, verified player identity and at least 10 non-push prior appearances. Provisional participation is labeled." if league == "MLB" else "Historical hit-rate estimates with sportsbook shrinkage. These estimates are not calibrated win probabilities.")
             for offset in range(0, len(picks), 2):
                 for column, pick in zip(st.columns(2), picks[offset:offset+2]):
                     with column:
@@ -844,10 +902,10 @@ def load_mlb_prediction_pipeline():
     if "run_mlb_prediction_pipeline" not in definitions or "render_mlb_prediction_center" in definitions:
         raise RuntimeError("dual_agent/mlb_prediction_pipeline.py contains the wrong code. Replace it with the supplied pipeline file; app.py belongs only in the repository root.")
     pipeline = importlib.import_module("dual_agent.mlb_prediction_pipeline")
-    if getattr(pipeline, "MLB_PIPELINE_VERSION", None) != 11:
+    if getattr(pipeline, "MLB_PIPELINE_VERSION", None) != 12:
         importlib.invalidate_caches()
         pipeline = importlib.reload(pipeline)
-    if getattr(pipeline, "MLB_PIPELINE_VERSION", None) != 11:
+    if getattr(pipeline, "MLB_PIPELINE_VERSION", None) != 12:
         raise RuntimeError("Deploy the matching dual_agent/mlb_prediction_pipeline.py from this update. The running MLB module is older than the seven-day forecast fix.")
     return pipeline
 
@@ -1143,7 +1201,12 @@ def render_game_addons(league, game, result):
                     st.markdown(f"**#{rank} · {prop['Player']} · {prop['Pick']} {prop['Line']:g} {prop['Market']}**")
                     st.caption(f"Estimated chance {prop['Estimated chance']:.1%} · projection {prop['Projected stat']:.1f} · {prop['Prior games']} prior appearances · {prop['Books']} books")
                     if prop.get("Best sportsbook"):
-                        st.caption(f"Best available odds: {prop['Best sportsbook']} · decimal odds {float(prop['Best decimal odds']):.2f}")
+                        st.caption(f"Best available odds: {prop['Best sportsbook']} · odds {decimal_to_american_label(float(prop['Best decimal odds']))}")
+                    offers = prop.get("Sportsbook offers", [])
+                    if offers:
+                        st.caption("Offered at: " + ", ".join(str(o['book']) + " (" + decimal_to_american_label(float(o['decimal_odds'])) + ")" for o in offers))
+                    if "neutral" in str(prop.get("Estimate method", "")):
+                        st.caption("One-sided listing · estimate uses prior appearances and a neutral prior; a margin-free market probability is unavailable.")
                     participation = prop.get("Participation status")
                     if participation:
                         st.caption(participation)
@@ -1243,7 +1306,7 @@ def render_mlb_prediction_center(location):
                 st.session_state.pop("mlb_live_pipeline_result", None)
             except Exception as exc:
                 st.error("Unable to activate MLB model: " + str(exc))
-    st.caption("Automatically ranks up to 10 team winners and 10 player props for games in the next seven days.")
+    st.caption("Scores the next seven days of games. The strongest ten lead the slate; ranked sportsbook props appear inside each game.")
     team_cards = st.empty()
     def show_team_cards(rows):
         winners = pd.DataFrame([{
@@ -1296,7 +1359,7 @@ def render_mlb_prediction_center(location):
         except Exception as exc:
             st.error("MLB prediction pipeline stopped: " + str(exc))
     result = st.session_state.get("mlb_live_pipeline_result")
-    if result and result.get("pipeline_version") != 11:
+    if result and result.get("pipeline_version") != 12:
         st.session_state.pop("mlb_live_pipeline_result", None)
         result = None
         st.info("The MLB pipeline was updated. Generate again to search the upcoming seven-day schedule.")
