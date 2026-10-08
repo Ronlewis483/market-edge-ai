@@ -1181,12 +1181,20 @@ def render_game_addons(league, game, result):
     score = "historical_support" if league == "NFL" else "Estimated chance"
     value_key = "estimated_return_per_unit" if league == "NFL" else "Estimated return per unit"
     props = [p for p in props if float(p.get(score, 0)) >= .65]
-    props = sorted(props, key=lambda row: (-float(row.get(score, 0)), -float(row[value_key])))[:10]
+    if league == "NFL":
+        props = [p for p in props if float(p.get(value_key, 0)) > 0]
+        markets = sorted({str(p.get('market','')) for p in props})
+        import hashlib
+        filter_id = hashlib.sha256('|'.join(str(game.get(k,'')) for k in ['home_team','away_team','commence_time']).encode()).hexdigest()[:16]
+        selected_market = st.selectbox('Player-prop market', ['All qualifying markets']+markets, key='nfl_prop_market_'+filter_id)
+        if selected_market != 'All qualifying markets':
+            props = [p for p in props if p.get('market')==selected_market]
+    props = sorted(props, key=lambda row: (-float(row.get(score, 0)), -float(row.get(value_key, 0))))[:10]
     with st.expander(f"🎯 Player props for this game ({len(props)})", expanded=True):
-        st.caption("Minimum 65% estimated cover chance · exact bet offered by a sportsbook")
+        st.caption("Minimum 65% estimated cover chance · exact bet offered by a sportsbook" + (" · positive estimated value at listed odds" if league == "NFL" else ""))
         if not props:
             issues = (result or {}).get("prop_issues", []) if league == "NFL" else (result or {}).get("player_props", {}).get("errors", [])
-            st.info("No eligible player props for this matchup yet. A listed exact bet, at least 65% estimated cover chance, usable history are required.")
+            st.info("No eligible player props for this matchup yet. A listed exact bet, at least 65% estimated cover chance, and usable history are required. NFL ranked bets also require positive estimated value.")
             if league == "MLB":
                 from collections import Counter
                 exclusions = (result or {}).get('player_props', {}).get('exclusions', [])
@@ -1214,6 +1222,7 @@ def render_game_addons(league, game, result):
                         st.caption("Single-book listing · no cross-book confirmation")
                     if offers:
                         st.caption("Offered at: " + ", ".join(str(o['bookmaker_key']) + " (" + format(float(o['american_odds']), '+g') + ")" for o in offers))
+                    st.caption("Positive estimated value at the best listed odds · ranks by cover chance, then value. Estimates are not calibrated.")
                     # Keep the existing manual bet-record workflow available.
                     import hashlib
                     identity = "|".join(str(prop.get(c, "")) for c in ("event_id", "game_time", "player", "market", "model_pick", "line"))
