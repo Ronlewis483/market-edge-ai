@@ -1112,7 +1112,7 @@ def nfl_enrichment_pool():
     return ThreadPoolExecutor(max_workers=2)
 
 
-def enrich_nfl_result(result, feature_games, odds_key):
+def enrich_nfl_result(result, feature_games, odds_key, progress_queue=None):
     """Run external enrichment without reading or writing session state."""
     import copy
     result = copy.deepcopy(result)
@@ -1121,6 +1121,8 @@ def enrich_nfl_result(result, feature_games, odds_key):
         result['predictions'] = attach_context(result.get('predictions'), result.get('live_odds'))
     except Exception as exc:
         result['context_issue'] = 'NFL context retrieval unavailable (' + type(exc).__name__ + ')'
+    if progress_queue is not None:
+        progress_queue.put(copy.deepcopy(result))
     try:
         from dual_agent.game_prediction_addons import enhance_result
         result = enhance_result("NFL", result, odds_key, feature_games)
@@ -1134,8 +1136,22 @@ def enrich_nfl_result(result, feature_games, odds_key):
 def render_nfl_enrichment_status():
     future = st.session_state.get('nfl_enrichment_future')
     if future is None:return
+    updates = st.session_state.get('nfl_enrichment_updates')
+    changed = False
+    if updates is not None:
+        from queue import Empty
+        while True:
+            try:
+                partial = updates.get_nowait()
+            except Empty:
+                break
+            st.session_state['nfl_prediction_pipeline_result'] = partial
+            st.session_state['live_nfl_predictions'] = partial.get('predictions')
+            st.session_state['nfl_enrichment_context_ready'] = True
+            changed = True
     if not future.done():
-        st.info('Winner predictions are ready. Loading QB forecasts, player props, injuries and weather in the background…')
+        if changed:st.rerun(scope='app')
+        st.info('Game context check finished. Collecting sportsbook props and QB forecasts…' if st.session_state.get('nfl_enrichment_context_ready') else 'Winner predictions are ready. Loading current game context…')
         return
     try:
         result = future.result()
@@ -1150,6 +1166,7 @@ def render_nfl_enrichment_status():
         result['context_issue'] = 'Background NFL inputs unavailable ('+type(exc).__name__+'); winner predictions are preserved.'
         st.session_state['nfl_prediction_pipeline_result'] = result
     st.session_state.pop('nfl_enrichment_future', None)
+    st.session_state.pop('nfl_enrichment_updates', None)
     st.rerun(scope='app')
 
 
@@ -1169,7 +1186,11 @@ def run_nfl_prediction_with_addons(feature_games, historical_accuracy=None, hist
     result['enrichment_pending'] = True
     st.session_state['nfl_prediction_pipeline_result'] = result
     odds_key = prediction_api_key("ODDS_API_KEY", "THE_ODDS_API_KEY")
-    st.session_state['nfl_enrichment_future'] = nfl_enrichment_pool().submit(enrich_nfl_result, result, feature_games, odds_key)
+    from queue import Queue
+    updates = Queue()
+    st.session_state['nfl_enrichment_updates'] = updates
+    st.session_state['nfl_enrichment_context_ready'] = False
+    st.session_state['nfl_enrichment_future'] = nfl_enrichment_pool().submit(enrich_nfl_result, result, feature_games, odds_key, updates)
     return result
 
 
@@ -1236,11 +1257,11 @@ def render_game_addons(league, game, result):
         if selected_market != 'All qualifying markets':
             props = [p for p in props if p.get('market')==selected_market]
     props = sorted(props, key=lambda row: (-float(row.get(score, 0)), -float(row.get(value_key, 0))))[:10]
-    with st.expander(f"🎯 Player props for this game ({len(props)})", expanded=True):
+    with st.expander("🎯 Player props for this game · loading" if league == "NFL" and (result or {}).get("enrichment_pending") and not props else f"🎯 Player props for this game ({len(props)})", expanded=True):
         st.caption("Minimum 65% estimated cover chance · exact bet offered by a sportsbook" + (" · positive estimated value at listed odds" if league == "NFL" else ""))
         if not props:
             issues = (result or {}).get("prop_issues", []) if league == "NFL" else (result or {}).get("player_props", {}).get("errors", [])
-            st.info("No eligible player props for this matchup yet. A listed exact bet, at least 65% estimated cover chance, and usable history are required. NFL ranked bets also require positive estimated value.")
+            st.info("Collecting fresh sportsbook lines and scoring player props…" if league == "NFL" and (result or {}).get("enrichment_pending") else "No eligible player props for this matchup yet. A listed exact bet, at least 65% estimated cover chance, and usable history are required. NFL ranked bets also require positive estimated value.")
             if league == "MLB":
                 from collections import Counter
                 exclusions = (result or {}).get('player_props', {}).get('exclusions', [])
