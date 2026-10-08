@@ -201,6 +201,70 @@ def generate_spread_picks(league, predictions, events, history=None, now=None):
     return {'picks': picks, 'issues': issues}
 
 
+QB_MARKETS = ['Passing yards','Passing touchdowns','Interceptions thrown','Passing completions',
+              'Passing attempts','Rushing yards','Rushing attempts','Rushing touchdowns']
+
+
+def attach_qb_forecasts(predictions, history, lines=None):
+    """Informational starter forecasts; never relax the ranked bet criteria."""
+    import copy
+    from dual_agent.nfl_player_props import MARKETS, canonical_name
+    from dual_agent.nfl_player_prop_prediction_pipeline import _historical_player_games, _estimate_prop, _select_consensus_props
+    frame = predictions.copy() if isinstance(predictions,pd.DataFrame) else pd.DataFrame(records(predictions))
+    if frame.empty or 'game_context' not in frame:return frame
+    contexts = []
+    market_lookup = {value:key for key,value in MARKETS.items()}
+    offered = _select_consensus_props(lines) if isinstance(lines,pd.DataFrame) and not lines.empty else pd.DataFrame()
+    for _,game in frame.iterrows():
+        context = copy.deepcopy(game.game_context) if isinstance(game.game_context,dict) else {}
+        cutoff = min(pd.Timestamp(game.commence_time),pd.Timestamp.now(tz='UTC'))
+        game_lines = matching_game_rows(game.to_dict(),offered)
+        for side in ['home','away']:
+            qb = context.get(side,{}).get('qb')
+            if not qb:continue
+            qb['projections'] = [];qb['forecasts'] = []
+            if history is None or history.empty:
+                qb['forecast_note'] = 'Player history unavailable. No projection or cover percentage invented.';continue
+            attempts = _historical_player_games(history,qb['name'],'Passing attempts',cutoff,window=100)
+            participation = set(attempts.loc[attempts.value>0,'game_time']) if not attempts.empty else None
+            values_by_market = {}
+            for market in QB_MARKETS:
+                games = _historical_player_games(history,qb['name'],market,cutoff,window=100)
+                if participation is not None:games = games.loc[games.game_time.isin(participation)]
+                values = pd.to_numeric(games.value, errors='coerce').replace([np.inf,-np.inf],np.nan).dropna().tail(12).to_numpy() if not games.empty else np.asarray([])
+                values_by_market[market] = values
+                if len(values):
+                    projection = float(np.average(values,weights=np.linspace(1.,2.,len(values))))
+                    qb['projections'].append({'market':market,'projection':projection,'sample_size':len(values)})
+            candidates = []
+            for prop in game_lines:
+                if canonical_name(prop['player']) != canonical_name(qb['name']):continue
+                market = market_lookup.get(prop['market_key'])
+                if market not in QB_MARKETS:continue
+                values = values_by_market.get(market, np.asarray([]))
+                for side_name, offers in prop['offered_sides'].items():
+                    if side_name not in {'OVER','UNDER'} or not offers:continue
+                    estimate = _estimate_prop(values,float(prop['line']),market,side=side_name)
+                    if not estimate:continue
+                    def price(offer):
+                        odds = float(offer['american_odds'])
+                        return 1+odds/100 if odds>0 else 1+100/abs(odds)
+                    best = max(offers,key=price)
+                    candidates.append({'market':market,'pick':side_name,'line':float(prop['line']),
+                        'chance':float(estimate['historical_support']),'projection':float(estimate['projection']),
+                        'sample_size':int(estimate['sample_size']),'book':best['bookmaker_key'],
+                        'american_odds':float(best['american_odds'])})
+            candidates.sort(key=lambda r:(-r['chance'],-r['sample_size']))
+            seen = set()
+            for candidate in candidates:
+                if candidate['market'] not in seen:
+                    seen.add(candidate['market']);qb['forecasts'].append(candidate)
+            qb['forecast_note'] = 'Recent historical projections; final starting role and availability remain unconfirmed.'
+        contexts.append(context)
+    frame['game_context'] = contexts
+    return frame
+
+
 def automatic_nfl_props(predictions, key):
     """Reuse existing NFL prop guards/ranking, scoped to predicted games."""
     from dual_agent.nfl_player_props_ui import cached_events, cached_props, cached_player_history, upcoming_week_events
@@ -285,7 +349,9 @@ def automatic_nfl_props(predictions, key):
         except Exception as exc:
             event = next((e for e in selected if e['id'] == event_id), {})
             issues.append(f"{event.get('away_team')} @ {event.get('home_team')}: prop model unavailable ({type(exc).__name__}).")
-    return pd.concat(forecasts, ignore_index=True) if forecasts else pd.DataFrame(), issues
+    combined = pd.concat(forecasts, ignore_index=True) if forecasts else pd.DataFrame()
+    combined.attrs['qb_forecast_lines'] = lines
+    return combined, issues
 
 
 def enhance_result(league, result, key, history=None):
@@ -306,4 +372,14 @@ def enhance_result(league, result, key, history=None):
         except Exception as exc:
             result['nfl_player_props'] = pd.DataFrame()
             result['prop_issues'] = [f'Player props unavailable ({type(exc).__name__}).']
+    if league == 'NFL':
+        try:
+            from dual_agent.nfl_player_props_ui import cached_player_history
+            props = result.get('nfl_player_props',pd.DataFrame())
+            lines = props.attrs.pop('qb_forecast_lines',None)
+            enriched = attach_qb_forecasts(predictions,cached_player_history((2025,2026)),lines)
+            result['predictions'] = enriched
+            if 'all_predictions' in result:result['all_predictions'] = enriched
+        except Exception as exc:
+            result['qb_forecast_issue'] = 'Quarterback forecast unavailable ('+type(exc).__name__+'); game predictions are preserved.'
     return result
