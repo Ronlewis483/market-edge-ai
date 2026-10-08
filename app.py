@@ -535,6 +535,33 @@ def render_mlb_game_context(game):
             team = context.get('teams', {}).get(side, {})
             st.markdown('**' + str(game.get(side+'_team', side.title())) + '**')
             st.write('Starting pitcher: ' + str(team.get('starter') or 'Unannounced') + ' · ' + str(team.get('starter_status', 'Unknown')))
+            with st.container(border=True):
+                st.markdown('**Pitcher forecast**')
+                forecasts = team.get('pitcher_forecasts', [])
+                for forecast in forecasts:
+                    st.markdown(f"**{forecast['Pick']} {forecast['Line']:g} {forecast['Market']} · {forecast['Estimated chance']:.1%} estimated cover chance**")
+                    st.caption(f"Projection {forecast['Projected stat']:.1f} · {forecast['Prior games']} prior starts · {forecast['Best sportsbook']} ({decimal_to_american_label(forecast['Best decimal odds'])})")
+                    if forecast.get('Non-push games', 0) < 10:
+                        st.caption('Limited history · fewer than 10 non-push starts. Informational forecast only.')
+                    elif forecast['Estimated chance'] < .65:
+                        st.caption('Below the 65% betting minimum · informational forecast only.')
+                    else:
+                        st.caption('Meets the cover-chance minimum; participation and quote checks still apply.')
+                    if 'neutral' in str(forecast.get('Estimate method','')):
+                        st.caption('One-sided sportsbook quote · estimate uses neutral shrinkage.')
+                covered = {f['Market'] for f in forecasts}
+                for projection in team.get('pitcher_projections', []):
+                    if projection['Market'] not in covered:
+                        st.write(f"{projection['Market']}: projected {projection['Projected stat']:.1f} · {projection['Prior games']} prior starts")
+                available_stats = covered | {p['Market'] for p in team.get('pitcher_projections', [])}
+                for label in ['Innings pitched','Strikeouts','Projected game ERA','Walks','Total pitches','Runs allowed']:
+                    if label not in available_stats:
+                        st.caption(label + ': unavailable in saved prior starts.')
+                st.caption('Innings use decimal innings (5.5 = 5½ innings on average). Projected game ERA uses prior earned runs per nine innings, not total runs.')
+                if not forecasts:
+                    st.caption('No usable fresh sportsbook line and cover estimate. Projections remain visible when history is available.')
+                st.caption(team.get('pitcher_forecast_note', 'Generate again to collect pitcher forecasts.'))
+                st.caption('Cover percentages exclude pushes and assume the pitcher starts. They are estimates, not measured prediction accuracy.')
             if team.get('lineup_confirmed'):
                 with st.expander('Posted batting order'):
                     for rank, name in enumerate(team.get('lineup', []), 1):
@@ -902,10 +929,10 @@ def load_mlb_prediction_pipeline():
     if "run_mlb_prediction_pipeline" not in definitions or "render_mlb_prediction_center" in definitions:
         raise RuntimeError("dual_agent/mlb_prediction_pipeline.py contains the wrong code. Replace it with the supplied pipeline file; app.py belongs only in the repository root.")
     pipeline = importlib.import_module("dual_agent.mlb_prediction_pipeline")
-    if getattr(pipeline, "MLB_PIPELINE_VERSION", None) != 12:
+    if getattr(pipeline, "MLB_PIPELINE_VERSION", None) != 13:
         importlib.invalidate_caches()
         pipeline = importlib.reload(pipeline)
-    if getattr(pipeline, "MLB_PIPELINE_VERSION", None) != 12:
+    if getattr(pipeline, "MLB_PIPELINE_VERSION", None) != 13:
         raise RuntimeError("Deploy the matching dual_agent/mlb_prediction_pipeline.py from this update. The running MLB module is older than the seven-day forecast fix.")
     return pipeline
 
@@ -1359,7 +1386,7 @@ def render_mlb_prediction_center(location):
         except Exception as exc:
             st.error("MLB prediction pipeline stopped: " + str(exc))
     result = st.session_state.get("mlb_live_pipeline_result")
-    if result and result.get("pipeline_version") != 12:
+    if result and result.get("pipeline_version") != 13:
         st.session_state.pop("mlb_live_pipeline_result", None)
         result = None
         st.info("The MLB pipeline was updated. Generate again to search the upcoming seven-day schedule.")
