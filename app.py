@@ -1477,7 +1477,48 @@ def render_nfl_game_context(game):
 
 
 
-@st.fragment(run_every="180s")
+@st.fragment(run_every='180s')
+def render_mlb_update_notice(location):
+    """Refresh data separately; never redraw or replace the cards automatically."""
+    previous = st.session_state.get('mlb_live_pipeline_result')
+    if not previous:
+        return
+    current = pd.Timestamp.now(tz='UTC')
+    checked = pd.to_datetime(st.session_state.get('mlb_last_refresh_attempt'), utc=True, errors='coerce')
+    if pd.isna(checked) or current-checked >= pd.Timedelta(seconds=180):
+        st.session_state['mlb_last_refresh_attempt'] = current.isoformat()
+        try:
+            import os
+            pipeline = load_mlb_prediction_pipeline()
+            key = os.environ.get('ODDS_API_KEY') or os.environ.get('THE_ODDS_API_KEY')
+            if not key:
+                try:
+                    key = st.secrets.get('ODDS_API_KEY') or st.secrets.get('THE_ODDS_API_KEY')
+                except Exception:
+                    key = None
+            updated = pipeline.run_mlb_prediction_pipeline(api_key=key, force_refresh=True)
+            try:
+                from dual_agent.game_prediction_addons import enhance_result
+                updated = enhance_result('MLB', updated, key)
+            except ImportError:
+                updated['spreads'] = {'picks': [], 'issues': ['Run-line module unavailable.']}
+            updated['pipeline_version'] = pipeline.MLB_PIPELINE_VERSION
+            st.session_state['mlb_pending_pipeline_result'] = updated
+            st.session_state.pop('mlb_background_refresh_issue', None)
+        except Exception as exc:
+            st.session_state['mlb_background_refresh_issue'] = str(exc)
+    pending = st.session_state.get('mlb_pending_pipeline_result')
+    if pending:
+        st.info('Updated MLB picks are ready. Your current cards stay visible until you choose to update them.')
+        if st.button('Show updated picks', key=location+'_apply_updated_picks'):
+            st.session_state['mlb_live_pipeline_result'] = pending
+            st.session_state.pop('mlb_pending_pipeline_result', None)
+            st.rerun(scope='app')
+    if st.session_state.get('mlb_background_refresh_issue'):
+        st.caption('Automatic update failed; displayed picks were kept. ' + st.session_state['mlb_background_refresh_issue'])
+
+
+@st.fragment
 def render_mlb_prediction_center(location):
     st.subheader("⚾ MLB Prediction Center")
     st.caption("Current lineups, starters, team form and available game conditions feed the saved matchup equation.")
@@ -1489,6 +1530,7 @@ def render_mlb_prediction_center(location):
                 activated = load_mlb_prediction_pipeline().activate_model(__import__("json").load(model_upload))
                 st.success("MLB model activated.")
                 st.session_state.pop("mlb_live_pipeline_result", None)
+                st.session_state.pop("mlb_pending_pipeline_result", None)
             except Exception as exc:
                 st.error("Unable to activate MLB model: " + str(exc))
     st.caption("Scores the next seven days of games. The strongest ten lead the slate; ranked sportsbook props appear inside each game.")
@@ -1517,10 +1559,9 @@ def render_mlb_prediction_center(location):
     if previous:
         retain_sport_picks("MLB", previous.get("all_predictions", previous.get("predictions", [])), limit=None)
         remember_game_addons("MLB", previous)
-    checked_at = pd.to_datetime(st.session_state.get("mlb_last_refresh_attempt"), utc=True, errors="coerce")
-    refresh_due = bool(previous and (pd.isna(checked_at) or pd.Timestamp.now(tz="UTC")-checked_at >= pd.Timedelta(seconds=180)))
-    st.caption("After generation, lineups, starters and available props refresh every three minutes while this screen stays open.")
-    if generated or refresh_due:
+    st.caption("Your displayed picks stay in place while you read. Automatic scans check for updates every three minutes; use Show updated picks when ready.")
+    if generated:
+        st.session_state.pop('mlb_pending_pipeline_result', None)
         st.session_state["mlb_last_refresh_attempt"] = pd.Timestamp.now(tz="UTC").isoformat()
         try:
             import os
@@ -1544,7 +1585,7 @@ def render_mlb_prediction_center(location):
         except Exception as exc:
             st.error("MLB prediction pipeline stopped: " + str(exc))
     result = st.session_state.get("mlb_live_pipeline_result")
-    if result and result.get("pipeline_version") != 14:
+    if result and result.get("pipeline_version") not in (13, 14):
         st.session_state.pop("mlb_live_pipeline_result", None)
         result = None
         st.info("The MLB pipeline was updated. Generate again to search the upcoming seven-day schedule.")
@@ -1951,6 +1992,7 @@ if page in ["🏈 NFL", "🏀 NBA", "⚾ MLB"]:
     elif selected_league == "⚾ MLB":
 
         render_mlb_prediction_center("mlb_sidebar")
+        render_mlb_update_notice("mlb_sidebar")
 
 
 # ============================================
@@ -2373,6 +2415,7 @@ if page == "🏈 NFL":
 if page == "🏠 Home":
     st.divider()
     render_mlb_prediction_center("mlb_home")
+    render_mlb_update_notice("mlb_home")
 
 if page == "📈 Stocks":
     from dual_agent.stock_opportunities_ui import render_stock_opportunities
