@@ -1573,7 +1573,7 @@ def render_mlb_prediction_center(location):
                 except Exception:
                     odds_key = None
             status = st.empty()
-            result = pipeline.run_mlb_prediction_pipeline(api_key=odds_key, progress=status.info, on_team_predictions=show_team_cards, force_refresh=True)
+            result = pipeline.run_mlb_prediction_pipeline(api_key=odds_key, progress=status.info, force_refresh=True)
             try:
                 from dual_agent.game_prediction_addons import enhance_result
                 result = enhance_result("MLB", result, odds_key)
