@@ -931,11 +931,11 @@ def load_mlb_prediction_pipeline():
     if "run_mlb_prediction_pipeline" not in definitions or "render_mlb_prediction_center" in definitions:
         raise RuntimeError("dual_agent/mlb_prediction_pipeline.py contains the wrong code. Replace it with the supplied pipeline file; app.py belongs only in the repository root.")
     pipeline = importlib.import_module("dual_agent.mlb_prediction_pipeline")
-    if getattr(pipeline, "MLB_PIPELINE_VERSION", None) != 14:
+    if getattr(pipeline, "MLB_PIPELINE_VERSION", None) not in (13, 14):
         importlib.invalidate_caches()
         pipeline = importlib.reload(pipeline)
-    if getattr(pipeline, "MLB_PIPELINE_VERSION", None) != 14:
-        raise RuntimeError("Deploy the matching dual_agent/mlb_prediction_pipeline.py from this update. The running MLB module is older than the seven-day forecast fix.")
+    if getattr(pipeline, "MLB_PIPELINE_VERSION", None) not in (13, 14):
+        raise RuntimeError(f"MLB pipeline compatibility error: loaded version {getattr(pipeline, 'MLB_PIPELINE_VERSION', None)!r} from {getattr(pipeline, '__file__', 'unknown path')}. Supported versions: 13 and 14.")
     return pipeline
 
 
@@ -1207,6 +1207,23 @@ def remember_game_addons(league, result):
             retain_sport_picks(league, result.get("spreads", {}).get("picks", []), kind="spreads", limit=None)
 
 
+def select_nfl_prop_list(props, mode):
+    """Rank independent lists before caps; retain one exact bet per player/market."""
+    candidates = [p for p in props if float(p.get('estimated_return_per_unit', 0)) > 0
+                  and len(p.get('sportsbook_offers', [])) >= 1
+                  and (mode == 'value' or float(p.get('historical_support', 0)) >= .65)]
+    primary, secondary = ('estimated_return_per_unit', 'historical_support') if mode == 'value' else ('historical_support', 'estimated_return_per_unit')
+    candidates.sort(key=lambda p: (-float(p.get(primary, 0)), -float(p.get(secondary, 0))))
+    picks, seen = [], set()
+    for prop in candidates:
+        identity = (prop.get('event_id'), prop.get('player'), prop.get('market'))
+        if identity not in seen:
+            seen.add(identity); picks.append(prop)
+        if len(picks) == 5:
+            break
+    return picks
+
+
 def prop_outcome_sentence(player, market, side, line, chance):
     """Explain the exact direction without treating an unlisted opposite as a bet."""
     side = str(side).upper()
@@ -1258,7 +1275,8 @@ def render_game_addons(league, game, result):
                  or len(p.get("sportsbook_offers", [])) >= 1]
     score = "historical_support" if league == "NFL" else "Estimated chance"
     value_key = "estimated_return_per_unit" if league == "NFL" else "Estimated return per unit"
-    props = [p for p in props if float(p.get(score, 0)) >= .65]
+    if league != "NFL":
+        props = [p for p in props if float(p.get(score, 0)) >= .65]
     if league == "NFL":
         props = [p for p in props if float(p.get(value_key, 0)) > 0]
         markets = sorted({str(p.get('market','')) for p in props})
@@ -1267,9 +1285,24 @@ def render_game_addons(league, game, result):
         selected_market = st.selectbox('Player-prop market', ['All qualifying markets']+markets, key='nfl_prop_market_'+filter_id)
         if selected_market != 'All qualifying markets':
             props = [p for p in props if p.get('market')==selected_market]
-    props = sorted(props, key=lambda row: (-float(row.get(score, 0)), -float(row.get(value_key, 0))))[:10]
+    if league == 'NFL':
+        probability_props = select_nfl_prop_list(props, 'probability')
+        value_props = select_nfl_prop_list(props, 'value')
+    else:
+        props = sorted(props, key=lambda row: (-float(row.get(score, 0)), -float(row.get(value_key, 0))))[:10]
     with st.expander("🎯 Player props for this game · loading" if league == "NFL" and (result or {}).get("enrichment_pending") and not props else f"🎯 Player props for this game ({len(props)})", expanded=True):
-        st.caption("Minimum 65% estimated cover chance · exact bet offered by a sportsbook" + (" · positive estimated value at listed odds" if league == "NFL" else ""))
+        st.caption('Most likely: minimum 65% estimated chance. Highest value: no probability minimum. Both require usable history, a listed exact bet, and positive estimated value.' if league == 'NFL' else 'Minimum 65% estimated cover chance · exact bet offered by a sportsbook')
+        if league == 'NFL':
+            probability_column, value_column = st.columns(2)
+            probability_column.markdown('### Most likely to win · top 5')
+            value_column.markdown('### Highest estimated value · top 5')
+            if not probability_props:
+                probability_column.info('No listed positive-value bets meet the 65% minimum.')
+            if not value_props:
+                value_column.info('No listed bets have positive estimated value.')
+            props = [dict(p, _display_column=column, _list_name=name, _list_rank=i)
+                     for name, column, picks in [('probability', probability_column, probability_props), ('value', value_column, value_props)]
+                     for i, p in enumerate(picks, 1)]
         if not props:
             issues = (result or {}).get("prop_issues", []) if league == "NFL" else (result or {}).get("player_props", {}).get("errors", [])
             st.info("Collecting fresh sportsbook lines and scoring player props…" if league == "NFL" and (result or {}).get("enrichment_pending") else "No eligible player props for this matchup yet. A listed exact bet, at least 65% estimated cover chance, and usable history are required. NFL ranked bets also require positive estimated value.")
@@ -1284,8 +1317,10 @@ def render_game_addons(league, game, result):
                 matching = [issue for issue in issues if str(game.get("home_team", "")) in issue and str(game.get("away_team", "")) in issue]
                 for issue in matching or issues[:1]:
                     st.caption(str(issue))
+        from contextlib import nullcontext
         for rank, prop in enumerate(props, 1):
-            with st.container(border=True):
+            with prop.get("_display_column", nullcontext()), st.container(border=True):
+                rank = prop.get("_list_rank", rank)
                 if league == "NFL":
                     side = str(prop["model_pick"])
                     pick = side if side in ("YES", "NO") else f"{side} {float(prop['line']):g}"
@@ -1300,7 +1335,9 @@ def render_game_addons(league, game, result):
                         st.caption("Available at one sportsbook · meets our listing requirement")
                     if offers:
                         st.caption("Offered at: " + ", ".join(str(o['bookmaker_key']) + " (" + format(float(o['american_odds']), '+g') + ")" for o in offers))
-                    st.caption("Positive estimated value at the best listed odds · ranks by cover chance, then value. Estimates are not calibrated.")
+                    st.caption('Positive estimated value · ordered by estimated value, then chance.' if prop.get('_list_name') == 'value' else 'Positive estimated value · ordered by estimated chance, then value.')
+                    if prop.get('_list_name') == 'value' and float(prop['historical_support']) < .65:
+                        st.caption('Below 65% estimated chance · value opportunity, not a high-probability pick')
                     comparisons = prop.get('outcome_comparison', [])
                     if isinstance(comparisons, list) and comparisons:
                         with st.expander('Compare both outcomes'):
@@ -1313,7 +1350,7 @@ def render_game_addons(league, game, result):
                     # Keep the existing manual bet-record workflow available.
                     import hashlib
                     identity = "|".join(str(prop.get(c, "")) for c in ("event_id", "game_time", "player", "market", "model_pick", "line"))
-                    button_key = "attached_nfl_prop_" + hashlib.sha256(identity.encode()).hexdigest()[:20]
+                    button_key = "attached_nfl_prop_" + str(prop.get("_list_name", "probability")) + hashlib.sha256(identity.encode()).hexdigest()[:20]
                     kickoff = pd.to_datetime(prop.get("game_time"), utc=True, errors="coerce")
                     if st.button("Record this player prop", key=button_key, disabled=pd.isna(kickoff) or kickoff <= pd.Timestamp.now(tz="UTC")):
                         st.session_state.update({"bet_builder_mode": "Single", "single_sport": "NFL",
@@ -1342,7 +1379,7 @@ def render_game_addons(league, game, result):
                             st.warning("Provisional participation—recheck the lineup or starter.")
                 st.caption(prop.get("pick_game_status", "Upcoming"))
         if props:
-            st.caption("Ordered from strongest to weakest within this game. Prop estimates and ranking scores are not calibrated future probabilities.")
+            st.caption("Each list has its own ranking: estimated chance on the left, estimated value on the right. Estimates are not calibrated future probabilities." if league == "NFL" else "Ordered from strongest to weakest within this game. Prop estimates and ranking scores are not calibrated future probabilities.")
 
 
 def nfl_prediction_features():
