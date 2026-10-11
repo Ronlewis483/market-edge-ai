@@ -1,4 +1,5 @@
 import requests
+from dual_agent.odds_request_cache import get as cached_odds_get
 import streamlit as st
 
 
@@ -39,7 +40,7 @@ def get_live_nfl_moneylines():
         "dateFormat": "iso",
     }
 
-    response = requests.get(
+    response = cached_odds_get(
         url,
         params=params,
         timeout=20,
