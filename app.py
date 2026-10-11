@@ -115,6 +115,7 @@ st.set_page_config(page_title="Market Edge AI V5", page_icon="📊", layout="wid
 # ==========================================
 
 import requests
+from dual_agent.odds_request_cache import get as cached_odds_get
 
 def render_stock_connection():
     with st.expander("Alpaca Connection"):
@@ -945,7 +946,7 @@ def cached_nfl_pick_statuses(api_key):
     if not api_key:
         return []
     try:
-        response = requests.get(
+        response = cached_odds_get(
             "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/scores",
             params={"apiKey": api_key, "daysFrom": 3, "dateFormat": "iso"},
             timeout=8,
@@ -1024,7 +1025,7 @@ def cached_sport_pick_statuses(sport, api_key):
     if not api_key:
         return []
     try:
-        response = requests.get(
+        response = cached_odds_get(
             f"https://api.the-odds-api.com/v4/sports/{sport}/scores",
             params={"apiKey": api_key, "daysFrom": 3, "dateFormat": "iso"}, timeout=8,
         )
@@ -1267,6 +1268,17 @@ def render_game_addons(league, game, result):
                 reasons = (result or {}).get("spreads", {}).get("issues", [])
                 text = next((r for r in reasons if str(game.get("away_team", "")) in r and str(game.get("home_team", "")) in r), None)
                 st.info(text or (reasons[0] if reasons and len(reasons)==1 else "No eligible spread estimate: two fresh matching books and complete model inputs are required."))
+    if league in ('NFL', 'MLB'):
+        import hashlib
+        refresh_identity = '|'.join(str(game.get(k, '')) for k in ('home_team', 'away_team', 'commence_time'))
+        if st.button('Refresh prop odds for this game', key='refresh_prop_odds_'+league+hashlib.sha256(refresh_identity.encode()).hexdigest()[:16]):
+            from dual_agent.odds_request_cache import refresh_game_props
+            matched = refresh_game_props(game.get('home_team'), game.get('away_team'))
+            if matched:
+                st.info('This game’s cached prop quotes were cleared. Generate predictions to fetch its new quotes; other games reuse cached responses.')
+            else:
+                st.info('No cached sportsbook event matched this game. Generate predictions to collect its available listings.')
+        st.caption('Quotes may be up to 30 minutes old. Refresh and regenerate before using current betting odds.')
     props_key = "nfl_saved_prop_cards" if league == "NFL" else f"{league.lower()}_saved_props_cards"
     props = matching_game_rows(game, st.session_state.get(props_key))
     if league == "NFL":
@@ -1477,45 +1489,8 @@ def render_nfl_game_context(game):
 
 
 
-@st.fragment(run_every='180s')
 def render_mlb_update_notice(location):
-    """Refresh data separately; never redraw or replace the cards automatically."""
-    previous = st.session_state.get('mlb_live_pipeline_result')
-    if not previous:
-        return
-    current = pd.Timestamp.now(tz='UTC')
-    checked = pd.to_datetime(st.session_state.get('mlb_last_refresh_attempt'), utc=True, errors='coerce')
-    if pd.isna(checked) or current-checked >= pd.Timedelta(seconds=180):
-        st.session_state['mlb_last_refresh_attempt'] = current.isoformat()
-        try:
-            import os
-            pipeline = load_mlb_prediction_pipeline()
-            key = os.environ.get('ODDS_API_KEY') or os.environ.get('THE_ODDS_API_KEY')
-            if not key:
-                try:
-                    key = st.secrets.get('ODDS_API_KEY') or st.secrets.get('THE_ODDS_API_KEY')
-                except Exception:
-                    key = None
-            updated = pipeline.run_mlb_prediction_pipeline(api_key=key, force_refresh=True)
-            try:
-                from dual_agent.game_prediction_addons import enhance_result
-                updated = enhance_result('MLB', updated, key)
-            except ImportError:
-                updated['spreads'] = {'picks': [], 'issues': ['Run-line module unavailable.']}
-            updated['pipeline_version'] = pipeline.MLB_PIPELINE_VERSION
-            st.session_state['mlb_pending_pipeline_result'] = updated
-            st.session_state.pop('mlb_background_refresh_issue', None)
-        except Exception as exc:
-            st.session_state['mlb_background_refresh_issue'] = str(exc)
-    pending = st.session_state.get('mlb_pending_pipeline_result')
-    if pending:
-        st.info('Updated MLB picks are ready. Your current cards stay visible until you choose to update them.')
-        if st.button('Show updated picks', key=location+'_apply_updated_picks'):
-            st.session_state['mlb_live_pipeline_result'] = pending
-            st.session_state.pop('mlb_pending_pipeline_result', None)
-            st.rerun(scope='app')
-    if st.session_state.get('mlb_background_refresh_issue'):
-        st.caption('Automatic update failed; displayed picks were kept. ' + st.session_state['mlb_background_refresh_issue'])
+    st.caption('Automatic sportsbook scans are off. Odds are reused for up to 30 minutes; generate picks when you want an update.')
 
 
 @st.fragment
@@ -1559,7 +1534,7 @@ def render_mlb_prediction_center(location):
     if previous:
         retain_sport_picks("MLB", previous.get("all_predictions", previous.get("predictions", [])), limit=None)
         remember_game_addons("MLB", previous)
-    st.caption("Your displayed picks stay in place while you read. Automatic scans check for updates every three minutes; use Show updated picks when ready.")
+    st.caption("Your displayed picks stay in place while you read. Automatic odds scans are off; sportsbook responses are reused for up to 30 minutes.")
     if generated:
         st.session_state.pop('mlb_pending_pipeline_result', None)
         st.session_state["mlb_last_refresh_attempt"] = pd.Timestamp.now(tz="UTC").isoformat()
