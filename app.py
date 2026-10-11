@@ -1210,9 +1210,9 @@ def remember_game_addons(league, result):
 
 def select_nfl_prop_list(props, mode):
     """Rank independent lists before caps; retain one exact bet per player/market."""
-    candidates = [p for p in props if float(p.get('estimated_return_per_unit', 0)) > 0
-                  and len(p.get('sportsbook_offers', [])) >= 1
-                  and (mode == 'value' or float(p.get('historical_support', 0)) >= .65)]
+    candidates = [p for p in props if len(p.get('sportsbook_offers', [])) >= 1
+                  and (float(p.get('estimated_return_per_unit', 0)) > 0 if mode == 'value'
+                       else float(p.get('historical_support', 0)) >= .65)]
     primary, secondary = ('estimated_return_per_unit', 'historical_support') if mode == 'value' else ('historical_support', 'estimated_return_per_unit')
     candidates.sort(key=lambda p: (-float(p.get(primary, 0)), -float(p.get(secondary, 0))))
     picks, seen = [], set()
@@ -1290,7 +1290,6 @@ def render_game_addons(league, game, result):
     if league != "NFL":
         props = [p for p in props if float(p.get(score, 0)) >= .65]
     if league == "NFL":
-        props = [p for p in props if float(p.get(value_key, 0)) > 0]
         markets = sorted({str(p.get('market','')) for p in props})
         import hashlib
         filter_id = hashlib.sha256('|'.join(str(game.get(k,'')) for k in ['home_team','away_team','commence_time']).encode()).hexdigest()[:16]
@@ -1303,21 +1302,22 @@ def render_game_addons(league, game, result):
     else:
         props = sorted(props, key=lambda row: (-float(row.get(score, 0)), -float(row.get(value_key, 0))))[:10]
     with st.expander("🎯 Player props for this game · loading" if league == "NFL" and (result or {}).get("enrichment_pending") and not props else f"🎯 Player props for this game ({len(props)})", expanded=True):
-        st.caption('Most likely: minimum 65% estimated chance. Highest value: no probability minimum. Both require usable history, a listed exact bet, and positive estimated value.' if league == 'NFL' else 'Minimum 65% estimated cover chance · exact bet offered by a sportsbook')
+        st.caption('Most likely: minimum 65% estimated chance, regardless of value. Highest value: positive estimated value, no probability minimum. Both require usable history and a listed exact bet.' if league == 'NFL' else 'Minimum 65% estimated cover chance · exact bet offered by a sportsbook')
         if league == 'NFL':
             probability_column, value_column = st.columns(2)
             probability_column.markdown('### Most likely to win · top 5')
             value_column.markdown('### Highest estimated value · top 5')
+            loading_props = bool((result or {}).get('enrichment_pending'))
             if not probability_props:
-                probability_column.info('No listed positive-value bets meet the 65% minimum.')
+                probability_column.info('Loading player-prop estimates…' if loading_props else 'No listed bets meet the 65% estimated-chance minimum.')
             if not value_props:
-                value_column.info('No listed bets have positive estimated value.')
+                value_column.info('Loading player-prop estimates…' if loading_props else 'No listed bets have positive estimated value.')
             props = [dict(p, _display_column=column, _list_name=name, _list_rank=i)
                      for name, column, picks in [('probability', probability_column, probability_props), ('value', value_column, value_props)]
                      for i, p in enumerate(picks, 1)]
         if not props:
             issues = (result or {}).get("prop_issues", []) if league == "NFL" else (result or {}).get("player_props", {}).get("errors", [])
-            st.info("Collecting fresh sportsbook lines and scoring player props…" if league == "NFL" and (result or {}).get("enrichment_pending") else "No eligible player props for this matchup yet. A listed exact bet, at least 65% estimated cover chance, and usable history are required. NFL ranked bets also require positive estimated value.")
+            st.info("Collecting fresh sportsbook lines and scoring player props…" if league == "NFL" and (result or {}).get("enrichment_pending") else "No eligible player props for this matchup yet. A listed exact bet, at least 65% estimated cover chance, and usable history are required. Only the highest-value list requires positive estimated value.")
             if league == "MLB":
                 from collections import Counter
                 exclusions = (result or {}).get('player_props', {}).get('exclusions', [])
@@ -1347,7 +1347,9 @@ def render_game_addons(league, game, result):
                         st.caption("Available at one sportsbook · meets our listing requirement")
                     if offers:
                         st.caption("Offered at: " + ", ".join(str(o['bookmaker_key']) + " (" + format(float(o['american_odds']), '+g') + ")" for o in offers))
-                    st.caption('Positive estimated value · ordered by estimated value, then chance.' if prop.get('_list_name') == 'value' else 'Positive estimated value · ordered by estimated chance, then value.')
+                    st.caption('Positive estimated value · ordered by estimated value, then chance.' if prop.get('_list_name') == 'value' else 'Ordered by estimated chance, then value.')
+                    if prop.get('_list_name') == 'probability' and float(prop.get('estimated_return_per_unit', 0)) <= 0:
+                        st.warning('High estimated chance, but the listed odds do not offer positive estimated value.')
                     if prop.get('_list_name') == 'value' and float(prop['historical_support']) < .65:
                         st.caption('Below 65% estimated chance · value opportunity, not a high-probability pick')
                     comparisons = prop.get('outcome_comparison', [])
