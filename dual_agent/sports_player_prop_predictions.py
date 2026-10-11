@@ -11,6 +11,7 @@ import unicodedata
 import numpy as np
 import pandas as pd
 import requests
+from dual_agent.odds_request_cache import get as cached_odds_get
 
 MARKETS = {'MLB': {
     'batter_hits': ('Hits', 'hits'),
@@ -37,29 +38,31 @@ def name_key(value):
     return ''.join(c for c in unicodedata.normalize('NFKD', str(value)).lower() if c.isalnum())
 
 
-def estimate_prop(values, line, side, market_probability, minimum=10):
+def estimate_prop(values, line, side, market_probability, minimum=10, minimum_decisions=None):
     values = np.asarray(values, dtype=float)
     values = values[np.isfinite(values)][-30:]
     wins = int((values > line).sum()) if side == 'Over' else int((values < line).sum())
     pushes = int((values == line).sum())
     decisions = len(values)-pushes
-    if len(values) < minimum or decisions < minimum:
+    if minimum_decisions is None:
+        minimum_decisions = minimum
+    if len(values) < minimum or decisions < minimum_decisions:
         return None
     # Preserve the existing short-sample shrinkage and eligibility criteria.
     chance = (wins+10*market_probability)/(decisions+10)
     return {'Estimated chance': float(chance), 'Projected stat': float(values.mean()),
-            'Prior games': len(values), 'Historical wins': wins, 'Historical pushes': pushes,
+            'Prior games': len(values), 'Non-push games': decisions, 'Historical wins': wins, 'Historical pushes': pushes,
             'Historical hit rate': wins/decisions, 'Estimate method': 'Prior 30 appearances + market shrinkage'}
 
 
 def _get(url, key, params=None, balldontlie=False):
-    response = requests.get(url, params=params, headers={'Authorization': key} if balldontlie else None, timeout=20)
+    response = cached_odds_get(url, params=params, headers={'Authorization': key} if balldontlie else None, timeout=20)
     if response.status_code != 200:
         raise RuntimeError('Player-prop data request failed (HTTP '+str(response.status_code)+').')
     return response.json()
 
 
-MLB_PROP_MATCH_VERSION = 5
+MLB_PROP_MATCH_VERSION = 6
 
 
 def mlb_team_key(value):
@@ -336,8 +339,8 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
         values = [float(v) for v in values if v is not None and np.isfinite(float(v))]
         if league == 'MLB':
             sample = values[-30:]
-            if not pitching_market and (len(sample) < 10 or sum(v != line for v in sample) < 10):
-                excluded(first, player, market, line, f'Need 10 usable non-push appearances; found {len(sample)} appearances and {sum(v != line for v in sample)} non-push results.')
+            if not pitching_market and (len(sample) < 10 or sum(v != line for v in sample) < 8):
+                excluded(first, player, market, line, f'Need 10 prior appearances and 8 non-push results; found {len(sample)} appearances and {sum(v != line for v in sample)} non-push results.')
                 continue
         qualified = False
         for side,market_p in [('Over',probability),('Under',1-probability)]:
@@ -346,7 +349,8 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
             if not available:
                 continue
             estimate = estimate_prop(values,line,side,market_p,
-                minimum=1 if league == 'MLB' and pitching_market else 10)
+                minimum=1 if league == 'MLB' and pitching_market else 10,
+                minimum_decisions=8 if league == 'MLB' and not pitching_market else None)
             if estimate and league == 'MLB' and pitching_market:
                 best_forecast = max(available, key=lambda q:q[price_key])
                 pitcher_forecasts.append({'game_id': int(first['game_id']), 'player_id': identity[0],
@@ -358,7 +362,8 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
                     'Participation status': participation,
                     'start_time': first['start_time'], 'Captured UTC': first['capture_time'],
                     'Estimate method': estimate['Estimate method'] if paired_probabilities else 'Prior appearances + neutral shrinkage; one-sided quote'})
-            enough_history = estimate and estimate['Prior games'] >= 10 and estimate['Prior games']-estimate['Historical pushes'] >= 10
+            required_decisions = 8 if league == 'MLB' and not pitching_market else 10
+            enough_history = estimate and estimate['Prior games'] >= 10 and estimate['Prior games']-estimate['Historical pushes'] >= required_decisions
             if enough_history and estimate['Estimated chance'] >= .65:
                 qualified = True
                 if not paired_probabilities:
