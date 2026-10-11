@@ -11,11 +11,9 @@ from dual_agent.nfl_player_prop_prediction_pipeline import (
     run_nfl_player_prop_prediction_pipeline,
 )
 
-@st.cache_data(ttl=600, show_spinner=False)
 def cached_events(key):
     return events(key)
 
-@st.cache_data(ttl=300, show_spinner=False)
 def cached_props(key, event_id, market_keys):
     return event_props(key,event_id,list(market_keys))
 
@@ -287,6 +285,9 @@ def render_nfl_player_props():
             with st.container(border=True):
                 st.markdown(f"### #{rank} · {prop['player']}")
                 st.caption(f"{prop.get('away_team','')} @ {prop.get('home_team','')}")
+                kickoff_time = pd.to_datetime(prop.get("game_time"), utc=True, errors="coerce")
+                if pd.notna(kickoff_time):
+                    st.caption(kickoff_time.tz_convert("America/Chicago").strftime("%b %d, %Y · %I:%M %p CT"))
                 st.caption(prop.get("pick_game_status", "Upcoming"))
                 side=str(prop['model_pick'])
                 pick=side if side in ['YES','NO'] else f"{side} {float(prop['line']):g}"
