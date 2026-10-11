@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 import pandas as pd
 import requests
+from dual_agent.odds_request_cache import get as cached_odds_get
 from scipy.stats import skellam
 
 NFL_FEATURES = ['win_pct_diff', 'avg_point_diff_diff', 'recent_5_win_pct_diff',
@@ -47,7 +48,7 @@ def matching_game_rows(game, candidates):
 def fetch_spread_events(league, key):
     if not key:
         raise ValueError('Sportsbook API key unavailable.')
-    response = requests.get(f'https://api.the-odds-api.com/v4/sports/{SPORTS[league]}/odds',
+    response = cached_odds_get(f'https://api.the-odds-api.com/v4/sports/{SPORTS[league]}/odds',
         params={'apiKey': key, 'regions': 'us', 'markets': 'spreads', 'oddsFormat': 'decimal'}, timeout=20)
     if response.status_code != 200:
         # Do not include credential-bearing request URLs in errors.
@@ -277,9 +278,9 @@ def automatic_nfl_props(predictions, key):
         raise RuntimeError('Deploy the matching NFL prop pipeline with the positive-value update.')
     run_nfl_player_prop_prediction_pipeline = pipeline_module.run_nfl_player_prop_prediction_pipeline
     import streamlit as st
-    @st.cache_data(ttl=300, show_spinner=False)
+    @st.cache_data(ttl=1800, show_spinner=False)
     def available_player_markets(api_key, event_id):
-        response = requests.get(f'https://api.the-odds-api.com/v4/sports/americanfootball_nfl/events/{event_id}/markets',
+        response = cached_odds_get(f'https://api.the-odds-api.com/v4/sports/americanfootball_nfl/events/{event_id}/markets',
             params={'apiKey':api_key,'regions':'us','dateFormat':'iso'}, timeout=20)
         if response.status_code != 200:
             raise ValueError(f'Market discovery HTTP {response.status_code}')
@@ -340,7 +341,7 @@ def automatic_nfl_props(predictions, key):
     for event_id, group in lines.groupby('event_id', sort=False):
         try:
             props = run_nfl_player_prop_prediction_pipeline(group, history,
-                window=12, max_results=200, horizon_days=7, retain_all_qualified=True)
+                window=12, max_results=200, horizon_days=7, retain_all_qualified=True, include_value_candidates=True)
             if not props.empty:
                 forecasts.append(props)
             else:
