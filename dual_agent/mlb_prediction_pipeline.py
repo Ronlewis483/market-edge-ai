@@ -12,10 +12,11 @@ import time
 import numpy as np
 import pandas as pd
 import requests
+from dual_agent.odds_request_cache import get as cached_odds_get
 from scipy.stats import skellam
 
 ACTIVE_MODEL_PATH = 'mlb/live_matchup/active.json'
-MLB_PIPELINE_VERSION = 13
+MLB_PIPELINE_VERSION = 14
 _HISTORY_CACHE = {}
 _CACHE_LOCK = RLock()
 CORE = ['home_field', 'offense_runs_per_game', 'opponent_runs_allowed',
@@ -548,9 +549,9 @@ def _generate_mlb_predictions(game_date=None, api_key=None, progress=None, on_te
     try:
         import importlib
         prop_module = importlib.import_module('dual_agent.sports_player_prop_predictions')
-        if getattr(prop_module, 'MLB_PROP_MATCH_VERSION', None) != 5:
+        if getattr(prop_module, 'MLB_PROP_MATCH_VERSION', None) != 6:
             prop_module = importlib.reload(prop_module)
-        if getattr(prop_module, 'MLB_PROP_MATCH_VERSION', None) != 5:
+        if getattr(prop_module, 'MLB_PROP_MATCH_VERSION', None) != 6:
             raise RuntimeError('Install the matching sports_player_prop_predictions.py update.')
         generate_player_prop_picks = prop_module.generate_player_prop_picks
         prop_games = [{'game_id': r['game_id'], 'start_time': r['start_time'], 'home_team': r['Home'], 'away_team': r['Away']} for r in all_eligible_predictions]
@@ -578,7 +579,7 @@ def _generate_mlb_predictions(game_date=None, api_key=None, progress=None, on_te
 def fetch_live_consensus(games, api_key):
     """One live US moneyline request. Only fresh two-sided quotes from >=2 books."""
     from dual_agent.mlb_historical_odds import team as _normalize_team
-    response = requests.get('https://api.the-odds-api.com/v4/sports/baseball_mlb/odds', params={'apiKey': api_key, 'regions': 'us', 'markets': 'h2h', 'oddsFormat': 'decimal'}, timeout=25)
+    response = cached_odds_get('https://api.the-odds-api.com/v4/sports/baseball_mlb/odds', params={'apiKey': api_key, 'regions': 'us', 'markets': 'h2h', 'oddsFormat': 'decimal'}, timeout=25)
     if response.status_code != 200:
         raise RuntimeError('Live odds request failed (HTTP '+str(response.status_code)+').')
     events = response.json(); probabilities = []
