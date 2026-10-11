@@ -383,6 +383,7 @@ def run_nfl_player_prop_prediction_pipeline(
     max_results=20,
     horizon_days=1,
     retain_all_qualified=False,
+    include_value_candidates=False,
 ):
     """
     Generate and rank future player-prop forecasts within the requested horizon.
@@ -532,7 +533,7 @@ def run_nfl_player_prop_prediction_pipeline(
                 estimate[
                     "historical_support"
                 ]
-                < 0.65
+                < 0.65 and not include_value_candidates
             ):
                 exclusions['below_65_percent'] += 1
                 continue
@@ -556,7 +557,7 @@ def run_nfl_player_prop_prediction_pipeline(
             push_chance = 0.0 if market == 'Anytime touchdown' else float(np.mean(values == float(line)))
             expected_return = (1-push_chance) * (estimate['historical_support'] * best_decimal - 1)
             # A listed bet must offer positive estimated value at its best actual price.
-            if not np.isfinite(expected_return) or expected_return <= 0:
+            if not np.isfinite(expected_return) or (expected_return <= 0 and not (include_value_candidates and estimate["historical_support"] >= .65)):
                 exclusions['nonpositive_value'] += 1
                 continue
 
@@ -674,7 +675,7 @@ def run_nfl_player_prop_prediction_pipeline(
                 "event_id",
                 "player",
                 "market",
-            ],
+            ] + (["model_pick", "line"] if include_value_candidates else []),
             keep="first",
         )
         .reset_index(drop=True)
@@ -689,13 +690,13 @@ def run_nfl_player_prop_prediction_pipeline(
 
     if retain_all_qualified:
         # Preserve every qualifying market for per-game UI filters before display caps.
-        all_props = results.head(max_results).copy().reset_index(drop=True)
+        all_props = (results if include_value_candidates else results.head(max_results)).copy().reset_index(drop=True)
         all_props['prop_rank'] = range(1,len(all_props)+1)
         all_props['is_best_prop'] = all_props.groupby(['event_id','player']).cumcount()==0
         identities = list(zip(all_props.event_id,all_props.player))
         ranks = {identity:i+1 for i,identity in enumerate(dict.fromkeys(identities))}
         all_props['player_rank'] = [ranks[identity] for identity in identities]
-        all_props['selection_reason'] = 'Minimum 65% estimated cover chance and positive estimated value at an actual listed price; ranked by cover chance, then value.'
+        all_props['selection_reason'] = ('Independent candidates: at least 65% estimated chance OR positive estimated value at an actual listed price.' if include_value_candidates else 'Minimum 65% estimated cover chance and positive estimated value at an actual listed price; ranked by cover chance, then value.')
         return all_props
 
     best_prop_per_player = (
