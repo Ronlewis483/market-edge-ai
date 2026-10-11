@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 import requests
+from dual_agent.odds_request_cache import get as cached_odds_get
 
 SPORT = 'americanfootball_nfl'
 BASE = 'https://api.the-odds-api.com/v4'
@@ -37,7 +38,7 @@ REQUIRED = {'player','market','game_time','value'}
 
 def fetch_json(path, key, **params):
     if not key: raise ValueError('Set ODDS_API_KEY in Streamlit Secrets.')
-    response = requests.get(BASE + path, params={'apiKey':key, **params}, timeout=25)
+    response = cached_odds_get(BASE + path, params={'apiKey':key, **params}, timeout=25)
     response.raise_for_status()
     return response.json(), response.headers.get('x-requests-remaining', '?')
 
