@@ -149,8 +149,65 @@ def mlb_cover_distribution(home_runs, away_runs, home_line):
     return home, max(0., 1-home-push), push
 
 
+def generate_mlb_run_lines(predictions, events, now):
+    """Always keep model run-line panels; actual offers need only one preferred platform."""
+    from dual_agent.preferred_sportsbooks import allowed, standalone_value
+    picks, issues = [], []
+    for game in records(predictions):
+        home, away, kickoff = game_fields(game)
+        if pd.isna(kickoff) or not now < kickoff <= now+pd.Timedelta(days=7):
+            continue
+        row = {'home_team': home, 'away_team': away, 'commence_time': kickoff.isoformat(),
+               'captured_at': now.isoformat(), 'offers': [], 'model_lines': [], 'books': 0,
+               'method': 'Saved projected runs + run-difference distribution', 'validated': False}
+        provisional = bool(game.get('Missing model inputs')) or str(game.get('Input status', '')).startswith('Early forecast')
+        row['provisional'] = provisional
+        try:
+            hr, ar = float(game['Projected home runs']), float(game['Projected away runs'])
+            def cover(team, line):
+                hc, ac, push = mlb_cover_distribution(hr, ar, line if team == home else -line)
+                return (hc if team == home else ac)/(1-push), push
+            home_line = -1.5 if hr >= ar else 1.5
+            for team, line in [(home, home_line), (away, -home_line)]:
+                chance, push = cover(team, line)
+                row['model_lines'].append({'team': team, 'line': line, 'chance': chance, 'push_chance': push})
+            matches = matching_game_rows(game, events)
+            if len(matches) == 1:
+                for book in matches[0].get('bookmakers', []):
+                    if not allowed(book.get('key')):
+                        continue
+                    for market in book.get('markets', []):
+                        stamp = pd.to_datetime(market.get('last_update') or book.get('last_update'), utc=True, errors='coerce')
+                        if market.get('key') != 'spreads' or pd.isna(stamp) or not pd.Timedelta(0) <= now-stamp <= pd.Timedelta(minutes=30):
+                            continue
+                        for outcome in market.get('outcomes', []):
+                            team = outcome.get('name')
+                            if team not in (home, away):
+                                continue
+                            try:
+                                line, price = float(outcome['point']), float(outcome['price'])
+                                if not np.isfinite([line, price]).all() or price <= 1:
+                                    continue
+                                chance, push = cover(team, line)
+                            except (ValueError, KeyError, TypeError):
+                                continue
+                            row['offers'].append({'platform': book['key'], 'team': team, 'line': line,
+                                'decimal_odds': price, 'chance': chance, 'push_chance': push,
+                                'quote_updated_at': stamp.isoformat(), 'value_eligible': standalone_value(book['key'])})
+            row['books'] = len({o['platform'] for o in row['offers']})
+            row['projected_home_margin'] = hr-ar
+            best = max(row['model_lines'], key=lambda r:r['chance'])
+            row.update(spread_team=best['team'], spread_line=best['line'], cover_chance=best['chance'], push_chance=best['push_chance'])
+        except (ValueError, KeyError, TypeError) as exc:
+            row['issue'] = str(exc)
+        picks.append(row)
+    return {'picks': picks, 'issues': issues}
+
+
 def generate_spread_picks(league, predictions, events, history=None, now=None):
     now = pd.Timestamp.now(tz='UTC') if now is None else pd.Timestamp(now)
+    if league == 'MLB':
+        return generate_mlb_run_lines(predictions, events, now)
     rows = records(predictions)
     margin_model = residuals = None
     if league == 'NFL':
@@ -379,6 +436,9 @@ def enhance_result(league, result, key, history=None):
         result['spreads'] = generate_spread_picks(league, predictions, events, history)
     except Exception as exc:
         result['spreads'] = {'picks': [], 'issues': [f'Spread estimates unavailable: {exc}' if isinstance(exc, ValueError) else f'Spread estimates unavailable ({type(exc).__name__}).']}
+        if league == 'MLB':
+            result['spreads'] = generate_mlb_run_lines(predictions, [], pd.Timestamp.now(tz='UTC'))
+            result['spreads']['issues'].append('Sportsbook run-line quotes unavailable; model-only forecasts shown.')
     if league == 'NFL':
         try:
             props, issues = automatic_nfl_props(predictions, key)
