@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import requests
 from dual_agent.odds_request_cache import get as cached_odds_get
+from dual_agent.preferred_sportsbooks import allowed
 
 SPORT = 'americanfootball_nfl'
 BASE = 'https://api.the-odds-api.com/v4'
@@ -52,6 +53,8 @@ def event_props(key, event_id, markets, regions='us'):
 def normalize_props(event):
     rows=[]
     for book in event.get('bookmakers', []):
+        if not allowed(book.get('key')):
+            continue
         for market in book.get('markets', []):
             for outcome in market.get('outcomes', []):
                 player = outcome.get('description')
