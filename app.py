@@ -1291,7 +1291,43 @@ def render_game_addons(league, game, result):
         return
     remember_game_addons(league, result or {})
     spread_key = "nfl_saved_spread_cards" if league == "NFL" else "mlb_saved_spreads_cards"
-    if league in ("NFL", "MLB"):
+    if league == 'MLB':
+        with st.expander('📏 Run-line predictions and platform offers', expanded=True):
+            # Compute the display fallback without any paid request, including older saved results.
+            from dual_agent.game_prediction_addons import generate_mlb_run_lines
+            saved = matching_game_rows(game, st.session_state.get(spread_key))
+            spread = next((r for r in saved if 'model_lines' in r), None)
+            if spread is None:
+                forecast = generate_mlb_run_lines([game], [], pd.Timestamp.now(tz='UTC'))
+                spread = forecast['picks'][0] if forecast['picks'] else {}
+            if spread.get('model_lines'):
+                st.caption('Model-only reference lines · not sportsbook listings')
+                for forecast in spread['model_lines']:
+                    st.markdown(f"**{forecast['team']} {forecast['line']:+g} · {forecast['chance']:.1%} estimated cover chance**")
+                if spread.get('provisional'):
+                    st.warning('Provisional model inputs · forecast only; participation information is incomplete.')
+            else:
+                st.info('Run-line panel available; estimate unavailable because projected runs are missing or unusable.')
+            offers = spread.get('offers', [])
+            if offers:
+                st.markdown('**Actual preferred-platform run-line offers**')
+                for offer in sorted(offers, key=lambda o:(o['platform'] != 'polymarket', o['platform'], -o['chance'])):
+                    stamp = pd.to_datetime(offer.get('quote_updated_at'), utc=True, errors='coerce')
+                    fresh = pd.notna(stamp) and pd.Timedelta(0) <= pd.Timestamp.now(tz='UTC')-stamp <= pd.Timedelta(minutes=30)
+                    with st.container(border=True):
+                        st.markdown(f"**{offer['platform']} · {offer['team']} {offer['line']:+g}**")
+                        st.write(f"Estimated {offer['chance']:.1%} chance of covering this exact run line")
+                        st.caption(f"Feed odds {decimal_to_american_label(float(offer['decimal_odds']))} · checked {offer.get('quote_updated_at')}")
+                        if not fresh:
+                            st.warning('Saved quote is stale. Generate again to verify current availability.')
+                        if not offer.get('value_eligible', True):
+                            st.caption('Pick’em listing · entry rules determine actual returns.')
+                if not any(o['platform'] == 'polymarket' for o in offers):
+                    st.caption('No matching Polymarket run-line offer was returned and accepted for this game.')
+            else:
+                st.caption('No matching preferred-platform run-line offer found. Reference forecasts above are informational, not verified bets.')
+            st.caption('Cover estimates exclude pushes. Run-line accuracy is not established.')
+    if league == "NFL":
         spreads = matching_game_rows(game, st.session_state.get(spread_key))
         with st.expander("📏 Spread prediction" if league == "NFL" else "📏 Run-line prediction", expanded=False):
             if spreads:
