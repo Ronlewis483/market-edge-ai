@@ -10,6 +10,7 @@ This module does not execute wagers.
 """
 
 import re
+from dual_agent.preferred_sportsbooks import allowed, standalone_value
 
 NFL_PROP_VALUE_VERSION = 1
 
@@ -346,6 +347,7 @@ def _select_consensus_props(prop_lines):
     if any(c not in prop_lines for c in required):
         return pd.DataFrame()
     props = prop_lines[required].copy()
+    props = props.loc[props['bookmaker_key'].map(allowed)]
     props['line'] = pd.to_numeric(props['line'], errors='coerce')
     props['american_odds'] = pd.to_numeric(props['american_odds'], errors='coerce')
     props['side'] = props['side'].astype(str).str.upper()
@@ -552,12 +554,14 @@ def run_nfl_player_prop_prediction_pipeline(
             def decimal_price(offer):
                 price = float(offer['american_odds'])
                 return 1 + price/100 if price > 0 else 1 + 100/abs(price)
-            best_offer = max(offered, key=decimal_price)
+            priced_offers = [offer for offer in offered if standalone_value(offer['bookmaker_key'])]
+            best_offer = max(priced_offers or offered, key=decimal_price)
+            value_eligible = bool(priced_offers)
             best_decimal = decimal_price(best_offer)
             push_chance = 0.0 if market == 'Anytime touchdown' else float(np.mean(values == float(line)))
             expected_return = (1-push_chance) * (estimate['historical_support'] * best_decimal - 1)
             # A listed bet must offer positive estimated value at its best actual price.
-            if not np.isfinite(expected_return) or (expected_return <= 0 and not (include_value_candidates and estimate["historical_support"] >= .65)):
+            if not np.isfinite(expected_return) or ((expected_return <= 0 or not value_eligible) and not (include_value_candidates and estimate["historical_support"] >= .65)):
                 exclusions['nonpositive_value'] += 1
                 continue
 
@@ -636,6 +640,7 @@ def run_nfl_player_prop_prediction_pipeline(
                     "best_decimal_odds": best_decimal,
                     "estimated_cover_chance": estimate['historical_support'],
                     "estimated_return_per_unit": expected_return,
+                    "value_eligible": value_eligible,
                     "estimated_push_chance": push_chance,
                     "break_even_cover_chance": 1/best_decimal,
                     "availability_checked_at": current_time.isoformat(),
