@@ -5,6 +5,7 @@ import json
 import threading
 import time
 import requests
+from dual_agent.preferred_sportsbooks import BOOKMAKERS
 
 TTL = 1800
 _entries = {}
@@ -14,6 +15,10 @@ _guard = threading.RLock()
 def get(url, params=None, **kwargs):
     if not str(url).startswith('https://api.the-odds-api.com/'):
         return requests.get(url, params=params, **kwargs)
+    params = dict(params or {})
+    if str(url).rstrip('/').endswith(('/odds', '/markets')):
+        params.pop('regions', None)
+        params['bookmakers'] = BOOKMAKERS
     identity = hashlib.sha256(json.dumps([url, params or {}], sort_keys=True, default=str).encode()).hexdigest()
     with _guard:
         lock = _locks.setdefault(identity, threading.Lock())
