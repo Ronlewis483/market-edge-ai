@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 import requests
 from dual_agent.odds_request_cache import get as cached_odds_get
+from dual_agent.preferred_sportsbooks import allowed, standalone_value
 
 MARKETS = {'MLB': {
     'batter_hits': ('Hits', 'hits'),
@@ -31,7 +32,14 @@ MARKETS = {'MLB': {
     'pitcher_walks': ('Pitcher walks', 'pitcher_walks'),
     'pitcher_earned_runs': ('Earned runs allowed', 'earned_runs'),
     'pitcher_outs': ('Outs recorded', 'pitching_outs')},
-    'NBA': {'player_points': ('Points', 'pts'), 'player_rebounds': ('Rebounds', 'reb'), 'player_assists': ('Assists', 'ast')}}
+    'NBA': {'player_points': ('Points', 'pts'), 'player_rebounds': ('Rebounds', 'reb'), 'player_assists': ('Assists', 'ast'),
+    'player_threes': ('Three-pointers made', 'fg3m'), 'player_blocks': ('Blocks', 'blk'),
+    'player_steals': ('Steals', 'stl'), 'player_turnovers': ('Turnovers', 'turnover'),
+    'player_points_rebounds_assists': ('Points + rebounds + assists', ('pts', 'reb', 'ast')),
+    'player_points_rebounds': ('Points + rebounds', ('pts', 'reb')),
+    'player_points_assists': ('Points + assists', ('pts', 'ast')),
+    'player_rebounds_assists': ('Rebounds + assists', ('reb', 'ast')),
+    'player_blocks_steals': ('Blocks + steals', ('blk', 'stl'))}}
 
 
 def name_key(value):
@@ -53,6 +61,13 @@ def estimate_prop(values, line, side, market_probability, minimum=10, minimum_de
     return {'Estimated chance': float(chance), 'Projected stat': float(values.mean()),
             'Prior games': len(values), 'Non-push games': decisions, 'Historical wins': wins, 'Historical pushes': pushes,
             'Historical hit rate': wins/decisions, 'Estimate method': 'Prior 30 appearances + market shrinkage'}
+
+
+def nba_market_value(row, stat):
+    """Sum supported components only when every component is actually present."""
+    fields = stat if isinstance(stat, tuple) else (stat,)
+    numbers = [pd.to_numeric(row.get(field), errors='coerce') for field in fields]
+    return float(sum(numbers)) if all(pd.notna(n) and np.isfinite(n) for n in numbers) else None
 
 
 def _get(url, key, params=None, balldontlie=False):
@@ -152,6 +167,8 @@ def fetch_prop_quotes(league, games, odds_key):
         if league == 'MLB' and not payload.get('bookmakers'):
             errors.append({'Game':game['away_team']+' @ '+game['home_team'], 'Reason':'Event matched, but no sportsbook prop lines were returned.'})
         for book in payload.get('bookmakers', []):
+            if not allowed(book.get('key')):
+                continue
             for market in book.get('markets', []):
                 key = market.get('key')
                 if key not in MARKETS[league]: continue
@@ -312,7 +329,7 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
         probability = float(np.median(paired_probabilities)) if paired_probabilities else .5
         stat = MARKETS[league][market][1]
         if league=='NBA':
-            values = [r.get(stat) for r in history_by_name.get(player, []) if pd.Timestamp(r['source_date'])+pd.Timedelta(hours=48)<start]
+            values = [nba_market_value(r, stat) for r in history_by_name.get(player, []) if pd.Timestamp(r['source_date'])+pd.Timedelta(hours=48)<start]
         else:
             identity = identities.get((int(first['game_id']),name_key(player)))
             if not identity:
@@ -364,17 +381,21 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
                     'Estimate method': estimate['Estimate method'] if paired_probabilities else 'Prior appearances + neutral shrinkage; one-sided quote'})
             required_decisions = 8 if league == 'MLB' and not pitching_market else 10
             enough_history = estimate and estimate['Prior games'] >= 10 and estimate['Prior games']-estimate['Historical pushes'] >= required_decisions
-            if enough_history and estimate['Estimated chance'] >= .65:
+            if enough_history and (league == 'NBA' or estimate['Estimated chance'] >= .65):
                 qualified = True
                 if not paired_probabilities:
                     estimate['Estimate method'] = 'Prior 30 appearances + neutral shrinkage; one-sided sportsbook quote'
-                best = max(available, key=lambda q:q[price_key])
+                priced_offers = [q for q in available if standalone_value(q['book'])]
+                best = max(priced_offers or available, key=lambda q:q[price_key])
+                value_eligible = bool(priced_offers)
                 push_chance = estimate['Historical pushes']/estimate['Prior games']
                 expected_return = (1-push_chance)*(estimate['Estimated chance']*best[price_key]-1)
                 if not np.isfinite(expected_return):
                     continue
+                if league == 'NBA' and estimate['Estimated chance'] < .65 and (expected_return <= 0 or not value_eligible):
+                    continue
                 picks.append({'Player':player,'Market':MARKETS[league][market][0],'Pick':side,'Line':line,
-                              'Market chance':market_p,'Best sportsbook':best['book'],'Best decimal odds':best[price_key], 'Sportsbook offers':[{'book':q['book'], 'decimal_odds':q[price_key]} for q in available], 'Estimated return per unit':expected_return,'Break-even cover chance':1/best[price_key],'Estimated push chance':push_chance,'Books':len(available),'Game':first['away_team']+' @ '+first['home_team'],
+                              'Market chance':market_p,'Best sportsbook':best['book'],'Best decimal odds':best[price_key], 'Sportsbook offers':[{'book':q['book'], 'decimal_odds':q[price_key]} for q in available], 'Estimated return per unit':expected_return,'Value eligible':value_eligible,'Break-even cover chance':1/best[price_key],'Estimated push chance':push_chance,'Books':len(available),'Game':first['away_team']+' @ '+first['home_team'],
                               'start_time':first['start_time'],'Captured UTC':first['capture_time'],
                               **({'Participation status': participation, 'Event match': first.get('Event match')} if league=='MLB' else {}), **estimate})
         if league == 'MLB' and not qualified:
@@ -383,9 +404,9 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
     picks.sort(key=lambda r:(-r['Estimated chance'],-r['Estimated return per unit'],-r['Prior games'],r['Player']))
     seen=set(); chosen=[]
     for pick in picks:
-        key=(pick['Game'],pick['start_time'],pick['Player'],pick['Market'])
+        key=(pick['Game'],pick['start_time'],pick['Player'],pick['Market']) + ((pick['Pick'], pick['Line']) if league == 'NBA' else ())
         if key not in seen:
             seen.add(key);chosen.append(pick)
         # Retain eligible picks for every matchup; the global list stays top ten.
-    return {'picks':chosen[:10],'game_picks':chosen,'errors':errors, **({'exclusions': exclusions, 'quoted_candidates':len(groups), 'pitcher_forecasts':pitcher_forecasts} if league=='MLB' else {}), 'message':f'{len(chosen)} player-prop estimates ranked from actual lines and prior appearances.',
+    return {'picks':chosen[:10],'game_picks':chosen,'errors':errors, **({'exclusions': exclusions, 'quoted_candidates':len(groups), 'pitcher_forecasts':pitcher_forecasts} if league in ('MLB','NBA') else {}), 'message':f'{len(chosen)} player-prop estimates ranked from actual lines and prior appearances.',
             'note':'Estimated chance is conditional on no push and player participation. Estimates are not calibrated; no availability or injury clearance is implied.'}
