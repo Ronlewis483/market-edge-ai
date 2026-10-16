@@ -1209,14 +1209,14 @@ def remember_game_addons(league, result):
             retain_sport_picks(league, result.get("spreads", {}).get("picks", []), kind="spreads", limit=None)
 
 
-def select_nfl_prop_list(props, mode):
-    """Rank independent lists before caps; retain one exact bet per player/market."""
-    from dual_agent.preferred_sportsbooks import allowed, standalone_value, diversify
-    candidates = [p for p in props if allowed(p.get('best_sportsbook', p.get('Best sportsbook'))) and len(p.get('sportsbook_offers', [])) >= 1
-                  and (float(p.get('estimated_return_per_unit', 0)) > 0 and p.get('value_eligible', p.get('Value eligible', standalone_value(p.get('best_sportsbook', p.get('Best sportsbook'))))) if mode == 'value'
-                       else float(p.get('historical_support', 0)) >= .65)]
-    primary, secondary = ('estimated_return_per_unit', 'historical_support') if mode == 'value' else ('historical_support', 'estimated_return_per_unit')
-    candidates.sort(key=lambda p: (-float(p.get(primary, 0)), -float(p.get(secondary, 0))))
+def select_nfl_prop_list(props, mode='probability'):
+    """Select most likely listed bets; prices never control eligibility or order."""
+    from dual_agent.preferred_sportsbooks import allowed, diversify
+    candidates = [p for p in props if allowed(p.get('best_sportsbook', p.get('Best sportsbook')))
+                  and len(p.get('sportsbook_offers', [])) >= 1
+                  and float(p.get('historical_support', 0)) >= .65]
+    candidates.sort(key=lambda p: (-float(p.get('historical_support', 0)),
+                                  -int(p.get('sample_size', p.get('Prior games', 0))), str(p.get('player', ''))))
     return diversify(candidates, limit=5)
 
 
@@ -1242,11 +1242,11 @@ def render_prop_category_rankings(props, league):
     if not markets:
         return
     with st.expander('Best player props by category', expanded=True):
-        st.caption('Each category has its own rankings. Tackles have no special cap; missing or unqualified bets are not invented.')
+        st.caption('Each category ranks by estimated cover chance. Odds are reference only; one exact listed offer is enough.')
         for market in markets:
             group = [p for p in props if str(p.get('market', '')) == market]
             with st.expander(market, expanded=False):
-                for column, mode, title in zip(st.columns(2), ['probability', 'value'], ['Most likely · top 5', 'Highest value · top 5']):
+                for column, mode, title in zip([st.container()], ['probability'], ['Most likely to cover · top 5']):
                     with column:
                         st.markdown('**'+title+'**')
                         chosen = select_nfl_prop_list(group, mode)
@@ -1266,8 +1266,6 @@ def render_prop_category_rankings(props, league):
                                 st.caption(f'{book} · {side} {float(line):g} · {label}')
                                 if book in ('prizepicks', 'underdog'):
                                     st.caption('Pick’em listing · feed price is indicative; actual entry rules determine returns.')
-                                elif mode == 'probability' and float(prop.get('estimated_return_per_unit', 0)) <= 0:
-                                    st.caption('High estimated chance; price does not offer positive estimated value.')
 
 
 def prop_outcome_sentence(player, market, side, line, chance):
@@ -1319,8 +1317,6 @@ def render_game_addons(league, game, result):
                     stamp = pd.to_datetime(offer['quote_updated_at'], utc=True, errors='coerce')
                     if pd.isna(stamp) or pd.Timestamp.now(tz='UTC')-stamp > pd.Timedelta(minutes=30):
                         st.warning('Saved total-runs quote is stale; verify the current line before using it.')
-                    if offer.get('estimated_value') is not None and offer['estimated_value'] > 0:
-                        st.caption('Positive estimated value at this listed price')
                 if not totals:
                     st.caption('No matching total-runs line returned. Projected combined runs are informational only.')
                 st.caption('Total-runs estimates use the saved projected run rates and an independent Poisson approximation; accuracy is not established.')
@@ -1383,9 +1379,9 @@ def render_game_addons(league, game, result):
         normalized = [dict(p, event_id=p.get('Game'), player=p.get('Player'), market=p.get('Market'),
                            historical_support=p.get('Estimated chance', 0), estimated_return_per_unit=p.get('Estimated return per unit', 0),
                            sportsbook_offers=p.get('Sportsbook offers', [])) for p in props]
-        with st.expander(f'🎯 {league} player props · probability and value', expanded=True):
+        with st.expander(f'🎯 {league} player props · ranked by estimated cover chance', expanded=True):
             st.caption('Preferred platforms: Polymarket, Underdog, DraftKings, PrizePicks, FanDuel · overall strongest picks plus independent category rankings.')
-            st.caption('Most likely: minimum 65% estimated chance. Highest value: positive estimated value with no probability minimum. Both require a listed exact bet and sufficient prior appearances. MLB hitters need 10 appearances with 8 non-push results; pitchers and NBA require 10 non-push results.')
+            st.caption('Minimum 65% estimated cover chance · one preferred platform offering the exact bet · existing history and participation checks. Odds do not affect ranking.')
             render_prop_category_rankings(normalized, league)
             from dual_agent.sports_player_prop_predictions import MARKETS
             markets = sorted({value[0] for value in MARKETS[league].values()} | {p['market'] for p in normalized})
@@ -1395,7 +1391,7 @@ def render_game_addons(league, game, result):
             selected = st.selectbox(league+' prop market', ['All supported markets']+markets, key=league.lower()+'_market_'+choice_key)
             if selected != 'All supported markets':
                 normalized = [p for p in normalized if p['market'] == selected]
-            for column, mode, title in zip(st.columns(2), ['probability', 'value'], ['Most likely to win · top 5', 'Highest estimated value · top 5']):
+            for column, mode, title in zip([st.container()], ['probability'], ['Most likely to cover · top 5']):
                 with column:
                     st.markdown('### '+title)
                     chosen = select_nfl_prop_list(normalized, mode)
@@ -1412,14 +1408,8 @@ def render_game_addons(league, game, result):
                                 st.caption(participation)
                                 if participation not in ('Confirmed lineup', 'Recorded starter'):
                                     st.warning('Provisional participation—recheck the lineup or starter.')
-                            if mode == 'value' and float(prop['Estimated chance']) < .65:
-                                st.caption('Below 65% estimated chance · value opportunity, not a high-probability pick')
                             if prop.get('Best sportsbook') in ('prizepicks', 'underdog'):
                                 st.caption('Pick’em selection · entry rules determine actual returns; feed price is indicative.')
-                            if mode == 'probability' and float(prop.get('Estimated return per unit', 0)) <= 0:
-                                st.warning('High estimated chance; listed odds do not offer positive estimated value.')
-                            elif mode == 'value':
-                                st.caption('Positive estimated value · ranked by value, then probability')
             if league == 'MLB' and not normalized:
                 reasons = (result or {}).get('player_props', {}).get('exclusions', [])
                 matching_reasons = [r for r in reasons if r.get('Game') == str(game.get('away_team'))+' @ '+str(game.get('home_team')) and (selected == 'All supported markets' or r.get('Market') == selected)]
@@ -1460,27 +1450,17 @@ def render_game_addons(league, game, result):
             props = [p for p in props if p.get('market')==selected_market]
     if league == 'NFL':
         probability_props = select_nfl_prop_list(props, 'probability')
-        value_props = select_nfl_prop_list(props, 'value')
     else:
         props = diversify(sorted(props, key=lambda row: (-float(row.get(score, 0)), -float(row.get(value_key, 0)))), limit=10, market_key='Market', identity_keys=('Game','Player','Market'))
     with st.expander("🎯 Player props for this game · loading" if league == "NFL" and (result or {}).get("enrichment_pending") and not props else f"🎯 Player props for this game ({len(props)})", expanded=True):
         st.caption('Preferred platforms: Polymarket, Underdog, DraftKings, PrizePicks, FanDuel · overall strongest picks plus independent category rankings.')
-        st.caption('Most likely: minimum 65% estimated chance, regardless of value. Highest value: positive estimated value, no probability minimum. Both require usable history and a listed exact bet.' if league == 'NFL' else 'Minimum 65% estimated cover chance · exact bet offered by a sportsbook')
+        st.caption('Minimum 65% estimated cover chance · exact side listed on one preferred platform · odds shown for reference only.')
         if league == 'NFL':
-            probability_column, value_column = st.columns(2)
-            probability_column.markdown('### Most likely to win · top 5')
-            value_column.markdown('### Highest estimated value · top 5')
-            loading_props = bool((result or {}).get('enrichment_pending'))
-            if not probability_props:
-                probability_column.info('Loading player-prop estimates…' if loading_props else 'No listed bets meet the 65% estimated-chance minimum.')
-            if not value_props:
-                value_column.info('Loading player-prop estimates…' if loading_props else 'No listed bets have positive estimated value.')
-            props = [dict(p, _display_column=column, _list_name=name, _list_rank=i)
-                     for name, column, picks in [('probability', probability_column, probability_props), ('value', value_column, value_props)]
-                     for i, p in enumerate(picks, 1)]
+            st.markdown('### Most likely to cover · top 5')
+            props = [dict(p, _list_name='probability', _list_rank=i) for i, p in enumerate(probability_props, 1)]
         if not props:
             issues = (result or {}).get("prop_issues", []) if league == "NFL" else (result or {}).get("player_props", {}).get("errors", [])
-            st.info("Collecting fresh sportsbook lines and scoring player props…" if league == "NFL" and (result or {}).get("enrichment_pending") else "No eligible player props for this matchup yet. A listed exact bet, at least 65% estimated cover chance, and usable history are required. Only the highest-value list requires positive estimated value.")
+            st.info("Collecting fresh sportsbook lines and scoring player props…" if league == "NFL" and (result or {}).get("enrichment_pending") else "No eligible player props for this matchup yet. A listed exact bet, at least 65% estimated cover chance, and usable history are required. Odds are reference only.")
             if league == "MLB":
                 from collections import Counter
                 exclusions = (result or {}).get('player_props', {}).get('exclusions', [])
@@ -1504,7 +1484,7 @@ def render_game_addons(league, game, result):
                     st.caption(f"Projection {float(prop['projected_value']):.1f} · {int(prop.get('sample_size', 0))} prior games")
                     st.caption(f"Estimated cover chance {float(prop['historical_support']):.1%} · historical estimate, not calibrated")
                     if prop.get('best_sportsbook') in ('prizepicks', 'underdog'):
-                        st.caption('Pick’em selection · feed price is indicative; entry rules determine actual returns. Excluded from standalone value ranking.')
+                        st.caption('Pick’em selection · feed price is indicative; entry rules determine actual returns. Odds are reference only.')
                     if prop.get("best_sportsbook"):
                         st.caption(f"Best available odds: {prop['best_sportsbook']} · {float(prop['best_american_odds']):+g}")
                     offers = prop.get("sportsbook_offers", [])
@@ -1512,11 +1492,7 @@ def render_game_addons(league, game, result):
                         st.caption("Available at one sportsbook · meets our listing requirement")
                     if offers:
                         st.caption("Offered at: " + ", ".join(str(o['bookmaker_key']) + " (" + format(float(o['american_odds']), '+g') + ")" for o in offers))
-                    st.caption('Positive estimated value · ordered by estimated value, then chance.' if prop.get('_list_name') == 'value' else 'Ordered by estimated chance, then value.')
-                    if prop.get('_list_name') == 'probability' and float(prop.get('estimated_return_per_unit', 0)) <= 0:
-                        st.warning('High estimated chance, but the listed odds do not offer positive estimated value.')
-                    if prop.get('_list_name') == 'value' and float(prop['historical_support']) < .65:
-                        st.caption('Below 65% estimated chance · value opportunity, not a high-probability pick')
+                    st.caption('Ranked by estimated cover chance · odds are reference only.')
                     comparisons = prop.get('outcome_comparison', [])
                     if isinstance(comparisons, list) and comparisons:
                         with st.expander('Compare both outcomes'):
@@ -1558,7 +1534,7 @@ def render_game_addons(league, game, result):
                             st.warning("Provisional participation—recheck the lineup or starter.")
                 st.caption(prop.get("pick_game_status", "Upcoming"))
         if props:
-            st.caption("Each list has its own ranking: estimated chance on the left, estimated value on the right. Estimates are not calibrated future probabilities." if league == "NFL" else "Ordered from strongest to weakest within this game. Prop estimates and ranking scores are not calibrated future probabilities.")
+            st.caption("Ranked by estimated cover chance. Estimates are not calibrated future probabilities." if league == "NFL" else "Ordered from strongest to weakest within this game. Prop estimates and ranking scores are not calibrated future probabilities.")
 
 
 def nfl_prediction_features():
