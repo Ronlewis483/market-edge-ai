@@ -106,6 +106,9 @@ def match_mlb_prop_events(games, events, now):
         pair = [(event, stamp) for event, stamp in valid.values()
                 if mlb_team_key(event.get('home_team')) == home and mlb_team_key(event.get('away_team')) == away]
         strict = [(e,t) for e,t in pair if abs(t-start) <= pd.Timedelta(minutes=15)]
+        reversed_exact = [(e,t) for e,t in valid.values() if mlb_team_key(e.get('home_team')) == away and mlb_team_key(e.get('away_team')) == home and abs(t-start) <= pd.Timedelta(minutes=15)]
+        if not strict and not pair and len(reversed_exact) == 1:
+            pair = reversed_exact; strict = reversed_exact
         if len(strict) == 1:
             event, stamp = strict[0]; method = 'Teams and start within 15 minutes'
         elif len(strict) > 1:
@@ -177,7 +180,11 @@ def fetch_prop_quotes(league, games, odds_key):
                 paired = {}
                 for outcome in market.get('outcomes', []):
                     try:
-                        player = str(outcome['description']); line = float(outcome['point']); price = float(outcome['price']); side = outcome['name']
+                        player = str(outcome['description']); price = float(outcome['price']); side = outcome['name']
+                        if league == 'MLB' and key == 'batter_home_runs' and side in ('Yes', 'No'):
+                            line = .5; side = 'Over' if side == 'Yes' else 'Under'
+                        else:
+                            line = float(outcome['point'])
                         if not np.isfinite([line,price]).all() or price<=1 or side not in ['Over','Under']: continue
                         paired.setdefault((player,line), {})[side] = price
                     except (KeyError, TypeError, ValueError): continue
@@ -190,6 +197,13 @@ def fetch_prop_quotes(league, games, odds_key):
                                    'home_team':game['home_team'],'away_team':game['away_team'],'start_time':start.isoformat(),
                                    'game_id':game.get('game_id'), 'capture_time':stamp.isoformat(),
                                    **({'Event match':match_notes[int(game['game_id'])]['Match']} if league=='MLB' else {})})
+        if league == 'MLB':
+            found = {q['market'] for q in quotes}
+            for market_key, (label, _) in MARKETS['MLB'].items():
+                if market_key not in found:
+                    errors.append({'Game': game['away_team']+' @ '+game['home_team'],
+                        'MLB start UTC': start.isoformat(), 'Market': label,
+                        'Reason': 'No usable fresh '+label.lower()+' offer was returned for this matched game.'})
         return quotes, errors
     # Separate HTTP requests; bounded concurrency also preserves slate order.
     with ThreadPoolExecutor(max_workers=4 if league == 'MLB' else 1) as pool:
@@ -381,7 +395,7 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
                     'Estimate method': estimate['Estimate method'] if paired_probabilities else 'Prior appearances + neutral shrinkage; one-sided quote'})
             required_decisions = 8 if league == 'MLB' and not pitching_market else 10
             enough_history = estimate and estimate['Prior games'] >= 10 and estimate['Prior games']-estimate['Historical pushes'] >= required_decisions
-            if enough_history and estimate['Estimated chance'] >= .65:
+            if enough_history:
 
                 if not paired_probabilities:
                     estimate['Estimate method'] = 'Prior 30 appearances + neutral shrinkage; one-sided sportsbook quote'
@@ -395,7 +409,7 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
                               'start_time':first['start_time'],'Captured UTC':first['capture_time'],
                               **({'Participation status': participation, 'Event match': first.get('Event match')} if league=='MLB' else {}), **estimate})
         if league == 'MLB' and not qualified:
-            excluded(first, player, market, line, 'No offered side has at least 65% estimated chance with sufficient history.')
+            excluded(first, player, market, line, 'No offered side has sufficient usable history for an estimate.')
     # One side of one line per player/market/game; avoid ranking duplicate books or alternatives.
     picks.sort(key=lambda r:(-r['Estimated chance'],-r['Prior games'],r['Player']))
     seen=set(); chosen=[]
