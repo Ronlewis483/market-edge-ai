@@ -548,7 +548,7 @@ def render_mlb_game_context(game):
                     if forecast.get('Non-push games', 0) < 10:
                         st.caption('Limited history · fewer than 10 non-push starts. Informational forecast only.')
                     elif forecast['Estimated chance'] < .65:
-                        st.caption('Below the 65% betting minimum · informational forecast only.')
+                        st.caption('Below 65% estimated cover chance · lower-confidence forecast.')
                     else:
                         st.caption('Meets the cover-chance minimum; participation and quote checks still apply.')
                     if 'neutral' in str(forecast.get('Estimate method','')):
@@ -1214,7 +1214,8 @@ def select_nfl_prop_list(props, mode='probability'):
     from dual_agent.preferred_sportsbooks import allowed, diversify
     candidates = [p for p in props if allowed(p.get('best_sportsbook', p.get('Best sportsbook')))
                   and len(p.get('sportsbook_offers', [])) >= 1
-                  and float(p.get('historical_support', 0)) >= .65]
+                  and np.isfinite(float(p.get('historical_support', float('nan'))))
+                  and 0 <= float(p['historical_support']) <= 1]
     candidates.sort(key=lambda p: (-float(p.get('historical_support', 0)),
                                   -int(p.get('sample_size', p.get('Prior games', 0))), str(p.get('player', ''))))
     return diversify(candidates, limit=5)
@@ -1261,6 +1262,8 @@ def render_prop_category_rankings(props, league):
                                 book = prop.get('best_sportsbook', prop.get('Best sportsbook'))
                                 st.markdown(f'**#{rank} · {player}**')
                                 st.write(prop_outcome_sentence(player, market, side, line, chance))
+                                if float(chance) < .65:
+                                    st.caption('Below 65% estimated cover chance · lower-confidence prediction')
                                 odds = prop.get('best_american_odds')
                                 label = f'{float(odds):+g}' if odds is not None else decimal_to_american_label(float(prop['Best decimal odds']))
                                 st.caption(f'{book} · {side} {float(line):g} · {label}')
@@ -1381,7 +1384,7 @@ def render_game_addons(league, game, result):
                            sportsbook_offers=p.get('Sportsbook offers', [])) for p in props]
         with st.expander(f'🎯 {league} player props · ranked by estimated cover chance', expanded=True):
             st.caption('Preferred platforms: Polymarket, Underdog, DraftKings, PrizePicks, FanDuel · overall strongest picks plus independent category rankings.')
-            st.caption('Minimum 65% estimated cover chance · one preferred platform offering the exact bet · existing history and participation checks. Odds do not affect ranking.')
+            st.caption('Strongest available estimates in each category · no probability cutoff · one exact listed offer and sufficient usable history required. Odds do not affect ranking.')
             render_prop_category_rankings(normalized, league)
             from dual_agent.sports_player_prop_predictions import MARKETS
             markets = sorted({value[0] for value in MARKETS[league].values()} | {p['market'] for p in normalized})
@@ -1401,7 +1404,11 @@ def render_game_addons(league, game, result):
                         with st.container(border=True):
                             st.markdown(f"**#{rank} · {prop['Player']} · {prop['Pick']} {float(prop['Line']):g} {prop['Market']}**")
                             st.write(prop_outcome_sentence(prop['Player'], prop['Market'], prop['Pick'], prop['Line'], prop['Estimated chance']))
-                            st.caption(f"Projection {float(prop['Projected stat']):.1f} · {prop['Prior games']} prior appearances")
+                            if float(prop['Estimated chance']) < .65:
+                                st.caption('Below 65% estimated cover chance · lower-confidence prediction')
+                            if prop.get('Historical wins') is not None:
+                                st.caption(f"Covered this side in {int(prop['Historical wins'])} of {int(prop['Non-push games'])} prior non-push appearances")
+                            st.caption(f"Projection {float(prop['Projected stat']):.2f} · {prop['Prior games']} prior appearances")
                             st.caption(f"{prop.get('Best sportsbook')} · {decimal_to_american_label(float(prop['Best decimal odds']))}")
                             participation = prop.get('Participation status')
                             if participation:
@@ -1415,8 +1422,22 @@ def render_game_addons(league, game, result):
                 matching_reasons = [r for r in reasons if r.get('Game') == str(game.get('away_team'))+' @ '+str(game.get('home_team')) and (selected == 'All supported markets' or r.get('Market') == selected)]
                 for reason in matching_reasons[:5]:
                     st.caption(f"{reason.get('Player', '')}: {reason.get('Reason', '')}")
-            for issue in (result or {}).get('player_props', {}).get('errors', [])[:3]:
-                st.caption(str(issue))
+            game_label = str(game.get('away_team'))+' @ '+str(game.get('home_team'))
+            game_time = pd.to_datetime(game.get('commence_time', game.get('start_time')), utc=True, errors='coerce')
+            shown_issues = 0
+            for issue in (result or {}).get('player_props', {}).get('errors', []):
+                if isinstance(issue, dict):
+                    issue_time = pd.to_datetime(issue.get('MLB start UTC'), utc=True, errors='coerce')
+                    if issue.get('Game') != game_label or (pd.notna(issue_time) and pd.notna(game_time) and abs(issue_time-game_time) > pd.Timedelta(minutes=15)):
+                        continue
+                    if issue.get('Market') and selected != 'All supported markets' and issue['Market'] != selected:
+                        continue
+                    st.caption(str(issue.get('Reason', 'Sportsbook offer unavailable for this game.')))
+                else:
+                    st.caption(str(issue))
+                shown_issues += 1
+                if shown_issues >= 3:
+                    break
             st.caption('Estimates are conditional on participation and exclude pushes; they are not calibrated future probabilities.')
         return
 
@@ -1426,8 +1447,6 @@ def render_game_addons(league, game, result):
                  or len(p.get("sportsbook_offers", [])) >= 1]
     score = "historical_support" if league == "NFL" else "Estimated chance"
     value_key = "estimated_return_per_unit" if league == "NFL" else "Estimated return per unit"
-    if league != "NFL":
-        props = [p for p in props if float(p.get(score, 0)) >= .65]
     if league == 'MLB':
         import hashlib
         from dual_agent.sports_player_prop_predictions import MARKETS
@@ -1454,13 +1473,13 @@ def render_game_addons(league, game, result):
         props = diversify(sorted(props, key=lambda row: (-float(row.get(score, 0)), -float(row.get(value_key, 0)))), limit=10, market_key='Market', identity_keys=('Game','Player','Market'))
     with st.expander("🎯 Player props for this game · loading" if league == "NFL" and (result or {}).get("enrichment_pending") and not props else f"🎯 Player props for this game ({len(props)})", expanded=True):
         st.caption('Preferred platforms: Polymarket, Underdog, DraftKings, PrizePicks, FanDuel · overall strongest picks plus independent category rankings.')
-        st.caption('Minimum 65% estimated cover chance · exact side listed on one preferred platform · odds shown for reference only.')
+        st.caption('Ranked by estimated cover chance · no probability cutoff · exact side listed on one preferred platform · odds are reference only.')
         if league == 'NFL':
             st.markdown('### Most likely to cover · top 5')
             props = [dict(p, _list_name='probability', _list_rank=i) for i, p in enumerate(probability_props, 1)]
         if not props:
             issues = (result or {}).get("prop_issues", []) if league == "NFL" else (result or {}).get("player_props", {}).get("errors", [])
-            st.info("Collecting fresh sportsbook lines and scoring player props…" if league == "NFL" and (result or {}).get("enrichment_pending") else "No eligible player props for this matchup yet. A listed exact bet, at least 65% estimated cover chance, and usable history are required. Odds are reference only.")
+            st.info("Collecting fresh sportsbook lines and scoring player props…" if league == "NFL" and (result or {}).get("enrichment_pending") else "No eligible player props for this matchup yet. A listed exact bet and usable history are required; no probability cutoff applies. Odds are reference only.")
             if league == "MLB":
                 from collections import Counter
                 exclusions = (result or {}).get('player_props', {}).get('exclusions', [])
@@ -1481,6 +1500,8 @@ def render_game_addons(league, game, result):
                     pick = side if side in ("YES", "NO") else f"{side} {float(prop['line']):g}"
                     st.markdown(f"**#{rank} · {prop['player']} · {pick} {prop['market']}**")
                     st.markdown(prop_outcome_sentence(prop["player"], prop["market"], side, prop["line"], prop["historical_support"]))
+                    if float(prop['historical_support']) < .65:
+                        st.caption('Below 65% estimated cover chance · lower-confidence prediction')
                     st.caption(f"Projection {float(prop['projected_value']):.1f} · {int(prop.get('sample_size', 0))} prior games")
                     st.caption(f"Estimated cover chance {float(prop['historical_support']):.1%} · historical estimate, not calibrated")
                     if prop.get('best_sportsbook') in ('prizepicks', 'underdog'):
@@ -1592,7 +1613,7 @@ def render_nfl_game_context(game):
                         st.markdown(f"**{forecast['pick']} {forecast['line']:g} {forecast['market']} · {forecast['chance']:.1%} estimated cover chance**")
                         st.caption(f"Projection {forecast['projection']:.1f} · {forecast['sample_size']} prior passing appearances · {forecast['book']} ({forecast['american_odds']:+g})")
                         if forecast['chance'] < .65:
-                            st.caption('Below the 65% betting minimum · informational forecast only.')
+                            st.caption('Below 65% estimated cover chance · lower-confidence forecast.')
                     covered = {f['market'] for f in forecasts}
                     projections = qb.get('projections', [])
                     for projection in projections:
