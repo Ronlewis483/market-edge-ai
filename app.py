@@ -432,8 +432,9 @@ def render_confidence_badge(label, confidence):
     st.markdown(f'<div class="me-confidence me-{tone}">{escape(label)} <span>{confidence:.1%}</span></div>', unsafe_allow_html=True)
 
 
+@st.fragment
 def render_prediction_workspace(league, predictions, result):
-    """Interactive game selector with a dedicated panel for the selected game's bets."""
+    """Filter saved predictions locally; widget changes rerun only this workspace."""
     from html import escape
     import hashlib
     if league == 'NFL':
@@ -1308,6 +1309,21 @@ def render_game_addons(league, game, result):
                     st.warning('Provisional model inputs · forecast only; participation information is incomplete.')
             else:
                 st.info('Run-line panel available; estimate unavailable because projected runs are missing or unusable.')
+            if spread.get('projected_total_runs') is not None:
+                st.markdown('**Game total runs · Over / Under**')
+                st.write(f"Projected combined runs: {spread['projected_total_runs']:.1f}")
+                totals = spread.get('total_offers', [])
+                for offer in sorted(totals, key=lambda o:(o['platform'] != 'polymarket', -o['chance'])):
+                    st.markdown(f"**{offer['platform']} · {offer['side']} {offer['line']:g} total runs · {offer['chance']:.1%} estimated cover chance**")
+                    st.caption(f"Feed odds {decimal_to_american_label(float(offer['decimal_odds']))} · quote {offer['quote_updated_at']}")
+                    stamp = pd.to_datetime(offer['quote_updated_at'], utc=True, errors='coerce')
+                    if pd.isna(stamp) or pd.Timestamp.now(tz='UTC')-stamp > pd.Timedelta(minutes=30):
+                        st.warning('Saved total-runs quote is stale; verify the current line before using it.')
+                    if offer.get('estimated_value') is not None and offer['estimated_value'] > 0:
+                        st.caption('Positive estimated value at this listed price')
+                if not totals:
+                    st.caption('No matching total-runs line returned. Projected combined runs are informational only.')
+                st.caption('Total-runs estimates use the saved projected run rates and an independent Poisson approximation; accuracy is not established.')
             offers = spread.get('offers', [])
             if offers:
                 st.markdown('**Actual preferred-platform run-line offers**')
@@ -1363,20 +1379,20 @@ def render_game_addons(league, game, result):
     props = matching_game_rows(game, st.session_state.get(props_key))
     from dual_agent.preferred_sportsbooks import allowed, diversify
     props = [p for p in props if allowed(p.get('best_sportsbook', p.get('Best sportsbook')))]
-    if league == 'NBA':
+    if league in ('NBA', 'MLB'):
         normalized = [dict(p, event_id=p.get('Game'), player=p.get('Player'), market=p.get('Market'),
                            historical_support=p.get('Estimated chance', 0), estimated_return_per_unit=p.get('Estimated return per unit', 0),
                            sportsbook_offers=p.get('Sportsbook offers', [])) for p in props]
-        with st.expander('🎯 NBA player props · probability and value', expanded=True):
+        with st.expander(f'🎯 {league} player props · probability and value', expanded=True):
             st.caption('Preferred platforms: Polymarket, Underdog, DraftKings, PrizePicks, FanDuel · overall strongest picks plus independent category rankings.')
-            st.caption('Most likely: minimum 65% estimated chance. Highest value: positive estimated value with no probability minimum. Both require a listed exact bet and 10 usable non-push appearances.')
-            render_prop_category_rankings(normalized, 'NBA')
+            st.caption('Most likely: minimum 65% estimated chance. Highest value: positive estimated value with no probability minimum. Both require a listed exact bet and sufficient prior appearances. MLB hitters need 10 appearances with 8 non-push results; pitchers and NBA require 10 non-push results.')
+            render_prop_category_rankings(normalized, league)
             from dual_agent.sports_player_prop_predictions import MARKETS
-            markets = sorted({value[0] for value in MARKETS['NBA'].values()} | {p['market'] for p in normalized})
+            markets = sorted({value[0] for value in MARKETS[league].values()} | {p['market'] for p in normalized})
             import hashlib
             choice_key = hashlib.sha256(str(game.get('commence_time')).encode()+str(game.get('home_team')).encode()).hexdigest()[:16]
-            render_prop_category_buttons(markets, 'nba_market_'+choice_key, 'All supported markets')
-            selected = st.selectbox('NBA prop market', ['All supported markets']+markets, key='nba_market_'+choice_key)
+            render_prop_category_buttons(markets, league.lower()+'_market_'+choice_key, 'All supported markets')
+            selected = st.selectbox(league+' prop market', ['All supported markets']+markets, key=league.lower()+'_market_'+choice_key)
             if selected != 'All supported markets':
                 normalized = [p for p in normalized if p['market'] == selected]
             for column, mode, title in zip(st.columns(2), ['probability', 'value'], ['Most likely to win · top 5', 'Highest estimated value · top 5']):
@@ -1391,12 +1407,24 @@ def render_game_addons(league, game, result):
                             st.write(prop_outcome_sentence(prop['Player'], prop['Market'], prop['Pick'], prop['Line'], prop['Estimated chance']))
                             st.caption(f"Projection {float(prop['Projected stat']):.1f} · {prop['Prior games']} prior appearances")
                             st.caption(f"{prop.get('Best sportsbook')} · {decimal_to_american_label(float(prop['Best decimal odds']))}")
+                            participation = prop.get('Participation status')
+                            if participation:
+                                st.caption(participation)
+                                if participation not in ('Confirmed lineup', 'Recorded starter'):
+                                    st.warning('Provisional participation—recheck the lineup or starter.')
+                            if mode == 'value' and float(prop['Estimated chance']) < .65:
+                                st.caption('Below 65% estimated chance · value opportunity, not a high-probability pick')
                             if prop.get('Best sportsbook') in ('prizepicks', 'underdog'):
                                 st.caption('Pick’em selection · entry rules determine actual returns; feed price is indicative.')
                             if mode == 'probability' and float(prop.get('Estimated return per unit', 0)) <= 0:
                                 st.warning('High estimated chance; listed odds do not offer positive estimated value.')
                             elif mode == 'value':
                                 st.caption('Positive estimated value · ranked by value, then probability')
+            if league == 'MLB' and not normalized:
+                reasons = (result or {}).get('player_props', {}).get('exclusions', [])
+                matching_reasons = [r for r in reasons if r.get('Game') == str(game.get('away_team'))+' @ '+str(game.get('home_team')) and (selected == 'All supported markets' or r.get('Market') == selected)]
+                for reason in matching_reasons[:5]:
+                    st.caption(f"{reason.get('Player', '')}: {reason.get('Reason', '')}")
             for issue in (result or {}).get('player_props', {}).get('errors', [])[:3]:
                 st.caption(str(issue))
             st.caption('Estimates are conditional on participation and exclude pushes; they are not calibrated future probabilities.')
