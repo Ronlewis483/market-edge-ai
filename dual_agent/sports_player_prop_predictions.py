@@ -381,28 +381,23 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
                     'Estimate method': estimate['Estimate method'] if paired_probabilities else 'Prior appearances + neutral shrinkage; one-sided quote'})
             required_decisions = 8 if league == 'MLB' and not pitching_market else 10
             enough_history = estimate and estimate['Prior games'] >= 10 and estimate['Prior games']-estimate['Historical pushes'] >= required_decisions
-            if enough_history:
+            if enough_history and estimate['Estimated chance'] >= .65:
 
                 if not paired_probabilities:
                     estimate['Estimate method'] = 'Prior 30 appearances + neutral shrinkage; one-sided sportsbook quote'
-                priced_offers = [q for q in available if standalone_value(q['book'])]
-                best = max(priced_offers or available, key=lambda q:q[price_key])
-                value_eligible = bool(priced_offers)
+                best = max(available, key=lambda q:q[price_key])
+                value_eligible = False
                 push_chance = estimate['Historical pushes']/estimate['Prior games']
                 expected_return = (1-push_chance)*(estimate['Estimated chance']*best[price_key]-1)
-                if not np.isfinite(expected_return):
-                    continue
-                if estimate['Estimated chance'] < .65 and (expected_return <= 0 or not value_eligible):
-                    continue
                 qualified = True
                 picks.append({'Player':player,'Market':MARKETS[league][market][0],'Pick':side,'Line':line,
                               'Market chance':market_p,'Best sportsbook':best['book'],'Best decimal odds':best[price_key], 'Sportsbook offers':[{'book':q['book'], 'decimal_odds':q[price_key]} for q in available], 'Estimated return per unit':expected_return,'Value eligible':value_eligible,'Break-even cover chance':1/best[price_key],'Estimated push chance':push_chance,'Books':len(available),'Game':first['away_team']+' @ '+first['home_team'],
                               'start_time':first['start_time'],'Captured UTC':first['capture_time'],
                               **({'Participation status': participation, 'Event match': first.get('Event match')} if league=='MLB' else {}), **estimate})
         if league == 'MLB' and not qualified:
-            excluded(first, player, market, line, 'No offered side has at least 65% estimated chance or positive estimated value with sufficient history.')
+            excluded(first, player, market, line, 'No offered side has at least 65% estimated chance with sufficient history.')
     # One side of one line per player/market/game; avoid ranking duplicate books or alternatives.
-    picks.sort(key=lambda r:(-r['Estimated chance'],-r['Estimated return per unit'],-r['Prior games'],r['Player']))
+    picks.sort(key=lambda r:(-r['Estimated chance'],-r['Prior games'],r['Player']))
     seen=set(); chosen=[]
     for pick in picks:
         key=(pick['Game'],pick['start_time'],pick['Player'],pick['Market']) + (pick['Pick'], pick['Line'])
