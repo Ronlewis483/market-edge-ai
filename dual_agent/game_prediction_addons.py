@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 import requests
 from dual_agent.odds_request_cache import get as cached_odds_get
-from scipy.stats import skellam
+from scipy.stats import skellam, poisson
 
 NFL_FEATURES = ['win_pct_diff', 'avg_point_diff_diff', 'recent_5_win_pct_diff',
                 'recent_5_point_diff_diff', 'rest_diff']
@@ -49,7 +49,7 @@ def fetch_spread_events(league, key):
     if not key:
         raise ValueError('Sportsbook API key unavailable.')
     response = cached_odds_get(f'https://api.the-odds-api.com/v4/sports/{SPORTS[league]}/odds',
-        params={'apiKey': key, 'regions': 'us', 'markets': 'spreads', 'oddsFormat': 'decimal'}, timeout=20)
+        params={'apiKey': key, 'regions': 'us', 'markets': 'spreads,totals' if league == 'MLB' else 'spreads', 'oddsFormat': 'decimal'}, timeout=20)
     if response.status_code != 200:
         # Do not include credential-bearing request URLs in errors.
         raise ValueError(f'Spread feed unavailable (HTTP {response.status_code}).')
@@ -158,7 +158,7 @@ def generate_mlb_run_lines(predictions, events, now):
         if pd.isna(kickoff) or not now < kickoff <= now+pd.Timedelta(days=7):
             continue
         row = {'home_team': home, 'away_team': away, 'commence_time': kickoff.isoformat(),
-               'captured_at': now.isoformat(), 'offers': [], 'model_lines': [], 'books': 0,
+               'captured_at': now.isoformat(), 'offers': [], 'total_offers': [], 'model_lines': [], 'books': 0,
                'method': 'Saved projected runs + run-difference distribution', 'validated': False}
         provisional = bool(game.get('Missing model inputs')) or str(game.get('Input status', '')).startswith('Early forecast')
         row['provisional'] = provisional
@@ -167,6 +167,9 @@ def generate_mlb_run_lines(predictions, events, now):
             def cover(team, line):
                 hc, ac, push = mlb_cover_distribution(hr, ar, line if team == home else -line)
                 return (hc if team == home else ac)/(1-push), push
+            if not np.isfinite([hr, ar]).all() or min(hr, ar) <= 0:
+                raise ValueError('Projected run rates unavailable.')
+            row['projected_total_runs'] = hr+ar
             home_line = -1.5 if hr >= ar else 1.5
             for team, line in [(home, home_line), (away, -home_line)]:
                 chance, push = cover(team, line)
@@ -178,7 +181,27 @@ def generate_mlb_run_lines(predictions, events, now):
                         continue
                     for market in book.get('markets', []):
                         stamp = pd.to_datetime(market.get('last_update') or book.get('last_update'), utc=True, errors='coerce')
-                        if market.get('key') != 'spreads' or pd.isna(stamp) or not pd.Timedelta(0) <= now-stamp <= pd.Timedelta(minutes=30):
+                        if pd.isna(stamp) or not pd.Timedelta(0) <= now-stamp <= pd.Timedelta(minutes=30):
+                            continue
+                        if market.get('key') == 'totals':
+                            for outcome in market.get('outcomes', []):
+                                side = outcome.get('name')
+                                try:
+                                    line, price = float(outcome['point']), float(outcome['price'])
+                                    if side not in ('Over', 'Under') or not np.isfinite([line, price]).all() or line < 0 or price <= 1:
+                                        continue
+                                    over = float(poisson.sf(line, hr+ar))
+                                    under = float(poisson.cdf(np.ceil(line)-1, hr+ar))
+                                    push = max(0., 1-over-under)
+                                    chance = (over if side == 'Over' else under)/(1-push)
+                                    row['total_offers'].append({'platform': book['key'], 'side': side, 'line': line,
+                                        'decimal_odds': price, 'chance': chance, 'push_chance': push,
+                                        'quote_updated_at': stamp.isoformat(), 'value_eligible': standalone_value(book['key']),
+                                        'estimated_value': (1-push)*(chance*price-1) if standalone_value(book['key']) else None})
+                                except (KeyError, TypeError, ValueError):
+                                    continue
+                            continue
+                        if market.get('key') != 'spreads':
                             continue
                         for outcome in market.get('outcomes', []):
                             team = outcome.get('name')
