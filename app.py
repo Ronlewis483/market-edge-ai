@@ -501,6 +501,8 @@ def render_prediction_workspace(league, predictions, result):
             confidence = float(game.get('confidence',0))
             render_confidence_badge('Estimated win chance', confidence)
             st.progress(min(1.,max(0.,confidence)))
+            if league == 'NBA':
+                render_nba_star_spotlight(game, result)
             if game.get('input_status'):
                 st.caption(game['input_status'])
             if game.get('input_notes'):
@@ -522,6 +524,97 @@ def render_prediction_workspace(league, predictions, result):
             elif league == 'MLB':
                 render_mlb_game_context(game)
             render_game_addons(league, game, result)
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_nba_spotlight_inputs(home_team, away_team, commence_time, nba_key):
+    """Fill older prediction snapshots without rerunning models or odds scans."""
+    from concurrent.futures import ThreadPoolExecutor
+    from dual_agent.nba_star_spotlight import collect_star_rosters, key
+    from dual_agent.sports_player_prop_predictions import _nba_history
+    game = {'home_team': home_team, 'away_team': away_team, 'commence_time': commence_time}
+    rosters = collect_star_rosters([game])
+    names = {key(player['player']): player['player']
+        for roster in rosters.values() for player in roster['players']}
+    histories = {}; issues = []
+    if not nba_key:
+        issues.append('Player statistics access is unavailable. Star identities remain visible.')
+        return rosters, histories, issues
+    def collect(name):
+        try:
+            return name, _nba_history(name, nba_key), None
+        except Exception as exc:
+            return name, [], 'Statistics unavailable for '+name+': '+str(exc)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        for name, rows, issue in pool.map(collect, names.values()):
+            histories[name] = rows
+            if issue:
+                issues.append(issue)
+    return rosters, histories, issues
+
+
+def render_nba_star_spotlight(game, result):
+    """Display saved forecasts or fill only the selected game's missing stars."""
+    st.markdown('#### ⭐ Star-player spotlight')
+    start = pd.to_datetime(game.get('commence_time'), utc=True, errors='coerce')
+    spotlight = next((row for row in result.get('player_props', {}).get('star_spotlights', [])
+        if row.get('home_team') == game.get('home_team')
+        and row.get('away_team') == game.get('away_team')
+        and pd.to_datetime(row.get('commence_time'), utc=True, errors='coerce') == start), None)
+    if not spotlight:
+        # Older committed prop pipelines do not return star_spotlights. Build
+        # this small panel directly, without requiring another Generate click.
+        try:
+            from dual_agent.nba_star_spotlight import build_star_spotlights
+            with st.spinner('Loading this game’s star-player forecasts…'):
+                rosters, histories, issues = load_nba_spotlight_inputs(
+                    game['home_team'], game['away_team'], start.isoformat(),
+                    prediction_api_key('BALLDONTLIE_API_KEY'))
+                props = result.get('player_props') or {}
+                picks = props.get('game_picks', props.get('picks', []))
+                spotlight = build_star_spotlights([game], rosters, histories, picks)[0]
+            for issue in issues:
+                st.caption(issue)
+        except Exception as exc:
+            st.warning('Unable to load this game’s star spotlight: '+str(exc))
+            return
+    st.caption('Two stars per team, selected by reported current-season salary. Star selection does not change the winner or prop equations.')
+    for team in spotlight['teams']:
+        st.markdown('**'+team['team']+'**')
+        if team.get('issue'):
+            st.caption(team['issue'])
+        for player in team['players']:
+            with st.container(border=True):
+                st.markdown('**⭐ '+player['player']+'**')
+                st.caption('Availability: '+player['status'])
+                if player['unavailable']:
+                    st.warning('Reported unavailable · historical averages only; no recommended prop shown.')
+                projections = player.get('projections', [])
+                main = [p for p in projections if p['market'] in ('Points', 'Rebounds', 'Assists', 'Three-pointers made')]
+                if main:
+                    columns = st.columns(2)
+                    for index, projection in enumerate(main):
+                        with columns[index % 2]:
+                            st.metric(projection['market'], f"{projection['projection']:.1f}")
+                    st.caption(player['projection_note'])
+                    with st.expander('All statistical projections & history'):
+                        for projection in projections:
+                            st.write(f"{projection['market']}: {projection['projection']:.1f} · {projection['prior_games']} prior games")
+                            if projection['prior_games'] < 10:
+                                st.caption('Limited history · informational average only.')
+                else:
+                    st.caption('Usable prior game statistics unavailable. No projection has been invented.')
+                props = player.get('props', [])
+                if props:
+                    st.markdown('**Most likely available props**')
+                    for pick in props[:3]:
+                        st.write(f"{pick['Pick']} {pick['Line']:g} {pick['Market']} · {pick['Estimated chance']:.1%} estimated cover chance")
+                        st.caption(f"{pick['Best sportsbook']} · {decimal_to_american_label(pick['Best decimal odds'])} · {pick['Prior games']} prior appearances")
+                    st.caption('Cover estimates exclude pushes and assume participation. Ranked by probability, not payout.')
+                elif not player['unavailable']:
+                    st.caption('No qualified listed prop available for this player. Statistical projections remain visible.')
+        if team.get('captured_at'):
+            st.caption('Roster source: '+team.get('source', 'ESPN')+' · captured '+team['captured_at'])
 
 
 def decimal_to_american_label(price):
