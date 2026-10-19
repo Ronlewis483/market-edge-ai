@@ -63,10 +63,14 @@ def normalize_props(event):
                 if side not in ('Over','Under','Yes','No'): continue
                 point = outcome.get('point')
                 if side in ('Over','Under') and point is None: continue
+                # Numeric Yes/No totals need their actual threshold. Never
+                # silently turn a missing passing/rushing/etc. line into 0.5.
+                market_key = str(market.get('key','')).removesuffix('_alternate')
+                if point is None and market_key != 'player_anytime_td': continue
                 rows.append({'event_id':event.get('id'), 'game_time':event.get('commence_time'),
                   'home_team':event.get('home_team'), 'away_team':event.get('away_team'),
                   'bookmaker':book.get('title'), 'bookmaker_key':book.get('key'),
-                  'market_key':str(market.get('key','')).removesuffix('_alternate'), 'player':player, 'side':side,
+                  'market_key':market_key, 'player':player, 'side':side,
                   'line':float(point) if point is not None else 0.5,
                   'american_odds':outcome.get('price'), 'last_update':market.get('last_update')})
     return pd.DataFrame(rows)
@@ -103,16 +107,46 @@ def historical_sample(history, player, market, cutoff, window=12, min_games=6):
     return h['value'].to_numpy(dtype=float)
 
 def probability(values, line, market, side):
-    """Smoothed empirical frequency. Descriptive baseline, NOT calibrated forecast."""
-    if side not in ('Over','Under','Yes','No'): return None
-    if market=='Anytime touchdown':
-        wins=(values>=1).sum() if side in ('Yes','Over') else (values<1).sum()
+    """Laplace-smoothed prior frequency, conditional on a non-push result.
+
+    For numeric totals, Yes means above the listed line and No means below
+    it, equivalent to Over/Under. Equality is a push. Anytime touchdown is
+    the binary event of scoring at least once. Exact offered sides are still
+    required by the caller; calculating a side does not invent a bet.
+    This remains a descriptive baseline, not a calibrated game forecast.
+    """
+    if market not in MARKETS or side not in ('Over', 'Under', 'Yes', 'No'):
+        return None
+    try:
+        sample = np.asarray(values, dtype=float)
+    except (TypeError, ValueError):
+        return None
+    if (sample.ndim != 1 or sample.size == 0
+            or not np.isfinite(sample).all() or (sample < 0).any()):
+        return None
+    if market == 'Anytime touchdown':
+        if side in ('Over', 'Under'):
+            try:
+                threshold = float(line)
+            except (TypeError, ValueError):
+                return None
+            # An anytime market means at least one TD, not another total.
+            if not math.isfinite(threshold) or threshold != 0.5:
+                return None
+        wins = int((sample >= 1).sum()) if side in ('Yes', 'Over') else int((sample < 1).sum())
+        eligible = sample.size
     else:
-        wins=(values>line).sum() if side=='Over' else (values<line).sum()
-    pushes=(values==line).sum() if market!='Anytime touchdown' else 0
-    eligible=len(values)-pushes
-    if eligible<=0: return None
-    return (wins+1)/(eligible+2)  # Laplace smoothing; excludes pushes
+        try:
+            threshold = float(line)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(threshold) or threshold < 0:
+            return None
+        wins = int((sample > threshold).sum()) if side in ('Over', 'Yes') else int((sample < threshold).sum())
+        eligible = sample.size - int((sample == threshold).sum())
+    if eligible <= 0:
+        return None
+    return float((wins + 1) / (eligible + 2))
 
 def analyze(odds, history, window=12, min_games=6):
     if odds.empty: return pd.DataFrame()
