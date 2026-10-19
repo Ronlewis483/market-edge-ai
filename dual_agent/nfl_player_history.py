@@ -38,6 +38,29 @@ def _column(frame, *candidates):
     )
 
 
+def _anytime_touchdown_values(stats):
+    """Binary scored/did-not-score history with complete scoring coverage.
+
+    Passing TDs credit the passer, not the touchdown scorer. Return, defensive
+    and recovery TD fields may overlap, so use a binary event rather than
+    adding overlapping counts. Unknown components never establish a No.
+    """
+    components = [
+        ('rushing_tds', 'rushing_touchdowns'),
+        ('receiving_tds', 'receiving_touchdowns'),
+        ('special_teams_tds',),  # nflverse: kick and punt return touchdowns
+        ('def_tds',),
+        ('fumble_recovery_tds',),
+    ]
+    columns = [_column(stats, *aliases) for aliases in components]
+    if not all(columns):
+        return None
+    values = pd.concat([pd.to_numeric(stats[c], errors='coerce') for c in columns], axis=1)
+    values = values.where(values.ge(0) & values.lt(float('inf')))
+    complete = values.notna().all(axis=1)
+    return values.gt(0).any(axis=1).astype(float).where(complete)
+
+
 def load_player_history(seasons):
     """Return completed regular-season game stats in validate_history() format.
 
@@ -278,30 +301,21 @@ def load_player_history(seasons):
                         pd.to_numeric(
                             stats[rush],
                             errors='coerce',
-                        ).fillna(0)
+                        )
                         + pd.to_numeric(
                             stats[rec],
                             errors='coerce',
-                        ).fillna(0)
+                        )
                     ),
                 }
             )
         )
 
-    # Anytime touchdown.
-    rush_td = _column(
-        stats,
-        'rushing_tds',
-        'rushing_touchdowns',
-    )
-
-    rec_td = _column(
-        stats,
-        'receiving_tds',
-        'receiving_touchdowns',
-    )
-
-    if rush_td and rec_td:
+    # All supported ways for the player to score, including return TDs.
+    # Incomplete scoring coverage is omitted for both sides to avoid selecting
+    # only known scorers and biasing the historical sample toward Yes.
+    anytime_values = _anytime_touchdown_values(stats)
+    if anytime_values is not None:
         records.append(
             pd.DataFrame(
                 {
@@ -311,16 +325,7 @@ def load_player_history(seasons):
                     'is_home': stats['is_home'],
                     'market': 'Anytime touchdown',
                     'game_time': stats['game_time'],
-                    'value': (
-                        pd.to_numeric(
-                            stats[rush_td],
-                            errors='coerce',
-                        ).fillna(0)
-                        + pd.to_numeric(
-                            stats[rec_td],
-                            errors='coerce',
-                        ).fillna(0)
-                    ),
+                    'value': anytime_values,
                 }
             )
         )
