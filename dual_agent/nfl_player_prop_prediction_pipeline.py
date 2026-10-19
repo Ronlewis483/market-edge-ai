@@ -13,6 +13,7 @@ import re
 from dual_agent.preferred_sportsbooks import allowed, standalone_value
 
 NFL_PROP_VALUE_VERSION = 1
+NFL_PROP_PROBABILITY_VERSION = 2
 
 import numpy as np
 import pandas as pd
@@ -81,9 +82,10 @@ def _historical_player_games(
     games = games.dropna(
         subset=["game_time", "value"]
     )
+    games = games.loc[np.isfinite(games['value'])]
 
     games = games.loc[
-        games["game_time"] < kickoff
+        games["game_time"] < min(kickoff, pd.Timestamp.now(tz='UTC'))
     ]
 
     games = (
@@ -117,6 +119,17 @@ def _estimate_prop(
     It is NOT a calibrated future probability.
     """
 
+    try:
+        values = np.asarray(values, dtype=float)
+        line = float(line)
+    except (TypeError, ValueError):
+        return None
+    if values.ndim != 1 or not np.isfinite(values).all() or not np.isfinite(line):
+        return None
+    if market not in MARKETS:
+        return None
+    if market == 'Anytime touchdown' and line != .5:
+        return None
     sample_size = len(values)
 
     if sample_size < 8:
@@ -173,7 +186,7 @@ def _estimate_prop(
             sample_size - pushes
         )
 
-    if eligible <= 0:
+    if eligible < 8:
         return None
 
     over_support = (
@@ -206,20 +219,13 @@ def _estimate_prop(
 
     else:
 
-        if projection > line:
+        if over_support >= under_support:
             model_pick = "OVER"
             support = over_support
 
-        elif projection < line:
+        else:
             model_pick = "UNDER"
             support = under_support
-
-        else:
-            model_pick = "PASS"
-            support = max(
-                over_support,
-                under_support,
-            )
 
         line_edge = abs(
             projection - line
@@ -236,7 +242,8 @@ def _estimate_prop(
         )
 
     if side is not None:
-        valid_sides = {'YES','NO'} if market == 'Anytime touchdown' else {'OVER','UNDER'}
+        valid_sides = {'YES','NO','OVER','UNDER'}
+        side = str(side).upper()
         if side not in valid_sides:
             return None
         model_pick = side
@@ -313,9 +320,12 @@ def _estimate_prop(
 
 
 def _compare_prop_outcomes(values, line, market, offered_sides):
-    """Score both outcomes; availability and value refer to the exact offered side."""
+    """Score both outcomes; only exact offered sides can qualify."""
     outcomes = []
-    for side in (('YES', 'NO') if market == 'Anytime touchdown' else ('OVER', 'UNDER')):
+    sides = ('YES', 'NO') if market == 'Anytime touchdown' else ('OVER', 'UNDER')
+    aliases = ('OVER', 'UNDER') if market == 'Anytime touchdown' else ('YES', 'NO')
+    sides += tuple(side for side in aliases if side in offered_sides)
+    for side in sides:
         estimate = _estimate_prop(values, line, market, side=side)
         if estimate is None:
             continue
@@ -332,10 +342,8 @@ def _compare_prop_outcomes(values, line, market, offered_sides):
             value = (1-push) * (row['chance'] * decimal(best) - 1)
             row.update(book=best['bookmaker_key'], american_odds=best['american_odds'],
                        positive_value=bool(np.isfinite(value) and value > 0))
-            row['qualifies'] = bool(row['chance'] >= .65)
-            row['reason'] = ('Meets recommendation criteria' if row['qualifies'] else
-                             'Below 65% estimated chance' if row['chance'] < .65 else
-                             'Below 65% estimated chance')
+            row['qualifies'] = True
+            row['reason'] = 'Exact side offered with sufficient history; ranked by cover chance without a probability cutoff.'
         outcomes.append(row)
     return outcomes
 
@@ -444,7 +452,7 @@ def run_nfl_player_prop_prediction_pipeline(
         return empty
 
     rows = []
-    exclusions = {'insufficient_history': 0, 'unoffered_direction': 0, 'below_65_percent': 0, 'nonpositive_value': 0}
+    exclusions = {'insufficient_history': 0, 'unoffered_direction': 0}
 
     for _, prop in (
         consensus_props.iterrows()
@@ -508,7 +516,7 @@ def run_nfl_player_prop_prediction_pipeline(
         )
 
         outcome_comparison = _compare_prop_outcomes(values, float(line), market, prop['offered_sides'])
-        valid_sides = {'YES','NO'} if market == 'Anytime touchdown' else {'OVER','UNDER'}
+        valid_sides = {'YES','NO','OVER','UNDER'}
         for offered_side in prop['offered_sides']:
             if offered_side not in valid_sides:
                 continue
@@ -527,17 +535,6 @@ def run_nfl_player_prop_prediction_pipeline(
             offered = prop['offered_sides'].get(estimate['model_pick'], [])
             if not offered:
                 exclusions['unoffered_direction'] += 1
-                continue
-
-            # Avoid displaying extremely weak
-            # or essentially coin-flip forecasts.
-            if (
-                estimate[
-                    "historical_support"
-                ]
-                < 0.65
-            ):
-                exclusions['below_65_percent'] += 1
                 continue
 
             if (
@@ -563,19 +560,19 @@ def run_nfl_player_prop_prediction_pipeline(
 
 
 
-            if score >= 0.70:
+            if estimate['historical_support'] >= 0.70:
                 confidence_group = (
                     "HIGH CONFIDENCE"
                 )
 
-            elif score >= 0.60:
+            elif estimate['historical_support'] >= 0.60:
                 confidence_group = (
                     "MODERATE"
                 )
 
             else:
                 confidence_group = (
-                    "CLOSE / PASS"
+                    "LOWER CONFIDENCE"
                 )
 
             rows.append(
@@ -651,6 +648,12 @@ def run_nfl_player_prop_prediction_pipeline(
 
     if results.empty:
         results.attrs['exclusions'] = exclusions
+        results.attrs['reason'] = (
+            'No usable offered props: '
+            f"{exclusions['insufficient_history']} candidates lacked at least 8 usable non-push prior appearances; "
+            f"{exclusions['unoffered_direction']} estimated sides had no matching listed bet. "
+            'No probability or expected-value cutoff applies.'
+        )
         return results
 
         # ----------------------------------------------------------
@@ -691,13 +694,13 @@ def run_nfl_player_prop_prediction_pipeline(
 
     if retain_all_qualified:
         # Preserve every qualifying market for per-game UI filters before display caps.
-        all_props = (results if include_value_candidates else results.head(max_results)).copy().reset_index(drop=True)
+        all_props = results.copy().reset_index(drop=True)
         all_props['prop_rank'] = range(1,len(all_props)+1)
         all_props['is_best_prop'] = all_props.groupby(['event_id','player']).cumcount()==0
         identities = list(zip(all_props.event_id,all_props.player))
         ranks = {identity:i+1 for i,identity in enumerate(dict.fromkeys(identities))}
         all_props['player_rank'] = [ranks[identity] for identity in identities]
-        all_props['selection_reason'] = 'Ranked by estimated cover chance; minimum 65%, exact side offered by one preferred platform. Odds are reference only.'
+        all_props['selection_reason'] = 'Ranked by estimated cover chance; no probability cutoff, exact side offered by one preferred platform. Odds are reference only.'
         return all_props
 
     best_prop_per_player = (
@@ -809,7 +812,7 @@ def run_nfl_player_prop_prediction_pipeline(
     )
 
     # ----------------------------------------------------------
-    # FINAL ORDER: rank cover chance across all bet types, with value breaking ties.
+    # FINAL ORDER: cover chance, then sample size; price/value never affects rank.
     # Player grouping must not put a weaker yards bet above a stronger NO TD bet.
     top_player_props = top_player_props.sort_values(
         ['historical_support', 'sample_size', 'player'],
@@ -818,7 +821,7 @@ def run_nfl_player_prop_prediction_pipeline(
     top_player_props['prop_rank'] = range(1, len(top_player_props) + 1)
     top_player_props['selection_reason'] = (
         'Ranked by estimated cover chance;  '
-        'minimum 65%, exact recommended side listed at one preferred platform. Odds are reference only.'
+        'no probability cutoff, exact recommended side listed at one preferred platform. Odds are reference only.'
     )
 
     return top_player_props
