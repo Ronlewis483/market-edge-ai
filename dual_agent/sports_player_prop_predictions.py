@@ -250,6 +250,118 @@ def _nba_history(player, api_key):
     return rows
 
 
+def _nba_request_issue(exc):
+    """Expose useful status without leaking provider response bodies or credentials."""
+    import re
+    match = re.search(r'(?:error|HTTP)\s+(\d{3})', str(exc), re.I)
+    code = match.group(1) if match else None
+    if code == '401': return 'HTTP 401: player-data API key was rejected'
+    if code == '403': return 'HTTP 403: player-data access was denied; check subscription permissions'
+    if code == '429' or 'rate limit' in str(exc).lower(): return 'Provider rate limit persisted after retries'
+    if code: return 'Provider returned HTTP '+code
+    return type(exc).__name__+': request could not complete'
+
+
+def _nba_history_batches(names, api_key, status=None):
+    """Yield completed player histories; never cache an incomplete stats batch."""
+    now = pd.Timestamp.now(tz='UTC')
+    root = Path('nba_player_history_cache'); root.mkdir(exist_ok=True)
+    day = now.strftime('%Y%m%d')
+    base = 'https://api.balldontlie.io/nba/v1'
+    def notify(message):
+        if status: status(message)
+    def save(path, data):
+        temporary = path.with_suffix('.tmp')
+        temporary.write_text(json.dumps(data))
+        temporary.replace(path)
+    missing = []
+    for name in names:
+        path = root/(name_key(name)+'_'+day+'.json')
+        try:
+            rows = json.loads(path.read_text())
+            if not isinstance(rows, list): raise ValueError('Invalid history cache')
+            yield name, rows, None
+        except (OSError, ValueError):
+            missing.append(name)
+    if not missing: return
+    catalog_path = root/('active_players_'+day+'.json')
+    try:
+        catalog = json.loads(catalog_path.read_text())
+        if not isinstance(catalog, list): raise ValueError('Invalid player catalog')
+    except (OSError, ValueError):
+        catalog = []; cursor = None; seen = set()
+        try:
+            for page in range(1, 101):
+                notify(f'Resolving player identities · roster page {page}')
+                params = {'per_page': 100}
+                if cursor is not None: params['cursor'] = cursor
+                payload = _get(base+'/players/active', api_key, params, True)
+                catalog.extend(payload.get('data', []))
+                cursor = payload.get('meta', {}).get('next_cursor')
+                if cursor is None: break
+                if str(cursor) in seen: raise RuntimeError('Repeated roster cursor')
+                seen.add(str(cursor))
+            else: raise RuntimeError('Player identity pagination incomplete')
+            save(catalog_path, catalog)
+        except Exception as exc:
+            for name in missing: yield name, [], 'NBA player directory: '+_nba_request_issue(exc)
+            return
+    index = {}
+    for player in catalog:
+        index.setdefault(name_key(player.get('first_name','')+' '+player.get('last_name','')), {})[player['id']] = player
+    resolved = []
+    for name in missing:
+        matches = list(index.get(name_key(name), {}).values())
+        if len(matches) != 1:
+            # Search is first OR last name, not an assumed full-name match.
+            notify('Resolving player identity · '+name)
+            try:
+                payload = _get(base+'/players', api_key,
+                               {'search': name.split()[-1], 'per_page': 100}, True)
+                matches = [r for r in payload.get('data', []) if name_key(r.get('first_name','')+' '+r.get('last_name','')) == name_key(name)]
+            except Exception as exc:
+                yield name, [], 'Player identity for '+name+': '+_nba_request_issue(exc)
+                continue
+        if len(matches) != 1:
+            yield name, [], 'No unique NBA player identity for '+name+'.'
+        else:
+            resolved.append((name, matches[0]['id']))
+    for offset in range(0, len(resolved), 8):
+        batch = resolved[offset:offset+8]
+        ids = {pid for name, pid in batch}; rows_by_id = {pid: [] for pid in ids}
+        cursor = None; seen = set()
+        try:
+            for page in range(1, 101):
+                notify(f'Loading stats batch {offset//8+1} of {(len(resolved)+7)//8} · page {page}')
+                params = {'player_ids[]': list(ids), 'per_page': 100,
+                          'start_date': (now-pd.Timedelta(days=365)).strftime('%Y-%m-%d'),
+                          'end_date': (now-pd.Timedelta(days=2)).strftime('%Y-%m-%d')}
+                if cursor is not None: params['cursor'] = cursor
+                payload = _get(base+'/stats', api_key, params, True)
+                for row in payload.get('data', []):
+                    pid = (row.get('player') or {}).get('id'); game = row.get('game', {})
+                    date = pd.to_datetime(game.get('date'), utc=True, errors='coerce')
+                    try: played = float(str(row.get('min') or '0').split(':')[0]) > 0
+                    except ValueError: played = False
+                    if pid in ids and str(game.get('status','')).startswith('Final') and pd.notna(date) and date+pd.Timedelta(hours=48)<now and played:
+                        rows_by_id[pid].append(dict(row, source_date=date.isoformat()))
+                cursor = payload.get('meta', {}).get('next_cursor')
+                if cursor is None: break
+                if str(cursor) in seen: raise RuntimeError('Repeated stats cursor')
+                seen.add(str(cursor))
+            else: raise RuntimeError('Stats pagination incomplete')
+        except Exception as exc:
+            # Discard all partial batch rows: incomplete samples must not drive picks.
+            for name, pid in batch:
+                yield name, [], 'NBA stats for '+name+': '+_nba_request_issue(exc)
+            continue
+        for name, pid in batch:
+            rows = list({r['game']['id']: r for r in rows_by_id[pid]}.values())
+            rows.sort(key=lambda r:(r['source_date'], r['game']['id']))
+            save(root/(name_key(name)+'_'+day+'.json'), rows)
+            yield name, rows, None
+
+
 def mlb_prop_identities(snapshots):
     """Resolve names within each game's teams; posted lineups override guesses."""
     candidates = {}
@@ -294,6 +406,8 @@ def mlb_prop_identities(snapshots):
 def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapshots=None, nba_key=None, progress=None):
     if not odds_key and league != 'NBA':
         return {'picks':[], 'message':'Player props need the configured Odds API key.', 'errors':[]}
+    if league == 'NBA' and progress:
+        progress({'picks': [], 'game_picks': [], 'errors': [], 'loading_progress': {'stage': 'Finding sportsbook lines', 'completed': 0, 'total': 0}})
     try:
         quotes, errors = fetch_prop_quotes(league, games, odds_key) if odds_key else ([], ['Sportsbook key unavailable; statistical star projections only.'])
     except Exception as exc:
@@ -308,6 +422,8 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
     history_by_name = {}; identities = {}; mlb_histories = {}
     if league=='NBA':
         from dual_agent.nba_star_spotlight import collect_star_rosters, build_star_spotlights, key as star_key
+        if progress:
+            progress({'picks': [], 'game_picks': [], 'errors': list(errors), 'loading_progress': {'stage': 'Finding team star rosters', 'completed': 0, 'total': 0}})
         star_rosters = collect_star_rosters(games)
         if not nba_key:
             errors.append('NBA projections need BALLDONTLIE_API_KEY and access to player game stats.')
@@ -317,28 +433,36 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
         for roster in star_rosters.values():
             for player in roster['players']:
                 names_by_key.setdefault(star_key(player['player']), player['player'])
-        names = sorted(names_by_key.values()) if nba_key else []
-        def collect(player):
-            try:return player, _nba_history(player,nba_key), None
-            except Exception:return player, [], 'Prior game stats unavailable for '+player
-        if progress:
-            progress({'picks': [], 'game_picks': [], 'errors': list(errors),
-                      'loading_progress': {'completed': 0, 'total': len(names)}})
-        with ThreadPoolExecutor(max_workers=3) as pool:
-            pending = [pool.submit(collect, player) for player in names]
-            for completed, future in enumerate(as_completed(pending), 1):
-                player, history, error = future.result()
-                history_by_name[player] = history
-                if error: errors.append(error)
-                if progress:
-                    # Score only completed players, using the same final ranking rules.
-                    ready_keys = {star_key(name) for name in history_by_name}
-                    ready_groups = {key: group for key, group in groups.items()
-                                    if star_key(key[1]) in ready_keys}
-                    partial = _rank_prop_candidates('NBA', games, ready_groups,
-                        history_by_name, list(errors), star_rosters, {}, {})
-                    partial['loading_progress'] = {'completed': completed, 'total': len(names)}
-                    progress(partial)
+        # Earliest games first; no games or candidates are removed from the scan.
+        priority = {}
+        for quote in quotes:
+            k = star_key(quote['player']); stamp = pd.Timestamp(quote['start_time'])
+            priority[k] = min(priority.get(k, stamp), stamp)
+        for game in games:
+            for side in ('home', 'away'):
+                for roster in star_rosters.values():
+                    if roster.get('team') == game[side+'_team']:
+                        for player in roster['players']:
+                            k = star_key(player['player']); stamp = pd.Timestamp(game['commence_time'])
+                            priority[k] = min(priority.get(k, stamp), stamp)
+        names = sorted(names_by_key.values(), key=lambda name:(priority.get(star_key(name), pd.Timestamp.max.tz_localize('UTC')), name)) if nba_key else []
+        completed = 0
+        def publish(stage):
+            if not progress: return
+            by_key = {star_key(name): rows for name, rows in history_by_name.items()}
+            ready = {q['player']: by_key[star_key(q['player'])] for q in quotes if star_key(q['player']) in by_key}
+            ready.update(history_by_name)
+            ready_groups = {key: group for key, group in groups.items() if star_key(key[1]) in by_key}
+            partial = _rank_prop_candidates('NBA', games, ready_groups,
+                ready, list(errors), star_rosters, {}, {})
+            partial['loading_progress'] = {'completed': completed, 'total': len(names), 'stage': stage}
+            progress(partial)
+        publish('Checking saved player histories')
+        for player, history, error in _nba_history_batches(names, nba_key, status=publish):
+            history_by_name[player] = history
+            completed += 1
+            if error: errors.append(error)
+            publish('Processed '+player)
         # Provider spellings may differ only in accents or punctuation.
         by_key = {star_key(name): rows for name, rows in history_by_name.items()}
         for q in quotes:
