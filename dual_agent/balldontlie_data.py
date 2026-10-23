@@ -76,6 +76,12 @@ def _games_to_dataframe(games):
     rows = []
 
     for game in games:
+        # Scores are present even on scheduled/in-progress games. Only a
+        # confirmed final may create a training outcome.
+        if not str(game.get('status', '')).strip().lower().startswith('final'):
+            continue
+        if game.get('postponed') is True:
+            continue
         home_team = game.get("home_team") or {}
         visitor_team = game.get("visitor_team") or {}
 
@@ -85,6 +91,8 @@ def _games_to_dataframe(games):
                 "game_date": game.get("date"),
                 "season": game.get("season"),
                 "status": game.get("status"),
+                "postseason": game.get("postseason"),
+                "postponed": game.get("postponed", False),
                 "home_team_id": home_team.get("id"),
                 "home_team": home_team.get("abbreviation"),
                 "away_team_id": visitor_team.get("id"),
@@ -101,8 +109,8 @@ def _games_to_dataframe(games):
 
     df["game_date"] = pd.to_datetime(
         df["game_date"],
-        errors="coerce",
-    )
+        errors="coerce", utc=True,
+    ).dt.tz_localize(None)
 
     df["home_points"] = pd.to_numeric(
         df["home_points"],
@@ -124,6 +132,11 @@ def _games_to_dataframe(games):
             "away_points",
         ]
     ).copy()
+
+    df = df.loc[(df.home_points > 0) & (df.away_points > 0)
+        & df.home_points.lt(float('inf')) & df.away_points.lt(float('inf'))
+        & df.home_points.ne(df.away_points)
+        & (df.game_date <= pd.Timestamp.now(tz='UTC').tz_localize(None))].copy()
 
     df["home_win"] = (
         df["home_points"] > df["away_points"]
@@ -205,10 +218,8 @@ def get_historical_games(
 
     games_df = _games_to_dataframe(all_games)
 
-    if games_df.empty:
-        raise ValueError(
-            f"No completed games were found for NBA season {season}."
-        )
+    # A newly started season may have no final games yet. Let the multi-season
+    # caller skip it while retaining older completed seasons.
 
     return games_df, request_count
 
