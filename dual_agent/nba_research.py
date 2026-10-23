@@ -1187,6 +1187,10 @@ def prepare_balldontlie_games_for_research(games):
         raise ValueError("No BALLDONTLIE games were supplied.")
 
     df = games.copy()
+    if 'status' in df:
+        df = df.loc[df['status'].astype(str).str.strip().str.lower().str.startswith('final')].copy()
+    if 'postponed' in df:
+        df = df.loc[~df['postponed'].eq(True)].copy()
 
     required_columns = [
         "game_id",
@@ -1217,8 +1221,8 @@ def prepare_balldontlie_games_for_research(games):
 
     df["game_date"] = pd.to_datetime(
         df["game_date"],
-        errors="coerce",
-    )
+        errors="coerce", utc=True,
+    ).dt.tz_localize(None)
 
     df["home_points"] = pd.to_numeric(
         df["home_points"],
@@ -1245,6 +1249,12 @@ def prepare_balldontlie_games_for_research(games):
             "home_win",
         ]
     ).copy()
+
+    df = df.loc[np.isfinite(df['home_points']) & np.isfinite(df['away_points'])
+        & df['home_points'].gt(0) & df['away_points'].gt(0)
+        & df['home_points'].ne(df['away_points'])].drop_duplicates('game_id', keep='last').copy()
+    if df.empty:
+        raise ValueError('No valid completed NBA results remain after outcome checks.')
 
     # --------------------------------------------------------
     # Sort chronologically
@@ -1288,6 +1298,35 @@ def prepare_balldontlie_games_for_research(games):
 # BALLDONTLIE CHRONOLOGICAL PRE-GAME FEATURE ENGINE
 # ============================================================
 
+NBA_FEATURE_SCHEMA_VERSION = 2
+NBA_LIVE_FEATURE_COLUMNS = ['home_games_played', 'away_games_played', 'home_win_pct', 'away_win_pct', 'home_win_pct_5', 'away_win_pct_5', 'home_win_pct_10', 'away_win_pct_10', 'home_avg_points', 'away_avg_points', 'home_avg_points_allowed', 'away_avg_points_allowed', 'home_avg_margin', 'away_avg_margin', 'home_venue_win_pct', 'away_venue_win_pct', 'home_rest_days', 'away_rest_days', 'win_pct_diff', 'recent_5_diff', 'recent_10_diff', 'margin_diff', 'venue_win_pct_diff', 'rest_days_diff']
+
+
+def _summarize_balldontlie_history(history, current_date, venue=None):
+    """One feature definition for chronological training and live matchups."""
+    current_date = pd.Timestamp(current_date)
+    if current_date.tzinfo is not None:
+        current_date = current_date.tz_convert('UTC').tz_localize(None)
+    # Exclude same-day and future records consistently in both paths.
+    history = sorted((g for g in history if pd.Timestamp(g['game_date']) < current_date),
+        key=lambda g: pd.Timestamp(g['game_date']))
+    if not history:
+        return {'games_played': 0, 'win_pct': .5, 'win_pct_5': .5,
+            'win_pct_10': .5, 'avg_points': 0., 'avg_points_allowed': 0.,
+            'avg_margin': 0., 'venue_win_pct': .5, 'rest_days': 7.}
+    last5, last10 = history[-5:], history[-10:]
+    venue_games = [g for g in history if g['venue'] == venue][-10:]
+    def average(rows, field, alternate=None):
+        return float(np.mean([g[field] if field in g else g[alternate] for g in rows]))
+    return {'games_played': len(history), 'win_pct': average(history, 'win'),
+        'win_pct_5': average(last5, 'win'), 'win_pct_10': average(last10, 'win'),
+        'avg_points': average(last10, 'points_for', 'points'),
+        'avg_points_allowed': average(last10, 'points_against', 'points_allowed'),
+        'avg_margin': average(last10, 'margin'),
+        'venue_win_pct': average(venue_games, 'win') if venue_games else .5,
+        'rest_days': float(max(0, min((current_date-pd.Timestamp(history[-1]['game_date'])).days, 10)))}
+
+
 def build_balldontlie_pregame_features(games, min_games=5):
     """
     Build pre-game NBA features using ONLY information that
@@ -1308,88 +1347,7 @@ def build_balldontlie_pregame_features(games, min_games=5):
         return team_history[team]
 
     def summarize_history(history, current_date, venue=None):
-        """
-        Calculate team statistics using games played strictly
-        before the current game.
-        """
-
-        if not history:
-            return {
-                "games_played": 0,
-                "win_pct": 0.5,
-                "win_pct_5": 0.5,
-                "win_pct_10": 0.5,
-                "avg_points": 0.0,
-                "avg_points_allowed": 0.0,
-                "avg_margin": 0.0,
-                "venue_win_pct": 0.5,
-                "rest_days": 7.0,
-            }
-
-        recent_5 = history[-5:]
-        recent_10 = history[-10:]
-
-        games_played = len(history)
-
-        win_pct = sum(g["win"] for g in history) / games_played
-
-        win_pct_5 = (
-            sum(g["win"] for g in recent_5) / len(recent_5)
-        )
-
-        win_pct_10 = (
-            sum(g["win"] for g in recent_10) / len(recent_10)
-        )
-
-        avg_points = (
-            sum(g["points_for"] for g in recent_10)
-            / len(recent_10)
-        )
-
-        avg_points_allowed = (
-            sum(g["points_against"] for g in recent_10)
-            / len(recent_10)
-        )
-
-        avg_margin = (
-            sum(g["margin"] for g in recent_10)
-            / len(recent_10)
-        )
-
-        venue_games = [
-            g for g in history
-            if g["venue"] == venue
-        ]
-
-        if venue_games:
-            venue_recent = venue_games[-10:]
-
-            venue_win_pct = (
-                sum(g["win"] for g in venue_recent)
-                / len(venue_recent)
-            )
-        else:
-            venue_win_pct = 0.5
-
-        last_game_date = history[-1]["game_date"]
-
-        rest_days = (
-            current_date - last_game_date
-        ).days
-
-        rest_days = max(0, min(rest_days, 10))
-
-        return {
-            "games_played": games_played,
-            "win_pct": win_pct,
-            "win_pct_5": win_pct_5,
-            "win_pct_10": win_pct_10,
-            "avg_points": avg_points,
-            "avg_points_allowed": avg_points_allowed,
-            "avg_margin": avg_margin,
-            "venue_win_pct": venue_win_pct,
-            "rest_days": rest_days,
-        }
+        return _summarize_balldontlie_history(history, current_date, venue)
 
     for _, game in df.iterrows():
 
@@ -1924,10 +1882,10 @@ def build_balldontlie_future_matchup_features(
 
     history["game_date"] = pd.to_datetime(
         history["game_date"],
-        errors="coerce",
-    )
+        errors="coerce", utc=True,
+    ).dt.tz_localize(None)
 
-    target_date = pd.to_datetime(game_date)
+    target_date = pd.to_datetime(game_date, utc=True).tz_localize(None)
 
     # Absolutely no games from the target date or future may be used.
     history = history[
@@ -1995,51 +1953,7 @@ def build_balldontlie_future_matchup_features(
         )
 
     def summarize_team(team_history, venue):
-
-        last_5 = team_history.tail(5)
-        last_10 = team_history.tail(10)
-
-        venue_history = team_history[
-            team_history["venue"] == venue
-        ]
-
-        last_game_date = team_history[
-            "game_date"
-        ].max()
-
-        rest_days = (
-            target_date - last_game_date
-        ).days
-
-        return {
-            "games_played": len(team_history),
-
-            "win_pct":
-                team_history["win"].mean(),
-
-            "win_pct_5":
-                last_5["win"].mean(),
-
-            "win_pct_10":
-                last_10["win"].mean(),
-
-            "avg_points":
-                team_history["points"].mean(),
-
-            "avg_points_allowed":
-                team_history["points_allowed"].mean(),
-
-            "avg_margin":
-                team_history["margin"].mean(),
-
-            "venue_win_pct":
-                venue_history["win"].mean()
-                if len(venue_history) > 0
-                else 0.5,
-
-            "rest_days":
-                rest_days,
-        }
+        return _summarize_balldontlie_history(team_history.to_dict('records'), target_date, venue)
 
     home = summarize_team(
         home_history,
@@ -2149,12 +2063,12 @@ def train_balldontlie_live_model(
 
     if prediction_date is not None:
         prediction_date = pd.to_datetime(
-            prediction_date
-        )
+            prediction_date, utc=True,
+        ).tz_localize(None)
 
         df["game_date"] = pd.to_datetime(
-            df["game_date"]
-        )
+            df["game_date"], utc=True,
+        ).dt.tz_localize(None)
 
         df = df[
             df["game_date"] < prediction_date
@@ -2179,14 +2093,10 @@ def train_balldontlie_live_model(
         "home_win",
     }
 
-    feature_columns = [
-        column
-        for column in df.columns
-        if column not in protected_columns
-        and pd.api.types.is_numeric_dtype(
-            df[column]
-        )
-    ]
+    feature_columns = list(NBA_LIVE_FEATURE_COLUMNS)
+    missing = [column for column in feature_columns if column not in df]
+    if missing:
+        raise ValueError('Missing explicit NBA model features: '+', '.join(missing))
 
     if not feature_columns:
         raise ValueError(
@@ -2251,6 +2161,7 @@ def train_balldontlie_live_model(
         "model": model,
         "feature_columns": feature_columns,
         "training_games": len(train_df),
+        "feature_schema_version": NBA_FEATURE_SCHEMA_VERSION,
     }
 
 
@@ -2344,161 +2255,12 @@ def predict_balldontlie_with_trained_model(
     }
 
 def predict_balldontlie_matchup(feature_games, matchup_features):
-    """
-    Train the NBA model on historical pre-game features and
-    generate probabilities for one future matchup.
-    """
-
-    if feature_games is None or len(feature_games) == 0:
-        raise ValueError("No historical feature games supplied.")
-
-    if matchup_features is None or len(matchup_features) == 0:
-        raise ValueError("No future matchup features supplied.")
-
-    from sklearn.linear_model import LogisticRegression
-    from sklearn.preprocessing import StandardScaler
-    from sklearn.pipeline import Pipeline
-
-    df = feature_games.copy()
-    future = matchup_features.copy()
-
-    # Prevent look-ahead leakage when testing historical matchups.
-    # Only games strictly before the matchup date may be used
-    # to train the prediction model.
-    if "game_date" in future.columns:
-        prediction_date = pd.to_datetime(
-            future["game_date"].iloc[0]
-        )
-    
-        df["game_date"] = pd.to_datetime(
-            df["game_date"]
-        )
-       
-    
-        df = df[
-            df["game_date"] < prediction_date
-        ].copy()
-    
-        
-        if len(df) == 0:
-            raise ValueError(
-                "No historical games exist before the prediction date."
-            )
-        
-        protected_columns = {
-            "game_id",
-            "game_date",
-            "season",
-            "home_team",
-            "away_team",
-            "home_points",
-            "away_points",
-            "point_margin",
-            "total_points",
-            "home_win",
-        }
-    
-        feature_columns = [
-            column
-            for column in df.columns
-            if column not in protected_columns
-            and pd.api.types.is_numeric_dtype(df[column])
-        ]
-    
-        if not feature_columns:
-            raise ValueError("No model feature columns were found.")
-    
-        missing_future_columns = [
-            column
-            for column in feature_columns
-            if column not in future.columns
-        ]
-    
-        if missing_future_columns:
-            raise ValueError(
-                "Future matchup is missing model features: "
-                + ", ".join(missing_future_columns)
-            )
-    
-        train_df = df.dropna(
-            subset=feature_columns + ["home_win"]
-        ).copy()
-
-
-    # Validate historical training data
-    MIN_TRAINING_GAMES = 500
-
-    if len(train_df) < MIN_TRAINING_GAMES:
-        raise ValueError(
-            f"Insufficient NBA training data: "
-            f"{len(train_df)} games available. "
-            f"At least {MIN_TRAINING_GAMES} required."
-        )
-
-    if train_df["home_win"].nunique() < 2:
-        raise ValueError(
-            "NBA training data must contain "
-            "both home wins and home losses."
-        )
-
-    if not np.isfinite(
-        train_df[feature_columns].to_numpy(dtype=float)
-    ).all():
-        raise ValueError(
-            "NBA training features contain "
-            "invalid or infinite values."
-        )
-
-        
-    
-    X_train = train_df[feature_columns]
-    y_train = train_df["home_win"].astype(int)
-
-    X_future = future[feature_columns]
-
-    model = Pipeline(
-        [
-            ("scaler", StandardScaler()),
-            (
-                "model",
-                
-                LogisticRegression(
-                    max_iter=2000,
-                    C=0.1,
-                    random_state=42,
-                ),
-            ),
-        ]
-    )
-
-    model.fit(X_train, y_train)
-
-    home_probability = float(
-        model.predict_proba(X_future)[0][1]
-    )
-
-    away_probability = 1.0 - home_probability
-
-    predicted_side = (
-        "HOME"
-        if home_probability >= 0.50
-        else "AWAY"
-    )
-
-    confidence = max(
-        home_probability,
-        away_probability,
-    )
-
-    return {
-        "home_win_probability": home_probability,
-        "away_win_probability": away_probability,
-        "predicted_side": predicted_side,
-        "confidence": confidence,
-        "feature_columns": feature_columns,
-        "feature_count": len(feature_columns),
-        "training_games": len(train_df),
-    }
+    """Use the same training and inference path as one-click predictions."""
+    if matchup_features is None or matchup_features.empty or 'game_date' not in matchup_features:
+        raise ValueError('A matchup date is required to prevent future-data leakage.')
+    trained = train_balldontlie_live_model(feature_games,
+        prediction_date=matchup_features['game_date'].iloc[0])
+    return predict_balldontlie_with_trained_model(trained, matchup_features)
 
 
 # ============================================================
