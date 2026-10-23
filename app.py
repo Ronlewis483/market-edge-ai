@@ -994,8 +994,14 @@ def enrich_nba_props(result, odds_key, nba_key, updates, context=None):
     result = copy.deepcopy(result)
     try:
         from dual_agent.sports_player_prop_predictions import generate_player_prop_picks
+        def publish_progress(props):
+            partial = copy.deepcopy(result)
+            partial['player_props'] = copy.deepcopy(props)
+            partial['nba_props_pending'] = True
+            updates.put(partial)
         result['player_props'] = generate_player_prop_picks('NBA',
-            result['all_predictions'].to_dict('records'), odds_key, nba_key=nba_key)
+            result['all_predictions'].to_dict('records'), odds_key, nba_key=nba_key,
+            progress=publish_progress)
     except Exception as exc:
         result['player_props'] = {'picks': [], 'message': 'Player-prop data unavailable. Team predictions are preserved.',
             'errors': ['NBA prop processing failed: '+type(exc).__name__+': '+str(exc)]}
@@ -1596,7 +1602,13 @@ def render_game_addons(league, game, result):
                            sportsbook_offers=p.get('Sportsbook offers', [])) for p in props]
         with st.expander(f'🎯 {league} player props · ranked by estimated cover chance', expanded=True):
             if league == 'NBA' and (result or {}).get('nba_props_pending'):
-                st.info('Game winners are ready. Player props are still loading in the background.')
+                progress = (result or {}).get('player_props', {}).get('loading_progress', {})
+                completed, total = progress.get('completed', 0), progress.get('total', 0)
+                if total:
+                    st.progress(min(completed / total, 1.0),
+                                text=f'Player history checked: {completed} of {total}. Rankings update as players finish.')
+                else:
+                    st.info('Finding sportsbook lines and players. Player props are loading in the background.')
             st.caption('Preferred platforms: Polymarket, Underdog, DraftKings, PrizePicks, FanDuel · overall strongest picks plus independent category rankings.')
             st.caption('Strongest available estimates in each category · no probability cutoff · one exact listed offer and sufficient usable history required. Odds do not affect ranking.')
             render_prop_category_rankings(normalized, league)
@@ -1613,7 +1625,10 @@ def render_game_addons(league, game, result):
                     st.markdown('### '+title)
                     chosen = select_nfl_prop_list(normalized, mode)
                     if not chosen:
-                        st.info('No listed bets meet this list’s criteria.')
+                        if league == 'NBA' and (result or {}).get('nba_props_pending'):
+                            st.caption('Still checking players for this game and category…')
+                        else:
+                            st.info('No listed bets meet this list’s criteria.')
                     for rank, prop in enumerate(chosen, 1):
                         with st.container(border=True):
                             st.markdown(f"**#{rank} · {prop['Player']} · {prop['Pick']} {float(prop['Line']):g} {prop['Market']}**")
