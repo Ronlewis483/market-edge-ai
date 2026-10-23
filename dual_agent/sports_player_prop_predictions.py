@@ -193,7 +193,8 @@ def fetch_prop_quotes(league, games, odds_key):
                         paired.setdefault((player,line), {})[side] = price
                     except (KeyError, TypeError, ValueError): continue
                 for (player,line), sides in paired.items():
-                    if league != 'MLB' and set(sides) != {'Over','Under'}: continue
+                    # One actual offered side is enough for NBA and MLB.
+                    # Only paired quotes contribute a margin-free market prior.
                     over = 1/sides['Over'] if 'Over' in sides else None
                     under = 1/sides['Under'] if 'Under' in sides else None
                     quotes.append({'player':player,'line':line,'market':key,'over_probability':over/(over+under) if over is not None and under is not None else None,
