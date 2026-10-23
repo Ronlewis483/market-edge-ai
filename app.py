@@ -529,9 +529,8 @@ def render_prediction_workspace(league, predictions, result):
 @st.cache_data(ttl=1800, show_spinner=False)
 def load_nba_spotlight_inputs(home_team, away_team, commence_time, nba_key):
     """Fill older prediction snapshots without rerunning models or odds scans."""
-    from concurrent.futures import ThreadPoolExecutor
     from dual_agent.nba_star_spotlight import collect_star_rosters, key
-    from dual_agent.sports_player_prop_predictions import _nba_history
+    from dual_agent.sports_player_prop_predictions import _nba_history_batches
     game = {'home_team': home_team, 'away_team': away_team, 'commence_time': commence_time}
     rosters = collect_star_rosters([game])
     names = {key(player['player']): player['player']
@@ -540,16 +539,9 @@ def load_nba_spotlight_inputs(home_team, away_team, commence_time, nba_key):
     if not nba_key:
         issues.append('Player statistics access is unavailable. Star identities remain visible.')
         return rosters, histories, issues
-    def collect(name):
-        try:
-            return name, _nba_history(name, nba_key), None
-        except Exception as exc:
-            return name, [], 'Statistics unavailable for '+name+': '+str(exc)
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        for name, rows, issue in pool.map(collect, names.values()):
-            histories[name] = rows
-            if issue:
-                issues.append(issue)
+    for name, rows, issue in _nba_history_batches(list(names.values()), nba_key):
+        histories[name] = rows
+        if issue: issues.append(issue)
     return rosters, histories, issues
 
 
@@ -615,7 +607,7 @@ def render_nba_star_spotlight(game, result):
                         st.caption(f"{pick['Best sportsbook']} · {decimal_to_american_label(pick['Best decimal odds'])} · {pick['Prior games']} prior appearances")
                     st.caption('Cover estimates exclude pushes and assume participation. Ranked by probability, not payout.')
                 elif not player['unavailable']:
-                    st.caption('No qualified listed prop available for this player. Statistical projections remain visible.')
+                    st.caption('No qualified listed prop available for this player.' + (' Statistical projections are shown above.' if player.get('projections') else ' Player history must load before a projection can be calculated.'))
         if team.get('captured_at'):
             st.caption('Roster source: '+team.get('source', 'ESPN')+' · captured '+team['captured_at'])
 
@@ -1651,6 +1643,10 @@ def render_game_addons(league, game, result):
                         with st.container(border=True):
                             st.markdown(f"**#{rank} · {prop['Player']} · {prop['Pick']} {float(prop['Line']):g} {prop['Market']}**")
                             st.write(prop_outcome_sentence(prop['Player'], prop['Market'], prop['Pick'], prop['Line'], prop['Estimated chance']))
+                            if league == 'NBA' and prop.get('Over chance') is not None:
+                                st.caption(f"Over {float(prop['Line']):g}: {prop['Over chance']:.1%} · Under {float(prop['Line']):g}: {prop['Under chance']:.1%} · conditional on no push")
+                                if not prop.get('Opposite side offered'):
+                                    st.caption('Opposite-side probability is a statistical estimate; an offer for that side was not found.')
                             if float(prop['Estimated chance']) < .65:
                                 st.caption('Below 65% estimated cover chance · lower-confidence prediction')
                             if prop.get('Historical wins') is not None:
