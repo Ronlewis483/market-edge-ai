@@ -3,7 +3,7 @@
 These are historical hit-rate estimates shrunk toward bookmaker consensus,
 not calibrated win probabilities from the game-winner model.
 """
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 from pathlib import Path
 import unicodedata
@@ -291,7 +291,7 @@ def mlb_prop_identities(snapshots):
     return {key: next(iter(values.values())) for key, values in candidates.items() if len(values) == 1}
 
 
-def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapshots=None, nba_key=None):
+def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapshots=None, nba_key=None, progress=None):
     if not odds_key and league != 'NBA':
         return {'picks':[], 'message':'Player props need the configured Odds API key.', 'errors':[]}
     try:
@@ -321,10 +321,24 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
         def collect(player):
             try:return player, _nba_history(player,nba_key), None
             except Exception:return player, [], 'Prior game stats unavailable for '+player
+        if progress:
+            progress({'picks': [], 'game_picks': [], 'errors': list(errors),
+                      'loading_progress': {'completed': 0, 'total': len(names)}})
         with ThreadPoolExecutor(max_workers=3) as pool:
-            for player, history, error in pool.map(collect,names):
+            pending = [pool.submit(collect, player) for player in names]
+            for completed, future in enumerate(as_completed(pending), 1):
+                player, history, error = future.result()
                 history_by_name[player] = history
-                if error:errors.append(error)
+                if error: errors.append(error)
+                if progress:
+                    # Score only completed players, using the same final ranking rules.
+                    ready_keys = {star_key(name) for name in history_by_name}
+                    ready_groups = {key: group for key, group in groups.items()
+                                    if star_key(key[1]) in ready_keys}
+                    partial = _rank_prop_candidates('NBA', games, ready_groups,
+                        history_by_name, list(errors), star_rosters, {}, {})
+                    partial['loading_progress'] = {'completed': completed, 'total': len(names)}
+                    progress(partial)
         # Provider spellings may differ only in accents or punctuation.
         by_key = {star_key(name): rows for name, rows in history_by_name.items()}
         for q in quotes:
@@ -347,6 +361,12 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
         subset['total_bases'] = subset['singles']+2*number('doubles')+3*number('triples')+4*number('batting_home_runs')
         subset['hits_runs_rbis'] = number('hits')+number('batting_runs')+number('rbi')
         mlb_histories = {int(pid): frame for pid,frame in subset.groupby('player_id')}
+    return _rank_prop_candidates(league, games, groups, history_by_name, errors,
+                                 star_rosters if league == 'NBA' else {}, identities, mlb_histories)
+
+
+def _rank_prop_candidates(league, games, groups, history_by_name, errors,
+                          star_rosters, identities, mlb_histories):
     picks = []; exclusions = []; pitcher_forecasts = []
     def excluded(first, player, market, line, reason):
         exclusions.append({'Player': player, 'Market': MARKETS[league].get(market, (market, None))[0], 'Line': line,
