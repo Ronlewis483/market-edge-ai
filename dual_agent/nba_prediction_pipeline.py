@@ -76,86 +76,12 @@ def _american_odds_metrics(
             float(expected_roi),
     }
 
-@st.cache_data(
-    ttl=21600,
-    show_spinner=False,
-)
-def _load_nba_historical_features(
-    seasons,
-    cutoff_date,
-):
-    """
-    Download and prepare historical NBA model data.
-
-    Cached for 6 hours so repeated prediction runs
-    do not rebuild multiple NBA seasons every time.
-    Feature schema 2: completed outcomes and identical training/live summaries.
-    """
-
-    (
-        historical_games,
-        season_summary,
-        requests_used,
-        ) = get_multiple_historical_seasons(
-        seasons
-    )
-
-    if (
-        historical_games is None
-        or len(historical_games) == 0
-    ):
-        raise ValueError(
-            "No historical NBA games were returned."
-        )
-
-    historical_games = (
-        historical_games.copy()
-    )
-
-    historical_dates = pd.to_datetime(
-        historical_games["game_date"],
-        utc=True,
-        errors="coerce",
-    )
-
-    historical_games = historical_games[
-        historical_dates.dt.date
-        < cutoff_date
-    ].copy()
-
-    if historical_games.empty:
-        raise ValueError(
-            "No historical NBA games are available "
-            "before the upcoming matchups."
-        )
-
-    prepared_games = (
-        prepare_balldontlie_games_for_research(
-            historical_games
-        )
-    )
-
-    feature_games = (
-        build_balldontlie_pregame_features(
-            prepared_games
-        )
-    )
-
-    if (
-        feature_games is None
-        or len(feature_games) == 0
-    ):
-        raise ValueError(
-            "NBA historical feature generation "
-            "returned no usable games."
-        )
-
-    return (
-        prepared_games,
-        feature_games,
-        season_summary,
-        requests_used,
-    )
+def _load_nba_historical_features(seasons, cutoff_date, progress=None):
+    """Check incremental disk history; reuse unchanged prepared feature tables."""
+    historical_games, season_summary, requests_used = get_multiple_historical_seasons(
+        seasons, progress=progress)
+    prepared, features = _build_cached_nba_historical_features(historical_games, cutoff_date)
+    return prepared, features, season_summary, requests_used
 
 @st.cache_data(
     ttl=86400,
@@ -213,6 +139,12 @@ def _build_cached_nba_historical_features(
         )
 
     return prepared_games, feature_games
+
+
+@st.cache_resource(ttl=86400, show_spinner=False)
+def _train_cached_nba_model(feature_games, prediction_date):
+    """Reuse the fitted model until its training data or cutoff changes."""
+    return train_balldontlie_live_model(feature_games, prediction_date=prediction_date)
 
 
 def run_nba_prediction_pipeline(
@@ -367,6 +299,7 @@ def run_nba_prediction_pipeline(
     ) = _load_nba_historical_features(
         seasons=seasons,
         cutoff_date=first_game_date,
+        progress=report,
     )
 
     report(
@@ -379,7 +312,7 @@ def run_nba_prediction_pipeline(
 
     report("Training NBA model...")
 
-    trained_model = train_balldontlie_live_model(
+    trained_model = _train_cached_nba_model(
         feature_games=feature_games,
         prediction_date=first_game_date,
     )
