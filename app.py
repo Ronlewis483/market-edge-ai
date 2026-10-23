@@ -1604,6 +1604,13 @@ def render_game_addons(league, game, result):
             if league == 'NBA' and (result or {}).get('nba_props_pending'):
                 progress = (result or {}).get('player_props', {}).get('loading_progress', {})
                 completed, total = progress.get('completed', 0), progress.get('total', 0)
+                if progress.get('stage'):
+                    st.caption(progress['stage'])
+                failures = (result or {}).get('player_props', {}).get('errors', [])
+                if failures:
+                    with st.expander('Player-data issues', expanded=True):
+                        for issue in failures[-5:]:
+                            st.warning(str(issue))
                 if total:
                     st.progress(min(completed / total, 1.0),
                                 text=f'Player history checked: {completed} of {total}. Rankings update as players finish.')
