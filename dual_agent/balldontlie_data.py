@@ -1,4 +1,8 @@
 import time
+import json
+import os
+import threading
+from pathlib import Path
 
 import pandas as pd
 import requests
@@ -6,6 +10,42 @@ import streamlit as st
 
 
 BALLDONTLIE_BASE_URL = "https://api.balldontlie.io/v1"
+_REQUEST_LOCK = threading.Lock()
+_LAST_REQUEST_AT = 0.0
+_HISTORY_LOCK = threading.Lock()
+
+
+def _setting(name, default):
+    value = os.environ.get(name)
+    if value is None:
+        try:
+            value = st.secrets.get(name, default)
+        except Exception:
+            value = default
+    return value
+
+
+def _pace_request():
+    """One request budget for history and NBA prop-stat calls in this process."""
+    global _LAST_REQUEST_AT
+    try:
+        rate = float(_setting('BALLDONTLIE_REQUESTS_PER_MINUTE', 5))
+    except (TypeError, ValueError):
+        rate = 5.
+    if not 0 < rate <= 600:
+        rate = 5.
+    interval = 60. / rate + .05
+    with _REQUEST_LOCK:
+        delay = interval - (time.monotonic() - _LAST_REQUEST_AT)
+        if delay > 0:
+            time.sleep(delay)
+        _LAST_REQUEST_AT = time.monotonic()
+
+
+def _write_history(path, state):
+    temporary = path.with_suffix('.tmp')
+    temporary.write_text(json.dumps(state, allow_nan=False))
+    temporary.replace(path)
 
 
 def _get_api_key():
@@ -20,12 +60,12 @@ def _get_api_key():
         )
 
 
-def _balldontlie_get(endpoint, params=None):
+def _balldontlie_get(endpoint, params=None, api_key=None):
     """
     Make an authenticated request to BALLDONTLIE.
     Automatically retry if the API rate-limits us.
     """
-    api_key = _get_api_key()
+    api_key = api_key or _get_api_key()
 
     headers = {
         "Authorization": api_key
@@ -34,8 +74,9 @@ def _balldontlie_get(endpoint, params=None):
     max_retries = 5
 
     for attempt in range(max_retries):
+        _pace_request()
         response = requests.get(
-            f"{BALLDONTLIE_BASE_URL}/{endpoint}",
+            endpoint if endpoint.startswith('https://api.balldontlie.io/') else f"{BALLDONTLIE_BASE_URL}/{endpoint}",
             headers=headers,
             params=params,
             timeout=30,
@@ -157,6 +198,7 @@ def get_historical_games(
     season=2023,
     per_page=100,
     fetch_all=True,
+    progress=None,
 ):
     """
     Retrieve historical NBA games for one season.
@@ -168,60 +210,81 @@ def get_historical_games(
     BALLDONTLIE rate limit.
     """
 
-    all_games = []
-    cursor = None
-    request_count = 0
-
-    while True:
-        params = {
-            "seasons[]": season,
-            "per_page": per_page,
-        }
-
-        if cursor is not None:
-            params["cursor"] = cursor
-
-        payload = _balldontlie_get(
-            "games",
-            params=params,
-        )
-
-        request_count += 1
-
-        batch = payload.get("data", [])
-
-        if not batch:
-            break
-
-        all_games.extend(batch)
-
-        if not fetch_all:
-            break
-
-        meta = payload.get("meta") or {}
-
-        next_cursor = meta.get("next_cursor")
-
-        if next_cursor is None:
-            break
-
-        cursor = next_cursor
-
-        # Free tier allows only a small number of requests
-        # per minute, so wait before requesting the next page.
-        time.sleep(13)
-
-    if not all_games:
-        raise ValueError(
-            f"No games were returned for NBA season {season}."
-        )
-
-    games_df = _games_to_dataframe(all_games)
-
-    # A newly started season may have no final games yet. Let the multi-season
-    # caller skip it while retaining older completed seasons.
-
-    return games_df, request_count
+    season = int(season)
+    if not 1 <= int(per_page) <= 100:
+        raise ValueError('NBA history page size must be between 1 and 100.')
+    # Partial research probes never read or overwrite the complete cache.
+    if not fetch_all:
+        payload = _balldontlie_get('games', {'seasons[]': season, 'per_page': per_page,
+            'end_date': pd.Timestamp.now(tz='UTC').strftime('%Y-%m-%d')})
+        return _games_to_dataframe(payload.get('data', [])), 1
+    root = Path(_setting('NBA_HISTORY_CACHE_DIR', '.market_edge_cache/nba_history'))
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / f'season_{season}_v1.json'
+    # Avoid duplicate bootstraps and checkpoint races across app sessions.
+    with _HISTORY_LOCK:
+        state = {}
+        if path.exists():
+            try:
+                state = json.loads(path.read_text())
+                if state.get('version') != 1 or state.get('season') != season:
+                    state = {}
+            except (ValueError, OSError):
+                state = {}
+        now = pd.Timestamp.now(tz='UTC')
+        checked = pd.to_datetime(state.get('checked_at'), utc=True, errors='coerce')
+        current_season = now.year if now.month >= 9 else now.year - 1
+        closed = season < current_season and pd.notna(checked) and checked >= pd.Timestamp(year=season+1, month=9, day=1, tz='UTC')
+        fresh = pd.notna(checked) and pd.Timedelta(0) <= now-checked < pd.Timedelta(minutes=15)
+        if state.get('complete') and (closed or fresh):
+            if progress: progress(f'Using saved NBA {season} history')
+            return _games_to_dataframe(state.get('games', [])), 0
+        if not state.get('pending'):
+            start = None
+            if state.get('complete') and pd.notna(checked):
+                # Overlap catches recently finalized games and score corrections.
+                start = (checked-pd.Timedelta(days=3)).strftime('%Y-%m-%d')
+                pending_dates = [g.get('date') for g in state.get('games', [])
+                    if not str(g.get('status', '')).lower().startswith(('final', 'postponed', 'cancel'))]
+                dates = pd.to_datetime(pending_dates, utc=True, errors='coerce').dropna()
+                if len(dates):
+                    start = min(start, (dates.min()-pd.Timedelta(days=1)).strftime('%Y-%m-%d'))
+            state.update(version=1, season=season, pending=True, next_cursor=None,
+                query_start=start, query_end=now.strftime('%Y-%m-%d'), pages=0)
+            state.setdefault('games', [])
+        request_count = 0
+        seen = set()
+        while True:
+            cursor = state.get('next_cursor')
+            if cursor is not None and str(cursor) in seen:
+                raise ValueError('NBA history pagination repeated a cursor; checkpoint retained.')
+            if cursor is not None: seen.add(str(cursor))
+            params = {'seasons[]': season, 'per_page': per_page, 'end_date': state['query_end']}
+            if state.get('query_start'): params['start_date'] = state['query_start']
+            if cursor is not None: params['cursor'] = cursor
+            if progress:
+                mode = 'updating recent results' if state.get('query_start') else 'building saved history'
+                progress(f"NBA {season}: {mode}, page {state['pages']+1}")
+            payload = _balldontlie_get('games', params)
+            request_count += 1
+            batch = payload.get('data', [])
+            if not isinstance(batch, list):
+                raise ValueError('Unexpected NBA history response; checkpoint retained.')
+            merged = {str(g['id']): g for g in state['games'] if g.get('id') is not None}
+            for game in batch:
+                if game.get('id') is not None: merged[str(game['id'])] = game
+            state['games'] = list(merged.values())
+            next_cursor = (payload.get('meta') or {}).get('next_cursor')
+            if not batch and next_cursor is not None:
+                raise ValueError('Empty NBA history page has a next cursor; refusing incomplete history.')
+            state['pages'] += 1
+            state['next_cursor'] = next_cursor
+            finished = next_cursor is None
+            if finished:
+                state.update(pending=False, complete=True, checked_at=now.isoformat())
+            _write_history(path, state)
+            if finished: break
+        return _games_to_dataframe(state['games']), request_count
 
 
 def test_balldontlie_connection():
@@ -272,14 +335,10 @@ def test_full_historical_season(season=2023):
         "games": games,
     }
 
-@st.cache_data(
-    ttl=86400,
-    show_spinner=False,
-)
-    
 def get_multiple_historical_seasons(
     seasons,
     per_page=100,
+    progress=None,
 ):
     """
     Download and combine multiple NBA seasons.
@@ -302,6 +361,7 @@ def get_multiple_historical_seasons(
             season=int(season),
             per_page=per_page,
             fetch_all=True,
+            progress=progress,
         )
 
         total_requests += request_count
@@ -327,10 +387,6 @@ def get_multiple_historical_seasons(
                 "api_requests": int(request_count),
             }
         )
-
-        # Give the free API tier extra breathing room
-        # before beginning another season.
-        time.sleep(13)
 
     if not season_frames:
         raise ValueError(
