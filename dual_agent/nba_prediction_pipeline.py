@@ -89,6 +89,7 @@ def _load_nba_historical_features(
 
     Cached for 6 hours so repeated prediction runs
     do not rebuild multiple NBA seasons every time.
+    Feature schema 2: completed outcomes and identical training/live summaries.
     """
 
     (
@@ -167,6 +168,7 @@ def _build_cached_nba_historical_features(
     """
     Prepare historical NBA games and build leakage-safe
     pregame features once, then reuse them for 24 hours.
+    Feature schema 2 uses shared training/live feature definitions.
     """
 
     if historical_games is None or len(historical_games) == 0:
@@ -301,7 +303,8 @@ def run_nba_prediction_pipeline(
     )
 
     odds_df = odds_df[
-        odds_df["game_time"] > current_time
+        (odds_df["game_time"] > current_time)
+        & (odds_df["game_time"] <= current_time + pd.Timedelta(days=7))
     ].copy()
 
     if odds_df.empty:
@@ -499,6 +502,7 @@ def run_nba_prediction_pipeline(
                     prediction.get(
                         "training_games"
                     ),
+                "input_status": "Team-form estimate · confidence not calibrated",
             })
 
         except Exception as error:
