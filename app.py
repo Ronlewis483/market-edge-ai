@@ -556,6 +556,9 @@ def load_nba_spotlight_inputs(home_team, away_team, commence_time, nba_key):
 def render_nba_star_spotlight(game, result):
     """Display saved forecasts or fill only the selected game's missing stars."""
     st.markdown('#### ⭐ Star-player spotlight')
+    if (result or {}).get('nba_props_pending'):
+        st.caption('Star forecasts will appear here when the background player-stat lookup finishes.')
+        return
     start = pd.to_datetime(game.get('commence_time'), utc=True, errors='coerce')
     spotlight = next((row for row in result.get('player_props', {}).get('star_spotlights', [])
         if row.get('home_team') == game.get('home_team')
@@ -713,6 +716,8 @@ def render_league_prediction_results(
 
     if pipeline_result is None:
         return
+    if league_name == 'NBA':
+        render_nba_enrichment_status()
 
     predictions = pipeline_result.get("all_predictions", pipeline_result.get("predictions"))
     opportunities = pipeline_result.get("opportunities")
@@ -973,43 +978,132 @@ def render_player_prop_picks(league, result):
                                     st.write(str(issue))
 
 
-def run_nba_prediction_with_props(progress_callback=None):
-    previous = st.session_state.get("nba_prediction_pipeline_result") or {}
-    retain_sport_picks("NBA", previous.get("all_predictions", previous.get("predictions")), limit=None)
-    retain_sport_picks("NBA", previous.get("player_props", {}).get("game_picks", previous.get("player_props", {}).get("picks", [])), kind="props", limit=None)
-    result = run_nba_prediction_pipeline(progress_callback=progress_callback)
-    now = pd.Timestamp.now(tz="UTC")
-    predictions = result.get("predictions")
-    if predictions is not None and not predictions.empty:
-        predictions = predictions.copy()
-        times = pd.to_datetime(predictions["commence_time"], utc=True, errors="coerce")
-        eligible_predictions = predictions.loc[(times>now)&(times<=now+pd.Timedelta(days=7))].sort_values("confidence", ascending=False)
-        result["all_predictions"] = eligible_predictions.copy()
-        predictions = eligible_predictions.head(10)
-        result["predictions"] = predictions
-        try:
-            from dual_agent.sports_player_prop_predictions import generate_player_prop_picks
-            result["player_props"] = generate_player_prop_picks("NBA", eligible_predictions.to_dict("records"),
-                prediction_api_key("ODDS_API_KEY", "THE_ODDS_API_KEY"), nba_key=prediction_api_key("BALLDONTLIE_API_KEY"))
-        except Exception as exc:
-            result["player_props"] = {"picks": [], "message": "Player-prop data unavailable. Team predictions are preserved.", "errors": [f"NBA prop processing failed: {type(exc).__name__}: {exc}"]}
-        try:
-            import dual_agent.supabase_db as storage
-            ready = storage.ensure_market_edge_storage_bucket()
-            if not ready.get("success"):
-                raise RuntimeError("Prediction storage unavailable")
-            saved_at = pd.Timestamp.now(tz="UTC")
-            props = result["player_props"]
-            props["picks"] = [r for r in props.get("picks", []) if pd.Timestamp(r["start_time"])>saved_at and saved_at-pd.Timestamp(r["Captured UTC"])<=pd.Timedelta(minutes=30)]
-            payload = {"created_at": saved_at.isoformat(), "predictions": predictions.to_dict("records"), "player_props": props}
-            path = "nba/generated_picks/" + saved_at.strftime("%Y%m%dT%H%M%S%fZ") + ".json"
-            storage.get_supabase_client().storage.from_(storage.MLB_STORAGE_BUCKET).upload(path,
-                __import__("json").dumps(storage._json_safe(payload), allow_nan=False).encode(), {"content-type": "application/json", "upsert": "false"})
-        except Exception:
-            result["player_props"].setdefault("errors", []).append("Unable to save this NBA prediction snapshot.")
-    else:
-        result["player_props"] = {"picks": [], "message": "No eligible NBA games in the next seven days.", "errors": []}
+@st.cache_resource(show_spinner=False)
+def nba_enrichment_pool():
+    from concurrent.futures import ThreadPoolExecutor
+    return ThreadPoolExecutor(max_workers=2)
+
+
+def enrich_nba_props(result, odds_key, nba_key, updates, context=None):
+    """Background work returns results; the UI thread owns session state."""
+    import copy
+    if context is not None:
+        from streamlit.runtime.scriptrunner import add_script_run_ctx
+        import threading
+        add_script_run_ctx(threading.current_thread(), context)
+    result = copy.deepcopy(result)
+    try:
+        from dual_agent.sports_player_prop_predictions import generate_player_prop_picks
+        result['player_props'] = generate_player_prop_picks('NBA',
+            result['all_predictions'].to_dict('records'), odds_key, nba_key=nba_key)
+    except Exception as exc:
+        result['player_props'] = {'picks': [], 'message': 'Player-prop data unavailable. Team predictions are preserved.',
+            'errors': ['NBA prop processing failed: '+type(exc).__name__+': '+str(exc)]}
+    result['nba_props_pending'] = False
+    result['nba_snapshot_pending'] = True
+    # Publish the props before any optional storage request can delay them.
+    updates.put(copy.deepcopy(result))
+    try:
+        import dual_agent.supabase_db as storage
+        ready = storage.ensure_market_edge_storage_bucket()
+        if not ready.get('success'):
+            raise RuntimeError('Prediction storage unavailable')
+        saved_at = pd.Timestamp.now(tz='UTC')
+        props = copy.deepcopy(result['player_props'])
+        props['picks'] = [r for r in props.get('picks', []) if pd.Timestamp(r['start_time']) > saved_at
+            and pd.Timedelta(0) <= saved_at-pd.Timestamp(r['Captured UTC']) <= pd.Timedelta(minutes=30)]
+        payload = {'created_at': saved_at.isoformat(),
+            'predictions': result['all_predictions'].to_dict('records'), 'player_props': props}
+        path = 'nba/generated_picks/'+saved_at.strftime('%Y%m%dT%H%M%S%fZ')+'.json'
+        storage.get_supabase_client().storage.from_(storage.MLB_STORAGE_BUCKET).upload(path,
+            __import__('json').dumps(storage._json_safe(payload), allow_nan=False).encode(),
+            {'content-type': 'application/json', 'upsert': 'false'})
+    except Exception:
+        result['player_props'].setdefault('errors', []).append('Unable to save this NBA prediction snapshot.')
+    result['nba_snapshot_pending'] = False
     return result
+
+
+@st.fragment(run_every='3s')
+def render_nba_enrichment_status():
+    future = st.session_state.get('nba_enrichment_future')
+    if future is None:
+        return
+    updates = st.session_state.get('nba_enrichment_updates')
+    changed = False
+    if updates is not None:
+        from queue import Empty
+        while True:
+            try:
+                partial = updates.get_nowait()
+            except Empty:
+                break
+            st.session_state['nba_prediction_pipeline_result'] = partial
+            remember_game_addons('NBA', partial)
+            changed = True
+    if not future.done():
+        if changed:
+            st.rerun(scope='app')
+        current = st.session_state.get('nba_prediction_pipeline_result') or {}
+        st.caption('Picks are ready. Saving the prediction snapshot…' if not current.get('nba_props_pending')
+            else 'Game winners are ready. Player props and star forecasts are loading in the background…')
+        return
+    try:
+        complete = future.result()
+        st.session_state['nba_prediction_pipeline_result'] = complete
+        remember_game_addons('NBA', complete)
+    except Exception as exc:
+        current = st.session_state.get('nba_prediction_pipeline_result') or {}
+        current['nba_props_pending'] = False
+        current['nba_snapshot_pending'] = False
+        current.setdefault('player_props', {}).setdefault('errors', []).append(
+            'Background NBA inputs unavailable ('+type(exc).__name__+'); game winners are preserved.')
+        st.session_state['nba_prediction_pipeline_result'] = current
+    st.session_state.pop('nba_enrichment_future', None)
+    st.session_state.pop('nba_enrichment_updates', None)
+    st.rerun(scope='app')
+
+
+def run_nba_prediction_with_props(progress_callback=None):
+    pending = st.session_state.get('nba_enrichment_future')
+    if pending is not None and not pending.done():
+        return st.session_state.get('nba_prediction_pipeline_result')
+    previous = st.session_state.get('nba_prediction_pipeline_result') or {}
+    retain_sport_picks('NBA', previous.get('all_predictions', previous.get('predictions')), limit=None)
+    retain_sport_picks('NBA', previous.get('player_props', {}).get('game_picks',
+        previous.get('player_props', {}).get('picks', [])), kind='props', limit=None)
+    result = run_nba_prediction_pipeline(progress_callback=progress_callback)
+    now = pd.Timestamp.now(tz='UTC')
+    predictions = result.get('predictions')
+    if predictions is None or predictions.empty:
+        result['player_props'] = {'picks': [], 'message': 'No eligible NBA games in the next seven days.', 'errors': []}
+        result['nba_props_pending'] = False
+        return result
+    times = pd.to_datetime(predictions['commence_time'], utc=True, errors='coerce')
+    eligible = predictions.loc[(times > now) & (times <= now+pd.Timedelta(days=7))].sort_values('confidence', ascending=False)
+    result['all_predictions'] = eligible.copy()
+    result['predictions'] = eligible.head(10).copy()
+    if eligible.empty:
+        result['player_props'] = {'picks': [], 'message': 'No eligible NBA games in the next seven days.', 'errors': []}
+        result['nba_props_pending'] = False
+        return result
+    from queue import Queue
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        context = get_script_run_ctx()
+    except ImportError:
+        context = None
+    updates = Queue()
+    result['player_props'] = {'picks': [], 'game_picks': [], 'errors': [],
+        'message': 'Player props are loading; game winners are ready.'}
+    result['nba_props_pending'] = True
+    st.session_state['nba_prediction_pipeline_result'] = result
+    st.session_state['nba_enrichment_updates'] = updates
+    st.session_state['nba_enrichment_future'] = nba_enrichment_pool().submit(enrich_nba_props,
+        result, prediction_api_key('ODDS_API_KEY', 'THE_ODDS_API_KEY'),
+        prediction_api_key('BALLDONTLIE_API_KEY'), updates, context)
+    return result
+
 
 
 def load_mlb_prediction_pipeline():
@@ -1375,6 +1469,27 @@ def prop_outcome_sentence(player, market, side, line, chance):
     return f"Estimated {float(chance):.0%} chance {player} {outcome}."
 
 
+def render_nfl_prop_diagnostics(game, result, selected_market, displayed_count):
+    """Explain the selected category from saved scan data; no API calls."""
+    from dual_agent.game_prediction_addons import matching_game_rows
+    diagnostics = matching_game_rows(game, (result or {}).get('prop_diagnostics', []))
+    if selected_market != 'All qualifying markets':
+        diagnostics = [row for row in diagnostics if row['market'] == selected_market]
+    else:
+        active = [row for row in diagnostics if row['source_listings'] or row['calculated_predictions']]
+        diagnostics = active or diagnostics[:1]
+    if not diagnostics:
+        return False
+    for row in diagnostics:
+        st.markdown('**'+row['market']+' · scan result**')
+        st.caption(row['reason'])
+        st.caption(f"{row['source_listings']} returned listings → {row['accepted_lines']} lines passed quote checks → "
+                   f"{row['players_with_usable_history']} players with usable history → {row['calculated_predictions']} calculated predictions")
+        if displayed_count == 0 and row['calculated_predictions']:
+            st.warning('Predictions were calculated but did not reach this card. The issue is in game matching or display filtering, not a missing sportsbook line.')
+    return True
+
+
 def render_game_addons(league, game, result):
     """Place independently estimated spreads and eligible props inside their game."""
     if league not in ("NFL", "MLB", "NBA"):
@@ -1469,6 +1584,10 @@ def render_game_addons(league, game, result):
         st.caption('Quotes may be up to 30 minutes old. Refresh and regenerate before using current betting odds.')
     props_key = "nfl_saved_prop_cards" if league == "NFL" else f"{league.lower()}_saved_props_cards"
     props = matching_game_rows(game, st.session_state.get(props_key))
+    if league == 'NFL' and not props:
+        # Completed background results are usable even before the session-card
+        # archive has been seeded. Still require exact teams and kickoff.
+        props = matching_game_rows(game, (result or {}).get('nfl_player_props'))
     from dual_agent.preferred_sportsbooks import allowed, diversify
     props = [p for p in props if allowed(p.get('best_sportsbook', p.get('Best sportsbook')))]
     if league in ('NBA', 'MLB'):
@@ -1476,6 +1595,8 @@ def render_game_addons(league, game, result):
                            historical_support=p.get('Estimated chance', 0), estimated_return_per_unit=p.get('Estimated return per unit', 0),
                            sportsbook_offers=p.get('Sportsbook offers', [])) for p in props]
         with st.expander(f'🎯 {league} player props · ranked by estimated cover chance', expanded=True):
+            if league == 'NBA' and (result or {}).get('nba_props_pending'):
+                st.info('Game winners are ready. Player props are still loading in the background.')
             st.caption('Preferred platforms: Polymarket, Underdog, DraftKings, PrizePicks, FanDuel · overall strongest picks plus independent category rankings.')
             st.caption('Strongest available estimates in each category · no probability cutoff · one exact listed offer and sufficient usable history required. Odds do not affect ranking.')
             render_prop_category_rankings(normalized, league)
@@ -1572,7 +1693,13 @@ def render_game_addons(league, game, result):
             props = [dict(p, _list_name='probability', _list_rank=i) for i, p in enumerate(probability_props, 1)]
         if not props:
             issues = (result or {}).get("prop_issues", []) if league == "NFL" else (result or {}).get("player_props", {}).get("errors", [])
-            st.info("Collecting fresh sportsbook lines and scoring player props…" if league == "NFL" and (result or {}).get("enrichment_pending") else "No eligible player props for this matchup yet. A listed exact bet and usable history are required; no probability cutoff applies. Odds are reference only.")
+            if league == 'NFL':
+                if (result or {}).get('enrichment_pending'):
+                    st.info('Collecting sportsbook lines and scoring player props…')
+                elif not render_nfl_prop_diagnostics(game, result, selected_market, len(props)):
+                    st.info('No saved scan details for this game/category. Generate predictions once to collect its category-specific results.')
+            else:
+                st.info('No eligible player props for this matchup yet. A listed exact bet and usable history are required; no probability cutoff applies. Odds are reference only.')
             if league == "MLB":
                 from collections import Counter
                 exclusions = (result or {}).get('player_props', {}).get('exclusions', [])
@@ -1582,8 +1709,15 @@ def render_game_addons(league, game, result):
                     st.caption(f'{count} candidates: {reason}')
             if issues and league == "NFL":
                 matching = [issue for issue in issues if str(game.get("home_team", "")) in issue and str(game.get("away_team", "")) in issue]
-                for issue in matching or issues[:1]:
-                    st.caption(str(issue))
+                if matching:
+                    with st.expander('Other scan notes for this game', expanded=False):
+                        for issue in matching:
+                            if 'Listed markets awaiting a matching history/scoring model:' in str(issue):
+                                st.caption('Some listed quarter, half, fantasy or other markets do not yet have a matching statistical model. This does not explain an empty full-game category above.')
+                            else:
+                                st.caption(str(issue))
+                elif any('NFL_PROP_PROBABILITY_VERSION' in str(issue) for issue in issues):
+                    st.warning('The NFL prop pipeline needs updating. Deploy the supplied nfl_player_prop_prediction_pipeline.py before generating again.')
         from contextlib import nullcontext
         for rank, prop in enumerate(props, 1):
             with prop.get("_display_column", nullcontext()), st.container(border=True):
