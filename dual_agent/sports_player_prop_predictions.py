@@ -217,37 +217,12 @@ def fetch_prop_quotes(league, games, odds_key):
 
 
 def _nba_history(player, api_key):
-    """Cache immutable completed box scores daily; never include ongoing games."""
-    now = pd.Timestamp.now(tz='UTC')
-    root = Path('nba_player_history_cache'); root.mkdir(exist_ok=True)
-    path = root/(name_key(player)+'_'+now.strftime('%Y%m%d')+'.json')
-    if path.exists(): return json.loads(path.read_text())
-    base = 'https://api.balldontlie.io/nba/v1'
-    result = _get(base+'/players', api_key, {'search':player,'per_page':100}, True)
-    matches = [p for p in result.get('data', []) if name_key(p.get('first_name','')+' '+p.get('last_name',''))==name_key(player)]
-    if len(matches)!=1: return []
-    rows = []; cursor = None
-    for _ in range(10):
-        params = {'player_ids[]':matches[0]['id'],'start_date':(now-pd.Timedelta(days=365)).strftime('%Y-%m-%d'), 'end_date':(now-pd.Timedelta(days=2)).strftime('%Y-%m-%d'),'per_page':100}
-        if cursor is not None: params['cursor'] = cursor
-        response = _get(base+'/stats', api_key, params, True)
-        for row in response.get('data', []):
-            game = row.get('game', {})
-            date = pd.to_datetime(game.get('date'), utc=True, errors='coerce')
-            minutes = str(row.get('min') or '0').split(':')[0]
-            try: played = float(minutes or 0)>0
-            except ValueError: played = False
-            if (str(game.get('status','')).startswith('Final') and pd.notna(date)
-                    and date+pd.Timedelta(hours=48)<now and played):
-                rows.append(dict(row, source_date=date.isoformat()))
-        cursor = response.get('meta', {}).get('next_cursor')
-        if cursor is None: break
-    else:
-        raise RuntimeError('NBA history pagination incomplete; player omitted.')
-    rows = list({r['game']['id']:r for r in rows}.values())
-    rows.sort(key=lambda r:(r['source_date'],r['game']['id']))
-    path.write_text(json.dumps(rows))
-    return rows
+    """Use the identical identity resolution and history cache as the batch loader."""
+    for name, rows, issue in _nba_history_batches([player], api_key):
+        if issue:
+            raise RuntimeError(issue)
+        return rows
+    return []
 
 
 def _nba_request_issue(exc):
@@ -279,7 +254,7 @@ def _nba_history_batches(names, api_key, status=None):
         path = root/(name_key(name)+'_'+day+'.json')
         try:
             rows = json.loads(path.read_text())
-            if not isinstance(rows, list): raise ValueError('Invalid history cache')
+            if not isinstance(rows, list) or not rows: raise ValueError('Empty or invalid history cache')
             yield name, rows, None
         except (OSError, ValueError):
             missing.append(name)
@@ -358,8 +333,9 @@ def _nba_history_batches(names, api_key, status=None):
         for name, pid in batch:
             rows = list({r['game']['id']: r for r in rows_by_id[pid]}.values())
             rows.sort(key=lambda r:(r['source_date'], r['game']['id']))
-            save(root/(name_key(name)+'_'+day+'.json'), rows)
-            yield name, rows, None
+            if rows:
+                save(root/(name_key(name)+'_'+day+'.json'), rows)
+            yield name, rows, None if rows else 'No completed played-game statistics returned for '+name+'.'
 
 
 def mlb_prop_identities(snapshots):
@@ -491,6 +467,8 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
 
 def _rank_prop_candidates(league, games, groups, history_by_name, errors,
                           star_rosters, identities, mlb_histories):
+    if league == 'NBA':
+        from dual_agent.nba_star_spotlight import build_star_spotlights
     picks = []; exclusions = []; pitcher_forecasts = []
     def excluded(first, player, market, line, reason):
         exclusions.append({'Player': player, 'Market': MARKETS[league].get(market, (market, None))[0], 'Line': line,
@@ -565,6 +543,13 @@ def _rank_prop_candidates(league, games, groups, history_by_name, errors,
                 if not paired_probabilities:
                     estimate['Estimate method'] = 'Prior 30 appearances + neutral shrinkage; one-sided sportsbook quote'
                 best = max(available, key=lambda q:q[price_key])
+                if league == 'NBA':
+                    opposite = 'Under' if side == 'Over' else 'Over'
+                    counterpart = estimate_prop(values, line, opposite, 1-market_p,
+                                                minimum=10, minimum_decisions=10)
+                    estimate['Over chance'] = estimate['Estimated chance'] if side == 'Over' else counterpart['Estimated chance']
+                    estimate['Under chance'] = estimate['Estimated chance'] if side == 'Under' else counterpart['Estimated chance']
+                    estimate['Opposite side offered'] = any((q.get('under_decimal_odds' if side == 'Over' else 'over_decimal_odds') or 0) > 1 for q in unique.values())
                 value_eligible = False
                 push_chance = estimate['Historical pushes']/estimate['Prior games']
                 expected_return = (1-push_chance)*(estimate['Estimated chance']*best[price_key]-1)
@@ -573,7 +558,7 @@ def _rank_prop_candidates(league, games, groups, history_by_name, errors,
                               'Market chance':market_p,'Best sportsbook':best['book'],'Best decimal odds':best[price_key], 'Sportsbook offers':[{'book':q['book'], 'decimal_odds':q[price_key]} for q in available], 'Estimated return per unit':expected_return,'Value eligible':value_eligible,'Break-even cover chance':1/best[price_key],'Estimated push chance':push_chance,'Books':len(available),'Game':first['away_team']+' @ '+first['home_team'],
                               'start_time':first['start_time'],'Captured UTC':first['capture_time'],
                               **({'Participation status': participation, 'Event match': first.get('Event match')} if league=='MLB' else {}), **estimate})
-        if league == 'MLB' and not qualified:
+        if league in ('MLB', 'NBA') and not qualified:
             excluded(first, player, market, line, 'No offered side has sufficient usable history for an estimate.')
     # One side of one line per player/market/game; avoid ranking duplicate books or alternatives.
     picks.sort(key=lambda r:(-r['Estimated chance'],-r['Prior games'],r['Player']))
