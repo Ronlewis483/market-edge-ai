@@ -380,19 +380,62 @@ def mlb_prop_identities(snapshots):
     return {key: next(iter(values.values())) for key, values in candidates.items() if len(values) == 1}
 
 
-def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapshots=None, nba_key=None, progress=None):
+def nba_sportsbook_prop_picks(quotes, errors):
+    """Market probabilities only; never invent a player-history model or sample."""
+    groups = {}
+    for quote in quotes:
+        groups.setdefault((quote['event_id'], quote['player'], quote['market'], quote['line']), []).append(quote)
+    picks = []; listings = []
+    for (_, player, market, line), group in groups.items():
+        first = group[0]
+        # Pick'em indicative feed prices do not establish standalone win chances.
+        priced = {q['book']: q for q in group if standalone_value(q['book'])}
+        paired = [q['over_probability'] for q in priced.values() if q.get('over_probability') is not None]
+        for side, field in [('Over','over_decimal_odds'), ('Under','under_decimal_odds')]:
+            offered = [q for q in priced.values() if (q.get(field) or 0)>1]
+            unpriced = [q for q in group if not standalone_value(q['book']) and (q.get(field) or 0)>1]
+            for quote in unpriced:
+                listings.append({'Player':player, 'Market':MARKETS['NBA'][market][0], 'Pick':side,
+                    'Line':line, 'Best sportsbook':quote['book'],
+                    'Game':first['away_team']+' @ '+first['home_team'], 'start_time':first['start_time']})
+            if not offered: continue
+            if paired:
+                over = float(np.median(paired))
+                chance = over if side=='Over' else 1-over
+                method = 'Median of same-line, same-book paired implied probabilities with margin normalized out'
+            else:
+                chance = float(np.median([1/q[field] for q in offered]))
+                method = 'Single-side implied probability from quoted prices; bookmaker margin remains'
+            best = max(offered, key=lambda q:q[field])
+            picks.append({'Player':player, 'Market':MARKETS['NBA'][market][0], 'Pick':side,
+                'Line':line, 'Estimated chance':chance, 'Probability source':'sportsbook_implied',
+                'Estimate method':method, 'Prior games':0, 'Projected stat':None,
+                'Best sportsbook':best['book'], 'Best decimal odds':best[field],
+                'Sportsbook offers':[{'book':q['book'],'decimal_odds':q[field]} for q in offered],
+                'Books':len(offered), 'Game':first['away_team']+' @ '+first['home_team'],
+                'start_time':first['start_time'], 'Captured UTC':first['capture_time']})
+    picks.sort(key=lambda row:(-row['Estimated chance'],row['Player'],row['Market'],row['Line']))
+    return {'picks':picks[:10], 'game_picks':picks, 'errors':list(errors),
+        'probability_source':'sportsbook_implied', 'unpriced_listings':listings,
+        'message':f'{len(picks)} actual sportsbook sides ranked by market-implied probability.',
+        'note':'Sportsbook-implied probabilities are not independent model predictions. No player history or injury verification was used.'}
+
+
+def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapshots=None, nba_key=None, progress=None, nba_history_enabled=False):
     if not odds_key and league != 'NBA':
         return {'picks':[], 'message':'Player props need the configured Odds API key.', 'errors':[]}
     if league == 'NBA' and progress:
         progress({'picks': [], 'game_picks': [], 'errors': [], 'loading_progress': {'stage': 'Finding sportsbook lines', 'completed': 0, 'total': 0}})
     try:
-        quotes, errors = fetch_prop_quotes(league, games, odds_key) if odds_key else ([], ['Sportsbook key unavailable; statistical star projections only.'])
+        quotes, errors = fetch_prop_quotes(league, games, odds_key) if odds_key else ([], ['Sportsbook API key unavailable.'])
     except Exception as exc:
         if league != 'NBA':
             raise
-        quotes, errors = [], [f'NBA sportsbook lines unavailable: {type(exc).__name__}: {exc}. Star projections use prior statistics only.']
+        quotes, errors = [], [f'NBA sportsbook lines unavailable: {type(exc).__name__}: {exc}.']
     if not quotes and league != 'NBA':
         return {'picks':[], 'message':'No fresh eligible sportsbook player-prop lines are available for upcoming games.', 'errors':errors}
+    if league == 'NBA' and not nba_history_enabled:
+        return nba_sportsbook_prop_picks(quotes, errors)
     groups = {}
     for q in quotes:
         groups.setdefault((q['event_id'],q['player'],q['market'],q['line']), []).append(q)
