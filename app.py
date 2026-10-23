@@ -1048,11 +1048,22 @@ def render_nba_enrichment_status():
             remember_game_addons('NBA', partial)
             changed = True
     if not future.done():
-        if changed:
-            st.rerun(scope='app')
+        # Poll this small fragment only. Background progress must not repeatedly
+        # redraw the prediction workspace or interrupt the selected game.
         current = st.session_state.get('nba_prediction_pipeline_result') or {}
-        st.caption('Picks are ready. Saving the prediction snapshot…' if not current.get('nba_props_pending')
-            else 'Game winners are ready. Player props and star forecasts are loading in the background…')
+        props = current.get('player_props', {})
+        progress = props.get('loading_progress', {})
+        st.caption(progress.get('stage') or ('Saving the prediction snapshot…'
+            if not current.get('nba_props_pending') else 'Loading NBA player props…'))
+        total, completed = progress.get('total', 0), progress.get('completed', 0)
+        if total:
+            st.progress(min(completed / total, 1.0),
+                        text=f'Player history checked: {completed} of {total}')
+        for issue in props.get('errors', [])[-3:]:
+            st.warning(str(issue))
+        if props.get('game_picks') or props.get('picks'):
+            if st.button('Show latest completed NBA props', key='nba_show_partial_props'):
+                st.rerun(scope='app')
         return
     try:
         complete = future.result()
