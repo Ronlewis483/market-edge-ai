@@ -71,6 +71,10 @@ def nba_market_value(row, stat):
 
 
 def _get(url, key, params=None, balldontlie=False):
+    if balldontlie:
+        # Share plan-aware pacing and 429 handling with NBA game history.
+        from dual_agent.balldontlie_data import _balldontlie_get
+        return _balldontlie_get(url, params=params, api_key=key)
     response = cached_odds_get(url, params=params, headers={'Authorization': key} if balldontlie else None, timeout=20)
     if response.status_code != 200:
         raise RuntimeError('Player-prop data request failed (HTTP '+str(response.status_code)+').')
@@ -288,19 +292,32 @@ def mlb_prop_identities(snapshots):
 
 
 def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapshots=None, nba_key=None):
-    if not odds_key:
+    if not odds_key and league != 'NBA':
         return {'picks':[], 'message':'Player props need the configured Odds API key.', 'errors':[]}
-    quotes, errors = fetch_prop_quotes(league, games, odds_key)
-    if not quotes:
+    try:
+        quotes, errors = fetch_prop_quotes(league, games, odds_key) if odds_key else ([], ['Sportsbook key unavailable; statistical star projections only.'])
+    except Exception as exc:
+        if league != 'NBA':
+            raise
+        quotes, errors = [], [f'NBA sportsbook lines unavailable: {type(exc).__name__}: {exc}. Star projections use prior statistics only.']
+    if not quotes and league != 'NBA':
         return {'picks':[], 'message':'No fresh eligible sportsbook player-prop lines are available for upcoming games.', 'errors':errors}
     groups = {}
     for q in quotes:
         groups.setdefault((q['event_id'],q['player'],q['market'],q['line']), []).append(q)
     history_by_name = {}; identities = {}; mlb_histories = {}
     if league=='NBA':
+        from dual_agent.nba_star_spotlight import collect_star_rosters, build_star_spotlights, key as star_key
+        star_rosters = collect_star_rosters(games)
         if not nba_key:
-            return {'picks':[], 'message':'NBA prop estimates need BALLDONTLIE_API_KEY and access to player game stats.', 'errors':errors}
-        names = sorted({q['player'] for q in quotes})
+            errors.append('NBA projections need BALLDONTLIE_API_KEY and access to player game stats.')
+        # Fetch each unique player once, reusing the existing daily history cache.
+        # Stars remain visible even without any available sportsbook market.
+        names_by_key = {star_key(q['player']): q['player'] for q in quotes}
+        for roster in star_rosters.values():
+            for player in roster['players']:
+                names_by_key.setdefault(star_key(player['player']), player['player'])
+        names = sorted(names_by_key.values()) if nba_key else []
         def collect(player):
             try:return player, _nba_history(player,nba_key), None
             except Exception:return player, [], 'Prior game stats unavailable for '+player
@@ -308,6 +325,10 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
             for player, history, error in pool.map(collect,names):
                 history_by_name[player] = history
                 if error:errors.append(error)
+        # Provider spellings may differ only in accents or punctuation.
+        by_key = {star_key(name): rows for name, rows in history_by_name.items()}
+        for q in quotes:
+            history_by_name[q['player']] = by_key.get(star_key(q['player']), [])
     else:
         if player_logs is None or player_logs.empty:
             return {'picks':[], 'message':'MLB player warehouse is unavailable; no prop estimates generated.', 'errors':errors}
@@ -418,5 +439,7 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
         if key not in seen:
             seen.add(key);chosen.append(pick)
         # Retain eligible picks for every matchup; the global list stays top ten.
-    return {'picks':chosen[:10],'game_picks':chosen,'errors':errors, **({'exclusions': exclusions, 'quoted_candidates':len(groups), 'pitcher_forecasts':pitcher_forecasts} if league in ('MLB','NBA') else {}), 'message':f'{len(chosen)} player-prop estimates ranked from actual lines and prior appearances.',
+    return {'picks':chosen[:10],'game_picks':chosen,'errors':errors,
+            **({'star_spotlights': build_star_spotlights(games, star_rosters, history_by_name, chosen)} if league == 'NBA' else {}),
+            **({'exclusions': exclusions, 'quoted_candidates':len(groups), 'pitcher_forecasts':pitcher_forecasts} if league in ('MLB','NBA') else {}), 'message':f'{len(chosen)} player-prop estimates ranked from actual lines and prior appearances.',
             'note':'Estimated chance is conditional on no push and player participation. Estimates are not calibrated; no availability or injury clearance is implied.'}
