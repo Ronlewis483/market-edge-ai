@@ -374,7 +374,7 @@ def _select_consensus_props(prop_lines):
             for side, quotes in offers.groupby('side'):
                 quotes = quotes.drop_duplicates('bookmaker_key', keep='last')
                 if len(quotes) >= 1:
-                    sides[side] = quotes[['bookmaker_key','american_odds']].to_dict('records')
+                    sides[side] = quotes[['bookmaker_key','american_odds','last_update']].to_dict('records')
             if sides:
                 lines.append((max(len(q) for q in sides.values()), float(line), sides))
         if not lines:
