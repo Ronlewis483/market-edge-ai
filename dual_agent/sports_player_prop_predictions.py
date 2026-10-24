@@ -421,7 +421,45 @@ def nba_sportsbook_prop_picks(quotes, errors):
         'note':'Sportsbook-implied probabilities are not independent model predictions. No player history or injury verification was used.'}
 
 
-def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapshots=None, nba_key=None, progress=None, nba_history_enabled=False):
+def estimate_nba_history(values, line, side):
+    """Independent, smoothed prior-game frequency; no sportsbook probability input."""
+    estimate = estimate_prop(values,line,side,.5,minimum=10,minimum_decisions=10)
+    if estimate is None: return None
+    estimate['Estimated chance'] = (estimate['Historical wins']+1)/(estimate['Non-push games']+2)
+    estimate['Estimate method'] = 'Last 30 completed played-game results + Beta(1,1) smoothing; sportsbook prices excluded'
+    estimate['Probability source'] = 'player_history'
+    estimate['Statistics source'] = 'API-Sports NBA'
+    estimate['Availability status'] = 'Participation and expected minutes not verified'
+    return estimate
+
+
+def generate_api_sports_props(games, quotes, api_key, errors, progress=None):
+    from dual_agent.nba_api_sports_history import load_histories
+    groups = {}
+    for quote in quotes:
+        groups.setdefault((quote['event_id'],quote['player'],quote['market'],quote['line']),[]).append(quote)
+    names=list(dict.fromkeys(q['player'] for q in sorted(quotes,key=lambda q:q['start_time'])))
+    def publish(stage):
+        if progress:
+            progress({'picks':[],'game_picks':[],'errors':list(errors),'probability_source':'player_history',
+                      'loading_progress':{'completed':0,'total':len(names),'stage':stage}})
+    if not names:
+        return {'picks':[],'game_picks':[],'errors':list(errors),'probability_source':'player_history',
+                'message':'No fresh sportsbook player lines were returned. No statistical bet prediction generated.'}
+    publish('Loading shared API-Sports NBA player history')
+    histories,issues=load_histories(names,api_key,progress=publish)
+    errors=list(errors)+issues
+    # Salary-based star selection is display-only and does not change the equation.
+    from dual_agent.nba_star_spotlight import collect_star_rosters
+    rosters=collect_star_rosters(games)
+    result=_rank_prop_candidates('NBA',games,groups,histories,errors,rosters,{}, {})
+    result.update(probability_source='player_history',statistics_source='API-Sports NBA',
+        message=f"{len(result['game_picks'])} independently calculated player-history estimates from actual sportsbook lines.",
+        note='Smoothed historical probabilities, not calibrated forecasts. Minutes, injuries and opponent adjustments are not verified inputs yet.')
+    return result
+
+
+def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapshots=None, nba_key=None, progress=None, nba_history_enabled=False, api_sports_key=None):
     if not odds_key and league != 'NBA':
         return {'picks':[], 'message':'Player props need the configured Odds API key.', 'errors':[]}
     if league == 'NBA' and progress:
@@ -434,6 +472,8 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
         quotes, errors = [], [f'NBA sportsbook lines unavailable: {type(exc).__name__}: {exc}.']
     if not quotes and league != 'NBA':
         return {'picks':[], 'message':'No fresh eligible sportsbook player-prop lines are available for upcoming games.', 'errors':errors}
+    if league == 'NBA' and api_sports_key:
+        return generate_api_sports_props(games,quotes,api_sports_key,errors,progress)
     if league == 'NBA' and not nba_history_enabled:
         return nba_sportsbook_prop_picks(quotes, errors)
     groups = {}
@@ -530,7 +570,7 @@ def _rank_prop_candidates(league, games, groups, history_by_name, errors,
         probability = float(np.median(paired_probabilities)) if paired_probabilities else .5
         stat = MARKETS[league][market][1]
         if league=='NBA':
-            values = [nba_market_value(r, stat) for r in history_by_name.get(player, []) if pd.Timestamp(r['source_date'])+pd.Timedelta(hours=48)<start]
+            values = [nba_market_value(r, stat) for r in history_by_name.get(player, []) if pd.Timestamp(r['source_date'])+(pd.Timedelta(0) if r.get('history_provider')=='api_sports' else pd.Timedelta(hours=48))<min(start,pd.Timestamp(first['capture_time']))]
         else:
             identity = identities.get((int(first['game_id']),name_key(player)))
             if not identity:
@@ -569,6 +609,8 @@ def _rank_prop_candidates(league, games, groups, history_by_name, errors,
             estimate = estimate_prop(values,line,side,market_p,
                 minimum=1 if league == 'MLB' and pitching_market else 10,
                 minimum_decisions=8 if league == 'MLB' and not pitching_market else None)
+            if league == 'NBA':
+                estimate = estimate_nba_history(values,line,side)
             if estimate and league == 'MLB' and pitching_market:
                 best_forecast = max(available, key=lambda q:q[price_key])
                 pitcher_forecasts.append({'game_id': int(first['game_id']), 'player_id': identity[0],
@@ -584,13 +626,12 @@ def _rank_prop_candidates(league, games, groups, history_by_name, errors,
             enough_history = estimate and estimate['Prior games'] >= 10 and estimate['Prior games']-estimate['Historical pushes'] >= required_decisions
             if enough_history:
 
-                if not paired_probabilities:
+                if league != 'NBA' and not paired_probabilities:
                     estimate['Estimate method'] = 'Prior 30 appearances + neutral shrinkage; one-sided sportsbook quote'
                 best = max(available, key=lambda q:q[price_key])
                 if league == 'NBA':
                     opposite = 'Under' if side == 'Over' else 'Over'
-                    counterpart = estimate_prop(values, line, opposite, 1-market_p,
-                                                minimum=10, minimum_decisions=10)
+                    counterpart = estimate_nba_history(values,line,opposite)
                     estimate['Over chance'] = estimate['Estimated chance'] if side == 'Over' else counterpart['Estimated chance']
                     estimate['Under chance'] = estimate['Estimated chance'] if side == 'Under' else counterpart['Estimated chance']
                     estimate['Opposite side offered'] = any((q.get('under_decimal_odds' if side == 'Over' else 'over_decimal_odds') or 0) > 1 for q in unique.values())
