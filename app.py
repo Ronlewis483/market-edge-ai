@@ -745,6 +745,7 @@ def render_league_prediction_results(
             started = start_nba_prop_loading(pipeline_result)
             if started: pipeline_result = started
         render_nba_enrichment_status()
+        st.caption('NBA team winners use the separate team-form model. Player injuries and expected minutes are not inputs to that winner equation.')
         load_times = pipeline_result.get('player_props', {}).get('loading_timings_seconds', {})
         if load_times:
             with st.expander('NBA prop loading time', expanded=False):
@@ -1227,7 +1228,14 @@ def merge_nba_display_props(previous, incoming):
         for row in payload.get('game_picks', payload.get('picks', [])):
             identity = tuple(str(row.get(k, '')) for k in ('Game','start_time','Player','Market','Pick','Line'))
             rows[identity] = row
-    ordered = sorted(rows.values(), key=lambda r: -float(r.get('Estimated chance', 0)))
+    from dual_agent.sports_player_prop_predictions import nba_identity_key
+    blocked = set(merged.get('unavailable_players', []))
+    now = pd.Timestamp.now(tz='UTC')
+    visible = [r for r in rows.values() if pd.to_datetime(r.get('start_time'),utc=True,errors='coerce')<=now
+               or (nba_identity_key(r.get('Player')) not in blocked
+                   and not (merged.get('scan_complete') and merged.get('nba_prop_model_version')==2
+                            and r.get('NBA prop model version',1)!=2))]
+    ordered = sorted(visible, key=lambda r: -float(r.get('Estimated chance', 0)))
     merged['game_picks'] = ordered; merged['picks'] = ordered[:10]
     return merged
 
@@ -1256,11 +1264,15 @@ def render_nba_prop_tracking():
     with st.expander('NBA prop results · covered / missed', expanded=False):
         st.caption('Frozen model recommendations, not placed bets. One stronger offered side per exact line. Missing final stats remain pending; sportsbook void rules require review.')
         frame = pd.DataFrame(records)
+        frame['Model version'] = pd.to_numeric(frame.get('NBA prop model version',pd.Series(1,index=frame.index)),errors='coerce').fillna(1).astype(int)
+        versions = sorted(frame['Model version'].unique().tolist(),reverse=True)
+        version = st.selectbox('NBA prop model version',versions,key='nba_tracking_model_version')
+        frame = frame.loc[frame['Model version']==version]
         decided = frame[frame['Tracking status'].isin(['Covered','Missed'])]
         covered = int((decided['Tracking status']=='Covered').sum())
         st.write(f'{covered} covered / {len(decided)} decided'+(f' · {covered/len(decided):.1%}' if len(decided) else ''))
         st.caption('Pushes and pending results are excluded from the accuracy rate. Results update when the background player-history scan runs.')
-        cols = [c for c in ['Game','Player','Market','Pick','Line','Estimated chance','Actual stat','Tracking status','start_time'] if c in frame]
+        cols = [c for c in ['Game','Player','Market','Pick','Line','Estimated chance','Actual stat','Tracking status','Model version','start_time'] if c in frame]
         st.dataframe(frame.sort_values('start_time', ascending=False)[cols], hide_index=True, use_container_width=True)
 
 
@@ -1275,6 +1287,12 @@ def render_nba_live_prop_cards(game, fallback):
         rows = matching_game_rows(game, st.session_state.get('nba_saved_props_cards'))
     from dual_agent.preferred_sportsbooks import allowed
     rows = [r for r in rows if allowed(r.get('Best sportsbook'))]
+    from dual_agent.sports_player_prop_predictions import nba_identity_key
+    blocked = set(payload.get('unavailable_players', []))
+    rows = [r for r in rows if pd.to_datetime(r.get('start_time'),utc=True,errors='coerce')<=pd.Timestamp.now(tz='UTC')
+            or (nba_identity_key(r.get('Player')) not in blocked
+                and not (payload.get('scan_complete') and payload.get('nba_prop_model_version')==2
+                         and r.get('NBA prop model version',1)!=2))]
     normalized = [dict(r, market=r.get('Market'), player=r.get('Player')) for r in rows]
     import hashlib
     identity = '|'.join(str(game.get(k,'')) for k in ('home_team','away_team','commence_time'))
@@ -1881,7 +1899,7 @@ def render_prop_comparisons(props, pending=False, limit=5, scope='main'):
         with st.container(border=True):
             title = f"{pair['player']} · {pair['market']}" if pair['binary'] else f"{pair['player']} · {pair['line']:g} {pair['market']}"
             st.markdown(f'**#{rank} · {title}**')
-            st.caption('Sportsbook-implied probabilities · not an independent player forecast' if pair['source']=='sportsbook_implied' else 'Historical estimates · conditional on participation and no push; not calibrated')
+            st.caption('Sportsbook-implied probabilities · not an independent player forecast' if pair['source']=='sportsbook_implied' else ('Minutes-adjusted count forecast · conditional on playing and no push; uncalibrated' if any(p.get('NBA prop model version')==2 for p in pair['sides'].values()) else 'Historical estimates · conditional on participation and no push; not calibrated'))
             for column,side,label in zip(st.columns(2),('Over','Under'),('YES','NO')):
                 with column:
                     prop = pair['sides'].get(side)
@@ -1900,6 +1918,9 @@ def render_prop_comparisons(props, pending=False, limit=5, scope='main'):
                     if prop.get('Statistics source'): st.caption('Statistics: '+prop['Statistics source'])
                     if prop.get('Estimate method'): st.caption(prop['Estimate method'])
                     if prop.get('Availability status'): st.caption(prop['Availability status'])
+                    if prop.get('NBA prop model version') == 2:
+                        st.caption(f"Estimated minutes: {prop['Expected minutes']:.1f} · recent {prop['Minutes sample']} appearances · projected stat: {prop['Projected stat']:.2f}")
+                        st.caption(prop.get('Opponent context','Opponent context unavailable'))
                     if prop.get('Historical wins') is not None:
                         st.caption(f"Covered in {int(prop['Historical wins'])} of {int(prop['Non-push games'])} non-push appearances")
                     elif prop.get('Prior games'):
