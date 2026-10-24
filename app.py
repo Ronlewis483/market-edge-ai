@@ -1014,7 +1014,7 @@ def enrich_nba_props(result, odds_key, nba_key, updates, context=None):
             updates.put(partial)
         result['player_props'] = generate_player_prop_picks('NBA',
             result['all_predictions'].to_dict('records'), odds_key, nba_key=nba_key,
-            progress=publish_progress, api_sports_key=nba_key)
+            progress=publish_progress, nba_history_enabled=True)
     except Exception as exc:
         result['player_props'] = {'picks': [], 'message': 'Player-prop data unavailable. Team predictions are preserved.',
             'errors': ['NBA prop processing failed: '+type(exc).__name__+': '+str(exc)]}
@@ -1115,7 +1115,7 @@ def start_nba_prop_loading(result):
     st.session_state['nba_enrichment_updates'] = updates
     st.session_state['nba_enrichment_future'] = nba_enrichment_pool().submit(enrich_nba_props,
         result, prediction_api_key('ODDS_API_KEY', 'THE_ODDS_API_KEY'),
-        prediction_api_key('API_SPORTS_KEY'), updates, context)
+        prediction_api_key('BALLDONTLIE_API_KEY'), updates, context)
     return result
 
 
