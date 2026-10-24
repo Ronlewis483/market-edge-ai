@@ -447,7 +447,7 @@ def generate_api_sports_props(games, quotes, api_key, errors, progress=None):
         return {'picks':[],'game_picks':[],'errors':list(errors),'probability_source':'player_history',
                 'message':'No fresh sportsbook player lines were returned. No statistical bet prediction generated.'}
     publish('Loading shared API-Sports NBA player history')
-    histories,issues=load_histories(names,api_key,progress=publish)
+    histories,issues=load_histories(names,api_key,progress=publish,games=games)
     errors=list(errors)+issues
     # Salary-based star selection is display-only and does not change the equation.
     from dual_agent.nba_star_spotlight import collect_star_rosters
