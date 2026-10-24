@@ -230,6 +230,18 @@ def load_player_history(seasons):
             'No completed player games matched the schedule.'
         )
 
+    # Settlement evidence is metadata only; historical model values are unchanged.
+    activity = pd.Series(False, index=stats.index)
+    for column in ['attempts','passing_attempts','completions','carries','rushing_attempts',
+                   'targets','receptions','fg_att','pat_att','fg_made','pat_made',
+                   'offense_snaps','defense_snaps','def_tackles_solo','def_tackles_with_assist',
+                   'def_sacks','def_interceptions','passing_sacks','sack_fumbles',
+                   'rushing_tds','receiving_tds','special_teams_tds','def_tds']:
+        if column in stats:
+            activity |= pd.to_numeric(stats[column], errors='coerce').gt(0)
+    participation = stats[['player','team','game_time']].copy()
+    participation['participation_verified'] = activity
+    participation = participation.groupby(['player','team','game_time'],as_index=False)['participation_verified'].max()
     records = []
 
     # Standard player prop markets.
@@ -352,6 +364,8 @@ def load_player_history(seasons):
         .str.strip()
         .ne('')
     ]
+
+    result = result.merge(participation,on=['player','team','game_time'],how='left',validate='many_to_one')
 
     return (
         result
