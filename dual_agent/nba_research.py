@@ -2038,6 +2038,84 @@ def build_balldontlie_future_matchup_features(
 # BALLDONTLIE LIVE NBA PREDICTION MODEL
 # ============================================================
 
+NBA_PROBABILITY_VERSION = 3
+
+
+def _nba_model_pipeline():
+    return Pipeline([('scaler', StandardScaler()),
+        ('model', LogisticRegression(max_iter=2000, C=0.1, random_state=42))])
+
+
+def _nba_home_probabilities(model, features, calibrator=None):
+    classes = list(model.classes_)
+    if set(classes) != {0, 1}:
+        raise ValueError('NBA target classes must be 0=away win and 1=home win.')
+    raw = np.asarray(model.predict_proba(features)[:, classes.index(1)], dtype=float)
+    if calibrator is None: return raw
+    score = np.log(np.clip(raw, 1e-7, 1-1e-7) / np.clip(1-raw, 1e-7, 1-1e-7)).reshape(-1, 1)
+    return np.asarray(calibrator.predict_proba(score)[:, list(calibrator.classes_).index(1)], dtype=float)
+
+
+def _nba_fit_calibrator(model, frame, features):
+    if len(frame) < 200 or frame.home_win.nunique() != 2:
+        return None
+    raw = _nba_home_probabilities(model, frame[features])
+    score = np.log(np.clip(raw, 1e-7, 1-1e-7) / np.clip(1-raw, 1e-7, 1-1e-7)).reshape(-1, 1)
+    calibrator = LogisticRegression(C=1.0, max_iter=1000, random_state=42)
+    calibrator.fit(score, frame.home_win.astype(int))
+    # An inverted relationship is a failure signal, not a license to flip picks.
+    return calibrator if float(calibrator.coef_[0, 0]) > 0 else None
+
+
+def _nba_chronological_tail(frame, minimum=300):
+    """Keep every game on the same date on one side of the boundary."""
+    boundary = frame.iloc[-minimum]['game_date'].normalize()
+    return frame[frame.game_date < boundary].copy(), frame[frame.game_date >= boundary].copy()
+
+
+def _nba_probability_metrics(actual, probabilities):
+    actual = np.asarray(actual, dtype=int)
+    p = np.clip(np.asarray(probabilities, dtype=float), 1e-7, 1-1e-7)
+    return {'games':len(actual), 'accuracy':float(np.mean((p >= .5) == actual)),
+        'brier_score':float(np.mean((p-actual)**2)),
+        'log_loss':float(-np.mean(actual*np.log(p)+(1-actual)*np.log(1-p)))}
+
+
+def _nba_recent_holdout(frame, features):
+    """One fixed chronological assessment, separate from final live fitting."""
+    earlier, audit = _nba_chronological_tail(frame)
+    train, calibration = _nba_chronological_tail(earlier)
+    if len(train)<500 or train.home_win.nunique()!=2:
+        return {'status':'Insufficient chronological training/calibration/holdout data'}
+    model = _nba_model_pipeline().fit(train[features],train.home_win.astype(int))
+    calibrator = _nba_fit_calibrator(model,calibration,features)
+    raw = _nba_home_probabilities(model,audit[features])
+    adjusted = _nba_home_probabilities(model,audit[features],calibrator)
+    actual = audit.home_win.to_numpy(dtype=int)
+    picked = (adjusted >= .5).astype(int); correct = picked == actual
+    confidence = np.maximum(adjusted,1-adjusted)
+    bands = []
+    for low,high in [(.5,.6),(.6,.7),(.7,.8),(.8,.9),(.9,1.000001)]:
+        mask = (confidence>=low)&(confidence<high); n=int(mask.sum())
+        bands.append({'band':f'{low:.0%}–{min(high,1):.0%}', 'games':n,
+            'average_probability':float(confidence[mask].mean()) if n else None,
+            'actual_accuracy':float(correct[mask].mean()) if n else None})
+    baseline = np.full(len(audit),float(train.home_win.mean()))
+    metrics = _nba_probability_metrics(actual,adjusted)
+    return {'status':'Recent chronological holdout; not a guarantee of live accuracy',
+        'training_games':len(train),'calibration_games':len(calibration), 'holdout_games':len(audit),
+        'training_end':train.game_date.max().isoformat(),
+        'calibration_start':calibration.game_date.min().isoformat(),
+        'calibration_end':calibration.game_date.max().isoformat(),
+        'holdout_start':audit.game_date.min().isoformat(),'holdout_end':audit.game_date.max().isoformat(),
+        'raw_model':_nba_probability_metrics(actual,raw),'calibrated_model':metrics,
+        'calibrator_fitted':calibrator is not None,
+        'always_home_accuracy':float(actual.mean()),
+        'training_home_rate_baseline':_nba_probability_metrics(actual,baseline),
+        'confidence_bands':bands,
+        'scope':'Features use prior actual results; this assesses the team-form algorithm, not archived live picks or injury-aware forecasts.'}
+
+
 def train_balldontlie_live_model(
     feature_games,
     prediction_date=None,
@@ -2060,6 +2138,12 @@ def train_balldontlie_live_model(
     from sklearn.pipeline import Pipeline
 
     df = feature_games.copy()
+    df['game_date'] = pd.to_datetime(df['game_date'], utc=True, errors='coerce').dt.tz_localize(None)
+    df = df.dropna(subset=['game_date']).sort_values('game_date', kind='stable')
+    if 'game_id' in df:
+        df = df.drop_duplicates('game_id', keep='last')
+    if not df['home_win'].dropna().isin([0, 1]).all():
+        raise ValueError('NBA home_win must contain only 0 and 1.')
 
     if prediction_date is not None:
         prediction_date = pd.to_datetime(
@@ -2132,37 +2216,28 @@ def train_balldontlie_live_model(
             "invalid or infinite values."
         )
 
-    X_train = train_df[feature_columns]
-    y_train = train_df["home_win"].astype(int)
-
-    model = Pipeline(
-        [
-            (
-                "scaler",
-                StandardScaler(),
-            ),
-            (
-                "model",
-                LogisticRegression(
-                    max_iter=2000,
-                    C=0.1,
-                    random_state=42,
-                ),
-            ),
-        ]
-    )
-
-    model.fit(
-        X_train,
-        y_train,
-    )
-
-    return {
-        "model": model,
-        "feature_columns": feature_columns,
-        "training_games": len(train_df),
-        "feature_schema_version": NBA_FEATURE_SCHEMA_VERSION,
-    }
+    validation = {'status':'Insufficient history for separate calibration and holdout periods'}
+    calibrator = None
+    fit_frame = train_df
+    calibration_games = 0
+    status = 'Raw team-form probability · calibration unavailable'
+    if len(train_df) >= 1100:
+        validation = _nba_recent_holdout(train_df,feature_columns)
+        candidate_fit, calibration = _nba_chronological_tail(train_df)
+        if len(candidate_fit)>=500 and candidate_fit.home_win.nunique()==2:
+            model = _nba_model_pipeline().fit(candidate_fit[feature_columns], candidate_fit.home_win.astype(int))
+            calibrator = _nba_fit_calibrator(model,calibration,feature_columns)
+            if calibrator is not None:
+                fit_frame = candidate_fit
+                calibration_games = len(calibration)
+                status = 'Chronological sigmoid adjustment fitted · live accuracy not established'
+    if calibrator is None:
+        model = _nba_model_pipeline().fit(fit_frame[feature_columns],fit_frame.home_win.astype(int))
+    return {'model':model,'calibrator':calibrator,'feature_columns':feature_columns,
+        'training_games':len(fit_frame), 'calibration_games':calibration_games,
+        'feature_schema_version':NBA_FEATURE_SCHEMA_VERSION,
+        'probability_version':NBA_PROBABILITY_VERSION,'calibration_status':status,
+        'validation_summary':validation}
 
 
 def predict_balldontlie_with_trained_model(
@@ -2210,11 +2285,9 @@ def predict_balldontlie_with_trained_model(
             "or infinite feature values."
         )
 
-    home_probability = float(
-        model.predict_proba(
-            X_future
-        )[0][1]
-    )
+    raw_home_probability = float(_nba_home_probabilities(model, X_future)[0])
+    home_probability = float(_nba_home_probabilities(model, X_future,
+        trained_model.get('calibrator'))[0])
 
     away_probability = (
         1.0 - home_probability
@@ -2234,6 +2307,10 @@ def predict_balldontlie_with_trained_model(
     return {
         "home_win_probability":
             home_probability,
+        'raw_home_win_probability':raw_home_probability,
+        'calibration_status':trained_model.get('calibration_status','Raw team-form probability · calibration unavailable'),
+        'calibration_games':trained_model.get('calibration_games',0),
+        'probability_version':trained_model.get('probability_version',2),
 
         "away_win_probability":
             away_probability,
