@@ -324,7 +324,7 @@ def attach_qb_forecasts(predictions, history, lines=None):
                 if market not in QB_MARKETS:continue
                 values = values_by_market.get(market, np.asarray([]))
                 for side_name, offers in prop['offered_sides'].items():
-                    if side_name not in {'OVER','UNDER'} or not offers:continue
+                    if side_name not in {'OVER','UNDER','YES','NO'} or not offers:continue
                     estimate = _estimate_prop(values,float(prop['line']),market,side=side_name)
                     if not estimate:continue
                     def price(offer):
@@ -346,16 +346,76 @@ def attach_qb_forecasts(predictions, history, lines=None):
     return frame
 
 
-def automatic_nfl_props(predictions, key):
+def nfl_prop_market_diagnostics(event, lines, history, forecasts, source_issue=None):
+    """Trace every configured category using collected data; never fetch odds."""
+    from dual_agent.nfl_player_props import MARKETS
+    from dual_agent.nfl_player_prop_prediction_pipeline import (
+        _select_consensus_props, _historical_player_games, _estimate_prop,
+    )
+    source = lines if isinstance(lines, pd.DataFrame) else pd.DataFrame()
+    estimates = forecasts if isinstance(forecasts, pd.DataFrame) else pd.DataFrame()
+    accepted = _select_consensus_props(source) if not source.empty else pd.DataFrame()
+    diagnostics = []
+    for label, market_key in MARKETS.items():
+        raw = source.loc[source.market_key.eq(market_key)] if not source.empty else source
+        valid = accepted.loc[accepted.market_key.eq(market_key)] if not accepted.empty else accepted
+        scored = estimates.loc[estimates.market.eq(label)] if not estimates.empty else estimates
+        unmatched = set(); short = set(); usable = set()
+        for _, candidate in valid.iterrows():
+            if history is None or history.empty:
+                unmatched.add(candidate.player); continue
+            games = _historical_player_games(history, candidate.player, label,
+                pd.Timestamp(candidate.game_time), window=12)
+            if games.empty:
+                unmatched.add(candidate.player); continue
+            values = games.value.to_numpy(dtype=float)
+            if any(_estimate_prop(values, candidate.line, label, side=side) is not None
+                   for side in candidate.offered_sides):
+                usable.add(candidate.player)
+            else:
+                short.add(candidate.player)
+        if source_issue:
+            reason = source_issue
+        elif len(scored):
+            reason = f'{len(scored)} listed {label.lower()} predictions were calculated for this game.'
+        elif raw.empty:
+            reason = f'No usable {label.lower()} listings were returned from the selected platforms for this game.'
+        elif valid.empty:
+            stamps = pd.to_datetime(raw.last_update, utc=True, errors='coerce')
+            ages = pd.Timestamp.now(tz='UTC') - stamps
+            stale = int((stamps.notna() & ~ages.between(pd.Timedelta(0), pd.Timedelta(minutes=30))).sum())
+            missing = int(stamps.isna().sum())
+            reason = f'{len(raw)} listings were returned, but none passed the quote, line, side and price checks.'
+            if stale: reason += f' {stale} quotes were older than 30 minutes or future-dated.'
+            if missing: reason += f' {missing} quotes had no usable update time.'
+        elif history is None or history.empty:
+            reason = 'Listed bets were found, but player history could not be loaded.'
+        else:
+            reason = f'{len(valid)} listed lines passed quote checks.'
+            if unmatched:
+                reason += f' No matching completed {label.lower()} history for '+', '.join(sorted(unmatched))+'.'
+            if short:
+                reason += ' Fewer than 8 usable non-push results in the last 12 appearances for '+', '.join(sorted(short))+'.'
+            if usable:
+                reason += ' Usable history exists; the model returned no displayable prediction. Review the processing note.'
+        diagnostics.append({'event_id': event.get('id'), 'home_team': event.get('home_team'),
+            'away_team': event.get('away_team'), 'commence_time': event.get('commence_time'),
+            'market': label, 'source_listings': len(raw), 'accepted_lines': len(valid),
+            'players_with_usable_history': len(usable), 'calculated_predictions': len(scored),
+            'reason': reason, 'checked_at': pd.Timestamp.now(tz='UTC').isoformat()})
+    return diagnostics
+
+
+def automatic_nfl_props(predictions, key, on_props=None):
     """Reuse existing NFL prop guards/ranking, scoped to predicted games."""
     from dual_agent.nfl_player_props_ui import cached_events, cached_props, cached_player_history, upcoming_week_events
     from dual_agent.nfl_player_props import MARKETS, normalize_props
     import importlib
     pipeline_module = importlib.import_module('dual_agent.nfl_player_prop_prediction_pipeline')
-    if getattr(pipeline_module, 'NFL_PROP_VALUE_VERSION', None) != 1:
+    if getattr(pipeline_module, 'NFL_PROP_PROBABILITY_VERSION', None) != 2:
         pipeline_module = importlib.reload(pipeline_module)
-    if getattr(pipeline_module, 'NFL_PROP_VALUE_VERSION', None) != 1:
-        raise RuntimeError('Deploy the matching NFL prop pipeline with the positive-value update.')
+    if getattr(pipeline_module, 'NFL_PROP_PROBABILITY_VERSION', None) != 2:
+        raise RuntimeError('Deploy the updated nfl_player_prop_prediction_pipeline.py with NFL_PROP_PROBABILITY_VERSION = 2.')
     run_nfl_player_prop_prediction_pipeline = pipeline_module.run_nfl_player_prop_prediction_pipeline
     import streamlit as st
     @st.cache_data(ttl=1800, show_spinner=False)
@@ -371,9 +431,15 @@ def automatic_nfl_props(predictions, key):
     predicted = records(predictions)
     selected = [event for event in upcoming_week_events(cached_events(key), now)
                 if len(matching_game_rows(event, predicted)) == 1]
+    selected.sort(key=lambda e:e.get('commence_time',''))
     frames, issues = [], []
+    frames_by_event, fetch_errors = {}, {}
     if not selected:
-        return pd.DataFrame(), ['No upcoming sportsbook events matched the generated game cards. No player-prop requests were made.']
+        empty = pd.DataFrame()
+        empty.attrs['prop_diagnostics'] = [row for game in predicted
+            for row in nfl_prop_market_diagnostics(game, None, None, None,
+                'No exact upcoming sportsbook event matched this game card. No prop requests were made for it.')]
+        return empty, ['No upcoming sportsbook events matched the generated game cards. No player-prop requests were made.']
     def load(event):
         notes = []
         try:
@@ -401,23 +467,42 @@ def automatic_nfl_props(predictions, key):
             event = pending[future]
             try:
                 frame, notes = future.result()
+                frames_by_event[event['id']] = frame
                 issues.extend(f"{event.get('away_team')} @ {event.get('home_team')}: {note}" for note in notes)
                 if not frame.empty:
                     frames.append(frame)
                 else:
                     issues.append(f"{event.get('away_team')} @ {event.get('home_team')}: no offered prop lines.")
             except Exception as exc:
-                issues.append(f"{event.get('away_team')} @ {event.get('home_team')}: prop feed unavailable ({type(exc).__name__}).")
+                fetch_errors[event['id']] = f'Prop listings could not be loaded ({type(exc).__name__}).'
+                issues.append(f"{event.get('away_team')} @ {event.get('home_team')}: {fetch_errors[event['id']]}")
     if not frames:
-        return pd.DataFrame(), issues
-    history = history_job.result()
+        empty = pd.DataFrame()
+        empty.attrs['prop_diagnostics'] = [row for event in selected
+            for row in nfl_prop_market_diagnostics(event, frames_by_event.get(event['id']), None, None,
+                fetch_errors.get(event['id']))]
+        return empty, issues
+    try:
+        history = history_job.result()
+    except Exception as exc:
+        history = pd.DataFrame()
+        issues.append(f'NFL player history could not be loaded ({type(exc).__name__}).')
     if history is None or len(history) == 0:
-        return pd.DataFrame(), [f"{e.get('away_team')} @ {e.get('home_team')}: sportsbook props were found, but NFL player history is empty. Check the player-history data source." for e in selected]
+        empty = pd.DataFrame()
+        empty.attrs['prop_diagnostics'] = [row for event in selected
+            for row in nfl_prop_market_diagnostics(event, frames_by_event.get(event['id']), history, None)]
+        return empty, issues + [f"{e.get('away_team')} @ {e.get('home_team')}: sportsbook props were found, but NFL player history is empty. Check the player-history data source." for e in selected]
 
     # The existing pipeline selects its top players internally. Run that same
     # equation per event so the slate-wide player limit cannot starve a game.
     forecasts = []
     lines = pd.concat(frames, ignore_index=True)
+    if 'game_time' in lines: lines = lines.sort_values('game_time',kind='stable')
+    try:
+        from dual_agent.sports_prop_workspace import settle_nfl
+        settle_nfl(history)
+    except Exception:
+        pass
     for event_id, group in lines.groupby('event_id', sort=False):
         try:
             props = run_nfl_player_prop_prediction_pipeline(group, history,
@@ -431,10 +516,9 @@ def automatic_nfl_props(predictions, key):
                 unsupported = sorted(set(group['market_key'].dropna()) - known_markets) if 'market_key' in group else ['missing market_key']
 
                 reason = props.attrs.get('reason') or (
-                    f"No qualifying offered bets: {counts.get('below_65_percent', 0)} below 65%, "
-                    f"{counts.get('unoffered_direction', 0)} model sides not offered, "
-                    f"{counts.get('insufficient_history', 0)} with insufficient usable history, "
-                    f"{counts.get('nonpositive_value', 0)} without positive estimated value."
+                    f"No usable offered bets: {counts.get('unoffered_direction', 0)} model sides not offered; "
+                    f"{counts.get('insufficient_history', 0)} candidates with insufficient usable history. "
+                    'No probability or expected-value cutoff applies.'
                 )
                 if unsupported:
                     reason += ' Unsupported market keys: ' + ', '.join(unsupported)
@@ -443,12 +527,22 @@ def automatic_nfl_props(predictions, key):
         except Exception as exc:
             event = next((e for e in selected if e['id'] == event_id), {})
             issues.append(f"{event.get('away_team')} @ {event.get('home_team')}: prop model unavailable ({type(exc).__name__}).")
+        if on_props and forecasts:
+            on_props(pd.concat(forecasts, ignore_index=True))
     combined = pd.concat(forecasts, ignore_index=True) if forecasts else pd.DataFrame()
+    combined.attrs['prop_diagnostics'] = [row for event in selected
+        for row in nfl_prop_market_diagnostics(event, frames_by_event.get(event['id']), history,
+            combined.loc[combined.event_id.eq(event['id'])] if not combined.empty else combined,
+            fetch_errors.get(event['id']))]
+    combined.attrs['prop_diagnostics'].extend(row for game in predicted
+        if not matching_game_rows(game, selected)
+        for row in nfl_prop_market_diagnostics(game, None, None, None,
+            'No exact upcoming sportsbook event matched this game card. No prop requests were made for it.'))
     combined.attrs['qb_forecast_lines'] = lines
     return combined, issues
 
 
-def enhance_result(league, result, key, history=None):
+def enhance_result(league, result, key, history=None, on_props=None):
     """Failures in add-ons never discard working winner predictions."""
     result = dict(result)
     predictions = result.get('all_predictions', result.get('predictions'))
@@ -464,11 +558,13 @@ def enhance_result(league, result, key, history=None):
             result['spreads']['issues'].append('Sportsbook run-line quotes unavailable; model-only forecasts shown.')
     if league == 'NFL':
         try:
-            props, issues = automatic_nfl_props(predictions, key)
+            props, issues = automatic_nfl_props(predictions, key, on_props=on_props)
+            result['prop_diagnostics'] = props.attrs.pop('prop_diagnostics', [])
             result['nfl_player_props'], result['prop_issues'] = props, issues
         except Exception as exc:
             result['nfl_player_props'] = pd.DataFrame()
-            result['prop_issues'] = [f'Player props unavailable ({type(exc).__name__}).']
+            result['prop_issues'] = [str(exc) if isinstance(exc, RuntimeError) and 'NFL_PROP_PROBABILITY_VERSION' in str(exc)
+                else f'Player props unavailable ({type(exc).__name__}).']
     if league == 'NFL':
         try:
             from dual_agent.nfl_player_props_ui import cached_player_history
