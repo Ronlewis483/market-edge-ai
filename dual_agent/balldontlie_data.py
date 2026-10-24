@@ -26,14 +26,14 @@ def _setting(name, default):
 
 
 def _pace_request():
-    """One request budget for history and NBA prop-stat calls in this process."""
+    """Paid ALL-STAR default; explicit setting may lower pacing for a trial."""
     global _LAST_REQUEST_AT
     try:
-        rate = float(_setting('BALLDONTLIE_REQUESTS_PER_MINUTE', 5))
+        rate = float(_setting('BALLDONTLIE_REQUESTS_PER_MINUTE', 60))
     except (TypeError, ValueError):
-        rate = 5.
+        rate = 60.
     if not 0 < rate <= 600:
-        rate = 5.
+        rate = 60.
     interval = 60. / rate + .05
     with _REQUEST_LOCK:
         delay = interval - (time.monotonic() - _LAST_REQUEST_AT)
