@@ -389,7 +389,7 @@ def attach_pitcher_forecasts(predictions, logs, offered_forecasts=None):
                 if team['pitcher_projections'] else 'No usable saved prior starts. Projection and cover percentage are unavailable.')
 
 
-def _generate_mlb_predictions(game_date=None, api_key=None, progress=None, on_team_predictions=None):
+def _generate_mlb_predictions(game_date=None, api_key=None, progress=None, on_team_predictions=None, on_prop_predictions=None):
     from dual_agent import mlb_research as research, supabase_db as storage
     from dual_agent.mlb_matchup_elo import attach_elo
     from dual_agent.mlb_matchup_context import attach_matchup_context
@@ -555,7 +555,7 @@ def _generate_mlb_predictions(game_date=None, api_key=None, progress=None, on_te
             raise RuntimeError('Install the matching sports_player_prop_predictions.py update.')
         generate_player_prop_picks = prop_module.generate_player_prop_picks
         prop_games = [{'game_id': r['game_id'], 'start_time': r['start_time'], 'home_team': r['Home'], 'away_team': r['Away']} for r in all_eligible_predictions]
-        props = generate_player_prop_picks('MLB', prop_games, api_key, player_logs=logs, snapshots=snapshots)
+        props = generate_player_prop_picks('MLB', prop_games, api_key, player_logs=logs, snapshots=snapshots, progress=on_prop_predictions)
     except Exception as exc:
         props = {'picks': [], 'errors': [{'stage': 'MLB prop generation', 'error_type': type(exc).__name__}],
                  'message': 'MLB player-prop generation failed ('+type(exc).__name__+'). See player-prop data coverage.'}
@@ -603,7 +603,7 @@ def fetch_live_consensus(games, api_key):
     return probabilities
 
 
-def run_mlb_prediction_pipeline(game_date=None, api_key=None, progress=None, on_team_predictions=None, force_refresh=False):
+def run_mlb_prediction_pipeline(game_date=None, api_key=None, progress=None, on_team_predictions=None, force_refresh=False, on_prop_predictions=None):
     """Reuse completed pregame results for three minutes, retaining source times."""
     import copy
     now = pd.Timestamp.now(tz='UTC')
@@ -616,7 +616,7 @@ def run_mlb_prediction_pipeline(game_date=None, api_key=None, progress=None, on_
         reused = bool(cached and time.monotonic()-cached[0]<180)
     if reused and progress:
         progress('Using predictions collected within the last three minutes...')
-    result = copy.deepcopy(_cached_history(key, 180, lambda: _generate_mlb_predictions(game_date, api_key, progress, on_team_predictions)))
+    result = copy.deepcopy(_cached_history(key, 180, lambda: _generate_mlb_predictions(game_date, api_key, progress, on_team_predictions, on_prop_predictions)))
     now = pd.Timestamp.now(tz='UTC')
     def eligible(row):
         return pd.Timestamp(row['start_time'])>now and now-pd.Timestamp(row['Captured UTC'])<=pd.Timedelta(minutes=15)
