@@ -550,7 +550,160 @@ def estimate_nba_history(values, line, side):
     return estimate
 
 
+def load_nba_prop_tracking(restore=False):
+    path = Path('nba_player_history_cache')/'prop_tracking_v1.json'
+    try:
+        payload = json.loads(path.read_text())
+        if payload.get('version') == 1 and isinstance(payload.get('records'), dict): return payload
+    except (OSError, ValueError, AttributeError):
+        pass
+    if restore:
+        try:
+            from dual_agent.balldontlie_data import _setting
+            url, key = _setting('SUPABASE_URL', ''), _setting('SUPABASE_KEY', '')
+            if url and key:
+                response = requests.get(str(url).rstrip('/')+'/storage/v1/object/authenticated/market-edge-data/nba/props/tracking_v1.json',
+                    headers={'apikey': key, 'Authorization': 'Bearer '+key}, timeout=3)
+                payload = response.json() if response.status_code == 200 else {}
+                if payload.get('version') == 1 and isinstance(payload.get('records'), dict):
+                    path.parent.mkdir(exist_ok=True); path.write_text(json.dumps(payload)); return payload
+        except Exception:
+            pass
+    empty = {'version': 1, 'records': {}}
+    if restore:
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(json.dumps(empty))
+    return empty
+
+
+def update_nba_prop_tracking(props):
+    """Freeze one stronger offered side per exact line; settle verified finals only."""
+    import hashlib
+    with _NBA_PROP_HISTORY_LOCK:
+        ledger = load_nba_prop_tracking(restore=True)
+        records = ledger['records']; now = pd.Timestamp.now(tz='UTC')
+        candidates = sorted(props.get('game_picks', props.get('picks', [])),
+                            key=lambda r: -float(r.get('Estimated chance', 0)))
+        for row in candidates:
+            start = pd.to_datetime(row.get('start_time'), utc=True, errors='coerce')
+            capture = pd.to_datetime(row.get('Captured UTC'), utc=True, errors='coerce')
+            if pd.isna(start) or pd.isna(capture) or not capture <= now < start: continue
+            if now-capture > pd.Timedelta(minutes=30) or not row.get('Best sportsbook'): continue
+            identity = '|'.join([str(row.get('Game')), start.isoformat(), nba_identity_key(row.get('Player')), str(row.get('Market')), str(float(row['Line']))])
+            record_id = hashlib.sha256(identity.encode()).hexdigest()
+            if record_id not in records:
+                records[record_id] = dict(row, **{'Tracking status': 'Pending',
+                    'Recorded UTC': now.isoformat(), 'Actual stat': None})
+        try:
+            archive = json.loads((Path('nba_player_history_cache')/'player_histories_v3.json').read_text())
+        except (OSError, ValueError):
+            archive = {'players': {}}
+        entries = archive.get('players', {})
+        # Resolve both teams from provider IDs/names already present in player logs.
+        teams = {}
+        def team_name(value):
+            key = name_key(value)
+            return {'laclippers': 'losangelesclippers'}.get(key, key)
+        for entry in entries.values():
+            for row in entry.get('rows', []):
+                team = row.get('team') or {}
+                if team.get('id') is not None and team.get('full_name'):
+                    teams[team['id']] = team_name(team['full_name'])
+        lookup = {label: stat for label, stat in MARKETS['NBA'].values()}
+        for record in records.values():
+            if record.get('Tracking status') != 'Pending': continue
+            start = pd.to_datetime(record.get('start_time'), utc=True, errors='coerce')
+            if pd.isna(start) or start >= now: continue
+            pair = str(record.get('Game', '')).split(' @ ', 1)
+            if len(pair) != 2: continue
+            away, home = map(team_name, pair)
+            entry = entries.get(nba_identity_key(record['Player']), {})
+            matches = {}
+            for row in entry.get('rows', []):
+                game = row.get('game') or {}
+                date = pd.to_datetime(game.get('date'), utc=True, errors='coerce')
+                if (not str(game.get('status','')).startswith('Final') or pd.isna(date)
+                        or date.date() != start.tz_convert('America/Chicago').date()): continue
+                if teams.get(game.get('home_team_id')) != home or teams.get(game.get('visitor_team_id')) != away: continue
+                matches[game.get('id')] = row
+            if len(matches) != 1 or record['Market'] not in lookup: continue
+            actual = nba_market_value(next(iter(matches.values())), lookup[record['Market']])
+            if actual is None: continue
+            line = float(record['Line']); side = record['Pick']
+            if side not in ('Over','Under'): continue
+            status = 'Push' if actual == line else ('Covered' if (actual > line) == (side == 'Over') else 'Missed')
+            record.update({'Tracking status': status, 'Actual stat': actual, 'Settled UTC': now.isoformat()})
+        root = Path('nba_player_history_cache'); root.mkdir(exist_ok=True)
+        path = root/'prop_tracking_v1.json'; temp = path.with_suffix('.tmp')
+        temp.write_text(pd.Series(ledger).to_json(date_format='iso')); temp.replace(path)
+        return ledger
+
+
+def save_nba_prop_results(result, remote=False):
+    """Checkpoint display results without changing their original quote times."""
+    try:
+        root = Path('nba_player_history_cache'); root.mkdir(exist_ok=True)
+        frame = result.get('all_predictions', result.get('predictions'))
+        rows = json.loads(frame.to_json(orient='records', date_format='iso')) if isinstance(frame, pd.DataFrame) else list(frame or [])
+        if not rows: return
+        payload = {'version': 1, 'saved_at': pd.Timestamp.now(tz='UTC').isoformat(),
+                   'predictions': rows, 'player_props': result.get('player_props', {})}
+        # pandas converts missing numeric values to JSON null.
+        data = pd.Series(payload).to_json(date_format='iso').encode()
+        path = root/'latest_prop_results_v1.json'
+        temporary = path.with_suffix('.tmp'); temporary.write_bytes(data); temporary.replace(path)
+        if remote:
+            from dual_agent.balldontlie_data import _setting
+            url, key = _setting('SUPABASE_URL', ''), _setting('SUPABASE_KEY', '')
+            if url and key:
+                requests.post(str(url).rstrip('/')+'/storage/v1/object/market-edge-data/nba/props/latest_results_v1.json',
+                    headers={'apikey': key, 'Authorization': 'Bearer '+key,
+                             'Content-Type': 'application/json', 'x-upsert': 'true'}, data=data, timeout=3)
+                ledger_path = root/'prop_tracking_v1.json'
+                if ledger_path.exists():
+                    requests.post(str(url).rstrip('/')+'/storage/v1/object/market-edge-data/nba/props/tracking_v1.json',
+                        headers={'apikey': key, 'Authorization': 'Bearer '+key,
+                                 'Content-Type': 'application/json', 'x-upsert': 'true'},
+                        data=ledger_path.read_bytes(), timeout=3)
+    except Exception:
+        pass  # Display/storage failure must not discard calculated predictions.
+
+
+def load_nba_prop_results():
+    """Restore last results for immediate display, not as verified current offers."""
+    path = Path('nba_player_history_cache')/'latest_prop_results_v1.json'
+    try:
+        payload = json.loads(path.read_text())
+    except (OSError, ValueError):
+        try:
+            from dual_agent.balldontlie_data import _setting
+            url, key = _setting('SUPABASE_URL', ''), _setting('SUPABASE_KEY', '')
+            if not url or not key: return None
+            response = requests.get(str(url).rstrip('/')+'/storage/v1/object/authenticated/market-edge-data/nba/props/latest_results_v1.json',
+                headers={'apikey': key, 'Authorization': 'Bearer '+key}, timeout=3)
+            if response.status_code != 200: return None
+            payload = response.json()
+        except Exception:
+            return None
+    if not isinstance(payload, dict) or payload.get('version') != 1: return None
+    frame = pd.DataFrame(payload.get('predictions', []))
+    if frame.empty or not {'home_team','away_team','commence_time','confidence'}.issubset(frame): return None
+    saved = pd.to_datetime(payload.get('saved_at'), utc=True, errors='coerce')
+    if pd.isna(saved): return None
+    times = pd.to_datetime(frame['commence_time'], utc=True, errors='coerce')
+    now = pd.Timestamp.now(tz='UTC')
+    # Existing status polling retires confirmed finals; bound old restore data.
+    frame = frame.loc[(times >= now-pd.Timedelta(days=1)) & (times <= now+pd.Timedelta(days=7))].copy()
+    if frame.empty: return None
+    return {'predictions': frame.head(10), 'all_predictions': frame,
+            'player_props': payload.get('player_props', {}), 'saved_props_at': saved.isoformat(),
+            'nba_props_pending': False, 'restored_saved_results': True}
+
+
 def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapshots=None, nba_key=None, progress=None, nba_history_enabled=True):
+    scan_started = time.perf_counter()
+    calculation_seconds = 0.0
+    timings = {}
     if not odds_key and league != 'NBA':
         return {'picks':[], 'message':'Player props need the configured Odds API key.', 'errors':[]}
     if league == 'NBA' and progress:
@@ -561,6 +714,7 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
         if league != 'NBA':
             raise
         quotes, errors = [], [f'NBA sportsbook lines unavailable: {type(exc).__name__}: {exc}.']
+    timings['Sportsbook collection'] = time.perf_counter()-scan_started
     if not quotes and league != 'NBA':
         return {'picks':[], 'message':'No fresh eligible sportsbook player-prop lines are available for upcoming games.', 'errors':errors}
     if league == 'NBA' and not nba_history_enabled:
@@ -573,12 +727,20 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
         from dual_agent.nba_star_spotlight import collect_star_rosters, build_star_spotlights, key as star_key
         if progress:
             progress({'picks': [], 'game_picks': [], 'errors': list(errors), 'loading_progress': {'stage': 'Finding team star rosters', 'completed': 0, 'total': 0}})
+        roster_started = time.perf_counter()
         star_rosters = collect_star_rosters(games)
+        timings['Team rosters'] = time.perf_counter()-roster_started
         if not nba_key:
             errors.append('NBA projections need BALLDONTLIE_API_KEY and access to player game stats.')
         # Fetch each unique player once, reusing the existing daily history cache.
         # Stars remain visible even without any available sportsbook market.
         names_by_key = {star_key(q['player']): q['player'] for q in quotes}
+        pending_ledger = load_nba_prop_tracking(restore=True)
+        for record in pending_ledger['records'].values():
+            kickoff = pd.to_datetime(record.get('start_time'), utc=True, errors='coerce')
+            if (record.get('Tracking status') == 'Pending' and pd.notna(kickoff)
+                    and kickoff < pd.Timestamp.now(tz='UTC')-pd.Timedelta(hours=2)):
+                names_by_key.setdefault(star_key(record['Player']), record['Player'])
         for roster in star_rosters.values():
             for player in roster['players']:
                 names_by_key.setdefault(star_key(player['player']), player['player'])
@@ -599,7 +761,7 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
         last_scored = -1
         last_publish = 0.0
         def publish(stage):
-            nonlocal last_scored, last_publish
+            nonlocal last_scored, last_publish, calculation_seconds
             if not progress: return
             # Network-page updates should not rescore the whole slate.
             if completed == last_scored or (completed < len(names) and completed % 8 and time.monotonic()-last_publish < 3):
@@ -610,17 +772,22 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
             ready = {q['player']: by_key[star_key(q['player'])] for q in quotes if star_key(q['player']) in by_key}
             ready.update(history_by_name)
             ready_groups = {key: group for key, group in groups.items() if star_key(key[1]) in by_key}
+            scoring_started = time.perf_counter()
             partial = _rank_prop_candidates('NBA', games, ready_groups,
                 ready, list(errors), star_rosters, {}, {})
+            calculation_seconds += time.perf_counter()-scoring_started
             partial.update(probability_source='player_history', statistics_source='BALLDONTLIE')
             partial['loading_progress'] = {'completed': completed, 'total': len(names), 'stage': stage}
             progress(partial)
+        history_started = time.perf_counter()
+        history_scoring_before = calculation_seconds
         publish('Checking saved player histories')
         for player, history, error in _nba_history_batches(names, nba_key, status=publish):
             history_by_name[player] = history
             completed += 1
             if error: errors.append(error)
             publish('Processed '+player)
+        timings['Player history and storage'] = max(0.0, time.perf_counter()-history_started-(calculation_seconds-history_scoring_before))
         # Provider spellings may differ only in accents or punctuation.
         by_key = {star_key(name): rows for name, rows in history_by_name.items()}
         for q in quotes:
@@ -643,9 +810,14 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
         subset['total_bases'] = subset['singles']+2*number('doubles')+3*number('triples')+4*number('batting_home_runs')
         subset['hits_runs_rbis'] = number('hits')+number('batting_runs')+number('rbi')
         mlb_histories = {int(pid): frame for pid,frame in subset.groupby('player_id')}
+    scoring_started = time.perf_counter()
     result = _rank_prop_candidates(league, games, groups, history_by_name, errors,
                                  star_rosters if league == 'NBA' else {}, identities, mlb_histories)
+    calculation_seconds += time.perf_counter()-scoring_started
     if league == 'NBA':
+        timings['Prediction calculations'] = calculation_seconds
+        timings['Total'] = time.perf_counter()-scan_started
+        result['loading_timings_seconds'] = {label: round(seconds, 2) for label, seconds in timings.items()}
         result.update(probability_source='player_history', statistics_source='BALLDONTLIE',
             note='Smoothed historical estimates; minutes, injuries and opponent adjustments are not verified inputs.')
         try:
