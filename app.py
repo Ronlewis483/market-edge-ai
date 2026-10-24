@@ -600,6 +600,8 @@ def render_nba_star_spotlight(game, result):
         if team.get('issue'):
             st.caption(team['issue'])
         for player in team['players']:
+            if not player.get('projections') and not player.get('props'):
+                continue
             with st.container(border=True):
                 st.markdown('**⭐ '+player['player']+'**')
                 st.caption('Availability: '+player['status'])
@@ -1072,7 +1074,7 @@ def render_nba_enrichment_status():
         if total:
             st.progress(min(completed / total, 1.0),
                         text=f'Player history checked: {completed} of {total}')
-        for issue in props.get('errors', [])[-3:]:
+        for issue in [e for e in props.get('errors', []) if not any(t in str(e) for t in ('No unique NBA player identity', 'No completed played-game statistics', 'Player identity for', 'NBA stats for'))][-3:]:
             st.warning(str(issue))
         if props.get('game_picks') or props.get('picks'):
             if st.button('Show latest completed NBA props', key='nba_show_partial_props'):
@@ -1796,7 +1798,7 @@ def render_game_addons(league, game, result):
                 completed, total = progress.get('completed', 0), progress.get('total', 0)
                 if progress.get('stage'):
                     st.caption(progress['stage'])
-                failures = (result or {}).get('player_props', {}).get('errors', [])
+                failures = [e for e in (result or {}).get('player_props', {}).get('errors', []) if not any(t in str(e) for t in ('No unique NBA player identity', 'No completed played-game statistics', 'Player identity for', 'NBA stats for'))]
                 if failures:
                     with st.expander('Player-data issues', expanded=True):
                         for issue in failures[-5:]:
@@ -1860,7 +1862,7 @@ def render_game_addons(league, game, result):
             if league in ('MLB','NBA') and not normalized:
                 reasons = (result or {}).get('player_props', {}).get('exclusions', [])
                 matching_reasons = [r for r in reasons if r.get('Game') == str(game.get('away_team'))+' @ '+str(game.get('home_team')) and (selected == 'All supported markets' or r.get('Market') == selected)]
-                for reason in matching_reasons[:5]:
+                for reason in (matching_reasons[:5] if league != 'NBA' else []):
                     st.caption(f"{reason.get('Player', '')}: {reason.get('Reason', '')}")
             game_label = str(game.get('away_team'))+' @ '+str(game.get('home_team'))
             game_time = pd.to_datetime(game.get('commence_time', game.get('start_time')), utc=True, errors='coerce')
