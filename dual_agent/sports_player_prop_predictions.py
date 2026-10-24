@@ -420,8 +420,7 @@ def _nba_history_batches_locked(names, api_key, status=None):
                     for row in payload.get('data', []):
                         pid = (row.get('player') or {}).get('id'); game = row.get('game', {})
                         date = pd.to_datetime(game.get('date'), utc=True, errors='coerce')
-                        try: played = float(str(row.get('min') or '0').split(':')[0]) > 0
-                        except ValueError: played = False
+                        played = nba_minutes(row.get('min')) is not None
                         if pid in active_ids and str(game.get('status','')).startswith('Final') and pd.notna(date) and date<now and played:
                             rows_by_id[pid].append(dict(row, source_date=date.isoformat(), history_provider='balldontlie'))
                     cursor = payload.get('meta', {}).get('next_cursor')
@@ -538,6 +537,206 @@ def nba_sportsbook_prop_picks(quotes, errors):
         'note':'Sportsbook-implied probabilities are not independent model predictions. No player history or injury verification was used.'}
 
 
+def nba_minutes(value):
+    """Provider minutes may be MM:SS or decimal; missing is never zero."""
+    try:
+        if ':' in str(value):
+            minute, second = str(value).split(':')
+            if not 0 <= float(second) < 60: return None
+            total = float(minute)+float(second)/60
+        else:
+            total = float(value)
+        return total if np.isfinite(total) and 0 < total <= 70 else None
+    except (ValueError, TypeError):
+        return None
+
+
+def load_nba_matchup_context(api_key):
+    """One cached league injury snapshot; defense uses existing game cache only."""
+    now = pd.Timestamp.now(tz='UTC'); root = Path('nba_player_history_cache'); root.mkdir(exist_ok=True)
+    path = root/'injury_context_v1.json'; injury = None
+    try:
+        saved = json.loads(path.read_text())
+        stamp = pd.to_datetime(saved.get('checked_at'),utc=True,errors='coerce')
+        if pd.notna(stamp) and pd.Timedelta(0)<=now-stamp<pd.Timedelta(minutes=15): injury=saved
+    except (OSError,ValueError): pass
+    if injury is None:
+        try:
+            if not api_key: raise RuntimeError('Player-data API key unavailable')
+            items=[]; cursor=None; seen=set()
+            for page in range(20):
+                params={'per_page':100}
+                if cursor is not None: params['cursor']=cursor
+                payload=_get('https://api.balldontlie.io/v1/player_injuries',api_key,params,True)
+                batch=payload.get('data')
+                if not isinstance(batch,list): raise ValueError('Invalid injury response')
+                items.extend(batch); cursor=(payload.get('meta') or {}).get('next_cursor')
+                if cursor is None: break
+                if str(cursor) in seen: raise ValueError('Repeated injury cursor')
+                seen.add(str(cursor))
+            else: raise ValueError('Injury pagination incomplete')
+            injury={'checked_at':now.isoformat(),'complete':True,'records':items}
+        except Exception as exc:
+            injury={'checked_at':now.isoformat(),'complete':False,'records':[],
+                    'issue':'NBA injury feed unavailable: '+_nba_request_issue(exc)}
+        temp=path.with_suffix('.tmp'); temp.write_text(json.dumps(injury)); temp.replace(path)
+    from dual_agent.balldontlie_data import _setting
+    game_root=Path(_setting('NBA_HISTORY_CACHE_DIR','.market_edge_cache/nba_history'))
+    games={}; teams={}; player_teams={}
+    for cache in game_root.glob('season_*_v1.json'):
+        try:
+            saved=json.loads(cache.read_text())
+            if not saved.get('complete'): continue
+            for game in saved.get('games',[]):
+                if game.get('id') is not None: games[game['id']]=game
+                for side in ('home_team','visitor_team'):
+                    team=game.get(side) or {}
+                    if team.get('id') is not None: teams[team['id']]=team
+        except (OSError,ValueError): continue
+    # Cached active directory provides team membership without new roster calls.
+    for cache in sorted(root.glob('active_players_*.json'),reverse=True)[:1]:
+        try:
+            for player in json.loads(cache.read_text()):
+                team=player.get('team') or {}
+                if team.get('id') is not None:
+                    teams[team['id']]=team; player_teams[player['id']]=team['id']
+        except (OSError,ValueError,KeyError): pass
+    injuries={}; blocked=[]
+    for item in injury['records']:
+        player=item.get('player') or {}; pid=player.get('id')
+        if pid is not None:
+            injuries.setdefault(pid,[]).append(item)
+            if player.get('team_id') is not None: player_teams[pid]=player['team_id']
+        if (name_key(item.get('status')) in {'out','doubtful','suspended','inactive','injuredreserve'}
+                or re.search(r'(?:will be limited to (?:about )?\d+(?:-\d+)? minutes|on a minutes restriction|under a minutes restriction|minutes will be restricted)',str(item.get('description','')),re.I)):
+            blocked.append(nba_identity_key(player.get('first_name','')+' '+player.get('last_name','')))
+    return {'checked_at':injury['checked_at'],'injury_complete':injury['complete'],
+            'injuries':injuries,'blocked_player_names':blocked,'games':list(games.values()),
+            'teams':teams,'player_teams':player_teams,'issue':injury.get('issue')}
+
+
+def nba_availability(rows, context):
+    context=context or {}; ids={r.get('player',{}).get('id') for r in rows if r.get('player',{}).get('id') is not None}
+    if len(ids)!=1: return False,'Player availability identity unverified',False
+    pid=next(iter(ids)); reports=context.get('injuries',{}).get(pid,[])
+    statuses=[str(r.get('status','')) for r in reports]
+    blocked=any(name_key(s) in {'out','doubtful','suspended','inactive','injuredreserve'} for s in statuses)
+    restriction=any(re.search(r'(?:will be limited to (?:about )?\d+(?:-\d+)? minutes|on a minutes restriction|under a minutes restriction|minutes will be restricted)',str(r.get('description','')),re.I) for r in reports)
+    if reports:
+        status='Injury feed: '+', '.join(dict.fromkeys(statuses))+' · checked '+str(context.get('checked_at'))
+    elif context.get('injury_complete'):
+        status='No injury listing in checked feed; participation is not confirmed'
+    else:
+        status='Injury status unverified; forecast is conditional on playing'
+    if restriction: status+=' · minutes restriction reported; future cap unverified'
+    return blocked,status,restriction
+
+
+def nba_points_defense(rows, matchup, context, cutoff):
+    """Conservative points-only allowance adjustment, not defense by position."""
+    context=context or {}; teams=context.get('teams',{})
+    def team_key(value):
+        k=name_key(value)
+        return {'laclippers':'losangelesclippers'}.get(k,k)
+    ids={r.get('player',{}).get('id') for r in rows if r.get('player',{}).get('id') is not None}
+    pid=next(iter(ids)) if len(ids)==1 else None
+    own=context.get('player_teams',{}).get(pid)
+    if own is None and rows: own=(rows[-1].get('team') or {}).get('id')
+    own_team=teams.get(own) or next((r.get('team') for r in reversed(rows) if (r.get('team') or {}).get('id')==own),{})
+    own_name=team_key(own_team.get('full_name'))
+    home,away=team_key(matchup.get('home_team')),team_key(matchup.get('away_team'))
+    opponent_name=away if own_name==home else home if own_name==away else None
+    opponent_ids=[tid for tid,t in teams.items() if team_key(t.get('full_name'))==opponent_name]
+    if len(opponent_ids)!=1: return 1.,'Opponent team identity unverified; no defensive adjustment'
+    opponent=opponent_ids[0]; all_values=[]; all_weights=[]; against=[]
+    for game in context.get('games',[]):
+        if not str(game.get('status','')).startswith('Final') or game.get('season_type')=='preseason': continue
+        date=pd.to_datetime(game.get('date'),utc=True,errors='coerce')
+        # Date-only feeds cannot establish an intraday pregame cutoff.
+        if pd.isna(date) or date.date()>=cutoff.date() or date<cutoff-pd.Timedelta(days=365): continue
+        try: hs,vs=float(game['home_team_score']),float(game['visitor_team_score'])
+        except (KeyError,TypeError,ValueError): continue
+        if not np.isfinite([hs,vs]).all() or min(hs,vs)<=0: continue
+        weight=2**(-max(0.,(cutoff-date).total_seconds()/86400)/90.)
+        all_values.extend([hs,vs]);all_weights.extend([weight,weight])
+        h=(game.get('home_team') or {}).get('id');v=(game.get('visitor_team') or {}).get('id')
+        if h==opponent: against.append((date,vs,weight))
+        elif v==opponent: against.append((date,hs,weight))
+    against=sorted(against,key=lambda r:r[0])[-20:]
+    if len(against)<5 or len(all_values)<60:
+        return 1.,'Insufficient verified opponent scoring history; no defensive adjustment'
+    w=np.array([g[2] for g in against]);effective=w.sum()**2/(w*w).sum()
+    baseline=np.average(all_values,weights=all_weights)
+    allowance=np.average([g[1] for g in against],weights=w)
+    ratio=1+(allowance/baseline-1)*effective/(effective+20)
+    factor=float(np.clip(ratio,.92,1.08))
+    return factor,f'Points component only: {factor:.3f}× allowance factor · {len(against)} prior opponent games; not pace or position adjusted'
+
+
+def estimate_nba_matchup(rows, stat, line, side, matchup, context=None):
+    """Recency-weighted per-minute counts with a mixture of recent minutes.
+
+    Negative-binomial dispersion includes historical excess count variance and
+    rate-estimation uncertainty. Fixed weighting choices are not calibrated.
+    """
+    from scipy.stats import nbinom
+    if side not in ('Over','Under') or not np.isfinite(float(line)): return None
+    cutoff=min(pd.Timestamp(matchup['start_time']),pd.Timestamp(matchup['capture_time']))
+    prior=[r for r in rows if pd.Timestamp(r['source_date'])<cutoff]
+    prior.sort(key=lambda r:(r['source_date'],str((r.get('game') or {}).get('id'))))
+    player_ids={r.get('player',{}).get('id') for r in prior if r.get('player',{}).get('id') is not None}
+    if len(player_ids)!=1: return None
+    blocked,status,restriction=nba_availability(prior,context)
+    if blocked or restriction: return None
+    sample=[]
+    for row in prior:
+        minute=nba_minutes(row.get('min')); value=nba_market_value(row,stat)
+        if minute is not None and value is not None and value>=0: sample.append((row,minute,value))
+    sample=sample[-30:]
+    if len(sample)<10: return None
+    actual=np.array([r[2] for r in sample]); minutes=np.array([r[1] for r in sample])
+    baseline=estimate_nba_history(actual,line,side)
+    if baseline is None: return None
+    n=len(sample); weight=2**(-np.arange(n-1,-1,-1)/10.)
+    effective=weight.sum()**2/(weight*weight).sum(); weight*=effective/weight.sum()
+    total=float(weight@actual); exposure=float(weight@minutes)
+    rate=(total+.5)/(exposure+1.)
+    observed_mean=rate*minutes
+    excess=max(0.,float(np.average((actual-observed_mean)**2-observed_mean,weights=weight)))
+    denominator=float(np.average(observed_mean**2,weights=weight))
+    dispersion=(excess/denominator if denominator>0 else 0.)+1/(total+.5)
+    role=[nba_minutes(r.get('min')) for r in prior]
+    role=np.array([m for m in role if m is not None][-10:])
+    if len(role)<5: return None
+    role=np.clip(role,0,48)  # Regulation minutes; no overtime prediction.
+    role_weight=2**(-np.arange(len(role)-1,-1,-1)/3.); role_weight/=role_weight.sum()
+    factor,opponent_note=nba_points_defense(prior,matchup,context,cutoff)
+    components=stat if isinstance(stat,tuple) else (stat,)
+    if 'pts' in components and factor!=1:
+        points=np.array([nba_market_value(r[0],'pts') for r in sample],dtype=float)
+        if np.isfinite(points).all():
+            point_rate=float(weight@points)/max(exposure,1.)
+            rate=max(0.,rate+(factor-1)*point_rate)
+    elif 'pts' not in components:
+        opponent_note='No verified category-specific defensive adjustment for this market'
+    means=np.maximum(rate*role,1e-12); shape=1/max(dispersion,1e-9)
+    probability=shape/(shape+means)
+    above=1-nbinom.cdf(np.floor(line),shape,probability)
+    below=nbinom.cdf(np.ceil(line)-1,shape,probability)
+    push=nbinom.pmf(line,shape,probability) if float(line).is_integer() and line>=0 else np.zeros(len(role))
+    over=float(role_weight@above);under=float(role_weight@below);push=float(role_weight@push)
+    if over+under<=0: return None
+    chance=(over if side=='Over' else under)/(over+under)
+    baseline.update({'Estimated chance':float(chance),'Over chance':over/(over+under),'Under chance':under/(over+under),
+        'Projected stat':float(role_weight@means),'Expected minutes':float(role_weight@role),
+        'Minutes sample':len(role),'Effective historical games':round(float(effective),2),
+        'Estimated push chance':push,'Availability status':status,
+        'Opponent context':opponent_note,'NBA prop model version':2,
+        'Estimate method':'Recency-weighted per-minute negative-binomial model + recent-minutes mixture; uncalibrated; sportsbook prices excluded',
+        'Model calculated UTC':pd.Timestamp.now(tz='UTC').isoformat()})
+    return baseline
+
+
 def estimate_nba_history(values, line, side):
     """Independent, smoothed prior-game frequency; no sportsbook probability input."""
     estimate = estimate_prop(values,line,side,.5,minimum=10,minimum_decisions=10)
@@ -590,7 +789,10 @@ def update_nba_prop_tracking(props):
             if pd.isna(start) or pd.isna(capture) or not capture <= now < start: continue
             if now-capture > pd.Timedelta(minutes=30) or not row.get('Best sportsbook'): continue
             identity = '|'.join([str(row.get('Game')), start.isoformat(), nba_identity_key(row.get('Player')), str(row.get('Market')), str(float(row['Line']))])
-            record_id = hashlib.sha256(identity.encode()).hexdigest()
+            version = int(row.get('NBA prop model version',1))
+            legacy_id = hashlib.sha256(identity.encode()).hexdigest()
+            record_id = hashlib.sha256((identity+'|model='+str(version)).encode()).hexdigest()
+            if version==1 and legacy_id in records: continue
             if record_id not in records:
                 records[record_id] = dict(row, **{'Tracking status': 'Pending',
                     'Recorded UTC': now.isoformat(), 'Actual stat': None})
@@ -722,9 +924,13 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
     groups = {}
     for q in quotes:
         groups.setdefault((q['event_id'],q['player'],q['market'],q['line']), []).append(q)
-    history_by_name = {}; identities = {}; mlb_histories = {}
+    history_by_name = {}; identities = {}; mlb_histories = {}; nba_context = {}
     if league=='NBA':
         from dual_agent.nba_star_spotlight import collect_star_rosters, build_star_spotlights, key as star_key
+        context_started = time.perf_counter()
+        nba_context = load_nba_matchup_context(nba_key)
+        timings['Injury and opponent context'] = time.perf_counter()-context_started
+        if nba_context.get('issue'): errors.append(nba_context['issue'])
         if progress:
             progress({'picks': [], 'game_picks': [], 'errors': list(errors), 'loading_progress': {'stage': 'Finding team star rosters', 'completed': 0, 'total': 0}})
         roster_started = time.perf_counter()
@@ -774,7 +980,7 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
             ready_groups = {key: group for key, group in groups.items() if star_key(key[1]) in by_key}
             scoring_started = time.perf_counter()
             partial = _rank_prop_candidates('NBA', games, ready_groups,
-                ready, list(errors), star_rosters, {}, {})
+                ready, list(errors), star_rosters, {}, {}, nba_context=nba_context)
             calculation_seconds += time.perf_counter()-scoring_started
             partial.update(probability_source='player_history', statistics_source='BALLDONTLIE')
             partial['loading_progress'] = {'completed': completed, 'total': len(names), 'stage': stage}
@@ -828,14 +1034,15 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
             result = _rank_prop_candidates(league,games,groups,history_by_name,errors,{},identities,mlb_histories)
     else:
         result = _rank_prop_candidates(league, games, groups, history_by_name, errors,
-                                     star_rosters if league == 'NBA' else {}, identities, mlb_histories)
+                                     star_rosters if league == 'NBA' else {}, identities, mlb_histories, nba_context=nba_context)
     calculation_seconds += time.perf_counter()-scoring_started
     if league == 'NBA':
         timings['Prediction calculations'] = calculation_seconds
         timings['Total'] = time.perf_counter()-scan_started
         result['loading_timings_seconds'] = {label: round(seconds, 2) for label, seconds in timings.items()}
+        result['scan_complete'] = True
         result.update(probability_source='player_history', statistics_source='BALLDONTLIE',
-            note='Smoothed historical estimates; minutes, injuries and opponent adjustments are not verified inputs.')
+            note='Experimental per-minute count forecasts, not calibrated probabilities. Recent minutes are estimated; injury reports do not confirm participation. Opponent allowance adjusts only points components.')
         try:
             stored = json.loads((Path('nba_player_history_cache')/'player_histories_v3.json').read_text())
             result['history_storage_status'] = stored.get('storage_status', 'Player history saved locally.')
@@ -845,7 +1052,7 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
 
 
 def _rank_prop_candidates(league, games, groups, history_by_name, errors,
-                          star_rosters, identities, mlb_histories):
+                          star_rosters, identities, mlb_histories, nba_context=None):
     if league == 'NBA':
         from dual_agent.nba_star_spotlight import build_star_spotlights
     picks = []; exclusions = []; pitcher_forecasts = []
@@ -865,6 +1072,11 @@ def _rank_prop_candidates(league, games, groups, history_by_name, errors,
         probability = float(np.median(paired_probabilities)) if paired_probabilities else .5
         stat = MARKETS[league][market][1]
         if league=='NBA':
+            nba_rows = history_by_name.get(player, [])
+            unavailable, availability_status, restricted = nba_availability(nba_rows,nba_context)
+            if unavailable or restricted:
+                excluded(first,player,market,line,availability_status)
+                continue
             values = [nba_market_value(r, stat) for r in history_by_name.get(player, []) if pd.Timestamp(r['source_date'])+(pd.Timedelta(0) if r.get('history_provider') in {'api_sports','balldontlie'} else pd.Timedelta(hours=48))<min(start,pd.Timestamp(first['capture_time']))]
         else:
             identity = identities.get((int(first['game_id']),name_key(player)))
@@ -905,7 +1117,7 @@ def _rank_prop_candidates(league, games, groups, history_by_name, errors,
                 minimum=1 if league == 'MLB' and pitching_market else 10,
                 minimum_decisions=8 if league == 'MLB' and not pitching_market else None)
             if league == 'NBA':
-                estimate = estimate_nba_history(values,line,side)
+                estimate = estimate_nba_matchup(nba_rows,stat,line,side,first,nba_context)
             if estimate and league == 'MLB' and pitching_market:
                 best_forecast = max(available, key=lambda q:q[price_key])
                 pitcher_forecasts.append({'game_id': int(first['game_id']), 'player_id': identity[0],
@@ -926,12 +1138,11 @@ def _rank_prop_candidates(league, games, groups, history_by_name, errors,
                 best = max(available, key=lambda q:q[price_key])
                 if league == 'NBA':
                     opposite = 'Under' if side == 'Over' else 'Over'
-                    counterpart = estimate_nba_history(values,line,opposite)
-                    estimate['Over chance'] = estimate['Estimated chance'] if side == 'Over' else counterpart['Estimated chance']
-                    estimate['Under chance'] = estimate['Estimated chance'] if side == 'Under' else counterpart['Estimated chance']
+                    # Both directions come from the same fitted predictive distribution.
+                    # Stored Over/Under chances already exclude the same push mass.
                     estimate['Opposite side offered'] = any((q.get('under_decimal_odds' if side == 'Over' else 'over_decimal_odds') or 0) > 1 for q in unique.values())
                 value_eligible = False
-                push_chance = estimate['Historical pushes']/estimate['Prior games']
+                push_chance = estimate.get('Estimated push chance',estimate['Historical pushes']/estimate['Prior games'])
                 expected_return = (1-push_chance)*(estimate['Estimated chance']*best[price_key]-1)
                 qualified = True
                 picks.append({'Player':player,'Market':MARKETS[league][market][0],'Pick':side,'Line':line,
@@ -949,6 +1160,6 @@ def _rank_prop_candidates(league, games, groups, history_by_name, errors,
             seen.add(key);chosen.append(pick)
         # Retain eligible picks for every matchup; the global list stays top ten.
     return {'picks':chosen[:10],'game_picks':chosen,'errors':errors,
-            **({'star_spotlights': build_star_spotlights(games, star_rosters, history_by_name, chosen)} if league == 'NBA' else {}),
+            **({'star_spotlights': build_star_spotlights(games, star_rosters, history_by_name, chosen), 'unavailable_players':(nba_context or {}).get('blocked_player_names',[]), 'nba_prop_model_version':2} if league == 'NBA' else {}),
             **({'exclusions': exclusions, 'quoted_candidates':len(groups), 'pitcher_forecasts':pitcher_forecasts} if league in ('MLB','NBA') else {}), 'message':f'{len(chosen)} player-prop estimates ranked from actual lines and prior appearances.',
             'note':'Estimated chance is conditional on no push and player participation. Estimates are not calibrated; no availability or injury clearance is implied.'}
