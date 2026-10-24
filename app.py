@@ -729,6 +729,8 @@ def render_league_prediction_results(
     }
     """
 
+    if league_name == 'NFL' and pipeline_result is None:
+        pipeline_result = restore_cross_result('NFL')
     if league_name == 'NBA' and pipeline_result is None:
         pipeline_result = restore_nba_display_results()
     if pipeline_result is None:
@@ -749,6 +751,11 @@ def render_league_prediction_results(
                 for label, seconds in load_times.items():
                     st.caption(f'{label}: {seconds:.1f} seconds')
 
+    if league_name == 'NFL':
+        saved = pd.to_datetime(pipeline_result.get('workspace_saved_at',pipeline_result.get('saved_at')),utc=True,errors='coerce')
+        if pd.notna(saved) and pd.Timestamp.now(tz='UTC')-saved>pd.Timedelta(minutes=30):
+            pending = st.session_state.get('nfl_enrichment_future')
+            if pending is None: pipeline_result = start_cross_refresh('NFL',pipeline_result)
     predictions = pipeline_result.get("all_predictions", pipeline_result.get("predictions"))
     opportunities = pipeline_result.get("opportunities")
     if league_name == "NFL":
@@ -1008,6 +1015,210 @@ def render_player_prop_picks(league, result):
                                     st.write(str(issue))
 
 
+def cross_sport_state(league):
+    return 'nfl_prediction_pipeline_result' if league == 'NFL' else 'mlb_live_pipeline_result'
+
+
+def render_cross_tracking(league):
+    from dual_agent.sports_prop_workspace import tracking_records
+    records = tracking_records(league)
+    if not records: return
+    with st.expander(league+' prop results · covered / missed', expanded=False):
+        frame = pd.DataFrame(records)
+        decided = frame[frame.status.isin(['Covered','Missed'])]
+        wins = int((decided.status=='Covered').sum())
+        st.write(f'{wins} covered / {len(decided)} decided'+(f' · {wins/len(decided):.1%}' if len(decided) else ''))
+        st.caption('Frozen model recommendations, not placed bets. One stronger offered side per exact line. Pushes and pending records are excluded from accuracy. Missing final stats or unverified participation stay pending; void rules require sportsbook review. Results update during prediction scans.')
+        cols = ['away_team','home_team','player','market','side','line','probability','actual','status','start_time']
+        st.dataframe(frame.sort_values('start_time',ascending=False)[[c for c in cols if c in frame]],hide_index=True,use_container_width=True)
+
+
+def restore_cross_result(league):
+    state = cross_sport_state(league)
+    existing = st.session_state.get(state)
+    if existing: return existing
+    checked = league.lower()+'_workspace_restore_checked'
+    if st.session_state.get(checked): return None
+    st.session_state[checked] = True
+    from dual_agent.sports_prop_workspace import restore_result
+    saved = restore_result(league)
+    if saved:
+        st.session_state[state] = saved
+        remember_game_addons(league,saved)
+        stamp = pd.to_datetime(saved.get('workspace_saved_at'),utc=True,errors='coerce')
+        if league=='NFL' and pd.notna(stamp) and pd.Timestamp.now(tz='UTC')-stamp>pd.Timedelta(minutes=30):
+            return start_cross_refresh(league,saved)
+    return saved
+
+
+def start_cross_refresh(league, result, feature_games=None):
+    """One background job per sport; cached results remain on screen."""
+    import copy
+    from queue import Queue
+    key = league.lower()
+    pending = st.session_state.get(key+'_enrichment_future')
+    if pending is not None and not pending.done(): return result
+    from dual_agent.sports_prop_workspace import merge_result
+    previous = st.session_state.get(cross_sport_state(league)) or {}
+    result = merge_result(league,previous,copy.deepcopy(result or {}))
+    result['workspace_pending'] = True
+    result['enrichment_pending'] = True
+    result['workspace_refresh_started'] = pd.Timestamp.now(tz='UTC').isoformat()
+    queue = Queue(); st.session_state[key+'_enrichment_updates'] = queue
+    st.session_state[cross_sport_state(league)] = result
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        context = get_script_run_ctx()
+    except ImportError: context = None
+    odds_key = prediction_api_key('ODDS_API_KEY','THE_ODDS_API_KEY')
+    if league == 'NFL':
+        if feature_games is None:
+            feature_games = st.session_state.get('nfl_live_feature_games')
+            if feature_games is None: feature_games = st.session_state.get('nfl_feature_games')
+        future = nfl_enrichment_pool().submit(enrich_nfl_result,result,feature_games,odds_key,queue,context)
+    else:
+        pipeline = load_mlb_prediction_pipeline()
+        future = nba_enrichment_pool().submit(enrich_mlb_workspace,result,pipeline,odds_key,queue,context)
+    st.session_state[key+'_enrichment_future'] = future
+    return result
+
+
+def enrich_mlb_workspace(previous, pipeline, odds_key, updates, context=None):
+    import copy
+    if context is not None:
+        import threading
+        from streamlit.runtime.scriptrunner import add_script_run_ctx
+        add_script_run_ctx(threading.current_thread(),context)
+    from dual_agent.sports_prop_workspace import merge_result,checkpoint,track,settle_mlb
+    current = copy.deepcopy(previous)
+    def publish(props=None, teams=None):
+        nonlocal current
+        incoming = {}
+        if props is not None: incoming['player_props'] = props
+        if teams is not None: incoming.update(predictions=teams[:10],all_predictions=teams)
+        current = merge_result('MLB',current,incoming)
+        current.update(workspace_pending=True,enrichment_pending=True,pipeline_version=pipeline.MLB_PIPELINE_VERSION)
+        updates.put(copy.deepcopy(current))
+        try:
+            checkpoint('MLB',current); track('MLB',current)
+        except Exception:
+            current['workspace_issue'] = 'MLB predictions are ready; local saving is unavailable.'
+    try:
+        fresh = pipeline.run_mlb_prediction_pipeline(api_key=odds_key,force_refresh=True,
+            on_team_predictions=lambda teams:publish(teams=teams),on_prop_predictions=lambda props:publish(props=props))
+        from dual_agent.game_prediction_addons import enhance_result
+        fresh = enhance_result('MLB',fresh,odds_key)
+        current = merge_result('MLB',current,fresh)
+        current['pipeline_version'] = pipeline.MLB_PIPELINE_VERSION
+    except Exception as exc:
+        current['workspace_issue'] = 'MLB refresh unavailable ('+type(exc).__name__+'); saved results remain visible.'
+    current.update(workspace_pending=False,enrichment_pending=False,workspace_saved_at=pd.Timestamp.now(tz='UTC').isoformat())
+    updates.put(copy.deepcopy(current))
+    try:
+        track('MLB',current); checkpoint('MLB',current)
+    except Exception:
+        current['workspace_issue'] = 'MLB predictions are ready; local saving is unavailable.'
+    try: settle_mlb()
+    except Exception: pass
+    try: checkpoint('MLB',current,remote=True)
+    except Exception: pass
+    return current
+
+
+def drain_cross_updates(league):
+    from queue import Empty
+    key = league.lower(); queue = st.session_state.get(key+'_enrichment_updates')
+    if queue is not None:
+        while True:
+            try: partial = queue.get_nowait()
+            except Empty: break
+            st.session_state[cross_sport_state(league)] = partial
+            remember_game_addons(league,partial)
+    future = st.session_state.get(key+'_enrichment_future')
+    if future is not None and future.done():
+        try:
+            current = future.result(); st.session_state[cross_sport_state(league)] = current
+            remember_game_addons(league,current)
+            if league=='NFL':
+                st.session_state['nfl_auto_prop_predictions'] = current.get('nfl_player_props',pd.DataFrame())
+                st.session_state['live_nfl_predictions'] = current.get('predictions')
+                st.session_state['nfl_prop_scan_scope'] = 'next_7_days_v1'
+        except Exception as exc:
+            current = st.session_state.get(cross_sport_state(league)) or {}
+            current.update(workspace_pending=False,enrichment_pending=False,
+                workspace_issue=league+' background refresh stopped ('+type(exc).__name__+').')
+        st.session_state.pop(key+'_enrichment_future',None)
+        st.session_state.pop(key+'_enrichment_updates',None)
+
+
+@st.fragment(run_every='3s')
+def render_cross_prop_cards(league, game, fallback):
+    """Refresh game-local cards only; this fragment never fetches odds/stats."""
+    from dual_agent.sports_prop_workspace import prop_rows,normalized
+    from dual_agent.game_prediction_addons import matching_game_rows
+    from dual_agent.preferred_sportsbooks import allowed
+    current = st.session_state.get(cross_sport_state(league)) or fallback or {}
+    props = matching_game_rows(game,prop_rows(league,current))
+    if not props:
+        archive = 'nfl_saved_prop_cards' if league=='NFL' else 'mlb_saved_props_cards'
+        props = matching_game_rows(game,st.session_state.get(archive))
+    props = [r for r in props if allowed(normalized(league,r)['book'])]
+    import hashlib
+    identity = '|'.join(str(game.get(k,game.get({'home_team':'Home','away_team':'Away','commence_time':'start_time'}.get(k,k),''))) for k in ('home_team','away_team','commence_time'))
+    scope = league.lower()+'_live_'+hashlib.sha256(identity.encode()).hexdigest()[:16]
+    with st.expander('🎯 '+league+' player props · ranked by cover chance',expanded=True):
+        if current.get('workspace_pending') or current.get('enrichment_pending'):
+            st.caption('Refreshing in the background · saved cards remain visible.')
+        stamp = [normalized(league,r)['captured_at'] for r in props]
+        valid = [t for t in stamp if pd.notna(t)]
+        if valid:
+            st.caption('Latest displayed quote/calculation check: '+max(valid).tz_convert('America/Chicago').strftime('%b %d, %I:%M %p CT'))
+            if any(pd.Timestamp.now(tz='UTC')-t>pd.Timedelta(minutes=30) for t in valid):
+                st.caption('Saved estimates include expired quotes. Verify the current line and player availability before betting.')
+        if league=='NFL':
+            from dual_agent.nfl_player_props import MARKETS
+            markets = sorted(MARKETS)
+        else:
+            from dual_agent.sports_player_prop_predictions import MARKETS
+            markets = sorted({label for label,stat in MARKETS['MLB'].values()})
+        render_prop_category_buttons(markets,scope+'_market','All supported markets')
+        selected = st.selectbox(league+' prop market',['All supported markets']+markets,key=scope+'_market')
+        shown = props if selected=='All supported markets' else [r for r in props if normalized(league,r)['market']==selected]
+        render_prop_comparisons(shown,pending=current.get('workspace_pending',current.get('enrichment_pending',False)),scope=scope)
+        if league=='MLB':
+            mapped = [dict(r,market=r.get('Market'),player=r.get('Player')) for r in props]
+            render_prop_category_rankings(mapped,league)
+        else:
+            reasons = [r for r in current.get('prop_diagnostics',[]) if r.get('home_team')==game.get('home_team') and r.get('away_team')==game.get('away_team')]
+            if not shown and reasons:
+                with st.expander('Why this category has no props',expanded=False):
+                    for reason in reasons[:8]: st.caption(str(reason.get('reason',reason)))
+
+
+@st.fragment(run_every='3s')
+def render_mlb_live_workspace(location):
+    drain_cross_updates('MLB')
+    result = st.session_state.get('mlb_live_pipeline_result') or {}
+    if result.get('workspace_pending'): st.caption('MLB update running in the background; saved cards remain available.')
+    if result.get('workspace_issue'): st.caption(result['workspace_issue'])
+    render_cross_tracking('MLB')
+    raw = result.get('all_predictions',result.get('predictions',[]))
+    frame = raw.copy() if isinstance(raw,pd.DataFrame) else pd.DataFrame(raw or [])
+    if frame.empty: return
+    winners = pd.DataFrame([dict(r,home_team=r.get('Home',r.get('home_team')),
+        away_team=r.get('Away',r.get('away_team')),predicted_team=r.get('Predicted winner',r.get('predicted_team')),
+        confidence=r.get('Winner probability',r.get('confidence')),
+        home_win_probability=r.get('Home win probability',r.get('home_win_probability')),
+        away_win_probability=r.get('away_win_probability',1-r.get('Home win probability',r.get('home_win_probability',.5))),
+        commence_time=r.get('start_time',r.get('commence_time'))) for r in frame.to_dict('records')])
+    if 'Captured UTC' in winners:
+        winners['Saved forecast captured UTC'] = winners['Captured UTC']
+        winners = winners.drop(columns=['Captured UTC'])
+    st.caption('Saved forecasts remain visible while current information is checked. Their original lines and probabilities are not refreshed by displaying them.')
+    attached = dict(result,predictions=winners,all_predictions=winners,opportunities=None)
+    render_league_prediction_results('MLB','⚾',attached)
+
+
 def merge_nba_display_props(previous, incoming):
     """Replace matching forecasts while retaining other saved game cards."""
     merged = dict(previous or {}); merged.update(incoming or {})
@@ -1056,6 +1267,7 @@ def render_nba_prop_tracking():
 @st.fragment(run_every='3s')
 def render_nba_live_prop_cards(game, fallback):
     """Only this game's cards refresh; no network requests or full-page reruns."""
+    from dual_agent.game_prediction_addons import matching_game_rows
     current = st.session_state.get('nba_prediction_pipeline_result') or fallback or {}
     payload = current.get('player_props', {})
     rows = matching_game_rows(game, payload.get('game_picks', payload.get('picks', [])))
@@ -1454,10 +1666,24 @@ def nfl_enrichment_pool():
     return ThreadPoolExecutor(max_workers=2)
 
 
-def enrich_nfl_result(result, feature_games, odds_key, progress_queue=None):
+def enrich_nfl_result(result, feature_games, odds_key, progress_queue=None, context=None):
     """Run external enrichment without reading or writing session state."""
     import copy
     result = copy.deepcopy(result)
+    if context is not None:
+        import threading
+        from streamlit.runtime.scriptrunner import add_script_run_ctx
+        add_script_run_ctx(threading.current_thread(),context)
+    from dual_agent.sports_prop_workspace import merge_result,checkpoint,track
+    previous = copy.deepcopy(result)
+    def publish_props(props):
+        partial = merge_result('NFL',previous,dict(result,nfl_player_props=props))
+        partial.update(workspace_pending=True,enrichment_pending=True)
+        if progress_queue is not None: progress_queue.put(copy.deepcopy(partial))
+        try:
+            checkpoint('NFL',partial); track('NFL',partial)
+        except Exception:
+            partial['workspace_issue'] = 'NFL predictions are ready; local saving is unavailable.'
     try:
         from dual_agent.nfl_live_context import attach_context
         result['predictions'] = attach_context(result.get('predictions'), result.get('live_odds'))
@@ -1467,49 +1693,35 @@ def enrich_nfl_result(result, feature_games, odds_key, progress_queue=None):
         progress_queue.put(copy.deepcopy(result))
     try:
         from dual_agent.game_prediction_addons import enhance_result
-        result = enhance_result("NFL", result, odds_key, feature_games)
+        result = enhance_result("NFL", result, odds_key, feature_games,on_props=publish_props)
     except Exception as exc:
         result['prop_issues'] = ['NFL add-ons unavailable ('+type(exc).__name__+'); winner predictions are preserved.']
-    result['enrichment_pending'] = False
+    result = merge_result('NFL',previous,result)
+    result.update(enrichment_pending=False,workspace_pending=False,workspace_saved_at=pd.Timestamp.now(tz='UTC').isoformat())
+    if progress_queue is not None: progress_queue.put(copy.deepcopy(result))
+    try:
+        track('NFL',result); checkpoint('NFL',result)
+    except Exception:
+        result['workspace_issue'] = 'NFL predictions are ready; local saving is unavailable.'
+    try:
+        from dual_agent.nfl_player_props_ui import cached_player_history
+        from dual_agent.sports_prop_workspace import settle_nfl
+        year = pd.Timestamp.now(tz='UTC').year
+        settle_nfl(cached_player_history((year-1,year)))
+    except Exception: pass
+    try: checkpoint('NFL',result,remote=True)
+    except Exception: pass
     return result
 
 
 @st.fragment(run_every='3s')
 def render_nfl_enrichment_status():
-    future = st.session_state.get('nfl_enrichment_future')
-    if future is None:return
-    updates = st.session_state.get('nfl_enrichment_updates')
-    changed = False
-    if updates is not None:
-        from queue import Empty
-        while True:
-            try:
-                partial = updates.get_nowait()
-            except Empty:
-                break
-            st.session_state['nfl_prediction_pipeline_result'] = partial
-            st.session_state['live_nfl_predictions'] = partial.get('predictions')
-            st.session_state['nfl_enrichment_context_ready'] = True
-            changed = True
-    if not future.done():
-        if changed:st.rerun(scope='app')
-        st.info('Game context check finished. Collecting sportsbook props and QB forecasts…' if st.session_state.get('nfl_enrichment_context_ready') else 'Winner predictions are ready. Loading current game context…')
-        return
-    try:
-        result = future.result()
-        st.session_state['nfl_prediction_pipeline_result'] = result
-        st.session_state['nfl_auto_prop_predictions'] = result.get('nfl_player_props', pd.DataFrame())
-        st.session_state['live_nfl_predictions'] = result.get('predictions')
-        st.session_state['nfl_prop_scan_scope'] = 'next_7_days_v1'
-        remember_game_addons('NFL', result)
-    except Exception as exc:
-        result = st.session_state.get('nfl_prediction_pipeline_result') or {}
-        result['enrichment_pending'] = False
-        result['context_issue'] = 'Background NFL inputs unavailable ('+type(exc).__name__+'); winner predictions are preserved.'
-        st.session_state['nfl_prediction_pipeline_result'] = result
-    st.session_state.pop('nfl_enrichment_future', None)
-    st.session_state.pop('nfl_enrichment_updates', None)
-    st.rerun(scope='app')
+    drain_cross_updates('NFL')
+    current = st.session_state.get('nfl_prediction_pipeline_result') or {}
+    if current.get('workspace_pending') or current.get('enrichment_pending'):
+        st.caption('NFL props are updating in the background; saved cards remain visible.')
+    if current.get('workspace_issue'): st.caption(current['workspace_issue'])
+    render_cross_tracking('NFL')
 
 
 def run_nfl_prediction_with_addons(feature_games, historical_accuracy=None, historical_sample=None):
@@ -1525,15 +1737,7 @@ def run_nfl_prediction_with_addons(feature_games, historical_accuracy=None, hist
     if predictions is None or len(predictions) == 0:
         result['enrichment_pending'] = False
         return result
-    result['enrichment_pending'] = True
-    st.session_state['nfl_prediction_pipeline_result'] = result
-    odds_key = prediction_api_key("ODDS_API_KEY", "THE_ODDS_API_KEY")
-    from queue import Queue
-    updates = Queue()
-    st.session_state['nfl_enrichment_updates'] = updates
-    st.session_state['nfl_enrichment_context_ready'] = False
-    st.session_state['nfl_enrichment_future'] = nfl_enrichment_pool().submit(enrich_nfl_result, result, feature_games, odds_key, updates)
-    return result
+    return start_cross_refresh('NFL',result,feature_games)
 
 
 def remember_game_addons(league, result):
@@ -1886,11 +2090,15 @@ def render_game_addons(league, game, result):
                     st.rerun()
                 else:
                     st.info('An NBA prop scan is already running. Its progress is shown above.')
-            elif matched:
-                st.info('This game’s cached prop quotes were cleared. Generate predictions to fetch its new quotes; other games reuse cached responses.')
+            elif league in ('NFL','MLB'):
+                start_cross_refresh(league,st.session_state.get(cross_sport_state(league)) or result)
+                st.info('Refreshing props in the background. Existing cards remain visible.')
             else:
                 st.info('No cached sportsbook event matched this game. Generate predictions to collect its available listings.')
         st.caption('Quotes may be up to 30 minutes old. Refresh and regenerate before using current betting odds.')
+    if league in ('NFL','MLB'):
+        render_cross_prop_cards(league,game,result)
+        return
     if league == 'NBA':
         render_nba_live_prop_cards(game, result)
         return
@@ -2176,7 +2384,12 @@ def render_nfl_freshness_monitor():
         st.warning('NFL history refresh unavailable: ' + str(exc))
 
 
+@st.fragment(run_every='3s')
 def render_nfl_game_context(game):
+    from dual_agent.game_prediction_addons import matching_game_rows
+    latest = (st.session_state.get('nfl_prediction_pipeline_result') or {}).get('predictions')
+    matching = matching_game_rows(game,latest)
+    if matching: game = matching[0]
     context = game.get('game_context')
     with st.expander('Quarterbacks, injuries & game conditions', expanded=True):
         if not isinstance(context,dict):
@@ -2240,7 +2453,7 @@ def render_nfl_game_context(game):
 
 
 def render_mlb_update_notice(location):
-    st.caption('Automatic sportsbook scans are off. Odds are reused for up to 30 minutes; generate picks when you want an update.')
+    st.caption('Saved props stay visible. A stale workspace refreshes in the background when opened; sportsbook responses are reused for up to 30 minutes.')
 
 
 @st.fragment
@@ -2259,75 +2472,18 @@ def render_mlb_prediction_center(location):
             except Exception as exc:
                 st.error("Unable to activate MLB model: " + str(exc))
     st.caption("Scores the next seven days of games. The strongest ten lead the slate; ranked sportsbook props appear inside each game.")
-    team_cards = st.empty()
-    def show_team_cards(rows):
-        winners = pd.DataFrame([{
-            **r,
-            "home_team": r.get("Home", r.get("home_team")),
-            "away_team": r.get("Away", r.get("away_team")),
-            "predicted_team": r.get("Predicted winner", r.get("predicted_team")),
-            "confidence": r.get("Winner probability", r.get("confidence")),
-            "home_win_probability": r.get("Home win probability", r.get("home_win_probability")),
-            "away_win_probability": r.get("away_win_probability", 1-r.get("Home win probability", r.get("home_win_probability", .5))),
-            "commence_time": r.get("start_time", r.get("commence_time")),
-            "input_status": r.get("Input status", r.get("input_status")),
-            "input_notes": r.get("Input notes", r.get("input_notes", [])),
-            "pick_game_status": r.get("pick_game_status", "Upcoming"),
-            "Captured UTC": r.get("Captured UTC"),
-        } for r in rows])
-        with team_cards.container():
-            attached = dict(st.session_state.get("mlb_live_pipeline_result") or {})
-            attached.update(predictions=winners, all_predictions=winners, opportunities=None)
-            render_league_prediction_results("MLB", "⚾", attached)
-    generated = st.button("⚾ Generate MLB Predictions · Next 7 Days", key=location + "_generate", type="primary", use_container_width=True)
-    previous = st.session_state.get("mlb_live_pipeline_result")
-    if previous:
-        retain_sport_picks("MLB", previous.get("all_predictions", previous.get("predictions", [])), limit=None)
-        remember_game_addons("MLB", previous)
-    st.caption("Your displayed picks stay in place while you read. Automatic odds scans are off; sportsbook responses are reused for up to 30 minutes.")
-    if generated:
-        st.session_state.pop('mlb_pending_pipeline_result', None)
-        st.session_state["mlb_last_refresh_attempt"] = pd.Timestamp.now(tz="UTC").isoformat()
+    previous = restore_cross_result('MLB')
+    generated = st.button('⚾ Generate MLB Predictions · Next 7 Days',key=location+'_generate',type='primary',use_container_width=True)
+    saved = pd.to_datetime((previous or {}).get('workspace_saved_at',(previous or {}).get('saved_at')),utc=True,errors='coerce')
+    needs_refresh = previous and pd.notna(saved) and pd.Timestamp.now(tz='UTC')-saved>pd.Timedelta(minutes=30)
+    if generated or (needs_refresh and st.session_state.get('mlb_enrichment_future') is None):
         try:
-            import os
-            pipeline = load_mlb_prediction_pipeline()
-            odds_key = os.environ.get("ODDS_API_KEY") or os.environ.get("THE_ODDS_API_KEY")
-            if not odds_key:
-                try:
-                    odds_key = st.secrets.get("ODDS_API_KEY") or st.secrets.get("THE_ODDS_API_KEY")
-                except Exception:
-                    odds_key = None
-            status = st.empty()
-            result = pipeline.run_mlb_prediction_pipeline(api_key=odds_key, progress=status.info, force_refresh=True)
-            try:
-                from dual_agent.game_prediction_addons import enhance_result
-                result = enhance_result("MLB", result, odds_key)
-            except ImportError:
-                result["spreads"] = {"picks": [], "issues": ["Deploy dual_agent/game_prediction_addons.py for run-line predictions."]}
-            result["pipeline_version"] = pipeline.MLB_PIPELINE_VERSION
-            st.session_state["mlb_live_pipeline_result"] = result
-            status.success(result["message"])
+            start_cross_refresh('MLB',previous or {})
         except Exception as exc:
-            st.error("MLB prediction pipeline stopped: " + str(exc))
-    result = st.session_state.get("mlb_live_pipeline_result")
-    if result and result.get("pipeline_version") not in (13, 14):
-        st.session_state.pop("mlb_live_pipeline_result", None)
-        result = None
-        st.info("The MLB pipeline was updated. Generate again to search the upcoming seven-day schedule.")
-    if result:
-        now = pd.Timestamp.now(tz="UTC")
-        rows = retain_sport_picks("MLB", result.get("all_predictions", result.get("predictions", [])), limit=None).to_dict("records")
-        if rows:
-            show_team_cards(rows)
-            st.caption("Picks are saved before first pitch. Confidence reflects the saved model; the 70% accuracy goal is not established.")
-        else:
-            st.info(result.get("message", "No fresh upcoming predictions. Generate again to collect current game information."))
-            if result.get("scheduled_games"):
-                st.dataframe(pd.DataFrame(result["scheduled_games"]), use_container_width=True, hide_index=True)
-        st.caption("Player props and run-line estimates are attached to their matching game cards.")
-        last_capture = pd.to_datetime(result.get("created_at"), utc=True, errors="coerce")
-        if pd.notna(last_capture):
-            st.caption("Last successful refresh: " + last_capture.tz_convert("America/Chicago").strftime("%b %d · %-I:%M %p CT"))
+            st.error('Unable to start MLB refresh ('+type(exc).__name__+'). Saved cards are preserved.')
+    st.caption('Saved cards appear first. Refreshes run in the background; opening a category makes no API request.')
+    render_mlb_live_workspace(location)
+
 
 
 if page == "🏠 Home":
@@ -2438,6 +2594,8 @@ if page == "🏠 Home":
         "nfl_prediction_pipeline_result",
         None,
     )
+    if nfl_pipeline_result is None:
+        nfl_pipeline_result = restore_cross_result('NFL')
     
     if nfl_pipeline_result is not None:
     
