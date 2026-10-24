@@ -1146,7 +1146,7 @@ def _rank_prop_candidates(league, games, groups, history_by_name, errors,
                 expected_return = (1-push_chance)*(estimate['Estimated chance']*best[price_key]-1)
                 qualified = True
                 picks.append({'Player':player,'Market':MARKETS[league][market][0],'Pick':side,'Line':line,
-                              'Market chance':market_p,'Best sportsbook':best['book'],'Best decimal odds':best[price_key], 'Sportsbook offers':[{'book':q['book'], 'decimal_odds':q[price_key]} for q in available], 'Estimated return per unit':expected_return,'Value eligible':value_eligible,'Break-even cover chance':1/best[price_key],'Estimated push chance':push_chance,'Books':len(available),'Game':first['away_team']+' @ '+first['home_team'],
+                              'Market chance':market_p,'Best sportsbook':best['book'],'Best decimal odds':best[price_key], 'Sportsbook offers':[{'book':q['book'], 'decimal_odds':q[price_key], 'updated_at':q['updated_at']} for q in available], 'Estimated return per unit':expected_return,'Value eligible':value_eligible,'Break-even cover chance':1/best[price_key],'Estimated push chance':push_chance,'Books':len(available),'Game':first['away_team']+' @ '+first['home_team'],
                               'start_time':first['start_time'],'Captured UTC':first['capture_time'],
                               **({'Participation status': participation, 'Event match': first.get('Event match'), 'game_id':int(first['game_id']), 'player_id':int(identity[0])} if league=='MLB' else {}), **estimate})
         if league in ('MLB', 'NBA') and not qualified:
