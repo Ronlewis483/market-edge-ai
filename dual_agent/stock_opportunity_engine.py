@@ -1,426 +1,656 @@
-"""Automatic stock research: next-hour trades and weekly-reviewed 63-session holds.
+"""Pregame player-prop estimates using actual lines and prior appearances.
 
-Read-only Alpaca data. No orders. Strategy selection and verification use separate
-chronological periods, include fixed round-trip costs, and never use live outcomes.
+These are historical hit-rate estimates shrunk toward bookmaker consensus,
+not calibrated win probabilities from the game-winner model.
 """
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import json
+import time
+import re
+from pathlib import Path
+import unicodedata
+
 import numpy as np
 import pandas as pd
 import requests
+from dual_agent.odds_request_cache import get as cached_odds_get
+from dual_agent.preferred_sportsbooks import allowed, standalone_value
 
-ENGINE_VERSION = 9
-DEFAULT_SYMBOLS = ['AAPL','MSFT','NVDA','AMZN','META','GOOGL','TSLA','AVGO','AMD','JPM','LLY','XOM']
-STRATEGIES = {'hour': ['Trend + VWAP', 'Range breakout', 'VWAP reclaim', 'EMA pullback', 'Opening range breakout', 'Momentum continuation', 'RSI recovery', 'Bollinger recovery'],
-              'hold': ['Long-term momentum', '63-day breakout', 'Trend pullback', '50-day reclaim', '20-day breakout']}
-
-
-# Shared request pacing across workers in this process.
-import threading
-import time
-_REQUEST_LOCK = threading.Lock()
-_NEXT_REQUEST = 0.0
-
-
-class RateLimitError(RuntimeError):
-    pass
-
-
-def _get(base, path, key, secret, params=None):
-    global _NEXT_REQUEST
-    for attempt in range(3):
-        with _REQUEST_LOCK:
-            delay=max(0.0,_NEXT_REQUEST-time.monotonic())
-            if delay>0:time.sleep(delay)
-            _NEXT_REQUEST=time.monotonic()+.7
-        response=requests.get(base+path,headers={'APCA-API-KEY-ID':key,
-            'APCA-API-SECRET-KEY':secret},params=params,timeout=20)
-        if response.status_code==429:
-            try:wait=max(5.0,float(response.headers.get('Retry-After',15)))
-            except (TypeError,ValueError):wait=15.0
-            with _REQUEST_LOCK:
-                _NEXT_REQUEST=max(_NEXT_REQUEST,time.monotonic()+min(wait,30))
-            if attempt==2 or wait>30:
-                raise RateLimitError('Alpaca temporarily limited requests (HTTP 429). The scanner will pause and retry automatically; this does not indicate invalid credentials.')
-            continue
-        if response.status_code!=200:
-            raise RuntimeError('Alpaca request failed (HTTP '+str(response.status_code)+'). Check credentials and data access.')
-        return response.json()
+MARKETS = {'MLB': {
+    'batter_hits': ('Hits', 'hits'),
+    'batter_home_runs': ('Home runs', 'batting_home_runs'),
+    'batter_total_bases': ('Total bases', 'total_bases'),
+    'batter_rbis': ('RBIs', 'rbi'),
+    'batter_runs_scored': ('Runs scored', 'batting_runs'),
+    'batter_hits_runs_rbis': ('Hits + runs + RBIs', 'hits_runs_rbis'),
+    'batter_singles': ('Singles', 'singles'),
+    'batter_doubles': ('Doubles', 'doubles'),
+    'batter_triples': ('Triples', 'triples'),
+    'batter_walks': ('Batter walks', 'batting_walks'),
+    'batter_strikeouts': ('Batter strikeouts', 'batting_strikeouts'),
+    'batter_stolen_bases': ('Stolen bases', 'stolen_bases'),
+    'pitcher_strikeouts': ('Pitcher strikeouts', 'pitcher_strikeouts'),
+    'pitcher_hits_allowed': ('Hits allowed', 'pitcher_hits'),
+    'pitcher_walks': ('Pitcher walks', 'pitcher_walks'),
+    'pitcher_earned_runs': ('Earned runs allowed', 'earned_runs'),
+    'pitcher_outs': ('Outs recorded', 'pitching_outs')},
+    'NBA': {'player_points': ('Points', 'pts'), 'player_rebounds': ('Rebounds', 'reb'), 'player_assists': ('Assists', 'ast'),
+    'player_threes': ('Three-pointers made', 'fg3m'), 'player_blocks': ('Blocks', 'blk'),
+    'player_steals': ('Steals', 'stl'), 'player_turnovers': ('Turnovers', 'turnover'),
+    'player_points_rebounds_assists': ('Points + rebounds + assists', ('pts', 'reb', 'ast')),
+    'player_points_rebounds': ('Points + rebounds', ('pts', 'reb')),
+    'player_points_assists': ('Points + assists', ('pts', 'ast')),
+    'player_rebounds_assists': ('Rebounds + assists', ('reb', 'ast')),
+    'player_blocks_steals': ('Blocks + steals', ('blk', 'stl'))}}
 
 
-def fetch_clock(key, secret, trading_url='https://paper-api.alpaca.markets'):
-    if trading_url not in ['https://paper-api.alpaca.markets','https://api.alpaca.markets']:
-        raise ValueError('Use the official Alpaca paper or live API URL.')
-    return _get(trading_url, '/v2/clock', key, secret)
+def name_key(value):
+    return ''.join(c for c in unicodedata.normalize('NFKD', str(value)).lower() if c.isalnum())
 
 
-def fetch_quotes(symbols, key, secret, feed='iex'):
-    return _get('https://data.alpaca.markets', '/v2/stocks/quotes/latest', key, secret,
-        {'symbols':','.join(symbols), 'feed':feed}).get('quotes', {})
+def estimate_prop(values, line, side, market_probability, minimum=10, minimum_decisions=None):
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)][-30:]
+    wins = int((values > line).sum()) if side == 'Over' else int((values < line).sum())
+    pushes = int((values == line).sum())
+    decisions = len(values)-pushes
+    if minimum_decisions is None:
+        minimum_decisions = minimum
+    if len(values) < minimum or decisions < minimum_decisions:
+        return None
+    # Preserve the existing short-sample shrinkage and eligibility criteria.
+    chance = (wins+10*market_probability)/(decisions+10)
+    return {'Estimated chance': float(chance), 'Projected stat': float(values.mean()),
+            'Prior games': len(values), 'Non-push games': decisions, 'Historical wins': wins, 'Historical pushes': pushes,
+            'Historical hit rate': wins/decisions, 'Estimate method': 'Prior 30 appearances + market shrinkage'}
 
 
-def fetch_bars(symbols, key, secret, horizon, feed='iex', now=None, start=None):
-    now = pd.Timestamp(now or pd.Timestamp.now(tz='UTC'))
-    days = 50 if horizon=='hour' else 365*6
-    params = {'symbols':','.join(symbols), 'timeframe':'5Min' if horizon=='hour' else '1Day',
-        'start':(pd.Timestamp(start) if start is not None else now-pd.Timedelta(days=days)).strftime('%Y-%m-%dT%H:%M:%SZ'),
-        'end':now.strftime('%Y-%m-%dT%H:%M:%SZ'), 'adjustment':'all', 'feed':feed,
-        'sort':'asc', 'limit':10000}
-    rows = []
-    for page in range(40):
-        payload = _get('https://data.alpaca.markets', '/v2/stocks/bars', key, secret, params)
-        for symbol, bars in payload.get('bars', {}).items():
-            rows.extend(dict(bar, symbol=symbol) for bar in bars)
-        token = payload.get('next_page_token')
-        if not token: break
-        params['page_token'] = token
-    else:
-        raise RuntimeError('Market history is incomplete; reduce the symbol list.')
-    if not rows: raise RuntimeError('Alpaca returned no history for this feed.')
-    frame = pd.DataFrame(rows).rename(columns={'t':'timestamp','o':'open','h':'high','l':'low','c':'close','v':'volume','vw':'vwap'})
-    frame['timestamp'] = pd.to_datetime(frame.timestamp, utc=True, errors='coerce')
-    frame = frame.dropna(subset=['timestamp']).drop_duplicates(['symbol','timestamp']).sort_values(['symbol','timestamp'])
-    local = frame.timestamp.dt.tz_convert('America/New_York')
-    if horizon == 'hour':
-        minute = local.dt.hour*60+local.dt.minute
-        frame = frame[(minute>=570)&(minute<960)&(frame.timestamp+pd.Timedelta(minutes=5)<=now)]
-    else:
-        # Today's daily bar is incomplete until the exchange session finishes.
-        frame = frame[local.dt.date < now.tz_convert('America/New_York').date()]
-    return frame.reset_index(drop=True)
+def nba_market_value(row, stat):
+    """Sum supported components only when every component is actually present."""
+    fields = stat if isinstance(stat, tuple) else (stat,)
+    numbers = [pd.to_numeric(row.get(field), errors='coerce') for field in fields]
+    return float(sum(numbers)) if all(pd.notna(n) and np.isfinite(n) for n in numbers) else None
 
 
-def indicators(frame, horizon):
-    g = frame.copy().sort_values('timestamp').reset_index(drop=True)
-    c = g.close
-    prior = c.shift()
-    g['atr'] = pd.concat([g.high-g.low, (g.high-prior).abs(), (g.low-prior).abs()],axis=1).max(axis=1).rolling(14).mean()
-    if horizon == 'hour':
-        day = g.timestamp.dt.tz_convert('America/New_York').dt.date
-        # Reset intraday indicators each session, with no overnight bars in VWAP.
-        g['session'] = day
-        g['fast'] = g.groupby('session').close.transform(lambda v:v.ewm(span=9,adjust=False).mean())
-        g['slow'] = g.groupby('session').close.transform(lambda v:v.ewm(span=20,adjust=False).mean())
-        weighted = (g.vwap if 'vwap' in g else (g.high+g.low+g.close)/3)*g.volume
-        g['session_vwap'] = weighted.groupby(day).cumsum()/g.volume.groupby(day).cumsum().replace(0,np.nan)
-        g['volume_mean'] = g.groupby('session').volume.transform(lambda v:v.shift().rolling(20,min_periods=12).mean())
-        prev_close = g.groupby('session').close.shift()
-        prev_vwap = g.groupby('session').session_vwap.shift()
-        high = g.groupby('session').high.transform(lambda v:v.shift().rolling(20,min_periods=20).max())
-        rising = g['slow'] > g.groupby('session').slow.shift(3)
-        g[STRATEGIES['hour'][0]] = (c>g.fast)&(g.fast>g.slow)&(c>g.session_vwap)&rising&(g.volume>.8*g.volume_mean)
-        g[STRATEGIES['hour'][1]] = (c>high)&(c>g.session_vwap)&(g.volume>.8*g.volume_mean)
-        g[STRATEGIES['hour'][2]] = (prev_close<=prev_vwap)&(c>g.session_vwap)&rising
-        previous_fast=g.groupby('session').fast.shift()
-        g['EMA pullback']=(prev_close<=previous_fast)&(c>g.fast)&(g.fast>g.slow)&(c>g.session_vwap)
-        minute=g.timestamp.dt.tz_convert('America/New_York').dt.hour*60+g.timestamp.dt.tz_convert('America/New_York').dt.minute
-        opening=g.high.where(minute<600).groupby(day).cummax().groupby(day).ffill()
-        g['Opening range breakout']=(minute>=600)&(c>opening)&(prev_close<=opening)&(c>g.session_vwap)
-        prior_three=g.groupby('session').close.shift(3)
-        g['Momentum continuation']=(c>prior_three)&(g.fast>g.slow)&rising&(c>g.session_vwap)&(g.volume>.8*g.volume_mean)
-        delta=g.groupby('session').close.diff()
-        gains=delta.clip(lower=0).groupby(day).transform(lambda v:v.ewm(alpha=1/14,adjust=False).mean())
-        losses=(-delta.clip(upper=0)).groupby(day).transform(lambda v:v.ewm(alpha=1/14,adjust=False).mean())
-        rsi=100-100/(1+gains/losses.replace(0,np.nan))
-        previous_rsi=rsi.groupby(day).shift()
-        g['RSI recovery']=(previous_rsi<35)&(rsi>=35)&rising
-        mean=g.groupby('session').close.transform(lambda v:v.rolling(20).mean())
-        std=g.groupby('session').close.transform(lambda v:v.rolling(20).std())
-        lower=mean-2*std
-        g['Bollinger recovery']=(prev_close<lower.groupby(day).shift())&(c>=lower)&rising
-    else:
-        g['ma50'] = c.rolling(50).mean();g['ma200'] = c.rolling(200).mean()
-        change = c.diff(); gain=change.clip(lower=0).ewm(alpha=1/14,adjust=False).mean(); loss=(-change.clip(upper=0)).ewm(alpha=1/14,adjust=False).mean()
-        rsi = 100-100/(1+gain/loss.replace(0,np.nan)); rsi = rsi.where(loss!=0,100)
-        trend = (c>g.ma200)&(g.ma50>g.ma200)
-        g[STRATEGIES['hold'][0]] = trend&(c.pct_change(63)>0)
-        g[STRATEGIES['hold'][1]] = trend&(c>g.high.shift().rolling(63).max())
-        g[STRATEGIES['hold'][2]] = trend&(rsi<50)&(rsi>25)
-        g['50-day reclaim']=(c>g.ma200)&(prior<=g.ma50.shift())&(c>g.ma50)
-        g['20-day breakout']=trend&(c>g.high.shift().rolling(20).max())
-    return g
+def _get(url, key, params=None, balldontlie=False):
+    if balldontlie:
+        # Share plan-aware pacing and 429 handling with NBA game history.
+        from dual_agent.balldontlie_data import _balldontlie_get
+        return _balldontlie_get(url, params=params, api_key=key)
+    response = cached_odds_get(url, params=params, headers={'Authorization': key} if balldontlie else None, timeout=20)
+    if response.status_code != 200:
+        raise RuntimeError('Player-prop data request failed (HTTP '+str(response.status_code)+').')
+    return response.json()
 
 
-def historical_trades(g, strategy, horizon, split, section):
-    """Next-bar entries and non-overlapping positions per symbol; costs included.
-
-    Hour trades close at a 1.5 ATR stop or after 12 five-minute bars. Hold trades
-    exit after 63 sessions. Entry prices cannot use the signal bar's closing price.
-    """
-    length = 12 if horizon=='hour' else 63
-    fee = .001 if horizon=='hour' else .002
-    records=[]; i=0
-    signals=g[strategy].fillna(False).to_numpy(); stamps=g.timestamp.tolist()
-    o=g.open.to_numpy();h=g.high.to_numpy();lo=g.low.to_numpy();c=g.close.to_numpy();atr=g.atr.to_numpy()
-    while i+length<len(g):
-        if not signals[i] or not np.isfinite(atr[i]) or atr[i]<=0:
-            i+=1;continue
-        entry=i+1; end=i+length
-        if horizon=='hour' and (g.session.iloc[entry]!=g.session.iloc[end] or stamps[end]-stamps[i]>pd.Timedelta(hours=1)):
-            i+=1;continue
-        if section=='selection' and stamps[end]>=split:
-            i+=1;continue
-        if section=='verification' and stamps[i]<split:
-            i+=1;continue
-        if not np.isfinite(o[entry]) or o[entry]<=0:
-            i+=1;continue
-        exit_price=c[end]; actual_end=end
-        if horizon=='hour':
-            stop=o[entry]-1.5*atr[i]
-            if stop<=0: i+=1;continue
-            for j in range(entry,end+1):
-                if lo[j]<=stop:
-                    exit_price=min(o[j],stop);actual_end=j;break
-        net=exit_price/o[entry]-1-fee
-        if np.isfinite(net):records.append({'return':float(net),'signal':stamps[i],'exit':stamps[actual_end]})
-        i=actual_end+1
-    return records
+MLB_PROP_MATCH_VERSION = 6
 
 
-def summarize(trades):
-    values=np.asarray([r['return'] for r in trades],dtype=float)
-    return {'trades':len(values),'mean_net_return':float(values.mean()) if len(values) else None,
-            'win_rate':float((values>0).mean()) if len(values) else None}
+def mlb_team_key(value):
+    key = name_key(value)
+    return {'ladodgers': 'losangelesdodgers', 'laangels': 'losangelesangels',
+            'oaklandathletics': 'athletics', 'sacramentoathletics': 'athletics',
+            'clevelandindians': 'clevelandguardians'}.get(key, key)
 
 
-def select_strategy(frames, horizon):
-    dates=sorted({t for g in frames.values() for t in g.timestamp})
-    if len(dates)<300:return {'qualified':False,'reason':'More market history is needed for strategy selection.'}
-    split=dates[int(len(dates)*.7)]
-    selection={}; verification={}
-    for strategy in STRATEGIES[horizon]:
-        chosen=[]; held=[]
-        for g in frames.values():
-            chosen.extend(historical_trades(g,strategy,horizon,split,'selection'))
-            held.extend(historical_trades(g,strategy,horizon,split,'verification'))
-        selection[strategy]=summarize(chosen);verification[strategy]=summarize(held)
-    checked=[]
-    for strategy in STRATEGIES[horizon]:
-        chosen=selection[strategy];held=verification[strategy]
-        passed=(chosen['trades']>=25 and held['trades']>=8 and
-                (horizon=='hour' or (chosen['mean_net_return'] is not None and chosen['mean_net_return']>0)) and
-                held['mean_net_return'] is not None and held['mean_net_return']>0)
-        checked.append({'qualified':passed,'strategy':strategy,'selection':chosen,'verification':held,
-                        'split_utc':split.isoformat(),'cost_assumption_bps':10 if horizon=='hour' else 20})
-    qualifying=[item for item in checked if item['qualified']]
-    return {'qualified':bool(qualifying),'strategies':checked,'qualified_strategies':qualifying,
-            'reason':None if qualifying else 'None of the independently evaluated strategies passed the history and positive net-return checks.'}
-
-
-def _single_opportunities(raw, quotes, clock, horizon, now=None, prepared_frames=None, prepared_evidence=None):
-    now=pd.Timestamp(now or pd.Timestamp.now(tz='UTC'))
-    frames=prepared_frames if prepared_frames is not None else {symbol:indicators(g,horizon) for symbol,g in raw.groupby('symbol')}
-    evidence=prepared_evidence if prepared_evidence is not None else select_strategy(frames,horizon)
-    result={'picks':[],'strategy_evidence':evidence,'as_of':now.isoformat(),'horizon':horizon,'warnings':[]}
-    if not evidence.get('qualified'):
-        result['message']=evidence['reason'];return result
-    if not clock.get('is_open'):
-        result['message']='Market closed. These strategies will be checked again during the regular session.';return result
-    if horizon=='hour' and pd.Timestamp(clock['next_close'])-now<pd.Timedelta(hours=1):
-        result['message']='Less than one hour remains in the regular session. No new hour-long trade.';return result
-    strategy=evidence['strategy']
-    result['exclusions']=[]
-    def reject(symbol,reason):
-        result['exclusions'].append({'symbol':symbol,'strategy':strategy,'reason':reason})
-    for symbol,g in frames.items():
-        if g.empty or not bool(g.iloc[-1][strategy]):reject(symbol,'No current entry signal');continue
-        row=g.iloc[-1];quote=quotes.get(symbol,{})
-        stamp=pd.to_datetime(quote.get('t'),utc=True,errors='coerce')
-        try:ask=float(quote['ap']);bid=float(quote['bp'])
-        except (KeyError,ValueError,TypeError):reject(symbol,'Live bid or ask unavailable');continue
-        if pd.isna(stamp) or stamp>now or now-stamp>pd.Timedelta(seconds=90) or not 0<bid<=ask:reject(symbol,'Quote missing, older than 90 seconds, or invalid');continue
-        spread=(ask-bid)/((ask+bid)/2)
-        if spread>.005 or ask<5:reject(symbol,'Spread above 0.5% or price below five dollars');continue
-        if horizon=='hour' and now-pd.Timestamp(row.timestamp)>pd.Timedelta(minutes=12):reject(symbol,'Completed intraday bars are older than 12 minutes');continue
-        if horizon=='hold' and now-pd.Timestamp(row.timestamp)>pd.Timedelta(days=5):reject(symbol,'Daily history is stale');continue
-        if horizon=='hour' and float(row.volume)*float(row.close)<50000:reject(symbol,'Latest five-minute dollar volume below 50,000 on this feed');continue
-        atr=float(row.atr)
-        if not np.isfinite(atr) or atr<=0:reject(symbol,'Not enough usable volatility history');continue
-        # Don't chase a price far from the latest completed signal bar.
-        if abs(ask/float(row.close)-1)>(.01 if horizon=='hour' else .05):reject(symbol,'Current price moved too far from the signal');continue
-        split=pd.Timestamp(evidence['split_utc'])
-        sample=summarize(historical_trades(g,strategy,horizon,split,'verification'))
-        if sample['trades']<2:reject(symbol,'Fewer than two recent historical trades for this stock and strategy');continue
-        if sample['mean_net_return'] is None or sample['mean_net_return']<=0:reject(symbol,'This stock and strategy have no positive recent average net return');continue
-        picks={'symbol':symbol,'strategy':strategy,'entry_reference':ask,'spread_pct':spread,
-               'quote_time':stamp.isoformat(),'signal_time':pd.Timestamp(row.timestamp).isoformat(),
-               'historical_mean_net_return':sample['mean_net_return'],'historical_win_rate':sample['win_rate'],
-               'verification_trades':sample['trades'],'holding_period':'Up to 1 hour' if horizon=='hour' else 'About 63 trading sessions',
-               'direction':'Long','rank_score':sample['mean_net_return']}
-        if horizon=='hour':
-            # Wilson lower bound: discounts high observed win rates from tiny samples.
-            n=sample['trades']; rate=sample['win_rate']; z=1.96
-            support=(rate+z*z/(2*n)-z*np.sqrt(rate*(1-rate)/n+z*z/(4*n*n)))/(1+z*z/n)
-            picks.update(rank_score=float(support),evidence_score=float(support),
-                         evidence_label='Limited history' if n<10 else 'Historical evidence',
-                         strategy_earlier_net_return=evidence['selection']['mean_net_return'])
-            stop=ask-1.5*atr
-            if stop<=0:reject(symbol,'Stop reference is invalid');continue
-            picks.update(stop_reference=stop,exit_time=min(now+pd.Timedelta(hours=1),pd.Timestamp(clock['next_close'])).isoformat())
-        result['picks'].append(picks)
-    result['picks'].sort(key=lambda p:(-p['rank_score'],-p['verification_trades'],p['symbol']))
-    result['picks']=result['picks'][:5]
-    result['message']='Candidates ranked by observed mean net return in the separate verification period.' if result['picks'] else 'No current setup passes the signal, history, quote and liquidity checks.'
-    return result
-
-
-def opportunities(raw,quotes,clock,horizon,now=None,prepared_frames=None,prepared_evidence=None):
-    frames=prepared_frames if prepared_frames is not None else {symbol:indicators(g,horizon) for symbol,g in raw.groupby('symbol')}
-    evidence=prepared_evidence if prepared_evidence is not None else select_strategy(frames,horizon)
-    result={'picks':[],'strategy_evidence':evidence,'horizon':horizon,'warnings':[]}
-    if not evidence.get('qualified'):
-        result['message']=evidence['reason'];return result
-    groups=[_single_opportunities(raw,quotes,clock,horizon,now,frames,item) for item in evidence['qualified_strategies']]
-    result['exclusions']=[item for group in groups for item in group.get('exclusions',[])]
-    picks=sorted([pick for group in groups for pick in group['picks']],key=lambda p:(-p['rank_score'],-p['verification_trades'],p['symbol'],p['strategy']))
-    seen=set()
-    for pick in picks:
-        if pick['symbol'] in seen:continue
-        seen.add(pick['symbol']);result['picks'].append(pick)
-        if len(result['picks'])==5:break
-    result['message']='Candidates ranked across independently qualifying strategies.' if result['picks'] else groups[0]['message']
-    result['as_of']=pd.Timestamp(now or pd.Timestamp.now(tz='UTC')).isoformat()
-    return result
-
-
-def fetch_universe(key, secret, trading_url):
-    if trading_url not in ['https://paper-api.alpaca.markets','https://api.alpaca.markets']:
-        raise ValueError('Use the official Alpaca paper or live API URL.')
-    assets = _get(trading_url, '/v2/assets', key, secret,
-                  {'status':'active','asset_class':'us_equity'})
-    return sorted({a['symbol'] for a in assets if a.get('tradable') and
-                   a.get('exchange') not in ['OTC', 'CRYPTO']})
-
-
-def screen_universe(symbols, key, secret, feed):
-    """Screen every provider-listed symbol; never truncate to a preset shortlist."""
-    snapshots = {}
-    for i in range(0,len(symbols),500):
-        snapshots.update(_get('https://data.alpaca.markets','/v2/stocks/snapshots',key,secret,
-                              {'symbols':','.join(symbols[i:i+500]),'feed':feed}))
-    eligible=[]
-    for symbol in symbols:
-        snap=snapshots.get(symbol) or {}
-        bar=snap.get('prevDailyBar') or {}
-        try:
-            price=float(bar['c']); dollars=price*float(bar['v'])
-        except (KeyError, TypeError, ValueError):continue
-        if price>=5 and dollars>=1000000:eligible.append(symbol)
-    return eligible, {'listed':len(symbols),'snapshots':len(snapshots),'eligible':len(eligible),'snapshot_data':snapshots}
-
-
-def shortlist(eligible, snapshots, limit=40):
-    """Current-data screening, not a claim of historical strategy performance."""
-    ranks=[]
-    for symbol in eligible:
-        snap=snapshots.get(symbol) or {}
-        prev=snap.get('prevDailyBar') or {}; today=snap.get('dailyBar') or {}
-        trade=snap.get('latestTrade') or {}
-        try:
-            prior=float(prev['c']); price=float(trade.get('p') or today.get('c') or prior)
-            if price<=0 or prior<=0:continue
-            dollars=prior*float(prev['v']); move=price/prior-1
-        except (KeyError,ValueError,TypeError):continue
-        ranks.append((symbol,dollars,move))
-    # Mix liquid names with movers; include pullbacks and positive momentum.
-    liquid=sorted(ranks,key=lambda r:(-r[1],r[0]))
-    movers=sorted(ranks,key=lambda r:(-abs(r[2]),-r[1],r[0]))
-    chosen=[]
-    for i in range(max(len(liquid),len(movers))):
-        for ranking in [liquid,movers]:
-            if i<len(ranking) and ranking[i][0] not in chosen:chosen.append(ranking[i][0])
-            if len(chosen)>=limit:return chosen
-    return chosen
-
-
-def reusable_history(symbols,key,secret,horizon,feed,cache):
-    """Stable per-symbol cache; update recent bars instead of reloading all history."""
-    import os, hashlib, time
-    from pathlib import Path
-    root=Path(os.environ.get('MARKET_EDGE_STOCK_CACHE','.cache/market_edge_stock_history'))
-    root.mkdir(parents=True,exist_ok=True)
-    now=pd.Timestamp.now(tz='UTC'); frames=[]; failed=[]; pending=[]
-    for symbol in symbols:
-        token=('bars_v5',feed,horizon,symbol)
-        path=root/(hashlib.sha256((feed+'|'+horizon+'|'+symbol).encode()).hexdigest()+'.json.gz')
-        old=cache.get(token)
-        if old is None and path.exists():
-            try:
-                data=pd.read_json(path,orient='table',compression='gzip')
-                old=(path.stat().st_mtime,data)
-                cache[token]=old
-            except Exception:old=None
-        # Refresh complete adjusted history daily; within the day fetch only overlap.
-        fresh_day=old is not None and pd.Timestamp(old[0],unit='s',tz='UTC').tz_convert('America/New_York').date()==now.tz_convert('America/New_York').date()
-        if fresh_day and horizon=='hold':frames.append(old[1]);continue
-        if fresh_day and time.time()-old[0]<300:frames.append(old[1]);continue
-        pending.append((symbol,token,path,old if fresh_day else None))
-    for i in range(0,len(pending),10):
-        batch=pending[i:i+10]
-        update=all(item[3] is not None for item in batch)
-        start=now-pd.Timedelta(days=2 if horizon=='hour' else 7) if update else None
-        cache['progress']={'text':('Updating day-trade bars' if update else 'Loading day-trade history') if horizon=='hour' else 'Loading buy-and-hold history','done':len(frames),'total':len(symbols)}
-        try:
-            fetched=fetch_bars([b[0] for b in batch],key,secret,horizon,feed,now,start)
-            for symbol,token,path,old in batch:
-                data=fetched[fetched.symbol==symbol].copy()
-                if data.empty and old is None:
-                    failed.append({'symbols':[symbol],'reason':'No usable completed bars returned.'});continue
-                if old is not None:
-                    data=pd.concat([old[1],data],ignore_index=True).drop_duplicates(['symbol','timestamp'],keep='last')
-                minimum=now-pd.Timedelta(days=50 if horizon=='hour' else 365*6)
-                data=data[data.timestamp>=minimum].sort_values('timestamp').reset_index(drop=True)
-                cache[token]=(time.time(),data);frames.append(data)
-                try:
-                    temporary=path.with_suffix('.tmp.gz')
-                    data.to_json(temporary,orient='table',compression='gzip')
-                    temporary.replace(path)
-                except OSError:
-                    cache['cache_warning']='Local history could not be saved; this process still reuses its memory cache.'
-        except RateLimitError:raise
-        except Exception as exc:failed.append({'symbols':[b[0] for b in batch],'reason':str(exc)})
-    return (pd.concat(frames,ignore_index=True) if frames else pd.DataFrame()),failed
-
-
-def scan_market(key, secret, feed, trading_url, cache):
-    import time
-    started=time.monotonic()
-    cache['progress']={'text':'Loading the active stock list','done':0,'total':0}
-    cached=cache.get('universe')
-    if not cached or time.monotonic()-cached[0]>86400:
-        cache['universe']=(time.monotonic(),fetch_universe(key,secret,trading_url))
-    symbols=cache['universe'][1]
-    clock=fetch_clock(key,secret,trading_url)
-    if not clock.get('is_open'):
-        return {'closed':True,'coverage':{'listed':len(symbols)},'as_of':pd.Timestamp.now(tz='UTC').isoformat()}
-    cache['progress']={'text':f'Screening current data for {len(symbols):,} stocks','done':0,'total':0}
-    screen=cache.get('market_screen')
-    if not screen or time.monotonic()-screen[0]>=300:
-        eligible,coverage=screen_universe(symbols,key,secret,feed)
-        cache['market_screen']=(time.monotonic(),eligible,coverage)
-    else:
-        eligible,coverage=screen[1],screen[2]
-    coverage=dict(coverage)
-    snapshots=coverage.pop('snapshot_data')
-    limit=cache.get('candidate_limit',40)
-    candidates=shortlist(eligible,snapshots,limit)
-    coverage['detailed_candidates']=len(candidates)
-    results={}
-    for horizon in ['hour','hold']:
-        raw,failed=reusable_history(candidates,key,secret,horizon,feed,cache)
-        if raw.empty:
-            result={'picks':[],'strategy_evidence':{},'message':'No usable history was returned for the screened candidates.'}
+def match_mlb_prop_events(games, events, now):
+    """One-to-one matching; allow changed times only for a unique same-day game."""
+    valid = {}
+    for event in events:
+        stamp = pd.to_datetime(event.get('commence_time'), utc=True, errors='coerce')
+        if event.get('id') and pd.notna(stamp) and stamp > now:
+            valid[str(event['id'])] = (event, stamp)
+    prepared = []
+    for game in games:
+        start = pd.to_datetime(game.get('start_time') or game.get('commence_time'), utc=True, errors='coerce')
+        if pd.notna(start) and now < start <= now+pd.Timedelta(days=7):
+            prepared.append((game, start, mlb_team_key(game['home_team']), mlb_team_key(game['away_team'])))
+    proposed = []; diagnostics = []
+    for game, start, home, away in prepared:
+        details = {'Game': game['away_team']+' @ '+game['home_team'],
+                   'MLB start UTC': start.isoformat(), 'Odds events returned': len(valid)}
+        pair = [(event, stamp) for event, stamp in valid.values()
+                if mlb_team_key(event.get('home_team')) == home and mlb_team_key(event.get('away_team')) == away]
+        strict = [(e,t) for e,t in pair if abs(t-start) <= pd.Timedelta(minutes=15)]
+        reversed_exact = [(e,t) for e,t in valid.values() if mlb_team_key(e.get('home_team')) == away and mlb_team_key(e.get('away_team')) == home and abs(t-start) <= pd.Timedelta(minutes=15)]
+        if not strict and not pair and len(reversed_exact) == 1:
+            pair = reversed_exact; strict = reversed_exact
+        if len(strict) == 1:
+            event, stamp = strict[0]; method = 'Teams and start within 15 minutes'
+        elif len(strict) > 1:
+            diagnostics.append(dict(details, Reason='Multiple sportsbook events match this start time.')); continue
         else:
-            cache['progress']={'text':('Evaluating day-trade strategies' if horizon=='hour' else 'Evaluating buy-and-hold strategies'),'done':len(candidates),'total':len(candidates)}
-            # Evaluate history first; read fresh quotes only after strategy selection.
-            frames={symbol:indicators(g,horizon) for symbol,g in raw.groupby('symbol')}
-            evidence=select_strategy(frames,horizon)
-            quotes=fetch_quotes(sorted(frames),key,secret,feed) if evidence.get('qualified') else {}
-            clock=fetch_clock(key,secret,trading_url)
-            result=opportunities(raw,quotes,clock,horizon,prepared_frames=frames,prepared_evidence=evidence)
-            result['history_symbols']=len(frames)
-        result['failed_batches']=failed
-        results[horizon]=result
-        # Publish each section when ready, without waiting for the other horizon.
-        cache['partial_result']={'closed':False,'results':dict(results),'coverage':dict(coverage),
-                                 'as_of':pd.Timestamp.now(tz='UTC').isoformat(),'seconds':time.monotonic()-started}
-    cache['candidate_limit']=min(limit+40,120) if any(not r['picks'] for r in results.values()) else 40
-    return cache['partial_result']
+            day = start.tz_convert('America/Chicago').date()
+            same_day = [(e,t) for e,t in pair if t.tz_convert('America/Chicago').date() == day]
+            same_games = [g for g,t,h,a in prepared if h==home and a==away and t.tz_convert('America/Chicago').date()==day]
+            if len(same_day)==1 and len(same_games)==1 and abs(same_day[0][1]-start)<=pd.Timedelta(hours=3):
+                event, stamp = same_day[0]; method = 'Unique same-day matchup; start times differ'
+            else:
+                reversed_pair = any(mlb_team_key(e.get('home_team'))==away and mlb_team_key(e.get('away_team'))==home for e,t in valid.values())
+                reason = ('No event returned for these teams and home/away order.' if not pair else
+                          'Start-time mismatch or multiple same-day games; automatic match withheld.')
+                if not pair and reversed_pair: reason = 'Odds feed has the opposite home/away order; automatic match withheld.'
+                diagnostics.append(dict(details, Reason=reason, **{'Odds starts UTC': [t.isoformat() for e,t in pair]})); continue
+        proposed.append((game, event, dict(details, **{'Odds start UTC':stamp.isoformat(), 'Match':method})))
+    counts = {}
+    for game,event,details in proposed: counts[event['id']] = counts.get(event['id'],0)+1
+    matched = {}; notes = {}
+    for game,event,details in proposed:
+        gid = int(game['game_id'])
+        if counts[event['id']] != 1:
+            diagnostics.append(dict(details, Reason='One sportsbook event would map to multiple MLB games.')); continue
+        matched[gid] = event; notes[gid] = details
+    return matched, notes, diagnostics
+
+
+def fetch_prop_quotes(league, games, odds_key):
+    sport = 'baseball_mlb' if league=='MLB' else 'basketball_nba'
+    base = 'https://api.the-odds-api.com/v4/sports/'+sport
+    now = pd.Timestamp.now(tz='UTC'); quotes = []; errors = []
+    params = {'apiKey': odds_key}
+    if league == 'MLB':
+        params.update(dateFormat='iso', commenceTimeFrom=now.strftime('%Y-%m-%dT%H:%M:%SZ'),
+                      commenceTimeTo=(now+pd.Timedelta(days=7,hours=3)).strftime('%Y-%m-%dT%H:%M:%SZ'))
+    events = _get(base+'/events', odds_key, params)
+    matches = {}; match_notes = {}
+    if league == 'MLB':
+        matches, match_notes, errors = match_mlb_prop_events(games, events, now)
+    from dual_agent.mlb_historical_odds import team
+    def collect(game):
+        quotes = []; errors = []
+        start = pd.to_datetime(game.get('start_time') or game.get('commence_time'), utc=True)
+        if not now<start<=now+pd.Timedelta(days=7): return quotes, errors
+        if league == 'MLB':
+            event = matches.get(int(game['game_id']))
+            if event is None: return quotes, errors
+        else:
+            matched = [event for event in events if team(event.get('home_team'))==team(game['home_team']) and team(event.get('away_team'))==team(game['away_team']) and abs(pd.to_datetime(event['commence_time'], utc=True)-start)<=pd.Timedelta(minutes=15)]
+            if len(matched)!=1:
+                errors.append('No unique prop event match for '+game['away_team']+' at '+game['home_team']); return quotes, errors
+            event = matched[0]
+        try:
+            payload = _get(base+'/events/'+event['id']+'/odds', odds_key, {'apiKey': odds_key, 'regions': 'us', 'markets': ','.join(MARKETS[league]), 'oddsFormat': 'decimal'})
+        except RuntimeError as exc:
+            errors.append(str(exc)); return quotes, errors
+        stamp = pd.Timestamp.now(tz='UTC')
+        if league == 'MLB' and not payload.get('bookmakers'):
+            errors.append({'Game':game['away_team']+' @ '+game['home_team'], 'Reason':'Event matched, but no sportsbook prop lines were returned.'})
+        for book in payload.get('bookmakers', []):
+            if not allowed(book.get('key')):
+                continue
+            for market in book.get('markets', []):
+                key = market.get('key')
+                if key not in MARKETS[league]: continue
+                updated = pd.to_datetime(market.get('last_update') or book.get('last_update'), utc=True, errors='coerce')
+                if pd.isna(updated) or updated>stamp or stamp-updated>pd.Timedelta(minutes=30) or updated>=start: continue
+                paired = {}
+                for outcome in market.get('outcomes', []):
+                    try:
+                        player = str(outcome['description']); price = float(outcome['price']); side = outcome['name']
+                        if league == 'MLB' and key == 'batter_home_runs' and side in ('Yes', 'No'):
+                            line = .5; side = 'Over' if side == 'Yes' else 'Under'
+                        else:
+                            line = float(outcome['point'])
+                        if not np.isfinite([line,price]).all() or price<=1 or side not in ['Over','Under']: continue
+                        paired.setdefault((player,line), {})[side] = price
+                    except (KeyError, TypeError, ValueError): continue
+                for (player,line), sides in paired.items():
+                    # One actual offered side is enough for NBA and MLB.
+                    # Only paired quotes contribute a margin-free market prior.
+                    over = 1/sides['Over'] if 'Over' in sides else None
+                    under = 1/sides['Under'] if 'Under' in sides else None
+                    quotes.append({'player':player,'line':line,'market':key,'over_probability':over/(over+under) if over is not None and under is not None else None,
+                                   'over_decimal_odds':sides.get('Over'), 'under_decimal_odds':sides.get('Under'), 'book':book.get('key'), 'updated_at':updated.isoformat(), 'event_id':event['id'],
+                                   'home_team':game['home_team'],'away_team':game['away_team'],'start_time':start.isoformat(),
+                                   'game_id':game.get('game_id'), 'capture_time':stamp.isoformat(),
+                                   **({'Event match':match_notes[int(game['game_id'])]['Match']} if league=='MLB' else {})})
+        if league == 'MLB':
+            found = {q['market'] for q in quotes}
+            for market_key, (label, _) in MARKETS['MLB'].items():
+                if market_key not in found:
+                    errors.append({'Game': game['away_team']+' @ '+game['home_team'],
+                        'MLB start UTC': start.isoformat(), 'Market': label,
+                        'Reason': 'No usable fresh '+label.lower()+' offer was returned for this matched game.'})
+        return quotes, errors
+    # Separate HTTP requests; bounded concurrency also preserves slate order.
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for game_quotes, game_errors in pool.map(collect, games):
+            quotes.extend(game_quotes); errors.extend(game_errors)
+    return quotes, errors
+
+
+def _nba_history(player, api_key):
+    """Use the identical identity resolution and history cache as the batch loader."""
+    for name, rows, issue in _nba_history_batches([player], api_key):
+        if issue:
+            raise RuntimeError(issue)
+        return rows
+    return []
+
+
+def _nba_request_issue(exc):
+    """Expose useful status without leaking provider response bodies or credentials."""
+    import re
+    match = re.search(r'(?:error|HTTP)\s+(\d{3})', str(exc), re.I)
+    code = match.group(1) if match else None
+    if code == '401': return 'HTTP 401: player-data API key was rejected'
+    if code == '403': return 'HTTP 403: player-data access was denied; check subscription permissions'
+    if code == '429' or 'rate limit' in str(exc).lower(): return 'Provider rate limit persisted after retries'
+    if code: return 'Provider returned HTTP '+code
+    return type(exc).__name__+': request could not complete'
+
+
+def nba_identity_key(name):
+    """Normalize suffixes and explicit aliases; require one unique provider ID."""
+    import re
+    clean = re.sub(r'\s+(?:jr\.?|sr\.?|ii|iii|iv)$', '', str(name).strip(), flags=re.I)
+    value = name_key(clean)
+    return {'alexsarr': 'alexandresarr', 'nicclaxton': 'nicolasclaxton'}.get(value, value)
+
+
+def _nba_history_batches(names, api_key, status=None):
+    """Yield completed player histories; never cache an incomplete stats batch."""
+    now = pd.Timestamp.now(tz='UTC')
+    root = Path('nba_player_history_cache'); root.mkdir(exist_ok=True)
+    day = now.strftime('%Y%m%d')
+    base = 'https://api.balldontlie.io/nba/v1'
+    def notify(message):
+        if status: status(message)
+    def save(path, data):
+        temporary = path.with_suffix('.tmp')
+        temporary.write_text(json.dumps(data))
+        temporary.replace(path)
+    missing = []
+    for name in names:
+        path = root/(name_key(name)+'_bdl_v2_'+day+'.json')
+        try:
+            if now.timestamp()-path.stat().st_mtime > 1800:
+                raise ValueError('Player history cache expired')
+            rows = json.loads(path.read_text())
+            if not isinstance(rows, list) or not rows: raise ValueError('Empty or invalid history cache')
+            yield name, rows, None
+        except (OSError, ValueError):
+            missing.append(name)
+    if not missing: return
+    catalog_path = root/('active_players_'+day+'.json')
+    try:
+        catalog = json.loads(catalog_path.read_text())
+        if not isinstance(catalog, list): raise ValueError('Invalid player catalog')
+    except (OSError, ValueError):
+        catalog = []; cursor = None; seen = set()
+        try:
+            for page in range(1, 101):
+                notify(f'Resolving player identities · roster page {page}')
+                params = {'per_page': 100}
+                if cursor is not None: params['cursor'] = cursor
+                payload = _get(base+'/players/active', api_key, params, True)
+                catalog.extend(payload.get('data', []))
+                cursor = payload.get('meta', {}).get('next_cursor')
+                if cursor is None: break
+                if str(cursor) in seen: raise RuntimeError('Repeated roster cursor')
+                seen.add(str(cursor))
+            else: raise RuntimeError('Player identity pagination incomplete')
+            save(catalog_path, catalog)
+        except Exception as exc:
+            for name in missing: yield name, [], 'NBA player directory: '+_nba_request_issue(exc)
+            return
+    index = {}
+    for player in catalog:
+        index.setdefault(nba_identity_key(player.get('first_name','')+' '+player.get('last_name','')), {})[player['id']] = player
+    resolved = []
+    for name in missing:
+        matches = list(index.get(nba_identity_key(name), {}).values())
+        if len(matches) != 1:
+            # Search is first OR last name, not an assumed full-name match.
+            notify('Resolving player identity · '+name)
+            try:
+                payload = _get(base+'/players', api_key,
+                               {'search': re.sub(r'\s+(?:jr\.?|sr\.?|ii|iii|iv)$', '', name, flags=re.I).split()[-1], 'per_page': 100}, True)
+                matches = [r for r in payload.get('data', []) if nba_identity_key(r.get('first_name','')+' '+r.get('last_name','')) == nba_identity_key(name)]
+            except Exception as exc:
+                yield name, [], 'Player identity for '+name+': '+_nba_request_issue(exc)
+                continue
+        if len(matches) != 1:
+            yield name, [], 'No unique NBA player identity for '+name+'.'
+        else:
+            resolved.append((name, matches[0]['id']))
+    for offset in range(0, len(resolved), 8):
+        batch = resolved[offset:offset+8]
+        ids = {pid for name, pid in batch}; rows_by_id = {pid: [] for pid in ids}
+        cursor = None; seen = set()
+        try:
+            for page in range(1, 101):
+                notify(f'Loading stats batch {offset//8+1} of {(len(resolved)+7)//8} · page {page}')
+                params = {'player_ids[]': list(ids), 'per_page': 100,
+                          'start_date': (now-pd.Timedelta(days=365)).strftime('%Y-%m-%d'),
+                          'end_date': now.strftime('%Y-%m-%d')}
+                if cursor is not None: params['cursor'] = cursor
+                payload = _get(base+'/stats', api_key, params, True)
+                for row in payload.get('data', []):
+                    pid = (row.get('player') or {}).get('id'); game = row.get('game', {})
+                    date = pd.to_datetime(game.get('date'), utc=True, errors='coerce')
+                    try: played = float(str(row.get('min') or '0').split(':')[0]) > 0
+                    except ValueError: played = False
+                    if pid in ids and str(game.get('status','')).startswith('Final') and pd.notna(date) and date<now and played:
+                        rows_by_id[pid].append(dict(row, source_date=date.isoformat(), history_provider='balldontlie'))
+                cursor = payload.get('meta', {}).get('next_cursor')
+                if cursor is None: break
+                if str(cursor) in seen: raise RuntimeError('Repeated stats cursor')
+                seen.add(str(cursor))
+            else: raise RuntimeError('Stats pagination incomplete')
+        except Exception as exc:
+            # Discard all partial batch rows: incomplete samples must not drive picks.
+            for name, pid in batch:
+                yield name, [], 'NBA stats for '+name+': '+_nba_request_issue(exc)
+            continue
+        for name, pid in batch:
+            rows = list({r['game']['id']: r for r in rows_by_id[pid]}.values())
+            rows.sort(key=lambda r:(r['source_date'], r['game']['id']))
+            if rows:
+                save(root/(name_key(name)+'_bdl_v2_'+day+'.json'), rows)
+            yield name, rows, None if rows else 'No completed played-game statistics returned for '+name+'.'
+
+
+def mlb_prop_identities(snapshots):
+    """Resolve names within each game's teams; posted lineups override guesses."""
+    candidates = {}
+    for gid, snapshot in (snapshots or {}).items():
+        feed = snapshot.get('raw_feed', {})
+        box = feed.get('liveData', {}).get('boxscore', {}).get('teams', {})
+        people = feed.get('gameData', {}).get('players', {})
+        for side in ['home', 'away']:
+            team = box.get(side, {})
+            lineup = {int(pid) for pid in team.get('battingOrder', [])}
+            posted = len(lineup) == 9
+            pitchers = team.get('pitchers', [])
+            recorded = int(pitchers[0]) if pitchers else None
+            probable = (snapshot.get('probable_pitchers', {}).get(side) or {})
+            probable_id = int(probable['id']) if probable.get('id') else None
+            conflict = recorded is not None and probable_id is not None and recorded != probable_id
+            starter = None if conflict else recorded if recorded is not None else probable_id
+            players = dict(team.get('players', {}))
+            if starter is not None and 'ID'+str(starter) not in players:
+                person = people.get('ID'+str(starter), {})
+                players['ID'+str(starter)] = {'person': {'id': starter,
+                    'fullName': person.get('fullName') or probable.get('fullName')}, 'position': {'code': '1'}}
+            for player in players.values():
+                person = player.get('person', {})
+                if not person.get('id') or not person.get('fullName'):
+                    continue
+                pid = int(person['id'])
+                position = player.get('position', {})
+                # A sportsbook line is still required. Bench players are excluded
+                # once a full lineup is posted; unknown lineups stay provisional.
+                hitter = pid in lineup or (not posted and position.get('code') != '1'
+                    and position.get('abbreviation') != 'P')
+                pitching = pid == starter
+                hitting_status = 'Confirmed lineup' if pid in lineup else 'Provisional — lineup unannounced'
+                pitching_status = 'Recorded starter' if recorded == starter and starter is not None else 'Probable starter — subject to change'
+                value = (pid, hitter, pitching, hitting_status, pitching_status)
+                key = (int(gid), name_key(person['fullName']))
+                candidates.setdefault(key, {})[pid] = value
+    return {key: next(iter(values.values())) for key, values in candidates.items() if len(values) == 1}
+
+
+def nba_sportsbook_prop_picks(quotes, errors):
+    """Market probabilities only; never invent a player-history model or sample."""
+    groups = {}
+    for quote in quotes:
+        groups.setdefault((quote['event_id'], quote['player'], quote['market'], quote['line']), []).append(quote)
+    picks = []; listings = []
+    for (_, player, market, line), group in groups.items():
+        first = group[0]
+        # Pick'em indicative feed prices do not establish standalone win chances.
+        priced = {q['book']: q for q in group if standalone_value(q['book'])}
+        paired = [q['over_probability'] for q in priced.values() if q.get('over_probability') is not None]
+        for side, field in [('Over','over_decimal_odds'), ('Under','under_decimal_odds')]:
+            offered = [q for q in priced.values() if (q.get(field) or 0)>1]
+            unpriced = [q for q in group if not standalone_value(q['book']) and (q.get(field) or 0)>1]
+            for quote in unpriced:
+                listings.append({'Player':player, 'Market':MARKETS['NBA'][market][0], 'Pick':side,
+                    'Line':line, 'Best sportsbook':quote['book'],
+                    'Game':first['away_team']+' @ '+first['home_team'], 'start_time':first['start_time']})
+            if not offered: continue
+            if paired:
+                over = float(np.median(paired))
+                chance = over if side=='Over' else 1-over
+                method = 'Median of same-line, same-book paired implied probabilities with margin normalized out'
+            else:
+                chance = float(np.median([1/q[field] for q in offered]))
+                method = 'Single-side implied probability from quoted prices; bookmaker margin remains'
+            best = max(offered, key=lambda q:q[field])
+            picks.append({'Player':player, 'Market':MARKETS['NBA'][market][0], 'Pick':side,
+                'Line':line, 'Estimated chance':chance, 'Probability source':'sportsbook_implied',
+                'Estimate method':method, 'Prior games':0, 'Projected stat':None,
+                'Best sportsbook':best['book'], 'Best decimal odds':best[field],
+                'Sportsbook offers':[{'book':q['book'],'decimal_odds':q[field]} for q in offered],
+                'Books':len(offered), 'Game':first['away_team']+' @ '+first['home_team'],
+                'start_time':first['start_time'], 'Captured UTC':first['capture_time']})
+    picks.sort(key=lambda row:(-row['Estimated chance'],row['Player'],row['Market'],row['Line']))
+    return {'picks':picks[:10], 'game_picks':picks, 'errors':list(errors),
+        'probability_source':'sportsbook_implied', 'unpriced_listings':listings,
+        'message':f'{len(picks)} actual sportsbook sides ranked by market-implied probability.',
+        'note':'Sportsbook-implied probabilities are not independent model predictions. No player history or injury verification was used.'}
+
+
+def estimate_nba_history(values, line, side):
+    """Independent, smoothed prior-game frequency; no sportsbook probability input."""
+    estimate = estimate_prop(values,line,side,.5,minimum=10,minimum_decisions=10)
+    if estimate is None: return None
+    estimate['Estimated chance'] = (estimate['Historical wins']+1)/(estimate['Non-push games']+2)
+    estimate['Estimate method'] = 'Last 30 completed played-game results + Beta(1,1) smoothing; sportsbook prices excluded'
+    estimate['Probability source'] = 'player_history'
+    estimate['Statistics source'] = 'BALLDONTLIE'
+    estimate['Availability status'] = 'Participation and expected minutes not verified'
+    return estimate
+
+
+def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapshots=None, nba_key=None, progress=None, nba_history_enabled=True):
+    if not odds_key and league != 'NBA':
+        return {'picks':[], 'message':'Player props need the configured Odds API key.', 'errors':[]}
+    if league == 'NBA' and progress:
+        progress({'picks': [], 'game_picks': [], 'errors': [], 'loading_progress': {'stage': 'Finding sportsbook lines', 'completed': 0, 'total': 0}})
+    try:
+        quotes, errors = fetch_prop_quotes(league, games, odds_key) if odds_key else ([], ['Sportsbook API key unavailable.'])
+    except Exception as exc:
+        if league != 'NBA':
+            raise
+        quotes, errors = [], [f'NBA sportsbook lines unavailable: {type(exc).__name__}: {exc}.']
+    if not quotes and league != 'NBA':
+        return {'picks':[], 'message':'No fresh eligible sportsbook player-prop lines are available for upcoming games.', 'errors':errors}
+    if league == 'NBA' and not nba_history_enabled:
+        return nba_sportsbook_prop_picks(quotes, errors)
+    groups = {}
+    for q in quotes:
+        groups.setdefault((q['event_id'],q['player'],q['market'],q['line']), []).append(q)
+    history_by_name = {}; identities = {}; mlb_histories = {}
+    if league=='NBA':
+        from dual_agent.nba_star_spotlight import collect_star_rosters, build_star_spotlights, key as star_key
+        if progress:
+            progress({'picks': [], 'game_picks': [], 'errors': list(errors), 'loading_progress': {'stage': 'Finding team star rosters', 'completed': 0, 'total': 0}})
+        star_rosters = collect_star_rosters(games)
+        if not nba_key:
+            errors.append('NBA projections need BALLDONTLIE_API_KEY and access to player game stats.')
+        # Fetch each unique player once, reusing the existing daily history cache.
+        # Stars remain visible even without any available sportsbook market.
+        names_by_key = {star_key(q['player']): q['player'] for q in quotes}
+        for roster in star_rosters.values():
+            for player in roster['players']:
+                names_by_key.setdefault(star_key(player['player']), player['player'])
+        # Earliest games first; no games or candidates are removed from the scan.
+        priority = {}
+        for quote in quotes:
+            k = star_key(quote['player']); stamp = pd.Timestamp(quote['start_time'])
+            priority[k] = min(priority.get(k, stamp), stamp)
+        for game in games:
+            for side in ('home', 'away'):
+                for roster in star_rosters.values():
+                    if roster.get('team') == game[side+'_team']:
+                        for player in roster['players']:
+                            k = star_key(player['player']); stamp = pd.Timestamp(game['commence_time'])
+                            priority[k] = min(priority.get(k, stamp), stamp)
+        names = sorted(names_by_key.values(), key=lambda name:(priority.get(star_key(name), pd.Timestamp.max.tz_localize('UTC')), name)) if nba_key else []
+        completed = 0
+        last_scored = -1
+        last_publish = 0.0
+        def publish(stage):
+            nonlocal last_scored, last_publish
+            if not progress: return
+            # Network-page updates should not rescore the whole slate.
+            if completed == last_scored or (completed < len(names) and completed % 8 and time.monotonic()-last_publish < 3):
+                return
+            last_scored = completed
+            last_publish = time.monotonic()
+            by_key = {star_key(name): rows for name, rows in history_by_name.items()}
+            ready = {q['player']: by_key[star_key(q['player'])] for q in quotes if star_key(q['player']) in by_key}
+            ready.update(history_by_name)
+            ready_groups = {key: group for key, group in groups.items() if star_key(key[1]) in by_key}
+            partial = _rank_prop_candidates('NBA', games, ready_groups,
+                ready, list(errors), star_rosters, {}, {})
+            partial.update(probability_source='player_history', statistics_source='BALLDONTLIE')
+            partial['loading_progress'] = {'completed': completed, 'total': len(names), 'stage': stage}
+            progress(partial)
+        publish('Checking saved player histories')
+        for player, history, error in _nba_history_batches(names, nba_key, status=publish):
+            history_by_name[player] = history
+            completed += 1
+            if error: errors.append(error)
+            publish('Processed '+player)
+        # Provider spellings may differ only in accents or punctuation.
+        by_key = {star_key(name): rows for name, rows in history_by_name.items()}
+        for q in quotes:
+            history_by_name[q['player']] = by_key.get(star_key(q['player']), [])
+    else:
+        if player_logs is None or player_logs.empty:
+            return {'picks':[], 'message':'MLB player warehouse is unavailable; no prop estimates generated.', 'errors':errors}
+        identities = mlb_prop_identities(snapshots)
+        wanted = {identity[0] for identity in identities.values()}
+        player_ids = pd.to_numeric(player_logs.player_id, errors='coerce')
+        subset = player_logs.loc[player_ids.isin(wanted)].copy()
+        subset['player_id'] = player_ids.loc[subset.index]
+        subset['prior_start'] = pd.to_datetime(subset.start_time, utc=True, errors='coerce')
+        subset['game_id'] = pd.to_numeric(subset.game_id, errors='coerce')
+        # Missing components stay unknown, rather than becoming fabricated zeros.
+        def number(column):
+            return pd.to_numeric(subset[column], errors='coerce') if column in subset else pd.Series(np.nan, index=subset.index)
+        singles = number('hits')-number('doubles')-number('triples')-number('batting_home_runs')
+        subset['singles'] = singles.where(singles >= 0)
+        subset['total_bases'] = subset['singles']+2*number('doubles')+3*number('triples')+4*number('batting_home_runs')
+        subset['hits_runs_rbis'] = number('hits')+number('batting_runs')+number('rbi')
+        mlb_histories = {int(pid): frame for pid,frame in subset.groupby('player_id')}
+    result = _rank_prop_candidates(league, games, groups, history_by_name, errors,
+                                 star_rosters if league == 'NBA' else {}, identities, mlb_histories)
+    if league == 'NBA':
+        result.update(probability_source='player_history', statistics_source='BALLDONTLIE',
+            note='Smoothed historical estimates; minutes, injuries and opponent adjustments are not verified inputs.')
+    return result
+
+
+def _rank_prop_candidates(league, games, groups, history_by_name, errors,
+                          star_rosters, identities, mlb_histories):
+    if league == 'NBA':
+        from dual_agent.nba_star_spotlight import build_star_spotlights
+    picks = []; exclusions = []; pitcher_forecasts = []
+    def excluded(first, player, market, line, reason):
+        exclusions.append({'Player': player, 'Market': MARKETS[league].get(market, (market, None))[0], 'Line': line,
+            'Game': first['away_team']+' @ '+first['home_team'], 'Reason': reason})
+    for (_,player,market,line), group in groups.items():
+        first = group[0]; start = pd.Timestamp(first['start_time'])
+        unique = {q['book']:q for q in group if q['book']}
+        if not unique:
+            if league == 'MLB': excluded(first, player, market, line, 'No sportsbook offers this exact line.')
+            continue
+        participation = None
+        paired_probabilities = [q['over_probability'] for q in unique.values() if q.get('over_probability') is not None]
+        # A one-sided quote cannot establish a margin-free market probability.
+        # Keep the ten-observation shrinkage, using an explicit neutral prior.
+        probability = float(np.median(paired_probabilities)) if paired_probabilities else .5
+        stat = MARKETS[league][market][1]
+        if league=='NBA':
+            values = [nba_market_value(r, stat) for r in history_by_name.get(player, []) if pd.Timestamp(r['source_date'])+(pd.Timedelta(0) if r.get('history_provider') in {'api_sports','balldontlie'} else pd.Timedelta(hours=48))<min(start,pd.Timestamp(first['capture_time']))]
+        else:
+            identity = identities.get((int(first['game_id']),name_key(player)))
+            if not identity:
+                excluded(first, player, market, line, 'No unique player identity found in this game feed.')
+                continue
+            pitching_market = market.startswith('pitcher_')
+            if (not pitching_market and not identity[1]) or (pitching_market and not identity[2]):
+                excluded(first, player, market, line, 'Player is outside the posted lineup or is not a recorded/probable starter.')
+                continue
+            participation = identity[4] if pitching_market else identity[3]
+            logs = mlb_histories.get(identity[0])
+            if logs is None:
+                excluded(first, player, market, line, 'No saved prior appearances for this player.')
+                continue
+            cutoff = min(start,pd.Timestamp(first['capture_time']))-pd.Timedelta(hours=48)
+            logs = logs[(logs.prior_start<cutoff)&(logs.game_id!=int(first['game_id']))]
+            if pitching_market: logs = logs[pd.to_numeric(logs.games_started, errors='coerce')>0]
+            else: logs = logs[pd.to_numeric(logs.plate_appearances, errors='coerce')>0]
+            logs = logs.sort_values('prior_start').drop_duplicates('game_id', keep='last')
+            if stat not in logs:
+                excluded(first, player, market, line, 'Saved history is missing the statistics for this market.')
+                continue
+            values = pd.to_numeric(logs[stat], errors='coerce').tolist()
+        values = [float(v) for v in values if v is not None and np.isfinite(float(v))]
+        if league == 'MLB':
+            sample = values[-30:]
+            if not pitching_market and (len(sample) < 10 or sum(v != line for v in sample) < 8):
+                excluded(first, player, market, line, f'Need 10 prior appearances and 8 non-push results; found {len(sample)} appearances and {sum(v != line for v in sample)} non-push results.')
+                continue
+        qualified = False
+        for side,market_p in [('Over',probability),('Under',1-probability)]:
+            price_key = 'over_decimal_odds' if side == 'Over' else 'under_decimal_odds'
+            available = [q for q in unique.values() if (q.get(price_key) or 0) > 1]
+            if not available:
+                continue
+            estimate = estimate_prop(values,line,side,market_p,
+                minimum=1 if league == 'MLB' and pitching_market else 10,
+                minimum_decisions=8 if league == 'MLB' and not pitching_market else None)
+            if league == 'NBA':
+                estimate = estimate_nba_history(values,line,side)
+            if estimate and league == 'MLB' and pitching_market:
+                best_forecast = max(available, key=lambda q:q[price_key])
+                pitcher_forecasts.append({'game_id': int(first['game_id']), 'player_id': identity[0],
+                    'Player': player, 'Market': MARKETS[league][market][0], 'Pick': side, 'Line': line,
+                    'Best sportsbook': best_forecast['book'], 'Best decimal odds': best_forecast[price_key],
+                    'Estimated chance': estimate['Estimated chance'], 'Projected stat': estimate['Projected stat'],
+                    'Prior games': estimate['Prior games'],
+                    'Non-push games': estimate['Prior games']-estimate['Historical pushes'],
+                    'Participation status': participation,
+                    'start_time': first['start_time'], 'Captured UTC': first['capture_time'],
+                    'Estimate method': estimate['Estimate method'] if paired_probabilities else 'Prior appearances + neutral shrinkage; one-sided quote'})
+            required_decisions = 8 if league == 'MLB' and not pitching_market else 10
+            enough_history = estimate and estimate['Prior games'] >= 10 and estimate['Prior games']-estimate['Historical pushes'] >= required_decisions
+            if enough_history:
+
+                if league != 'NBA' and not paired_probabilities:
+                    estimate['Estimate method'] = 'Prior 30 appearances + neutral shrinkage; one-sided sportsbook quote'
+                best = max(available, key=lambda q:q[price_key])
+                if league == 'NBA':
+                    opposite = 'Under' if side == 'Over' else 'Over'
+                    counterpart = estimate_nba_history(values,line,opposite)
+                    estimate['Over chance'] = estimate['Estimated chance'] if side == 'Over' else counterpart['Estimated chance']
+                    estimate['Under chance'] = estimate['Estimated chance'] if side == 'Under' else counterpart['Estimated chance']
+                    estimate['Opposite side offered'] = any((q.get('under_decimal_odds' if side == 'Over' else 'over_decimal_odds') or 0) > 1 for q in unique.values())
+                value_eligible = False
+                push_chance = estimate['Historical pushes']/estimate['Prior games']
+                expected_return = (1-push_chance)*(estimate['Estimated chance']*best[price_key]-1)
+                qualified = True
+                picks.append({'Player':player,'Market':MARKETS[league][market][0],'Pick':side,'Line':line,
+                              'Market chance':market_p,'Best sportsbook':best['book'],'Best decimal odds':best[price_key], 'Sportsbook offers':[{'book':q['book'], 'decimal_odds':q[price_key]} for q in available], 'Estimated return per unit':expected_return,'Value eligible':value_eligible,'Break-even cover chance':1/best[price_key],'Estimated push chance':push_chance,'Books':len(available),'Game':first['away_team']+' @ '+first['home_team'],
+                              'start_time':first['start_time'],'Captured UTC':first['capture_time'],
+                              **({'Participation status': participation, 'Event match': first.get('Event match')} if league=='MLB' else {}), **estimate})
+        if league in ('MLB', 'NBA') and not qualified:
+            excluded(first, player, market, line, 'No offered side has sufficient usable history for an estimate.')
+    # One side of one line per player/market/game; avoid ranking duplicate books or alternatives.
+    picks.sort(key=lambda r:(-r['Estimated chance'],-r['Prior games'],r['Player']))
+    seen=set(); chosen=[]
+    for pick in picks:
+        key=(pick['Game'],pick['start_time'],pick['Player'],pick['Market']) + (pick['Pick'], pick['Line'])
+        if key not in seen:
+            seen.add(key);chosen.append(pick)
+        # Retain eligible picks for every matchup; the global list stays top ten.
+    return {'picks':chosen[:10],'game_picks':chosen,'errors':errors,
+            **({'star_spotlights': build_star_spotlights(games, star_rosters, history_by_name, chosen)} if league == 'NBA' else {}),
+            **({'exclusions': exclusions, 'quoted_candidates':len(groups), 'pitcher_forecasts':pitcher_forecasts} if league in ('MLB','NBA') else {}), 'message':f'{len(chosen)} player-prop estimates ranked from actual lines and prior appearances.',
+            'note':'Estimated chance is conditional on no push and player participation. Estimates are not calibrated; no availability or injury clearance is implied.'}
