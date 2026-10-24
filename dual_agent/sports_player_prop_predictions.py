@@ -811,8 +811,24 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
         subset['hits_runs_rbis'] = number('hits')+number('batting_runs')+number('rbi')
         mlb_histories = {int(pid): frame for pid,frame in subset.groupby('player_id')}
     scoring_started = time.perf_counter()
-    result = _rank_prop_candidates(league, games, groups, history_by_name, errors,
-                                 star_rosters if league == 'NBA' else {}, identities, mlb_histories)
+    if league == 'MLB' and progress:
+        # Publish completed games independently; reuse quote/history inputs.
+        scored = []; excluded_rows = []; pitcher_rows = []; result = {}
+        for game in sorted(games, key=lambda g:g.get('start_time',g.get('commence_time',''))):
+            game_groups = {key:group for key,group in groups.items() if group[0].get('game_id')==game.get('game_id')}
+            partial = _rank_prop_candidates(league,[game],game_groups,history_by_name,errors,{},identities,mlb_histories)
+            scored.extend(partial.get('game_picks', []))
+            excluded_rows.extend(partial.get('exclusions', [])); pitcher_rows.extend(partial.get('pitcher_forecasts', []))
+            ordered = sorted(scored,key=lambda r:(-r['Estimated chance'],-r['Prior games'],r['Player']))
+            result = dict(partial,game_picks=ordered,picks=ordered[:10],exclusions=list(excluded_rows),
+                          pitcher_forecasts=list(pitcher_rows),quoted_candidates=len(groups),
+                          message=f'{len(ordered)} player-prop estimates ranked from actual lines and prior appearances.')
+            progress(result)
+        if not result:
+            result = _rank_prop_candidates(league,games,groups,history_by_name,errors,{},identities,mlb_histories)
+    else:
+        result = _rank_prop_candidates(league, games, groups, history_by_name, errors,
+                                     star_rosters if league == 'NBA' else {}, identities, mlb_histories)
     calculation_seconds += time.perf_counter()-scoring_started
     if league == 'NBA':
         timings['Prediction calculations'] = calculation_seconds
@@ -921,7 +937,7 @@ def _rank_prop_candidates(league, games, groups, history_by_name, errors,
                 picks.append({'Player':player,'Market':MARKETS[league][market][0],'Pick':side,'Line':line,
                               'Market chance':market_p,'Best sportsbook':best['book'],'Best decimal odds':best[price_key], 'Sportsbook offers':[{'book':q['book'], 'decimal_odds':q[price_key]} for q in available], 'Estimated return per unit':expected_return,'Value eligible':value_eligible,'Break-even cover chance':1/best[price_key],'Estimated push chance':push_chance,'Books':len(available),'Game':first['away_team']+' @ '+first['home_team'],
                               'start_time':first['start_time'],'Captured UTC':first['capture_time'],
-                              **({'Participation status': participation, 'Event match': first.get('Event match')} if league=='MLB' else {}), **estimate})
+                              **({'Participation status': participation, 'Event match': first.get('Event match'), 'game_id':int(first['game_id']), 'player_id':int(identity[0])} if league=='MLB' else {}), **estimate})
         if league in ('MLB', 'NBA') and not qualified:
             excluded(first, player, market, line, 'No offered side has sufficient usable history for an estimate.')
     # One side of one line per player/market/game; avoid ranking duplicate books or alternatives.
