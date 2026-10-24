@@ -211,7 +211,7 @@ def fetch_prop_quotes(league, games, odds_key):
                         'Reason': 'No usable fresh '+label.lower()+' offer was returned for this matched game.'})
         return quotes, errors
     # Separate HTTP requests; bounded concurrency also preserves slate order.
-    with ThreadPoolExecutor(max_workers=4 if league == 'MLB' else 1) as pool:
+    with ThreadPoolExecutor(max_workers=4) as pool:
         for game_quotes, game_errors in pool.map(collect, games):
             quotes.extend(game_quotes); errors.extend(game_errors)
     return quotes, errors
