@@ -252,8 +252,10 @@ def _nba_history_batches(names, api_key, status=None):
         temporary.replace(path)
     missing = []
     for name in names:
-        path = root/(name_key(name)+'_'+day+'.json')
+        path = root/(name_key(name)+'_bdl_v2_'+day+'.json')
         try:
+            if now.timestamp()-path.stat().st_mtime > 1800:
+                raise ValueError('Player history cache expired')
             rows = json.loads(path.read_text())
             if not isinstance(rows, list) or not rows: raise ValueError('Empty or invalid history cache')
             yield name, rows, None
@@ -311,7 +313,7 @@ def _nba_history_batches(names, api_key, status=None):
                 notify(f'Loading stats batch {offset//8+1} of {(len(resolved)+7)//8} · page {page}')
                 params = {'player_ids[]': list(ids), 'per_page': 100,
                           'start_date': (now-pd.Timedelta(days=365)).strftime('%Y-%m-%d'),
-                          'end_date': (now-pd.Timedelta(days=2)).strftime('%Y-%m-%d')}
+                          'end_date': now.strftime('%Y-%m-%d')}
                 if cursor is not None: params['cursor'] = cursor
                 payload = _get(base+'/stats', api_key, params, True)
                 for row in payload.get('data', []):
@@ -319,8 +321,8 @@ def _nba_history_batches(names, api_key, status=None):
                     date = pd.to_datetime(game.get('date'), utc=True, errors='coerce')
                     try: played = float(str(row.get('min') or '0').split(':')[0]) > 0
                     except ValueError: played = False
-                    if pid in ids and str(game.get('status','')).startswith('Final') and pd.notna(date) and date+pd.Timedelta(hours=48)<now and played:
-                        rows_by_id[pid].append(dict(row, source_date=date.isoformat()))
+                    if pid in ids and str(game.get('status','')).startswith('Final') and pd.notna(date) and date<now and played:
+                        rows_by_id[pid].append(dict(row, source_date=date.isoformat(), history_provider='balldontlie'))
                 cursor = payload.get('meta', {}).get('next_cursor')
                 if cursor is None: break
                 if str(cursor) in seen: raise RuntimeError('Repeated stats cursor')
@@ -335,7 +337,7 @@ def _nba_history_batches(names, api_key, status=None):
             rows = list({r['game']['id']: r for r in rows_by_id[pid]}.values())
             rows.sort(key=lambda r:(r['source_date'], r['game']['id']))
             if rows:
-                save(root/(name_key(name)+'_'+day+'.json'), rows)
+                save(root/(name_key(name)+'_bdl_v2_'+day+'.json'), rows)
             yield name, rows, None if rows else 'No completed played-game statistics returned for '+name+'.'
 
 
@@ -428,38 +430,12 @@ def estimate_nba_history(values, line, side):
     estimate['Estimated chance'] = (estimate['Historical wins']+1)/(estimate['Non-push games']+2)
     estimate['Estimate method'] = 'Last 30 completed played-game results + Beta(1,1) smoothing; sportsbook prices excluded'
     estimate['Probability source'] = 'player_history'
-    estimate['Statistics source'] = 'API-Sports NBA'
+    estimate['Statistics source'] = 'BALLDONTLIE'
     estimate['Availability status'] = 'Participation and expected minutes not verified'
     return estimate
 
 
-def generate_api_sports_props(games, quotes, api_key, errors, progress=None):
-    from dual_agent.nba_api_sports_history import load_histories
-    groups = {}
-    for quote in quotes:
-        groups.setdefault((quote['event_id'],quote['player'],quote['market'],quote['line']),[]).append(quote)
-    names=list(dict.fromkeys(q['player'] for q in sorted(quotes,key=lambda q:q['start_time'])))
-    def publish(stage):
-        if progress:
-            progress({'picks':[],'game_picks':[],'errors':list(errors),'probability_source':'player_history',
-                      'loading_progress':{'completed':0,'total':len(names),'stage':stage}})
-    if not names:
-        return {'picks':[],'game_picks':[],'errors':list(errors),'probability_source':'player_history',
-                'message':'No fresh sportsbook player lines were returned. No statistical bet prediction generated.'}
-    publish('Loading shared API-Sports NBA player history')
-    histories,issues=load_histories(names,api_key,progress=publish,games=games)
-    errors=list(errors)+issues
-    # Salary-based star selection is display-only and does not change the equation.
-    from dual_agent.nba_star_spotlight import collect_star_rosters
-    rosters=collect_star_rosters(games)
-    result=_rank_prop_candidates('NBA',games,groups,histories,errors,rosters,{}, {})
-    result.update(probability_source='player_history',statistics_source='API-Sports NBA',
-        message=f"{len(result['game_picks'])} independently calculated player-history estimates from actual sportsbook lines.",
-        note='Smoothed historical probabilities, not calibrated forecasts. Minutes, injuries and opponent adjustments are not verified inputs yet.')
-    return result
-
-
-def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapshots=None, nba_key=None, progress=None, nba_history_enabled=False, api_sports_key=None):
+def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapshots=None, nba_key=None, progress=None, nba_history_enabled=True):
     if not odds_key and league != 'NBA':
         return {'picks':[], 'message':'Player props need the configured Odds API key.', 'errors':[]}
     if league == 'NBA' and progress:
@@ -472,8 +448,6 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
         quotes, errors = [], [f'NBA sportsbook lines unavailable: {type(exc).__name__}: {exc}.']
     if not quotes and league != 'NBA':
         return {'picks':[], 'message':'No fresh eligible sportsbook player-prop lines are available for upcoming games.', 'errors':errors}
-    if league == 'NBA' and api_sports_key:
-        return generate_api_sports_props(games,quotes,api_sports_key,errors,progress)
     if league == 'NBA' and not nba_history_enabled:
         return nba_sportsbook_prop_picks(quotes, errors)
     groups = {}
@@ -515,6 +489,7 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
             ready_groups = {key: group for key, group in groups.items() if star_key(key[1]) in by_key}
             partial = _rank_prop_candidates('NBA', games, ready_groups,
                 ready, list(errors), star_rosters, {}, {})
+            partial.update(probability_source='player_history', statistics_source='BALLDONTLIE')
             partial['loading_progress'] = {'completed': completed, 'total': len(names), 'stage': stage}
             progress(partial)
         publish('Checking saved player histories')
@@ -545,8 +520,12 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
         subset['total_bases'] = subset['singles']+2*number('doubles')+3*number('triples')+4*number('batting_home_runs')
         subset['hits_runs_rbis'] = number('hits')+number('batting_runs')+number('rbi')
         mlb_histories = {int(pid): frame for pid,frame in subset.groupby('player_id')}
-    return _rank_prop_candidates(league, games, groups, history_by_name, errors,
+    result = _rank_prop_candidates(league, games, groups, history_by_name, errors,
                                  star_rosters if league == 'NBA' else {}, identities, mlb_histories)
+    if league == 'NBA':
+        result.update(probability_source='player_history', statistics_source='BALLDONTLIE',
+            note='Smoothed historical estimates; minutes, injuries and opponent adjustments are not verified inputs.')
+    return result
 
 
 def _rank_prop_candidates(league, games, groups, history_by_name, errors,
@@ -570,7 +549,7 @@ def _rank_prop_candidates(league, games, groups, history_by_name, errors,
         probability = float(np.median(paired_probabilities)) if paired_probabilities else .5
         stat = MARKETS[league][market][1]
         if league=='NBA':
-            values = [nba_market_value(r, stat) for r in history_by_name.get(player, []) if pd.Timestamp(r['source_date'])+(pd.Timedelta(0) if r.get('history_provider')=='api_sports' else pd.Timedelta(hours=48))<min(start,pd.Timestamp(first['capture_time']))]
+            values = [nba_market_value(r, stat) for r in history_by_name.get(player, []) if pd.Timestamp(r['source_date'])+(pd.Timedelta(0) if r.get('history_provider') in {'api_sports','balldontlie'} else pd.Timedelta(hours=48))<min(start,pd.Timestamp(first['capture_time']))]
         else:
             identity = identities.get((int(first['game_id']),name_key(player)))
             if not identity:
