@@ -400,27 +400,44 @@ def _nba_history_batches_locked(names, api_key, status=None):
         ids = {pid for name, pid in batch}; rows_by_id = {pid: [] for pid in ids}
         checked_dates = [pd.to_datetime(known[name].get('checked_at'), utc=True, errors='coerce') for name, pid in batch]
         since = max(now-pd.Timedelta(days=365), min(checked_dates)-pd.Timedelta(days=3)) if all(pd.notna(d) for d in checked_dates) else now-pd.Timedelta(days=365)
-        cursor = None; seen = set()
         try:
-            for page in range(1, 101):
-                notify(f"{'Updating new results' if all(pd.notna(d) for d in checked_dates) else 'Saving initial player history'} · batch {offset+1} of {len(batches)} · page {page}")
-                params = {'player_ids[]': list(ids), 'per_page': 100,
-                          'start_date': since.strftime('%Y-%m-%d'),
-                          'end_date': now.strftime('%Y-%m-%d')}
-                if cursor is not None: params['cursor'] = cursor
-                payload = _get(base+'/stats', api_key, params, True)
-                for row in payload.get('data', []):
-                    pid = (row.get('player') or {}).get('id'); game = row.get('game', {})
-                    date = pd.to_datetime(game.get('date'), utc=True, errors='coerce')
-                    try: played = float(str(row.get('min') or '0').split(':')[0]) > 0
-                    except ValueError: played = False
-                    if pid in ids and str(game.get('status','')).startswith('Final') and pd.notna(date) and date<now and played:
-                        rows_by_id[pid].append(dict(row, source_date=date.isoformat(), history_provider='balldontlie'))
-                cursor = payload.get('meta', {}).get('next_cursor')
-                if cursor is None: break
-                if str(cursor) in seen: raise RuntimeError('Repeated stats cursor')
-                seen.add(str(cursor))
-            else: raise RuntimeError('Stats pagination incomplete')
+            incremental = all(pd.notna(d) for d in checked_dates)
+            windows = [(since, now)] if incremental else [
+                (now-pd.Timedelta(days=90), now),
+                (now-pd.Timedelta(days=180), now-pd.Timedelta(days=90)),
+                (now-pd.Timedelta(days=365), now-pd.Timedelta(days=180))]
+            active_ids = set(ids)
+            for window_start, window_end in windows:
+                if not active_ids: break
+                cursor = None; seen = set()
+                for page in range(1, 101):
+                    notify(f"{'Updating new results' if incremental else 'Loading recent player history'} · batch {offset+1} of {len(batches)} · page {page}")
+                    params = {'player_ids[]': sorted(active_ids), 'per_page': 100,
+                              'start_date': window_start.strftime('%Y-%m-%d'),
+                              'end_date': window_end.strftime('%Y-%m-%d')}
+                    if cursor is not None: params['cursor'] = cursor
+                    payload = _get(base+'/stats', api_key, params, True)
+                    for row in payload.get('data', []):
+                        pid = (row.get('player') or {}).get('id'); game = row.get('game', {})
+                        date = pd.to_datetime(game.get('date'), utc=True, errors='coerce')
+                        try: played = float(str(row.get('min') or '0').split(':')[0]) > 0
+                        except ValueError: played = False
+                        if pid in active_ids and str(game.get('status','')).startswith('Final') and pd.notna(date) and date<now and played:
+                            rows_by_id[pid].append(dict(row, source_date=date.isoformat(), history_provider='balldontlie'))
+                    cursor = payload.get('meta', {}).get('next_cursor')
+                    if cursor is None: break
+                    if str(cursor) in seen: raise RuntimeError('Repeated stats cursor')
+                    seen.add(str(cursor))
+                else: raise RuntimeError('Stats pagination incomplete')
+                if not incremental:
+                    # Finish each date window: provider ordering is not assumed.
+                    # Only extend history for players still short of 30 usable
+                    # results in at least one supported statistical category.
+                    for pid in list(active_ids):
+                        unique = {r['game']['id']: r for r in rows_by_id[pid]}.values()
+                        if all(sum(nba_market_value(r, stat) is not None for r in unique) >= 30
+                               for label, stat in MARKETS['NBA'].values()):
+                            active_ids.remove(pid)
         except Exception as exc:
             # Discard all partial batch rows: incomplete samples must not drive picks.
             for name, pid in batch:
