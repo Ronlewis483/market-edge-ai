@@ -519,6 +519,21 @@ def render_prediction_workspace(league, predictions, result):
                         st.warning('Training medians used for: ' + ', '.join(missing))
                 if game.get('training_games') is not None:
                     st.write('Historical training games:', game['training_games'])
+                if league == 'NBA':
+                    st.write('Probability method:', game.get('input_status','Unverified'))
+                    if game.get('raw_home_win_probability') is not None:
+                        st.write('Raw home win chance:', f"{float(game['raw_home_win_probability']):.1%}")
+                    st.write('Calibration games:', int(game.get('calibration_games',0)))
+                    assessment = (result or {}).get('validation_summary', {})
+                    st.caption(assessment.get('status','No chronological assessment saved for these predictions. Generate once to calculate it.'))
+                    if assessment.get('holdout_games'):
+                        metrics = assessment['calibrated_model']
+                        st.write(f"Recent historical holdout: {metrics['accuracy']:.1%} correct across {assessment['holdout_games']} games")
+                        st.write(f"Always-home baseline: {assessment['always_home_accuracy']:.1%}")
+                        st.write(f"Brier score: {metrics['brier_score']:.4f} · raw model: {assessment['raw_model']['brier_score']:.4f} (lower is better)")
+                        st.caption('This is a historical assessment of the algorithm, not an audit of your saved live tickets. Injury and expected-minute inputs remain unavailable.')
+                        st.dataframe(pd.DataFrame(assessment['confidence_bands']), hide_index=True)
+
             if league == 'NFL':
                 render_nfl_game_context(game)
             elif league == 'MLB':
