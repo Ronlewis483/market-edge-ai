@@ -563,6 +563,9 @@ def load_nba_spotlight_inputs(home_team, away_team, commence_time, nba_key):
 def render_nba_star_spotlight(game, result):
     """Display saved forecasts or fill only the selected game's missing stars."""
     st.markdown('#### ⭐ Star-player spotlight')
+    if (result or {}).get('player_props', {}).get('probability_source') == 'player_history' and not (result or {}).get('player_props', {}).get('star_spotlights'):
+        st.caption('Player-history predictions are shown in the prop cards below.')
+        return
     if (result or {}).get('player_props', {}).get('probability_source') == 'sportsbook_implied':
         st.caption('Sportsbook prop listings are shown below. Independent star projections need a player-statistics source.')
         return
@@ -1011,7 +1014,7 @@ def enrich_nba_props(result, odds_key, nba_key, updates, context=None):
             updates.put(partial)
         result['player_props'] = generate_player_prop_picks('NBA',
             result['all_predictions'].to_dict('records'), odds_key, nba_key=nba_key,
-            progress=publish_progress)
+            progress=publish_progress, api_sports_key=nba_key)
     except Exception as exc:
         result['player_props'] = {'picks': [], 'message': 'Player-prop data unavailable. Team predictions are preserved.',
             'errors': ['NBA prop processing failed: '+type(exc).__name__+': '+str(exc)]}
@@ -1112,7 +1115,7 @@ def start_nba_prop_loading(result):
     st.session_state['nba_enrichment_updates'] = updates
     st.session_state['nba_enrichment_future'] = nba_enrichment_pool().submit(enrich_nba_props,
         result, prediction_api_key('ODDS_API_KEY', 'THE_ODDS_API_KEY'),
-        None, updates, context)
+        prediction_api_key('API_SPORTS_KEY'), updates, context)
     return result
 
 
@@ -1492,6 +1495,15 @@ def prop_comparisons(props):
                 candidates.append(detail)
         else:
             candidates.append(original)
+            # The model may estimate both outcomes; an unlisted side is forecast-only.
+            raw_side=str(original.get('Pick','')).upper()
+            opposite='Under' if raw_side=='OVER' else 'Over' if raw_side=='UNDER' else None
+            chance=original.get((opposite+' chance') if opposite else '')
+            if opposite and chance is not None and original.get('Probability source')=='player_history':
+                detail=dict(original,Pick=opposite,**{'Estimated chance':chance,
+                    'Best sportsbook':None,'Best decimal odds':None,'_offered':False,'_comparison':True})
+                detail.pop('Historical wins',None)
+                candidates.append(detail)
     for prop in candidates:
         raw_side = str(prop.get('Pick','')).upper()
         side = {'OVER':'Over','YES':'Over','UNDER':'Under','NO':'Under'}.get(raw_side)
@@ -1568,7 +1580,9 @@ def render_prop_comparisons(props, pending=False, limit=5, scope='main'):
                         st.caption(str(prop['Best sportsbook']) + (' · '+decimal_to_american_label(float(price)) if price is not None and np.isfinite(float(price)) and float(price)>1 else ''))
                     else:
                         st.caption('Forecast only · no matching sportsbook bet found')
+                    if prop.get('Statistics source'): st.caption('Statistics: '+prop['Statistics source'])
                     if prop.get('Estimate method'): st.caption(prop['Estimate method'])
+                    if prop.get('Availability status'): st.caption(prop['Availability status'])
                     if prop.get('Historical wins') is not None:
                         st.caption(f"Covered in {int(prop['Historical wins'])} of {int(prop['Non-push games'])} non-push appearances")
                     elif prop.get('Prior games'):
@@ -1843,7 +1857,7 @@ def render_game_addons(league, game, result):
                                         st.warning('Provisional participation—recheck the lineup or starter.')
                                 if prop.get('Best sportsbook') in ('prizepicks', 'underdog'):
                                     st.caption('Pick’em selection · entry rules determine actual returns; feed price is indicative.')
-            if league == 'MLB' and not normalized:
+            if league in ('MLB','NBA') and not normalized:
                 reasons = (result or {}).get('player_props', {}).get('exclusions', [])
                 matching_reasons = [r for r in reasons if r.get('Game') == str(game.get('away_team'))+' @ '+str(game.get('home_team')) and (selected == 'All supported markets' or r.get('Market') == selected)]
                 for reason in matching_reasons[:5]:
