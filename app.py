@@ -1,10308 +1,1165 @@
-import pandas as pd
+"""Pregame player-prop estimates using actual lines and prior appearances.
+
+These are historical hit-rate estimates shrunk toward bookmaker consensus,
+not calibrated win probabilities from the game-winner model.
+"""
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import json
+import time
+import threading
+import re
+from pathlib import Path
+import unicodedata
+
 import numpy as np
-from dual_agent.nba_data import test_nba_connections
-from dual_agent.nba_history import test_nba_history
-
-from dual_agent.balldontlie_data import (
-    test_balldontlie_connection,
-    test_full_historical_season,
-    test_multiple_historical_seasons,
-    audit_historical_games,
-    get_multiple_historical_seasons,
-)
-from dual_agent.nba_research import (
-    run_nba_research,
-    run_multi_season_nba_research,
-    nba_calibration_summary,
-    prepare_balldontlie_games_for_research,
-    build_balldontlie_pregame_features,
-    audit_balldontlie_pregame_features,
-    run_balldontlie_walkforward_model,
-    build_balldontlie_future_matchup_features,
-    predict_balldontlie_matchup,
-    calculate_no_vig_model_edge,
-    get_live_nba_moneylines,
-    normalize_nba_team_name,
-)
-
-from dual_agent.nfl_data import (
-    test_sportradar_connection,
-    get_nfl_seasons,
-    get_nfl_season_games,
-    get_multiple_nfl_seasons,
-    audit_nfl_games,
-)
-
-from dual_agent.nfl_research import (
-    build_nfl_pregame_features,
-    run_nfl_walkforward_model,
-    run_nfl_walkforward_model_v2,
-    compare_nfl_v1_v2,
-    build_nfl_future_matchup_features,
-    predict_nfl_matchup,
-)
-
-from dual_agent.nfl_decision import (
-    build_nfl_confidence_profile,
-    get_nfl_decision,
-)
-
-from dual_agent.nfl_market import (
-    calculate_nfl_market_edge,
-    classify_nfl_market_edge,
-)
-
-from dual_agent.nfl_odds import (
-    get_live_nfl_moneylines,
-    get_best_nfl_moneylines,
-)
-
-from dual_agent.nfl_live_engine import (
-    build_live_nfl_opportunities,
-)
-
-
-from dual_agent.nfl_accuracy_audit import (
-    run_nfl_accuracy_audit,
-)
-
-from dual_agent.nfl_prediction_pipeline import (
-    run_nfl_prediction_pipeline,
-)
-
-from dual_agent.nba_prediction_pipeline import (
-    run_nba_prediction_pipeline,
-)
-
-
-from dual_agent.nfl_player_props_ui import render_nfl_player_props
-
-from dual_agent.nfl_player_props_v2 import (
-    compare_v1_v2_walkforward,
-    compare_v1_v2a_v2b_walkforward,
-)
-
-import streamlit as st
-
-from dual_agent.supabase_db import (
-    test_connection,
-    save_bet,
-    get_all_bets,
-    update_bet_result,
-    save_prediction_snapshot,
-    load_mlb_pitcher_history,
-    save_mlb_pitcher_history,
-    load_mlb_player_history,
-    save_mlb_player_history,
-    get_mlb_player_history_status,
-)
-
-from dual_agent.bet_settlement import (
-    auto_settle_bets,
-)
-
-from dual_agent.nfl_player_history import load_player_history
-
-from dual_agent.mlb_research import (
-    fetch_mlb_games,
-    get_missing_mlb_player_log_games,
-    collect_mlb_player_logs_batch,
-)
-st.set_page_config(page_title="Market Edge AI V5", page_icon="📊", layout="wide")
-
-# ==========================================
-# MARKET EDGE AI V5 - ALPACA CONNECTION TEST
-# ==========================================
-
+import pandas as pd
 import requests
 from dual_agent.odds_request_cache import get as cached_odds_get
+from dual_agent.preferred_sportsbooks import allowed, standalone_value
 
-def render_stock_connection():
-    with st.expander("Alpaca Connection"):
-
-        if st.button("Test Alpaca API", key="test_alpaca_connection"):
-
-            try:
-                api_key = st.secrets["ALPACA_API_KEY"]
-                secret_key = prediction_api_key("ALPACA_SECRET_KEY", "ALPACA_API_SECRET")
-                if not secret_key:
-                    raise KeyError("ALPACA_SECRET_KEY or ALPACA_API_SECRET")
-
-                headers = {
-                    "APCA-API-KEY-ID": api_key,
-                    "APCA-API-SECRET-KEY": secret_key,
-                }
-
-                response = requests.get(
-                    "https://data.alpaca.markets/v2/stocks/AAPL/bars",
-                    headers=headers,
-                    params={
-                        "timeframe": "1Day",
-                        "limit": 1,
-                        "feed": "iex",
-                    },
-                    timeout=15,
-                )
-
-                if response.status_code == 200:
-
-                    data = response.json()
-                    bars = data.get("bars", [])
-
-                    st.success("Alpaca API connected successfully!")
-
-                    if bars:
-                        st.write("Latest available AAPL bar:")
-                        st.json(bars[0])
-                    else:
-                        st.warning(
-                            "Connection successful, but no price bars were returned."
-                        )
-
-                else:
-                    st.error(
-                        f"Alpaca API returned HTTP {response.status_code}."
-                    )
-                    st.write(response.text[:500])
-
-            except KeyError as error:
-                st.error(
-                    f"Missing Alpaca credential in Streamlit Secrets: {error}"
-                )
-
-            except requests.RequestException as error:
-                st.error(f"Alpaca connection error: {error}")
-
-            except Exception as error:
-                st.error(f"Connection test failed: {error}")
-from dual_agent.research import DEFAULT_UNIVERSE, latest_scan, run_research
-
-from dual_agent.stock import (
-    train_all as train_stock_models,
-    metrics_all as stock_model_metrics,
-)
-from dual_agent.signal_engine import clean_symbols, stock_decision, sports_decision, GATES
-from dual_agent.validated_model import VALIDATED_STOCK_MODEL as M
-from trading_center_ui import render_trading_center
+MARKETS = {'MLB': {
+    'batter_hits': ('Hits', 'hits'),
+    'batter_home_runs': ('Home runs', 'batting_home_runs'),
+    'batter_total_bases': ('Total bases', 'total_bases'),
+    'batter_rbis': ('RBIs', 'rbi'),
+    'batter_runs_scored': ('Runs scored', 'batting_runs'),
+    'batter_hits_runs_rbis': ('Hits + runs + RBIs', 'hits_runs_rbis'),
+    'batter_singles': ('Singles', 'singles'),
+    'batter_doubles': ('Doubles', 'doubles'),
+    'batter_triples': ('Triples', 'triples'),
+    'batter_walks': ('Batter walks', 'batting_walks'),
+    'batter_strikeouts': ('Batter strikeouts', 'batting_strikeouts'),
+    'batter_stolen_bases': ('Stolen bases', 'stolen_bases'),
+    'pitcher_strikeouts': ('Pitcher strikeouts', 'pitcher_strikeouts'),
+    'pitcher_hits_allowed': ('Hits allowed', 'pitcher_hits'),
+    'pitcher_walks': ('Pitcher walks', 'pitcher_walks'),
+    'pitcher_earned_runs': ('Earned runs allowed', 'earned_runs'),
+    'pitcher_outs': ('Outs recorded', 'pitching_outs')},
+    'NBA': {'player_points': ('Points', 'pts'), 'player_rebounds': ('Rebounds', 'reb'), 'player_assists': ('Assists', 'ast'),
+    'player_threes': ('Three-pointers made', 'fg3m'), 'player_blocks': ('Blocks', 'blk'),
+    'player_steals': ('Steals', 'stl'), 'player_turnovers': ('Turnovers', 'turnover'),
+    'player_points_rebounds_assists': ('Points + rebounds + assists', ('pts', 'reb', 'ast')),
+    'player_points_rebounds': ('Points + rebounds', ('pts', 'reb')),
+    'player_points_assists': ('Points + assists', ('pts', 'ast')),
+    'player_rebounds_assists': ('Rebounds + assists', ('reb', 'ast')),
+    'player_blocks_steals': ('Blocks + steals', ('blk', 'stl'))}}
 
 
-# ==========================================
-# MARKET EDGE AI — DASHBOARD V2 THEME
-# ==========================================
-
-st.markdown(
-    """
-    <style>
-
-    /* Main application background */
-    .stApp {
-        background: #0B1220;
-        color: #F8FAFC;
-    }
-
-    /* Main content spacing */
-    .block-container {
-        padding-top: 2rem;
-        padding-bottom: 3rem;
-        max-width: 1500px;
-    }
-
-    /* Sidebar */
-    section[data-testid="stSidebar"] {
-        background: #111C30;
-        border-right: 1px solid #243247;
-    }
-
-    /* Headings */
-    h1, h2, h3 {
-        color: #F8FAFC !important;
-        letter-spacing: -0.5px;
-    }
-
-    h1 {
-        font-weight: 800 !important;
-    }
-
-    /* Dashboard metric cards */
-    div[data-testid="stMetric"] {
-        background: #172338;
-        border: 1px solid #263850;
-        border-radius: 16px;
-        padding: 20px;
-    }
-
-    div[data-testid="stMetricLabel"] {
-        color: #94A3B8;
-    }
-
-    div[data-testid="stMetricValue"] {
-        color: #F8FAFC;
-        font-weight: 700;
-    }
-
-    /* Buttons */
-    .stButton > button {
-        background: #172338;
-        color: #F8FAFC;
-        border: 1px solid #334155;
-        border-radius: 10px;
-        font-weight: 600;
-        min-height: 42px;
-    }
-
-    .stButton > button:hover {
-        border-color: #38BDF8;
-        color: #38BDF8;
-    }
-
-    .stButton > button[kind="primary"] {
-        background: #0284C7;
-        color: white;
-        border: none;
-    }
-
-    /* Input fields */
-    div[data-baseweb="select"] > div,
-    div[data-baseweb="input"] > div {
-        background: #172338;
-        border-radius: 10px;
-    }
-
-    /* Expandable sections */
-    div[data-testid="stExpander"] {
-        background: #111C30;
-        border: 1px solid #263850;
-        border-radius: 12px;
-    }
-
-    /* Data tables */
-    div[data-testid="stDataFrame"] {
-        border: 1px solid #263850;
-        border-radius: 12px;
-        overflow: hidden;
-    }
-
-    /* Horizontal dividers */
-    hr {
-        border-color: #263850;
-    }
-
-    
-/* ==========================================
-   NAVIGATION & TOOLBAR VISIBILITY FIX
-   ========================================== */
-
-/* Sidebar navigation labels */
-section[data-testid="stSidebar"] label,
-section[data-testid="stSidebar"] p,
-section[data-testid="stSidebar"] span {
-    color: #E2E8F0 !important;
-}
-
-/* Sidebar radio navigation */
-section[data-testid="stSidebar"]
-div[role="radiogroup"] label {
-    color: #F8FAFC !important;
-}
-
-/* Streamlit top toolbar */
-header[data-testid="stHeader"] {
-    background: #111C30 !important;
-    color: #F8FAFC !important;
-}
-
-/* Toolbar buttons and icons */
-header[data-testid="stHeader"] button {
-    color: #F8FAFC !important;
-}
-
-header[data-testid="stHeader"] button svg {
-    color: #F8FAFC !important;
-    fill: none;
-    stroke: currentColor;
-}
-
-/* Toolbar icon visibility */
-[data-testid="stToolbar"] button,
-[data-testid="stToolbar"] svg {
-    color: #F8FAFC !important;
-}
-
-/* Main text and input labels */
-.stApp label,
-.stApp .stMarkdown p {
-    color: #E2E8F0;
-}
-
-/* Selected sidebar navigation item */
-section[data-testid="stSidebar"]
-div[role="radiogroup"]
-label:has(input:checked) {
-    background: #1E3A5F;
-    border-radius: 8px;
-    padding: 8px;
-}
-
-/* Selected navigation text */
-section[data-testid="stSidebar"]
-label:has(input:checked) p {
-    color: #38BDF8 !important;
-    font-weight: 700;
-}
+def name_key(value):
+    return ''.join(c for c in unicodedata.normalize('NFKD', str(value)).lower() if c.isalnum())
 
 
-/* Prediction workspace: responsive master/detail panels with native controls. */
-.me-workspace-header { border: 1px solid #284868; background: linear-gradient(120deg, #112d48, #152039 70%); border-radius: 18px; padding: 22px 26px; margin: 4px 0 20px; box-shadow: 0 8px 24px #0002; }
-.me-workspace-header h2 { color: #f1f7ff; margin: 8px 0; }
-.me-workspace-header p { color: #bed0e4; margin: 0; }
-.me-eyebrow { color: #70d6ff; font-size: .75rem; font-weight: 800; letter-spacing: .13em; }
-/* Presentation polish: keep native controls and all labels accessible. */
-:root { --me-panel: #121e31; --me-border: #2a3b55; --me-muted: #b6c4d8; }
-.stApp { background: radial-gradient(ellipse at top right, #152a43 0, #0b1220 42%); }
-.block-container { padding-top: 1.6rem; max-width: 1440px; }
-h1 { font-size: 2.05rem !important; line-height: 1.2 !important; }
-h2 { font-size: 1.55rem !important; line-height: 1.3 !important; }
-h3 { font-size: 1.18rem !important; line-height: 1.4 !important; }
-[data-testid="stCaptionContainer"] p { color: var(--me-muted) !important; line-height: 1.5; }
-section[data-testid="stSidebar"] { background: #101b2d; }
-section[data-testid="stSidebar"] .stButton > button { justify-content: flex-start; min-height: 44px; border-radius: 9px; background: transparent; border-color: transparent; }
-section[data-testid="stSidebar"] .stButton > button[kind="primary"] { background: #133d60; border: 1px solid #328ec4; border-left: 3px solid #54c5fa; }
-section[data-testid="stSidebar"] [data-testid="stCaptionContainer"] { margin-top: .55rem; }
-.stButton > button { transition: border-color .12s ease, background .12s ease; }
-.stButton > button[kind="primary"] { background: #0369a1; border: 1px solid #3199cf; box-shadow: 0 4px 16px #0003; }
-.stButton > button[kind="primary"]:hover { background: #075985; color: #fff; border-color: #7dd3fc; }
-button:focus-visible, input:focus-visible, summary:focus-visible { outline: 2px solid #7dd3fc !important; outline-offset: 3px; }
-[data-testid="stVerticalBlockBorderWrapper"] { border-color: var(--me-border) !important; border-radius: 14px !important; background: #101b2bcc; }
-[data-testid="stMetric"] { padding: 14px 16px; border-radius: 12px; background: #16243a; }
-[data-testid="stMetricLabel"] { color: #c1cee0; }
-[data-testid="stMetricValue"] { font-size: 1.75rem; }
-[data-testid="stExpander"] { border-radius: 11px; background: #101b2b; }
-[data-testid="stExpander"] summary { min-height: 46px; color: #e7effc; font-weight: 600; }
-[data-baseweb="tab-list"] { gap: .5rem; border-bottom: 1px solid var(--me-border); }
-[data-baseweb="tab"] { color: #c4d1e4; font-weight: 600; padding: .7rem 1rem; }
-[data-baseweb="tab"][aria-selected="true"] { color: #7dd3fc; background: #183650; border-radius: 8px 8px 0 0; }
-[data-testid="stAlert"] { border-radius: 10px; }
-hr { margin: 1.1rem 0; opacity: .7; }
-.me-confidence { display: inline-flex; align-items: center; gap: .7rem; font-size: .78rem; font-weight: 700; letter-spacing: .035em; padding: .45rem .7rem; border: 1px solid; border-radius: 8px; margin: .25rem 0 .7rem; }
-.me-confidence span { font-size: .9rem; letter-spacing: 0; }
-.me-strong { color: #9ce9c3; background: #113b31; border-color: #296b55; }
-.me-moderate { color: #a9daff; background: #173754; border-color: #2c638c; }
-.me-close { color: #f5d78d; background: #3b3020; border-color: #74603a; }
-@media (max-width: 760px) {
- .block-container { padding: 1.1rem .9rem 2rem; }
- h1 { font-size: 1.7rem !important; }
- h2 { font-size: 1.3rem !important; }
- [data-testid="stMetric"] { padding: 10px; }
- [data-testid="stMetricValue"] { font-size: 1.35rem; }
- .me-confidence { font-size: .7rem; gap: .4rem; }
-}
-@media (prefers-reduced-motion: reduce) { .stButton > button { transition: none; } }
-
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-def prediction_date_groups(predictions, now=None):
-    """Rank the full visible slate: strongest ten first, then every remaining pick."""
-    if predictions is None or predictions.empty:
-        return []
-    current = pd.Timestamp.now(tz="UTC") if now is None else pd.Timestamp(now)
-    current = current.tz_localize("UTC") if current.tzinfo is None else current.tz_convert("UTC")
-    times = pd.to_datetime(predictions["commence_time"], utc=True, errors="coerce")
-    # Retention already removes confirmed finals. Keep saved active games as well.
-    visible = predictions.loc[times.notna() & (times <= current + pd.Timedelta(days=7))]
-    ranked = visible.sort_values("confidence", ascending=False, kind="stable")
-    return [
-        ("⭐ TOP 10 STRONGEST PICKS", "The highest-confidence predictions across the league's seven-day slate, ranked strongest first. Saved active picks remain visible until final.", ranked.iloc[:10]),
-        ("🏟️ ALL REMAINING GAME PICKS", "Every other available prediction, ranked by confidence. Games above are not repeated.", ranked.iloc[10:]),
-    ]
+def estimate_prop(values, line, side, market_probability, minimum=10, minimum_decisions=None):
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)][-30:]
+    wins = int((values > line).sum()) if side == 'Over' else int((values < line).sum())
+    pushes = int((values == line).sum())
+    decisions = len(values)-pushes
+    if minimum_decisions is None:
+        minimum_decisions = minimum
+    if len(values) < minimum or decisions < minimum_decisions:
+        return None
+    # Preserve the existing short-sample shrinkage and eligibility criteria.
+    chance = (wins+10*market_probability)/(decisions+10)
+    return {'Estimated chance': float(chance), 'Projected stat': float(values.mean()),
+            'Prior games': len(values), 'Non-push games': decisions, 'Historical wins': wins, 'Historical pushes': pushes,
+            'Historical hit rate': wins/decisions, 'Estimate method': 'Prior 30 appearances + market shrinkage'}
 
 
-def visible_prediction_rows(predictions):
-    if predictions is None or predictions.empty:
-        return predictions
-    groups = prediction_date_groups(predictions)
-    return pd.concat([rows for _, _, rows in groups], ignore_index=True)
+def nba_market_value(row, stat):
+    """Sum supported components only when every component is actually present."""
+    fields = stat if isinstance(stat, tuple) else (stat,)
+    numbers = [pd.to_numeric(row.get(field), errors='coerce') for field in fields]
+    return float(sum(numbers)) if all(pd.notna(n) and np.isfinite(n) for n in numbers) else None
 
 
-def render_confidence_badge(label, confidence):
-    from html import escape
-    tone = "strong" if confidence >= .70 else "moderate" if confidence >= .58 else "close"
-    st.markdown(f'<div class="me-confidence me-{tone}">{escape(label)} <span>{confidence:.1%}</span></div>', unsafe_allow_html=True)
+def _get(url, key, params=None, balldontlie=False):
+    if balldontlie:
+        # Share plan-aware pacing and 429 handling with NBA game history.
+        from dual_agent.balldontlie_data import _balldontlie_get
+        return _balldontlie_get(url, params=params, api_key=key)
+    response = cached_odds_get(url, params=params, headers={'Authorization': key} if balldontlie else None, timeout=20)
+    if response.status_code != 200:
+        raise RuntimeError('Player-prop data request failed (HTTP '+str(response.status_code)+').')
+    return response.json()
 
 
-@st.fragment
-def render_prediction_workspace(league, predictions, result):
-    """Filter saved predictions locally; widget changes rerun only this workspace."""
-    from html import escape
-    import hashlib
-    if league == 'NFL':
-        render_nfl_enrichment_status()
-        render_nfl_freshness_monitor()
-        if result.get('context_issue'):st.warning(result['context_issue'])
-        if result.get('qb_forecast_issue'):st.warning(result['qb_forecast_issue'])
-    st.markdown(f'<div class="me-workspace-header"><div class="me-eyebrow">PREDICTION WORKSPACE · {escape(league)}</div><h2>Find your next pick</h2><p>Select a game. Compare its winner, spread and strongest player props.</p></div>', unsafe_allow_html=True)
-    controls = st.columns([2, 2, 3])
-    with controls[0]:
-        period = st.selectbox("Game window", ["Next 7 days + active", "Today"], key=f"workspace_window_{league}")
-    with controls[1]:
-        threshold = st.selectbox("Winner confidence", ["All predictions", "70% or higher", "80% or higher"], key=f"workspace_confidence_{league}")
-    with controls[2]:
-        search = st.text_input("Find a team", key=f"workspace_search_{league}", placeholder="Search either team…")
-    frame = predictions.copy()
-    if period == 'Today':
-        dates = pd.to_datetime(frame.commence_time, utc=True, errors='coerce').dt.tz_convert('America/Chicago').dt.date
-        frame = frame.loc[dates == pd.Timestamp.now(tz='America/Chicago').date()]
-    if threshold != 'All predictions':
-        frame = frame.loc[frame.confidence >= (.8 if threshold.startswith('80') else .7)]
-    if search.strip():
-        mask = frame.home_team.astype(str).str.contains(search.strip(), case=False, regex=False) | frame.away_team.astype(str).str.contains(search.strip(), case=False, regex=False)
-        frame = frame.loc[mask]
-    frame = frame.sort_values('confidence', ascending=False, kind='stable')
-    if frame.empty:
-        st.info('No games match these filters. Try another team or confidence level.')
-        return
-    games = frame.to_dict('records')
-    def identity(game):
-        value = '|'.join(str(game.get(c,'')) for c in ('home_team','away_team','commence_time'))
-        return hashlib.sha256(value.encode()).hexdigest()[:16]
-    ids = {identity(g): g for g in games}
-    selection_key = f'workspace_selected_{league}'
-    if st.session_state.get(selection_key) not in ids:
-        st.session_state[selection_key] = identity(games[0])
-    left, right = st.columns([1, 1.25], gap='large')
-    with left:
-        st.subheader(f'{league} game picks')
-        st.caption(f'{len(games)} games · strongest ten first, then the remaining slate')
-        with st.container(height=650, border=True):
-            for rank, game in enumerate(games, 1):
-                if rank == 1:
-                    st.markdown('**⭐ STRONGEST TEN**')
-                elif rank == 11:
-                    st.markdown('**ALL REMAINING GAMES**')
-                gid = identity(game)
-                with st.container(border=True):
-                    stamp = pd.to_datetime(game.get('commence_time'), utc=True, errors='coerce')
-                    date_text = stamp.tz_convert('America/Chicago').strftime('%b %d, %Y · %-I:%M %p CT') if pd.notna(stamp) else 'Time pending'
-                    st.caption(date_text + ' · ' + str(game.get('pick_game_status', 'Upcoming')))
-                    st.markdown(f"**#{rank} · {game['away_team']} @ {game['home_team']}**")
-                    confidence = float(game.get('confidence',0))
-                    render_confidence_badge(str(game.get('predicted_team','Winner pending')), confidence)
-                    if st.button('Selected game' if st.session_state[selection_key] == gid else 'View game & player props', key=f'workspace_pick_{league}_{gid}', type='primary' if st.session_state[selection_key] == gid else 'secondary', use_container_width=True):
-                        st.session_state[selection_key] = gid
-    game = ids[st.session_state[selection_key]]
-    with right:
-        st.subheader('Game spotlight')
-        with st.container(border=True):
-            st.markdown(f"### {game['away_team']} @ {game['home_team']}")
-            st.caption(str(game.get('pick_game_status','Upcoming')))
-            st.markdown(f"**🏆 Predicted winner: {game.get('predicted_team','Pending')}**")
-            confidence = float(game.get('confidence',0))
-            render_confidence_badge('Estimated win chance', confidence)
-            st.progress(min(1.,max(0.,confidence)))
-            if league == 'NBA':
-                render_nba_star_spotlight(game, result)
-            if game.get('input_status'):
-                st.caption(game['input_status'])
-            if game.get('input_notes'):
-                notes = game['input_notes']
-                st.warning(' · '.join(notes) if isinstance(notes,list) else str(notes))
-                st.caption('Early forecasts with missing inputs need an update before treating them as recommended picks.')
-            with st.expander('View model details'):
-                st.write('Home win chance:', f"{float(game.get('home_win_probability',0)):.1%}")
-                st.write('Away win chance:', f"{float(game.get('away_win_probability',0)):.1%}")
-                if league == 'MLB':
-                    st.caption('Equation: ' + str(game.get('Equation', 'Saved matchup model')))
-                    missing = game.get('Missing model inputs', [])
-                    if missing:
-                        st.warning('Training medians used for: ' + ', '.join(missing))
-                if game.get('training_games') is not None:
-                    st.write('Historical training games:', game['training_games'])
-                if league == 'NBA':
-                    st.write('Probability method:', game.get('input_status','Unverified'))
-                    if game.get('raw_home_win_probability') is not None:
-                        st.write('Raw home win chance:', f"{float(game['raw_home_win_probability']):.1%}")
-                    st.write('Calibration games:', int(game.get('calibration_games',0)))
-                    assessment = (result or {}).get('validation_summary', {})
-                    st.caption(assessment.get('status','No chronological assessment saved for these predictions. Generate once to calculate it.'))
-                    if assessment.get('holdout_games'):
-                        metrics = assessment['calibrated_model']
-                        st.write(f"Recent historical holdout: {metrics['accuracy']:.1%} correct across {assessment['holdout_games']} games")
-                        st.write(f"Always-home baseline: {assessment['always_home_accuracy']:.1%}")
-                        st.write(f"Brier score: {metrics['brier_score']:.4f} · raw model: {assessment['raw_model']['brier_score']:.4f} (lower is better)")
-                        st.caption('This is a historical assessment of the algorithm, not an audit of your saved live tickets. Injury and expected-minute inputs remain unavailable.')
-                        st.dataframe(pd.DataFrame(assessment['confidence_bands']), hide_index=True)
-
-            if league == 'NFL':
-                render_nfl_game_context(game)
-            elif league == 'MLB':
-                render_mlb_game_context(game)
-            render_game_addons(league, game, result)
+MLB_PROP_MATCH_VERSION = 6
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def load_nba_spotlight_inputs(home_team, away_team, commence_time, nba_key):
-    """Fill older prediction snapshots without rerunning models or odds scans."""
-    from dual_agent.nba_star_spotlight import collect_star_rosters, key
-    from dual_agent.sports_player_prop_predictions import _nba_history_batches
-    game = {'home_team': home_team, 'away_team': away_team, 'commence_time': commence_time}
-    rosters = collect_star_rosters([game])
-    names = {key(player['player']): player['player']
-        for roster in rosters.values() for player in roster['players']}
-    histories = {}; issues = []
-    if not nba_key:
-        issues.append('Player statistics access is unavailable. Star identities remain visible.')
-        return rosters, histories, issues
-    for name, rows, issue in _nba_history_batches(list(names.values()), nba_key):
-        histories[name] = rows
-        if issue: issues.append(issue)
-    return rosters, histories, issues
+def mlb_team_key(value):
+    key = name_key(value)
+    return {'ladodgers': 'losangelesdodgers', 'laangels': 'losangelesangels',
+            'oaklandathletics': 'athletics', 'sacramentoathletics': 'athletics',
+            'clevelandindians': 'clevelandguardians'}.get(key, key)
 
 
-def render_nba_star_spotlight(game, result):
-    """Display saved forecasts or fill only the selected game's missing stars."""
-    st.markdown('#### ⭐ Star-player spotlight')
-    if (result or {}).get('player_props', {}).get('probability_source') == 'player_history' and not (result or {}).get('player_props', {}).get('star_spotlights'):
-        st.caption('Player-history predictions are shown in the prop cards below.')
-        return
-    if (result or {}).get('player_props', {}).get('probability_source') == 'sportsbook_implied':
-        st.caption('Sportsbook prop listings are shown below. Independent star projections need a player-statistics source.')
-        return
-    if (result or {}).get('nba_props_pending'):
-        st.caption('Star forecasts will appear here when the background player-stat lookup finishes.')
-        return
-    start = pd.to_datetime(game.get('commence_time'), utc=True, errors='coerce')
-    spotlight = next((row for row in result.get('player_props', {}).get('star_spotlights', [])
-        if row.get('home_team') == game.get('home_team')
-        and row.get('away_team') == game.get('away_team')
-        and pd.to_datetime(row.get('commence_time'), utc=True, errors='coerce') == start), None)
-    if not spotlight:
-        # Older committed prop pipelines do not return star_spotlights. Build
-        # this small panel directly, without requiring another Generate click.
+def match_mlb_prop_events(games, events, now):
+    """One-to-one matching; allow changed times only for a unique same-day game."""
+    valid = {}
+    for event in events:
+        stamp = pd.to_datetime(event.get('commence_time'), utc=True, errors='coerce')
+        if event.get('id') and pd.notna(stamp) and stamp > now:
+            valid[str(event['id'])] = (event, stamp)
+    prepared = []
+    for game in games:
+        start = pd.to_datetime(game.get('start_time') or game.get('commence_time'), utc=True, errors='coerce')
+        if pd.notna(start) and now < start <= now+pd.Timedelta(days=7):
+            prepared.append((game, start, mlb_team_key(game['home_team']), mlb_team_key(game['away_team'])))
+    proposed = []; diagnostics = []
+    for game, start, home, away in prepared:
+        details = {'Game': game['away_team']+' @ '+game['home_team'],
+                   'MLB start UTC': start.isoformat(), 'Odds events returned': len(valid)}
+        pair = [(event, stamp) for event, stamp in valid.values()
+                if mlb_team_key(event.get('home_team')) == home and mlb_team_key(event.get('away_team')) == away]
+        strict = [(e,t) for e,t in pair if abs(t-start) <= pd.Timedelta(minutes=15)]
+        reversed_exact = [(e,t) for e,t in valid.values() if mlb_team_key(e.get('home_team')) == away and mlb_team_key(e.get('away_team')) == home and abs(t-start) <= pd.Timedelta(minutes=15)]
+        if not strict and not pair and len(reversed_exact) == 1:
+            pair = reversed_exact; strict = reversed_exact
+        if len(strict) == 1:
+            event, stamp = strict[0]; method = 'Teams and start within 15 minutes'
+        elif len(strict) > 1:
+            diagnostics.append(dict(details, Reason='Multiple sportsbook events match this start time.')); continue
+        else:
+            day = start.tz_convert('America/Chicago').date()
+            same_day = [(e,t) for e,t in pair if t.tz_convert('America/Chicago').date() == day]
+            same_games = [g for g,t,h,a in prepared if h==home and a==away and t.tz_convert('America/Chicago').date()==day]
+            if len(same_day)==1 and len(same_games)==1 and abs(same_day[0][1]-start)<=pd.Timedelta(hours=3):
+                event, stamp = same_day[0]; method = 'Unique same-day matchup; start times differ'
+            else:
+                reversed_pair = any(mlb_team_key(e.get('home_team'))==away and mlb_team_key(e.get('away_team'))==home for e,t in valid.values())
+                reason = ('No event returned for these teams and home/away order.' if not pair else
+                          'Start-time mismatch or multiple same-day games; automatic match withheld.')
+                if not pair and reversed_pair: reason = 'Odds feed has the opposite home/away order; automatic match withheld.'
+                diagnostics.append(dict(details, Reason=reason, **{'Odds starts UTC': [t.isoformat() for e,t in pair]})); continue
+        proposed.append((game, event, dict(details, **{'Odds start UTC':stamp.isoformat(), 'Match':method})))
+    counts = {}
+    for game,event,details in proposed: counts[event['id']] = counts.get(event['id'],0)+1
+    matched = {}; notes = {}
+    for game,event,details in proposed:
+        gid = int(game['game_id'])
+        if counts[event['id']] != 1:
+            diagnostics.append(dict(details, Reason='One sportsbook event would map to multiple MLB games.')); continue
+        matched[gid] = event; notes[gid] = details
+    return matched, notes, diagnostics
+
+
+def fetch_prop_quotes(league, games, odds_key):
+    sport = 'baseball_mlb' if league=='MLB' else 'basketball_nba'
+    base = 'https://api.the-odds-api.com/v4/sports/'+sport
+    now = pd.Timestamp.now(tz='UTC'); quotes = []; errors = []
+    params = {'apiKey': odds_key}
+    if league == 'MLB':
+        params.update(dateFormat='iso', commenceTimeFrom=now.strftime('%Y-%m-%dT%H:%M:%SZ'),
+                      commenceTimeTo=(now+pd.Timedelta(days=7,hours=3)).strftime('%Y-%m-%dT%H:%M:%SZ'))
+    events = _get(base+'/events', odds_key, params)
+    matches = {}; match_notes = {}
+    if league == 'MLB':
+        matches, match_notes, errors = match_mlb_prop_events(games, events, now)
+    from dual_agent.mlb_historical_odds import team
+    def collect(game):
+        quotes = []; errors = []
+        start = pd.to_datetime(game.get('start_time') or game.get('commence_time'), utc=True)
+        if not now<start<=now+pd.Timedelta(days=7): return quotes, errors
+        if league == 'MLB':
+            event = matches.get(int(game['game_id']))
+            if event is None: return quotes, errors
+        else:
+            matched = [event for event in events if team(event.get('home_team'))==team(game['home_team']) and team(event.get('away_team'))==team(game['away_team']) and abs(pd.to_datetime(event['commence_time'], utc=True)-start)<=pd.Timedelta(minutes=15)]
+            if len(matched)!=1:
+                errors.append('No unique prop event match for '+game['away_team']+' at '+game['home_team']); return quotes, errors
+            event = matched[0]
         try:
-            from dual_agent.nba_star_spotlight import build_star_spotlights
-            with st.spinner('Loading this game’s star-player forecasts…'):
-                rosters, histories, issues = load_nba_spotlight_inputs(
-                    game['home_team'], game['away_team'], start.isoformat(),
-                    prediction_api_key('BALLDONTLIE_API_KEY'))
-                props = result.get('player_props') or {}
-                picks = props.get('game_picks', props.get('picks', []))
-                spotlight = build_star_spotlights([game], rosters, histories, picks)[0]
-            for issue in issues:
-                st.caption(issue)
-        except Exception as exc:
-            st.warning('Unable to load this game’s star spotlight: '+str(exc))
-            return
-    st.caption('Two stars per team, selected by reported current-season salary. Star selection does not change the winner or prop equations.')
-    for team in spotlight['teams']:
-        st.markdown('**'+team['team']+'**')
-        if team.get('issue'):
-            st.caption(team['issue'])
-        for player in team['players']:
-            if not player.get('projections') and not player.get('props'):
+            payload = _get(base+'/events/'+event['id']+'/odds', odds_key, {'apiKey': odds_key, 'regions': 'us', 'markets': ','.join(MARKETS[league]), 'oddsFormat': 'decimal'})
+        except RuntimeError as exc:
+            errors.append(str(exc)); return quotes, errors
+        stamp = pd.Timestamp.now(tz='UTC')
+        if league == 'MLB' and not payload.get('bookmakers'):
+            errors.append({'Game':game['away_team']+' @ '+game['home_team'], 'Reason':'Event matched, but no sportsbook prop lines were returned.'})
+        for book in payload.get('bookmakers', []):
+            if not allowed(book.get('key')):
                 continue
-            with st.container(border=True):
-                st.markdown('**⭐ '+player['player']+'**')
-                st.caption('Availability: '+player['status'])
-                if player['unavailable']:
-                    st.warning('Reported unavailable · historical averages only; no recommended prop shown.')
-                projections = player.get('projections', [])
-                main = [p for p in projections if p['market'] in ('Points', 'Rebounds', 'Assists', 'Three-pointers made')]
-                if main:
-                    columns = st.columns(2)
-                    for index, projection in enumerate(main):
-                        with columns[index % 2]:
-                            st.metric(projection['market'], f"{projection['projection']:.1f}")
-                    st.caption(player['projection_note'])
-                    with st.expander('All statistical projections & history'):
-                        for projection in projections:
-                            st.write(f"{projection['market']}: {projection['projection']:.1f} · {projection['prior_games']} prior games")
-                            if projection['prior_games'] < 10:
-                                st.caption('Limited history · informational average only.')
-                else:
-                    st.caption('Usable prior game statistics unavailable. No projection has been invented.')
-                props = player.get('props', [])
-                if props:
-                    st.markdown('**Most likely available props**')
-                    for pick in props[:3]:
-                        st.write(f"{pick['Pick']} {pick['Line']:g} {pick['Market']} · {pick['Estimated chance']:.1%} estimated cover chance")
-                        st.caption(f"{pick['Best sportsbook']} · {decimal_to_american_label(pick['Best decimal odds'])} · {pick['Prior games']} prior appearances")
-                    st.caption('Cover estimates exclude pushes and assume participation. Ranked by probability, not payout.')
-                elif not player['unavailable']:
-                    st.caption('No qualified listed prop available for this player.' + (' Statistical projections are shown above.' if player.get('projections') else ' Player history must load before a projection can be calculated.'))
-        if team.get('captured_at'):
-            st.caption('Roster source: '+team.get('source', 'ESPN')+' · captured '+team['captured_at'])
+            for market in book.get('markets', []):
+                key = market.get('key')
+                if key not in MARKETS[league]: continue
+                updated = pd.to_datetime(market.get('last_update') or book.get('last_update'), utc=True, errors='coerce')
+                if pd.isna(updated) or updated>stamp or stamp-updated>pd.Timedelta(minutes=30) or updated>=start: continue
+                paired = {}
+                for outcome in market.get('outcomes', []):
+                    try:
+                        player = str(outcome['description']); price = float(outcome['price']); side = outcome['name']
+                        if league == 'MLB' and key == 'batter_home_runs' and side in ('Yes', 'No'):
+                            line = .5; side = 'Over' if side == 'Yes' else 'Under'
+                        else:
+                            line = float(outcome['point'])
+                        if not np.isfinite([line,price]).all() or price<=1 or side not in ['Over','Under']: continue
+                        paired.setdefault((player,line), {})[side] = price
+                    except (KeyError, TypeError, ValueError): continue
+                for (player,line), sides in paired.items():
+                    # One actual offered side is enough for NBA and MLB.
+                    # Only paired quotes contribute a margin-free market prior.
+                    over = 1/sides['Over'] if 'Over' in sides else None
+                    under = 1/sides['Under'] if 'Under' in sides else None
+                    quotes.append({'player':player,'line':line,'market':key,'over_probability':over/(over+under) if over is not None and under is not None else None,
+                                   'over_decimal_odds':sides.get('Over'), 'under_decimal_odds':sides.get('Under'), 'book':book.get('key'), 'updated_at':updated.isoformat(), 'event_id':event['id'],
+                                   'home_team':game['home_team'],'away_team':game['away_team'],'start_time':start.isoformat(),
+                                   'game_id':game.get('game_id'), 'capture_time':stamp.isoformat(),
+                                   **({'Event match':match_notes[int(game['game_id'])]['Match']} if league=='MLB' else {})})
+        if league == 'MLB':
+            found = {q['market'] for q in quotes}
+            for market_key, (label, _) in MARKETS['MLB'].items():
+                if market_key not in found:
+                    errors.append({'Game': game['away_team']+' @ '+game['home_team'],
+                        'MLB start UTC': start.isoformat(), 'Market': label,
+                        'Reason': 'No usable fresh '+label.lower()+' offer was returned for this matched game.'})
+        return quotes, errors
+    # Separate HTTP requests; bounded concurrency also preserves slate order.
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for game_quotes, game_errors in pool.map(collect, games):
+            quotes.extend(game_quotes); errors.extend(game_errors)
+    return quotes, errors
 
 
-def decimal_to_american_label(price):
-    return f"{100*(price-1):+.0f}" if price >= 2 else f"{-100/(price-1):.0f}"
+def _nba_history(player, api_key):
+    """Use the identical identity resolution and history cache as the batch loader."""
+    for name, rows, issue in _nba_history_batches([player], api_key):
+        if issue:
+            raise RuntimeError(issue)
+        return rows
+    return []
 
 
-def render_mlb_game_context(game):
-    context = game.get('game_context')
-    with st.expander('Game inputs · starters, lineups & conditions', expanded=True):
-        if not isinstance(context, dict):
-            st.info('Generate again to collect the current MLB game inputs.')
+def _nba_request_issue(exc):
+    """Expose useful status without leaking provider response bodies or credentials."""
+    import re
+    match = re.search(r'(?:error|HTTP)\s+(\d{3})', str(exc), re.I)
+    code = match.group(1) if match else None
+    if code == '401': return 'HTTP 401: player-data API key was rejected'
+    if code == '403': return 'HTTP 403: player-data access was denied; check subscription permissions'
+    if code == '429' or 'rate limit' in str(exc).lower(): return 'Provider rate limit persisted after retries'
+    if code: return 'Provider returned HTTP '+code
+    return type(exc).__name__+': request could not complete'
+
+
+def nba_identity_key(name):
+    """Normalize suffixes and explicit aliases; require one unique provider ID."""
+    import re
+    clean = re.sub(r'\s+(?:jr\.?|sr\.?|ii|iii|iv)$', '', str(name).strip(), flags=re.I)
+    value = name_key(clean)
+    return {'alexsarr': 'alexandresarr', 'nicclaxton': 'nicolasclaxton'}.get(value, value)
+
+
+def _nba_load_history_archive(path):
+    """Disk first; restore the shared private archive only after local cache loss."""
+    try:
+        archive = json.loads(path.read_text())
+        if archive.get('version') == 3 and isinstance(archive.get('players'), dict):
+            return archive
+    except (OSError, ValueError, AttributeError):
+        pass
+    try:
+        from dual_agent.balldontlie_data import _setting
+        url, key = _setting('SUPABASE_URL', ''), _setting('SUPABASE_KEY', '')
+        if url and key:
+            response = requests.get(str(url).rstrip('/')+'/storage/v1/object/authenticated/market-edge-data/nba/props/player_histories_v3.json',
+                headers={'apikey': key, 'Authorization': 'Bearer '+key}, timeout=3)
+            if response.status_code == 200:
+                archive = response.json()
+                if archive.get('version') == 3 and isinstance(archive.get('players'), dict):
+                    path.write_text(json.dumps(archive))
+                    return archive
+    except Exception:
+        pass  # Optional remote storage must not prevent prop generation.
+    return {'version': 3, 'players': {}}
+
+
+def _nba_save_remote_history_archive(archive):
+    """One private archive write per completed scan, rather than per player."""
+    try:
+        from dual_agent.balldontlie_data import _setting
+        url, key = _setting('SUPABASE_URL', ''), _setting('SUPABASE_KEY', '')
+        if not url or not key:
+            archive['storage_status'] = 'Local history saved; remote storage is not configured.'
             return
-        st.caption('Captured UTC: ' + str(context.get('captured_at', 'Unknown')))
-        for side in ['away', 'home']:
-            team = context.get('teams', {}).get(side, {})
-            st.markdown('**' + str(game.get(side+'_team', side.title())) + '**')
-            st.write('Starting pitcher: ' + str(team.get('starter') or 'Unannounced') + ' · ' + str(team.get('starter_status', 'Unknown')))
-            with st.container(border=True):
-                st.markdown('**Pitcher forecast**')
-                forecasts = team.get('pitcher_forecasts', [])
-                for forecast in forecasts:
-                    st.markdown(f"**{forecast['Pick']} {forecast['Line']:g} {forecast['Market']} · {forecast['Estimated chance']:.1%} estimated cover chance**")
-                    st.caption(f"Projection {forecast['Projected stat']:.1f} · {forecast['Prior games']} prior starts · {forecast['Best sportsbook']} ({decimal_to_american_label(forecast['Best decimal odds'])})")
-                    if forecast.get('Non-push games', 0) < 10:
-                        st.caption('Limited history · fewer than 10 non-push starts. Informational forecast only.')
-                    elif forecast['Estimated chance'] < .65:
-                        st.caption('Below 65% estimated cover chance · lower-confidence forecast.')
-                    else:
-                        st.caption('Meets the cover-chance minimum; participation and quote checks still apply.')
-                    if 'neutral' in str(forecast.get('Estimate method','')):
-                        st.caption('One-sided sportsbook quote · estimate uses neutral shrinkage.')
-                covered = {f['Market'] for f in forecasts}
-                for projection in team.get('pitcher_projections', []):
-                    if projection['Market'] not in covered:
-                        st.write(f"{projection['Market']}: projected {projection['Projected stat']:.1f} · {projection['Prior games']} prior starts")
-                available_stats = covered | {p['Market'] for p in team.get('pitcher_projections', [])}
-                for label in ['Innings pitched','Strikeouts','Projected game ERA','Walks','Total pitches','Runs allowed']:
-                    if label not in available_stats:
-                        st.caption(label + ': unavailable in saved prior starts.')
-                st.caption('Innings use decimal innings (5.5 = 5½ innings on average). Projected game ERA uses prior earned runs per nine innings, not total runs.')
-                if not forecasts:
-                    st.caption('No usable fresh sportsbook line and cover estimate. Projections remain visible when history is available.')
-                st.caption(team.get('pitcher_forecast_note', 'Generate again to collect pitcher forecasts.'))
-                st.caption('Cover percentages exclude pushes and assume the pitcher starts. They are estimates, not measured prediction accuracy.')
-            if team.get('lineup_confirmed'):
-                with st.expander('Posted batting order'):
-                    for rank, name in enumerate(team.get('lineup', []), 1):
-                        st.write(f'{rank}. {name}')
-            else:
-                st.caption('Full batting order is not posted. Provisional players are labeled on prop cards.')
-        updates = context.get('current_information', {})
-        weather = updates.get('stadium_forecast') or {}
-        venue = (updates.get('stadium_metadata') or {}).get('data', {})
-        if venue.get('name'):
-            st.write('Stadium: ' + venue['name'])
-        if weather:
-            for key, label in [('temperature_2m','Temperature'), ('wind_speed_10m','Wind'), ('precipitation_probability','Rain chance')]:
-                if weather.get(key) is not None:
-                    st.caption(f"{label}: {weather[key]} {weather.get('units', {}).get(key, '')}")
-            st.caption(str(weather.get('roof_status', 'Roof status unverified')))
-            st.caption('Outdoor stadium forecast; enclosed-field conditions may differ.')
-        else:
-            st.caption('Game-time weather is unavailable.')
-        news = [n for n in updates.get('player_news', []) if n.get('report_match')]
-        if news:
-            with st.expander('Player report mentions · availability requires verification'):
-                for item in news:
-                    st.write(str(item.get('player_name')) + ': ' + str(item.get('excerpt', '')))
-        market = context.get('market_home_probability')
-        if market is not None:
-            st.caption(f"Sportsbook comparison · home {market:.1%} / away {1-market:.1%}")
-        else:
-            st.caption('Fresh sportsbook winner comparison is unavailable.')
-        with st.expander('Inputs used by the saved equation'):
-            st.write(', '.join(context.get('model_columns', [])))
-            st.caption('Only inputs with saved coefficients affect the numerical forecast. Report mentions do not imply confirmed injury or medical clearance.')
-        for issue in updates.get('errors', []):
-            st.caption('Unavailable source: ' + str(issue.get('scope', 'Game update')))
-
-
-def render_league_prediction_results(
-    league_name,
-    league_icon,
-    pipeline_result,
-):
-    """
-    Shared prediction-results UI for NFL, NBA, and MLB.
-
-    Expected pipeline_result:
-    {
-        "predictions": pandas.DataFrame,
-        "opportunities": pandas.DataFrame,
-        ...
-    }
-    """
-
-    if league_name == 'NFL' and pipeline_result is None:
-        pipeline_result = restore_cross_result('NFL')
-    if league_name == 'NBA' and pipeline_result is None:
-        pipeline_result = restore_nba_display_results()
-    if pipeline_result is None:
-        return
-    if league_name == 'NBA':
-        saved_stamp = pd.to_datetime(pipeline_result.get('saved_props_at'), utc=True, errors='coerce')
-        last_check = pd.to_datetime(st.session_state.get('nba_last_display_refresh'), utc=True, errors='coerce')
-        display_now = pd.Timestamp.now(tz='UTC')
-        if (pd.notna(saved_stamp) and display_now-saved_stamp > pd.Timedelta(minutes=30)
-                and (pd.isna(last_check) or display_now-last_check > pd.Timedelta(minutes=30))):
-            st.session_state['nba_last_display_refresh'] = display_now.isoformat()
-            started = start_nba_prop_loading(pipeline_result)
-            if started: pipeline_result = started
-        render_nba_enrichment_status()
-        st.caption('NBA team winners use the separate team-form model. Player injuries and expected minutes are not inputs to that winner equation.')
-        load_times = pipeline_result.get('player_props', {}).get('loading_timings_seconds', {})
-        if load_times:
-            with st.expander('NBA prop loading time', expanded=False):
-                for label, seconds in load_times.items():
-                    st.caption(f'{label}: {seconds:.1f} seconds')
-
-    if league_name == 'NFL':
-        saved = pd.to_datetime(pipeline_result.get('workspace_saved_at',pipeline_result.get('saved_at')),utc=True,errors='coerce')
-        if pd.notna(saved) and pd.Timestamp.now(tz='UTC')-saved>pd.Timedelta(minutes=30):
-            pending = st.session_state.get('nfl_enrichment_future')
-            if pending is None: pipeline_result = start_cross_refresh('NFL',pipeline_result)
-    predictions = pipeline_result.get("all_predictions", pipeline_result.get("predictions"))
-    opportunities = pipeline_result.get("opportunities")
-    if league_name == "NFL":
-        predictions = retain_nfl_picks(predictions, "nfl_saved_team_cards")
-
-    if league_name in ("NBA", "MLB"):
-        predictions = retain_sport_picks(league_name, predictions, limit=None)
-    predictions = visible_prediction_rows(predictions)
-    if predictions is None or predictions.empty:
-        st.info(
-            f"No upcoming {league_name} predictions are currently available."
-        )
-        return
-
-    if league_name in ("NBA", "MLB"):
-        if predictions.empty:
-            st.info(f"No upcoming or active {league_name} picks available.")
-            return
-    prediction_count = len(predictions)
-
-    # ============================================
-    # UPCOMING GAME PREDICTIONS
-    # ============================================
-
-    with st.expander(
-        f"{league_icon} Strongest {league_name} Team Picks "
-        f"({prediction_count})",
-        expanded=True,
-    ):
-        st.caption(
-            "Model-generated win probabilities for upcoming games."
-        )
-
-        # ========================================
-        # CONFIDENCE SUMMARY
-        # ========================================
-
-        high_confidence_count = int(
-            (predictions["confidence"] >= 0.70).sum()
-        )
-
-        moderate_count = int(
-            (
-                (predictions["confidence"] >= 0.58)
-                & (predictions["confidence"] < 0.70)
-            ).sum()
-        )
-
-        close_count = int(
-            (predictions["confidence"] < 0.58).sum()
-        )
-
-        (
-            summary_col1,
-            summary_col2,
-            summary_col3,
-            summary_col4,
-        ) = st.columns(4)
-
-        summary_col1.metric(
-            "Games",
-            prediction_count,
-        )
-
-        summary_col2.metric(
-            "High Confidence",
-            high_confidence_count,
-        )
-
-        summary_col3.metric(
-            "Moderate",
-            moderate_count,
-        )
-
-        summary_col4.metric(
-            "Close Matchups",
-            close_count,
-        )
-
-        st.markdown("")
-
-        # ========================================
-        # SORT PREDICTIONS
-        # ========================================
-
-        sorted_predictions = predictions.sort_values(
-            by="confidence",
-            ascending=False,
-        ).reset_index(drop=True)
-
-        render_prediction_workspace(league_name, sorted_predictions, pipeline_result)
-
-        st.markdown("---")
-
-        st.caption(
-            "The strongest ten picks appear first; the remaining games are ranked by "
-            "model confidence. Confidence "
-            "represents estimated win probability and does not "
-            "by itself indicate betting value."
-        )
-
-    # ============================================
-    # MARKET OPPORTUNITIES
-    # ============================================
-
-    if (
-        opportunities is not None
-        and not opportunities.empty
-    ):
-
-        with st.expander(
-            "💰 Market Opportunities",
-            expanded=False,
-        ):
-
-            st.caption(
-                "Model-vs-market analysis using available "
-                "sportsbook moneylines."
-            )
-
-            st.dataframe(
-                opportunities,
-                use_container_width=True,
-                hide_index=True,
-            )
-
-# Connection diagnostics live in Research Lab below the sidebar routing.
-
-
-# ==========================================
-# MARKET EDGE AI — NAVIGATION V2
-# ==========================================
-
-def select_main_page(destination):
-    st.session_state["main_navigation"] = destination
-
-
-with st.sidebar:
-    st.markdown("## ⚡ MARKET EDGE AI")
-    st.caption("Your sports & market dashboard")
-    navigation_groups = [
-        ("START", ["🏠 Home"]),
-        ("SPORTS", ["🏈 NFL", "🏀 NBA", "⚾ MLB"]),
-        ("MARKETS", ["📈 Stocks"]),
-        ("WORKSPACE", ["🎟️ My Bets", "📊 Performance", "🧪 Research Lab"]),
-    ]
-    navigation_options = [item for _, items in navigation_groups for item in items]
-    if st.session_state.get("main_navigation") not in navigation_options:
-        st.session_state["main_navigation"] = "🏠 Home"
-    for group, destinations in navigation_groups:
-        st.caption(group)
-        for destination in destinations:
-            st.button(destination, key="nav_" + destination, use_container_width=True,
-                type="primary" if st.session_state["main_navigation"] == destination else "secondary",
-                on_click=select_main_page, args=(destination,))
-    page = st.session_state["main_navigation"]
-    st.divider()
-    st.caption("Calendar dates & game times shown in Central time")
-
-if page == "🧪 Research Lab":
-    with st.expander("Database Connection Status"):
-        if st.button("Test Supabase Connection"):
-            success, message = test_connection()
-
-
-            if success:
-                st.success(message)
-            else:
-                st.error("Database connection failed.")
-                st.error(f"Error details: {message}")
-
-
-
-default=clean_symbols(DEFAULT_UNIVERSE)
-
-
-def prediction_api_key(name, alternate=None):
-    import os
-    value = os.environ.get(name) or (os.environ.get(alternate) if alternate else None)
-    if value:
-        return value
-    try:
-        return st.secrets.get(name) or (st.secrets.get(alternate) if alternate else None)
+        response = requests.post(str(url).rstrip('/')+'/storage/v1/object/market-edge-data/nba/props/player_histories_v3.json',
+            headers={'apikey': key, 'Authorization': 'Bearer '+key,
+                     'Content-Type': 'application/json', 'x-upsert': 'true'},
+            data=json.dumps(archive, allow_nan=False).encode(), timeout=3)
+        archive['storage_status'] = ('Player history backed up to Supabase.' if response.status_code in (200,201)
+            else 'Local history saved; remote backup unavailable (HTTP '+str(response.status_code)+').')
     except Exception:
-        return None
+        archive['storage_status'] = 'Local history saved; remote backup unavailable.'
 
 
-def render_player_prop_picks(league, result):
-    props = (result or {}).get("player_props", {})
-    now = pd.Timestamp.now(tz="UTC")
-    picks = retain_sport_picks(league, props.get("picks", []), kind="props").to_dict("records")
-    with st.expander(f"🎯 Strongest {league} Player Prop Picks ({len(picks)})", expanded=True):
-        if not picks:
-            st.info(props.get("message", "Generate predictions to collect available player-prop lines."))
-        else:
-            st.caption("Ranked by estimated confidence after eligibility checks: a fresh exact bet from at least one sportsbook, verified player identity and sufficient prior history: hitters need 10 appearances and 8 non-push results; qualifying pitcher bets need 10 non-push starts. Provisional participation is labeled." if league == "MLB" else "Historical hit-rate estimates with sportsbook shrinkage. These estimates are not calibrated win probabilities.")
-            for offset in range(0, len(picks), 2):
-                for column, pick in zip(st.columns(2), picks[offset:offset+2]):
-                    with column:
-                        with st.container(border=True):
-                            st.caption(pick["Game"])
-                            pick_time = pd.to_datetime(pick.get("start_time"), utc=True, errors="coerce")
-                            if pd.notna(pick_time):
-                                st.caption(pick_time.tz_convert("America/Chicago").strftime("%b %d, %Y · %I:%M %p CT"))
-                            st.caption(pick.get("pick_game_status", "Upcoming"))
-                            st.markdown("### " + pick["Player"])
-                            st.markdown(f"**{pick['Pick']} {pick['Line']:g} {pick['Market']}**")
-                            if pick.get("Event match") == "Unique same-day matchup; start times differ":
-                                st.caption("MLB and sportsbook start times differ; matched a unique same-day game.")
-                            if pick.get("Participation status"):
-                                st.caption(pick["Participation status"])
-                                if pick["Participation status"] != "Confirmed lineup" and pick["Participation status"] != "Recorded starter":
-                                    st.warning("Participation is provisional. Recheck the lineup or starter before using this pick.")
-                            st.metric("Confidence · excludes pushes", f"{pick['Estimated chance']:.1%}")
-                            st.progress(min(1.0, max(0.0, pick["Estimated chance"])))
-                            st.caption(f"Projection {pick['Projected stat']:.1f} · {pick['Prior games']} prior appearances · {pick['Books']} books")
-                            st.caption(f"Historical wins: {pick['Historical wins']} · pushes: {pick['Historical pushes']}")
-            st.caption(props.get("note", "Player participation is required; availability is not confirmed by an offered line."))
-        issues = list(props.get("errors", [])) + list(props.get("exclusions", []))
-        if issues:
-            with st.expander(f"🔎 Why some props aren't available ({len(issues)})"):
-                st.caption("These games or players were left out of the prop picks. Here's why.")
-                def friendly_time(value):
-                    stamp = pd.to_datetime(value, utc=True, errors="coerce")
-                    return stamp.tz_convert("America/Chicago").strftime("%b %d, %Y · %-I:%M %p CT") if pd.notna(stamp) else None
-                for offset in range(0, len(issues), 2):
-                    for column, issue in zip(st.columns(2), issues[offset:offset+2]):
-                        with column:
-                            with st.container(border=True):
-                                if isinstance(issue, dict):
-                                    st.markdown("**" + str(issue.get("Player") or issue.get("Game") or "Player-prop update") + "**")
-                                    if issue.get("Player") and issue.get("Game"):
-                                        st.caption(str(issue["Game"]))
-                                    reason = str(issue.get("Reason") or issue.get("error") or issue.get("error_type") or "Information is unavailable.")
-                                    messages = {
-                                        "No event returned for these teams and home/away order.": "The odds provider hasn't returned a matching game for this matchup.",
-                                        "Start-time mismatch or multiple same-day games; automatic match withheld.": "The game dates or times don't line up, or there is more than one possible game. This prop was left out until the match is clear.",
-                                        "Odds feed has the opposite home/away order; automatic match withheld.": "The two sources disagree about which team is at home. This prop was left out until the matchup is clear.",
-                                        "Multiple sportsbook events match this start time.": "More than one sportsbook game matches. We couldn't identify the correct one.",
-                                        "One sportsbook event would map to multiple MLB games.": "This sportsbook game matches multiple scheduled games. We couldn't identify the correct one.",
-                                        "Event matched, but no sportsbook prop lines were returned.": "The game was found, but the provider returned no player-prop lines.",
-                                        "Fewer than two books offer this same two-sided line.": "We need matching over/under lines from two sportsbooks. This candidate doesn't have enough coverage.",
-                                        "No unique player identity found in this game feed.": "We couldn't confidently identify this player in the game information.",
-                                        "No saved prior appearances for this player.": "Saved player history is unavailable for this estimate.",
-                                        "Player is outside the posted lineup or is not a recorded/probable starter.": "This player isn't in the posted lineup or listed as a starting pitcher.",
-                                    }
-                                    st.write(messages.get(reason, reason))
-                                    scheduled = friendly_time(issue.get("MLB start UTC"))
-                                    if scheduled:
-                                        st.caption("MLB schedule: " + scheduled)
-                                    odds_times = [friendly_time(t) for t in issue.get("Odds starts UTC", [])]
-                                    odds_times = [t for t in odds_times if t]
-                                    if odds_times:
-                                        st.caption("Sportsbook schedule: " + " · ".join(odds_times))
-                                else:
-                                    st.markdown("**Player-prop update**")
-                                    st.write(str(issue))
+_NBA_PROP_HISTORY_LOCK = threading.RLock()
 
 
-def cross_sport_state(league):
-    return 'nfl_prediction_pipeline_result' if league == 'NFL' else 'mlb_live_pipeline_result'
+def _nba_history_batches(names, api_key, status=None):
+    with _NBA_PROP_HISTORY_LOCK:
+        yield from _nba_history_batches_locked(names, api_key, status)
 
 
-def render_cross_tracking(league):
-    from dual_agent.sports_prop_workspace import tracking_records
-    records = tracking_records(league)
-    if not records: return
-    with st.expander(league+' prop results · covered / missed', expanded=False):
-        frame = pd.DataFrame(records)
-        decided = frame[frame.status.isin(['Covered','Missed'])]
-        wins = int((decided.status=='Covered').sum())
-        st.write(f'{wins} covered / {len(decided)} decided'+(f' · {wins/len(decided):.1%}' if len(decided) else ''))
-        st.caption('Frozen model recommendations, not placed bets. One stronger offered side per exact line. Pushes and pending records are excluded from accuracy. Missing final stats or unverified participation stay pending; void rules require sportsbook review. Results update during prediction scans.')
-        cols = ['away_team','home_team','player','market','side','line','probability','actual','status','start_time']
-        st.dataframe(frame.sort_values('start_time',ascending=False)[[c for c in cols if c in frame]],hide_index=True,use_container_width=True)
-
-
-def restore_cross_result(league):
-    state = cross_sport_state(league)
-    existing = st.session_state.get(state)
-    if existing: return existing
-    checked = league.lower()+'_workspace_restore_checked'
-    if st.session_state.get(checked): return None
-    st.session_state[checked] = True
-    from dual_agent.sports_prop_workspace import restore_result
-    saved = restore_result(league)
-    if saved:
-        st.session_state[state] = saved
-        remember_game_addons(league,saved)
-        stamp = pd.to_datetime(saved.get('workspace_saved_at'),utc=True,errors='coerce')
-        if league=='NFL' and pd.notna(stamp) and pd.Timestamp.now(tz='UTC')-stamp>pd.Timedelta(minutes=30):
-            return start_cross_refresh(league,saved)
-    return saved
-
-
-def start_cross_refresh(league, result, feature_games=None):
-    """One background job per sport; cached results remain on screen."""
-    import copy
-    from queue import Queue
-    key = league.lower()
-    pending = st.session_state.get(key+'_enrichment_future')
-    if pending is not None and not pending.done(): return result
-    from dual_agent.sports_prop_workspace import merge_result
-    previous = st.session_state.get(cross_sport_state(league)) or {}
-    result = merge_result(league,previous,copy.deepcopy(result or {}))
-    result['workspace_pending'] = True
-    result['enrichment_pending'] = True
-    result['workspace_refresh_started'] = pd.Timestamp.now(tz='UTC').isoformat()
-    queue = Queue(); st.session_state[key+'_enrichment_updates'] = queue
-    st.session_state[cross_sport_state(league)] = result
-    try:
-        from streamlit.runtime.scriptrunner import get_script_run_ctx
-        context = get_script_run_ctx()
-    except ImportError: context = None
-    odds_key = prediction_api_key('ODDS_API_KEY','THE_ODDS_API_KEY')
-    if league == 'NFL':
-        if feature_games is None:
-            feature_games = st.session_state.get('nfl_live_feature_games')
-            if feature_games is None: feature_games = st.session_state.get('nfl_feature_games')
-        future = nfl_enrichment_pool().submit(enrich_nfl_result,result,feature_games,odds_key,queue,context)
-    else:
-        pipeline = load_mlb_prediction_pipeline()
-        future = nba_enrichment_pool().submit(enrich_mlb_workspace,result,pipeline,odds_key,queue,context)
-    st.session_state[key+'_enrichment_future'] = future
-    return result
-
-
-def enrich_mlb_workspace(previous, pipeline, odds_key, updates, context=None):
-    import copy
-    if context is not None:
-        import threading
-        from streamlit.runtime.scriptrunner import add_script_run_ctx
-        add_script_run_ctx(threading.current_thread(),context)
-    from dual_agent.sports_prop_workspace import merge_result,checkpoint,track,settle_mlb
-    current = copy.deepcopy(previous)
-    def publish(props=None, teams=None):
-        nonlocal current
-        incoming = {}
-        if props is not None: incoming['player_props'] = props
-        if teams is not None: incoming.update(predictions=teams[:10],all_predictions=teams)
-        current = merge_result('MLB',current,incoming)
-        current.update(workspace_pending=True,enrichment_pending=True,pipeline_version=pipeline.MLB_PIPELINE_VERSION)
-        updates.put(copy.deepcopy(current))
-        try:
-            checkpoint('MLB',current); track('MLB',current)
-        except Exception:
-            current['workspace_issue'] = 'MLB predictions are ready; local saving is unavailable.'
-    try:
-        fresh = pipeline.run_mlb_prediction_pipeline(api_key=odds_key,force_refresh=True,
-            on_team_predictions=lambda teams:publish(teams=teams),on_prop_predictions=lambda props:publish(props=props))
-        from dual_agent.game_prediction_addons import enhance_result
-        fresh = enhance_result('MLB',fresh,odds_key)
-        current = merge_result('MLB',current,fresh)
-        current['pipeline_version'] = pipeline.MLB_PIPELINE_VERSION
-    except Exception as exc:
-        current['workspace_issue'] = 'MLB refresh unavailable ('+type(exc).__name__+'); saved results remain visible.'
-    current.update(workspace_pending=False,enrichment_pending=False,workspace_saved_at=pd.Timestamp.now(tz='UTC').isoformat())
-    updates.put(copy.deepcopy(current))
-    try:
-        track('MLB',current); checkpoint('MLB',current)
-    except Exception:
-        current['workspace_issue'] = 'MLB predictions are ready; local saving is unavailable.'
-    try: settle_mlb()
-    except Exception: pass
-    try: checkpoint('MLB',current,remote=True)
-    except Exception: pass
-    return current
-
-
-def drain_cross_updates(league):
-    from queue import Empty
-    key = league.lower(); queue = st.session_state.get(key+'_enrichment_updates')
-    if queue is not None:
-        while True:
-            try: partial = queue.get_nowait()
-            except Empty: break
-            st.session_state[cross_sport_state(league)] = partial
-            remember_game_addons(league,partial)
-    future = st.session_state.get(key+'_enrichment_future')
-    if future is not None and future.done():
-        try:
-            current = future.result(); st.session_state[cross_sport_state(league)] = current
-            remember_game_addons(league,current)
-            if league=='NFL':
-                st.session_state['nfl_auto_prop_predictions'] = current.get('nfl_player_props',pd.DataFrame())
-                st.session_state['live_nfl_predictions'] = current.get('predictions')
-                st.session_state['nfl_prop_scan_scope'] = 'next_7_days_v1'
-        except Exception as exc:
-            current = st.session_state.get(cross_sport_state(league)) or {}
-            current.update(workspace_pending=False,enrichment_pending=False,
-                workspace_issue=league+' background refresh stopped ('+type(exc).__name__+').')
-        st.session_state.pop(key+'_enrichment_future',None)
-        st.session_state.pop(key+'_enrichment_updates',None)
-
-
-@st.fragment(run_every='3s')
-def render_cross_prop_cards(league, game, fallback):
-    """Refresh game-local cards only; this fragment never fetches odds/stats."""
-    from dual_agent.sports_prop_workspace import prop_rows,normalized
-    from dual_agent.game_prediction_addons import matching_game_rows
-    from dual_agent.preferred_sportsbooks import allowed
-    current = st.session_state.get(cross_sport_state(league)) or fallback or {}
-    props = matching_game_rows(game,prop_rows(league,current))
-    if not props:
-        archive = 'nfl_saved_prop_cards' if league=='NFL' else 'mlb_saved_props_cards'
-        props = matching_game_rows(game,st.session_state.get(archive))
-    props = [r for r in props if allowed(normalized(league,r)['book'])]
-    import hashlib
-    identity = '|'.join(str(game.get(k,game.get({'home_team':'Home','away_team':'Away','commence_time':'start_time'}.get(k,k),''))) for k in ('home_team','away_team','commence_time'))
-    scope = league.lower()+'_live_'+hashlib.sha256(identity.encode()).hexdigest()[:16]
-    with st.expander('🎯 '+league+' player props · ranked by cover chance',expanded=True):
-        if current.get('workspace_pending') or current.get('enrichment_pending'):
-            st.caption('Refreshing in the background · saved cards remain visible.')
-        stamp = [normalized(league,r)['captured_at'] for r in props]
-        valid = [t for t in stamp if pd.notna(t)]
-        if valid:
-            st.caption('Latest displayed quote/calculation check: '+max(valid).tz_convert('America/Chicago').strftime('%b %d, %I:%M %p CT'))
-            if any(pd.Timestamp.now(tz='UTC')-t>pd.Timedelta(minutes=30) for t in valid):
-                st.caption('Saved estimates include expired quotes. Verify the current line and player availability before betting.')
-        if league=='NFL':
-            from dual_agent.nfl_player_props import MARKETS
-            markets = sorted(MARKETS)
-        else:
-            from dual_agent.sports_player_prop_predictions import MARKETS
-            markets = sorted({label for label,stat in MARKETS['MLB'].values()})
-        render_prop_category_buttons(markets,scope+'_market','All supported markets')
-        selected = st.selectbox(league+' prop market',['All supported markets']+markets,key=scope+'_market')
-        shown = props if selected=='All supported markets' else [r for r in props if normalized(league,r)['market']==selected]
-        render_prop_comparisons(shown,pending=current.get('workspace_pending',current.get('enrichment_pending',False)),scope=scope)
-        if league=='MLB':
-            mapped = [dict(r,market=r.get('Market'),player=r.get('Player')) for r in props]
-            render_prop_category_rankings(mapped,league)
-        else:
-            reasons = [r for r in current.get('prop_diagnostics',[]) if r.get('home_team')==game.get('home_team') and r.get('away_team')==game.get('away_team')]
-            if not shown and reasons:
-                with st.expander('Why this category has no props',expanded=False):
-                    for reason in reasons[:8]: st.caption(str(reason.get('reason',reason)))
-
-
-@st.fragment(run_every='3s')
-def render_mlb_live_workspace(location):
-    drain_cross_updates('MLB')
-    result = st.session_state.get('mlb_live_pipeline_result') or {}
-    if result.get('workspace_pending'): st.caption('MLB update running in the background; saved cards remain available.')
-    if result.get('workspace_issue'): st.caption(result['workspace_issue'])
-    render_cross_tracking('MLB')
-    raw = result.get('all_predictions',result.get('predictions',[]))
-    frame = raw.copy() if isinstance(raw,pd.DataFrame) else pd.DataFrame(raw or [])
-    if frame.empty: return
-    winners = pd.DataFrame([dict(r,home_team=r.get('Home',r.get('home_team')),
-        away_team=r.get('Away',r.get('away_team')),predicted_team=r.get('Predicted winner',r.get('predicted_team')),
-        confidence=r.get('Winner probability',r.get('confidence')),
-        home_win_probability=r.get('Home win probability',r.get('home_win_probability')),
-        away_win_probability=r.get('away_win_probability',1-r.get('Home win probability',r.get('home_win_probability',.5))),
-        commence_time=r.get('start_time',r.get('commence_time'))) for r in frame.to_dict('records')])
-    if 'Captured UTC' in winners:
-        winners['Saved forecast captured UTC'] = winners['Captured UTC']
-        winners = winners.drop(columns=['Captured UTC'])
-    st.caption('Saved forecasts remain visible while current information is checked. Their original lines and probabilities are not refreshed by displaying them.')
-    attached = dict(result,predictions=winners,all_predictions=winners,opportunities=None)
-    render_league_prediction_results('MLB','⚾',attached)
-
-
-def merge_nba_display_props(previous, incoming):
-    """Replace matching forecasts while retaining other saved game cards."""
-    merged = dict(previous or {}); merged.update(incoming or {})
-    rows = {}
-    for payload in (previous or {}, incoming or {}):
-        for row in payload.get('game_picks', payload.get('picks', [])):
-            identity = tuple(str(row.get(k, '')) for k in ('Game','start_time','Player','Market','Pick','Line'))
-            rows[identity] = row
-    from dual_agent.sports_player_prop_predictions import nba_identity_key
-    blocked = set(merged.get('unavailable_players', []))
+def _nba_history_batches_locked(names, api_key, status=None):
+    """Yield completed player histories; never cache an incomplete stats batch."""
     now = pd.Timestamp.now(tz='UTC')
-    visible = [r for r in rows.values() if pd.to_datetime(r.get('start_time'),utc=True,errors='coerce')<=now
-               or (nba_identity_key(r.get('Player')) not in blocked
-                   and not (merged.get('scan_complete') and merged.get('nba_prop_model_version')==2
-                            and r.get('NBA prop model version',1)!=2))]
-    ordered = sorted(visible, key=lambda r: -float(r.get('Estimated chance', 0)))
-    merged['game_picks'] = ordered; merged['picks'] = ordered[:10]
-    return merged
-
-
-def restore_nba_display_results():
-    if st.session_state.get('nba_saved_display_checked'): return None
-    st.session_state['nba_saved_display_checked'] = True
-    from dual_agent.sports_player_prop_predictions import load_nba_prop_results
-    saved = load_nba_prop_results()
-    if saved is None: return None
-    st.session_state['nba_prediction_pipeline_result'] = saved
-    remember_game_addons('NBA', saved)
-    stamp = pd.Timestamp(saved['saved_props_at'])
-    quotes = saved.get('player_props', {}).get('game_picks', [])
-    quote_times = [pd.to_datetime(r.get('Captured UTC'), utc=True, errors='coerce') for r in quotes]
-    stale = any(pd.isna(t) or pd.Timestamp.now(tz='UTC')-t > pd.Timedelta(minutes=30) for t in quote_times)
-    if stale or pd.Timestamp.now(tz='UTC')-stamp > pd.Timedelta(minutes=30):
-        return start_nba_prop_loading(saved)
-    return saved
-
-
-def render_nba_prop_tracking():
-    from dual_agent.sports_player_prop_predictions import load_nba_prop_tracking
-    records = list(load_nba_prop_tracking().get('records', {}).values())
-    if not records: return
-    with st.expander('NBA prop results · covered / missed', expanded=False):
-        st.caption('Frozen model recommendations, not placed bets. One stronger offered side per exact line. Missing final stats remain pending; sportsbook void rules require review.')
-        frame = pd.DataFrame(records)
-        frame['Model version'] = pd.to_numeric(frame.get('NBA prop model version',pd.Series(1,index=frame.index)),errors='coerce').fillna(1).astype(int)
-        versions = sorted(frame['Model version'].unique().tolist(),reverse=True)
-        version = st.selectbox('NBA prop model version',versions,key='nba_tracking_model_version')
-        frame = frame.loc[frame['Model version']==version]
-        decided = frame[frame['Tracking status'].isin(['Covered','Missed'])]
-        covered = int((decided['Tracking status']=='Covered').sum())
-        st.write(f'{covered} covered / {len(decided)} decided'+(f' · {covered/len(decided):.1%}' if len(decided) else ''))
-        st.caption('Pushes and pending results are excluded from the accuracy rate. Results update when the background player-history scan runs.')
-        cols = [c for c in ['Game','Player','Market','Pick','Line','Estimated chance','Actual stat','Tracking status','Model version','start_time'] if c in frame]
-        st.dataframe(frame.sort_values('start_time', ascending=False)[cols], hide_index=True, use_container_width=True)
-
-
-@st.fragment(run_every='3s')
-def render_nba_live_prop_cards(game, fallback):
-    """Only this game's cards refresh; no network requests or full-page reruns."""
-    from dual_agent.game_prediction_addons import matching_game_rows
-    current = st.session_state.get('nba_prediction_pipeline_result') or fallback or {}
-    payload = current.get('player_props', {})
-    rows = matching_game_rows(game, payload.get('game_picks', payload.get('picks', [])))
-    if not rows:
-        rows = matching_game_rows(game, st.session_state.get('nba_saved_props_cards'))
-    from dual_agent.preferred_sportsbooks import allowed
-    rows = [r for r in rows if allowed(r.get('Best sportsbook'))]
-    from dual_agent.sports_player_prop_predictions import nba_identity_key
-    blocked = set(payload.get('unavailable_players', []))
-    rows = [r for r in rows if pd.to_datetime(r.get('start_time'),utc=True,errors='coerce')<=pd.Timestamp.now(tz='UTC')
-            or (nba_identity_key(r.get('Player')) not in blocked
-                and not (payload.get('scan_complete') and payload.get('nba_prop_model_version')==2
-                         and r.get('NBA prop model version',1)!=2))]
-    normalized = [dict(r, market=r.get('Market'), player=r.get('Player')) for r in rows]
-    import hashlib
-    identity = '|'.join(str(game.get(k,'')) for k in ('home_team','away_team','commence_time'))
-    scope = 'nba_live_'+hashlib.sha256(identity.encode()).hexdigest()[:16]
-    with st.expander('🎯 NBA player props · ranked by cover chance', expanded=True):
-        if current.get('nba_props_pending'):
-            st.caption('Refreshing in the background · existing cards remain visible.')
-        captured = [pd.to_datetime(r.get('Captured UTC'), utc=True, errors='coerce') for r in rows]
-        valid = [t for t in captured if pd.notna(t)]
-        if valid:
-            st.caption('Latest displayed quote check: '+max(valid).tz_convert('America/Chicago').strftime('%b %d, %I:%M %p CT'))
-            if any(pd.Timestamp.now(tz='UTC')-t > pd.Timedelta(minutes=30) for t in valid):
-                st.caption('Saved estimates include expired quotes. Recheck lines and player availability before betting.')
-        from dual_agent.sports_player_prop_predictions import MARKETS
-        markets = ['All supported markets']+sorted({v[0] for v in MARKETS['NBA'].values()})
-        render_prop_category_buttons(markets[1:], scope+'_market', 'All supported markets')
-        selected = st.selectbox('NBA prop market', markets, key=scope+'_market')
-        shown = normalized if selected == markets[0] else [r for r in normalized if r['market'] == selected]
-        render_prop_comparisons(shown, pending=current.get('nba_props_pending', False), scope=scope)
-        render_prop_category_rankings(normalized, 'NBA')
-
-
-@st.cache_resource(show_spinner=False)
-def nba_enrichment_pool():
-    from concurrent.futures import ThreadPoolExecutor
-    return ThreadPoolExecutor(max_workers=2)
-
-
-def enrich_nba_props(result, odds_key, nba_key, updates, context=None):
-    """Background work returns results; the UI thread owns session state."""
-    import copy
-    if context is not None:
-        from streamlit.runtime.scriptrunner import add_script_run_ctx
-        import threading
-        add_script_run_ctx(threading.current_thread(), context)
-    result = copy.deepcopy(result)
-    try:
-        from dual_agent.sports_player_prop_predictions import generate_player_prop_picks, save_nba_prop_results
-        def publish_progress(props):
-            partial = copy.deepcopy(result)
-            partial['player_props'] = merge_nba_display_props(result.get('player_props', {}), props)
-            save_nba_prop_results(partial)
-            partial['nba_props_pending'] = True
-            updates.put(partial)
-            try:
-                from dual_agent.sports_player_prop_predictions import update_nba_prop_tracking
-                update_nba_prop_tracking(partial['player_props'])
-            except Exception:
-                pass
-        result['player_props'] = generate_player_prop_picks('NBA',
-            result['all_predictions'].sort_values('commence_time', kind='stable').to_dict('records'), odds_key, nba_key=nba_key,
-            progress=publish_progress, nba_history_enabled=True)
-    except Exception as exc:
-        result['player_props'] = {'picks': [], 'message': 'Player-prop data unavailable. Team predictions are preserved.',
-            'errors': ['NBA prop processing failed: '+type(exc).__name__+': '+str(exc)]}
-    result['player_props'] = merge_nba_display_props(result.get('_previous_player_props', {}), result['player_props'])
-    result.pop('_previous_player_props', None)
-    result['saved_props_at'] = pd.Timestamp.now(tz='UTC').isoformat()
-    from dual_agent.sports_player_prop_predictions import save_nba_prop_results, update_nba_prop_tracking
-    try:
-        update_nba_prop_tracking(result['player_props'])
-    except Exception:
-        result['player_props'].setdefault('errors', []).append('NBA prop tracking could not be updated; predictions are preserved.')
-    save_nba_prop_results(result)
-    result['nba_props_pending'] = False
-    result['nba_snapshot_pending'] = True
-    # Publish the props before any optional storage request can delay them.
-    updates.put(copy.deepcopy(result))
-    save_nba_prop_results(result, remote=True)
-    try:
-        import dual_agent.supabase_db as storage
-        ready = storage.ensure_market_edge_storage_bucket()
-        if not ready.get('success'):
-            raise RuntimeError('Prediction storage unavailable')
-        saved_at = pd.Timestamp.now(tz='UTC')
-        props = copy.deepcopy(result['player_props'])
-        props['picks'] = [r for r in props.get('picks', []) if pd.Timestamp(r['start_time']) > saved_at
-            and pd.Timedelta(0) <= saved_at-pd.Timestamp(r['Captured UTC']) <= pd.Timedelta(minutes=30)]
-        payload = {'created_at': saved_at.isoformat(),
-            'predictions': result['all_predictions'].to_dict('records'), 'player_props': props}
-        path = 'nba/generated_picks/'+saved_at.strftime('%Y%m%dT%H%M%S%fZ')+'.json'
-        storage.get_supabase_client().storage.from_(storage.MLB_STORAGE_BUCKET).upload(path,
-            __import__('json').dumps(storage._json_safe(payload), allow_nan=False).encode(),
-            {'content-type': 'application/json', 'upsert': 'false'})
-    except Exception:
-        result['player_props'].setdefault('errors', []).append('Unable to save this NBA prediction snapshot.')
-    result['nba_snapshot_pending'] = False
-    return result
-
-
-@st.fragment(run_every='3s')
-def render_nba_enrichment_status():
-    future = st.session_state.get('nba_enrichment_future')
-    render_nba_prop_tracking()
-    if future is None:
-        return
-    updates = st.session_state.get('nba_enrichment_updates')
-    changed = False
-    if updates is not None:
-        from queue import Empty
-        while True:
-            try:
-                partial = updates.get_nowait()
-            except Empty:
-                break
-            st.session_state['nba_prediction_pipeline_result'] = partial
-            remember_game_addons('NBA', partial)
-            changed = True
-    if not future.done():
-        # Poll this small fragment only. Background progress must not repeatedly
-        # redraw the prediction workspace or interrupt the selected game.
-        current = st.session_state.get('nba_prediction_pipeline_result') or {}
-        props = current.get('player_props', {})
-        progress = props.get('loading_progress', {})
-        st.caption(progress.get('stage') or ('Saving the prediction snapshot…'
-            if not current.get('nba_props_pending') else 'Loading NBA player props…'))
-        total, completed = progress.get('total', 0), progress.get('completed', 0)
-        if total:
-            st.progress(min(completed / total, 1.0),
-                        text=f'Player history checked: {completed} of {total}')
-        for issue in [e for e in props.get('errors', []) if not any(t in str(e) for t in ('No unique NBA player identity', 'No completed played-game statistics', 'Player identity for', 'NBA stats for'))][-3:]:
-            st.warning(str(issue))
-        if props.get('game_picks') or props.get('picks'):
-            if st.button('Show latest completed NBA props', key='nba_show_partial_props'):
-                st.rerun(scope='app')
-        return
-    try:
-        complete = future.result()
-        st.session_state['nba_prediction_pipeline_result'] = complete
-        remember_game_addons('NBA', complete)
-    except Exception as exc:
-        current = st.session_state.get('nba_prediction_pipeline_result') or {}
-        current['nba_props_pending'] = False
-        current['nba_snapshot_pending'] = False
-        current.setdefault('player_props', {}).setdefault('errors', []).append(
-            'Background NBA inputs unavailable ('+type(exc).__name__+'); game winners are preserved.')
-        st.session_state['nba_prediction_pipeline_result'] = current
-    st.session_state.pop('nba_enrichment_future', None)
-    st.session_state.pop('nba_enrichment_updates', None)
-    st.caption('NBA player props are up to date for the completed scan.')
-
-
-def start_nba_prop_loading(result):
-    """Start props without rerunning the winner model; preserve all team picks."""
-    import copy
-    pending = st.session_state.get('nba_enrichment_future')
-    if pending is not None and not pending.done():
-        return False
-    result = copy.deepcopy(result)
-    from queue import Queue
-    try:
-        from streamlit.runtime.scriptrunner import get_script_run_ctx
-        context = get_script_run_ctx()
-    except ImportError:
-        context = None
-    updates = Queue()
-    previous = (st.session_state.get('nba_prediction_pipeline_result') or {}).get('player_props', {})
-    result['player_props'] = merge_nba_display_props(previous, result.get('player_props', {}))
-    result['_previous_player_props'] = copy.deepcopy(result['player_props'])
-    result['player_props']['message'] = 'Refreshing in the background; saved estimates remain visible.'
-    result['nba_props_pending'] = True
-    st.session_state['nba_prediction_pipeline_result'] = result
-    st.session_state['nba_enrichment_updates'] = updates
-    st.session_state['nba_enrichment_future'] = nba_enrichment_pool().submit(enrich_nba_props,
-        result, prediction_api_key('ODDS_API_KEY', 'THE_ODDS_API_KEY'),
-        prediction_api_key('BALLDONTLIE_API_KEY'), updates, context)
-    return result
-
-
-def run_nba_prediction_with_props(progress_callback=None):
-    pending = st.session_state.get('nba_enrichment_future')
-    if pending is not None and not pending.done():
-        return st.session_state.get('nba_prediction_pipeline_result')
-    previous = st.session_state.get('nba_prediction_pipeline_result') or {}
-    retain_sport_picks('NBA', previous.get('all_predictions', previous.get('predictions')), limit=None)
-    retain_sport_picks('NBA', previous.get('player_props', {}).get('game_picks',
-        previous.get('player_props', {}).get('picks', [])), kind='props', limit=None)
-    result = run_nba_prediction_pipeline(progress_callback=progress_callback)
-    now = pd.Timestamp.now(tz='UTC')
-    predictions = result.get('predictions')
-    if predictions is None or predictions.empty:
-        result['player_props'] = {'picks': [], 'message': 'No eligible NBA games in the next seven days.', 'errors': []}
-        result['nba_props_pending'] = False
-        return result
-    times = pd.to_datetime(predictions['commence_time'], utc=True, errors='coerce')
-    eligible = predictions.loc[(times > now) & (times <= now+pd.Timedelta(days=7))].sort_values('confidence', ascending=False)
-    result['all_predictions'] = eligible.copy()
-    result['predictions'] = eligible.head(10).copy()
-    if eligible.empty:
-        result['player_props'] = {'picks': [], 'message': 'No eligible NBA games in the next seven days.', 'errors': []}
-        result['nba_props_pending'] = False
-        return result
-    return start_nba_prop_loading(result)
-
-
-
-def load_mlb_prediction_pipeline():
-    import ast
-    import importlib
-    from pathlib import Path
-    # Validate the file before import: importing misplaced app.py code creates
-    # a second set of Streamlit widgets before a module-version check can run.
-    spec = importlib.util.find_spec("dual_agent.mlb_prediction_pipeline")
-    if spec is None or not spec.origin:
-        raise RuntimeError("Add the supplied mlb_prediction_pipeline.py inside dual_agent/.")
-    tree = ast.parse(Path(spec.origin).read_text(encoding="utf-8"))
-    definitions = {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
-    if "run_mlb_prediction_pipeline" not in definitions or "render_mlb_prediction_center" in definitions:
-        raise RuntimeError("dual_agent/mlb_prediction_pipeline.py contains the wrong code. Replace it with the supplied pipeline file; app.py belongs only in the repository root.")
-    pipeline = importlib.import_module("dual_agent.mlb_prediction_pipeline")
-    if getattr(pipeline, "MLB_PIPELINE_VERSION", None) not in (13, 14):
-        importlib.invalidate_caches()
-        pipeline = importlib.reload(pipeline)
-    if getattr(pipeline, "MLB_PIPELINE_VERSION", None) not in (13, 14):
-        raise RuntimeError(f"MLB pipeline compatibility error: loaded version {getattr(pipeline, 'MLB_PIPELINE_VERSION', None)!r} from {getattr(pipeline, '__file__', 'unknown path')}. Supported versions: 13 and 14.")
-    return pipeline
-
-
-@st.cache_data(ttl=180, show_spinner=False)
-def cached_nfl_pick_statuses(api_key):
-    """Check completion, never infer final status from elapsed time."""
-    if not api_key:
-        return []
-    try:
-        response = cached_odds_get(
-            "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/scores",
-            params={"apiKey": api_key, "daysFrom": 3, "dateFormat": "iso"},
-            timeout=8,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        return payload if isinstance(payload, list) else []
-    except (requests.RequestException, ValueError):
-        return []
-
-
-def nfl_pick_identity(row, time_column):
-    kickoff = pd.to_datetime(row.get(time_column), utc=True, errors="coerce")
-    if pd.isna(kickoff):
-        return None
-    return (str(row.get("home_team", "")).strip(),
-            str(row.get("away_team", "")).strip(), kickoff.isoformat())
-
-
-def merge_nfl_saved_picks(previous, fresh, time_column, identity_columns, statuses, now, completed=()):
-    """Freeze existing started picks; update future picks and retire confirmed finals."""
-    now = pd.Timestamp(now)
-    now = now.tz_localize("UTC") if now.tzinfo is None else now.tz_convert("UTC")
-    final_games = set(completed)
-    status_by_game = {}
-    for status in statuses:
-        game = nfl_pick_identity(status, "commence_time")
-        if game is not None:
-            status_by_game[game] = status
-            if status.get("completed") is True:
-                final_games.add(game)
-    def records(value):
-        return value.to_dict("records") if isinstance(value, pd.DataFrame) else []
-    saved = {}
-    # Existing started predictions take priority over a regenerated prediction.
-    for row in records(previous) + records(fresh):
-        game = nfl_pick_identity(row, time_column)
-        if game is None or game in final_games:
-            continue
-        kickoff = pd.Timestamp(game[2])
-        if kickoff > now + pd.Timedelta(days=7):
-            continue
-        identity = game + tuple(str(row.get(c, "")) for c in identity_columns)
-        if identity in saved and kickoff <= now:
-            continue
-        row = dict(row)
-        status = status_by_game.get(game, {})
-        row["pick_game_status"] = (
-            "Upcoming" if kickoff > now else
-            "In progress · saved pregame pick" if status.get("scores") else
-            "Started · awaiting game status · saved pregame pick"
-        )
-        saved[identity] = row
-    return pd.DataFrame(saved.values()), final_games
-
-
-def retain_nfl_picks(rows, archive_key, time_column="commence_time", identity_columns=(), now=None):
-    current = pd.Timestamp.now(tz="UTC") if now is None else pd.Timestamp(now)
-    previous = st.session_state.get(archive_key)
-    needs_status = False
-    for frame in (previous, rows):
-        if isinstance(frame, pd.DataFrame) and time_column in frame:
-            times = pd.to_datetime(frame[time_column], utc=True, errors="coerce")
-            needs_status = needs_status or bool((times <= current).any())
-    statuses = cached_nfl_pick_statuses(st.secrets.get("ODDS_API_KEY", st.secrets.get("THE_ODDS_API_KEY", ""))) if needs_status else []
-    final_key = archive_key + "_completed"
-    visible, completed = merge_nfl_saved_picks(previous, rows, time_column, identity_columns,
-        statuses, current, st.session_state.get(final_key, set()))
-    st.session_state[archive_key] = visible
-    st.session_state[final_key] = completed
-    return visible
-
-
-@st.cache_data(ttl=180, show_spinner=False)
-def cached_sport_pick_statuses(sport, api_key):
-    if not api_key:
-        return []
-    try:
-        response = cached_odds_get(
-            f"https://api.the-odds-api.com/v4/sports/{sport}/scores",
-            params={"apiKey": api_key, "daysFrom": 3, "dateFormat": "iso"}, timeout=8,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        return payload if isinstance(payload, list) else []
-    except (requests.RequestException, ValueError):
-        return []
-
-
-def retain_sport_picks(league, rows, kind="teams", now=None, limit=10):
-    """Keep saved pregame cards through kickoff; retire only confirmed finals."""
-    current = pd.Timestamp.now(tz="UTC") if now is None else pd.Timestamp(now)
-    frame = rows.copy() if isinstance(rows, pd.DataFrame) else pd.DataFrame(rows or [])
-    if not frame.empty:
-        if "commence_time" not in frame and "start_time" in frame:
-            frame["commence_time"] = frame["start_time"]
-        if "home_team" not in frame:
-            if "Home" in frame:
-                frame["home_team"] = frame["Home"]
-                frame["away_team"] = frame["Away"]
-            elif "Game" in frame:
-                teams = frame["Game"].astype(str).str.split(" @ ", n=1, expand=True)
-                if teams.shape[1] == 2:
-                    frame["away_team"], frame["home_team"] = teams[0], teams[1]
-        if "Captured UTC" in frame:
-            kickoff = pd.to_datetime(frame["commence_time"], utc=True, errors="coerce")
-            captured = pd.to_datetime(frame["Captured UTC"], utc=True, errors="coerce")
-            # A stale line is retained only as an existing pregame pick, never a new recommendation.
-            frame = frame.loc[(kickoff <= current) | ((captured <= current) & (current-captured <= pd.Timedelta(minutes=15)))].copy()
-    archive_key = f"{league.lower()}_saved_{kind}_cards"
-    previous = st.session_state.get(archive_key)
-    if isinstance(previous, pd.DataFrame) and "Captured UTC" in previous:
-        kickoff = pd.to_datetime(previous["commence_time"], utc=True, errors="coerce")
-        captured = pd.to_datetime(previous["Captured UTC"], utc=True, errors="coerce")
-        previous = previous.loc[(kickoff <= current) | ((captured <= current) & (current-captured <= pd.Timedelta(minutes=15)))].copy()
-    started = any(isinstance(f, pd.DataFrame) and "commence_time" in f and
-        bool((pd.to_datetime(f["commence_time"], utc=True, errors="coerce") <= current).any())
-        for f in (previous, frame))
-    sport = {"MLB": "baseball_mlb", "NBA": "basketball_nba"}[league]
-    statuses = cached_sport_pick_statuses(sport, prediction_api_key("ODDS_API_KEY", "THE_ODDS_API_KEY")) if started else []
-    columns = ("Player", "Market", "Pick", "Line") if kind == "props" else ()
-    done_key = archive_key + "_completed"
-    visible, completed = merge_nfl_saved_picks(previous, frame, "commence_time", columns,
-        statuses, current, st.session_state.get(done_key, set()))
-    st.session_state[archive_key] = visible
-    st.session_state[done_key] = completed
-    if visible.empty:
-        return visible
-    kickoff = pd.to_datetime(visible["commence_time"], utc=True, errors="coerce")
-    live = visible.loc[kickoff <= current]
-    future = visible.loc[kickoff > current]
-    score = next((c for c in ("Estimated chance", "confidence", "Winner probability") if c in future), None)
-    if score:
-        future = future.sort_values(score, ascending=False, kind="stable")
-    # Saved live cards cannot be displaced by the next batch of upcoming top-ten picks.
-    return pd.concat([live, future if limit is None else future.head(limit)], ignore_index=True)
-
-
-def nfl_week_rows(rows, now=None):
-    """Keep unstarted games in the next seven days, one row per matchup."""
-    if rows is None:
-        return None
-    frame = rows.copy() if isinstance(rows, pd.DataFrame) else pd.DataFrame(rows)
-    if frame.empty:
-        return frame
-    if "commence_time" not in frame:
-        return frame.iloc[:0].copy()
-    current = pd.Timestamp.now(tz="UTC") if now is None else pd.Timestamp(now)
-    current = current.tz_localize("UTC") if current.tzinfo is None else current.tz_convert("UTC")
-    kickoff = pd.to_datetime(frame["commence_time"], utc=True, errors="coerce")
-    frame = frame.loc[(kickoff > current) & (kickoff <= current + pd.Timedelta(days=7))].copy()
-    frame["commence_time"] = kickoff.loc[frame.index]
-    if "confidence" in frame:
-        frame = frame.sort_values("confidence", ascending=False, kind="stable")
-    identity = [c for c in ("home_team", "away_team", "commence_time") if c in frame]
-    if len(identity) == 3:
-        frame = frame.drop_duplicates(identity, keep="first")
-    return frame.reset_index(drop=True)
-
-
-@st.cache_resource(show_spinner=False)
-def nfl_enrichment_pool():
-    from concurrent.futures import ThreadPoolExecutor
-    return ThreadPoolExecutor(max_workers=2)
-
-
-def enrich_nfl_result(result, feature_games, odds_key, progress_queue=None, context=None):
-    """Run external enrichment without reading or writing session state."""
-    import copy
-    result = copy.deepcopy(result)
-    if context is not None:
-        import threading
-        from streamlit.runtime.scriptrunner import add_script_run_ctx
-        add_script_run_ctx(threading.current_thread(),context)
-    from dual_agent.sports_prop_workspace import merge_result,checkpoint,track
-    previous = copy.deepcopy(result)
-    def publish_props(props):
-        partial = merge_result('NFL',previous,dict(result,nfl_player_props=props))
-        partial.update(workspace_pending=True,enrichment_pending=True)
-        if progress_queue is not None: progress_queue.put(copy.deepcopy(partial))
-        try:
-            checkpoint('NFL',partial); track('NFL',partial)
-        except Exception:
-            partial['workspace_issue'] = 'NFL predictions are ready; local saving is unavailable.'
-    try:
-        from dual_agent.nfl_live_context import attach_context
-        result['predictions'] = attach_context(result.get('predictions'), result.get('live_odds'))
-    except Exception as exc:
-        result['context_issue'] = 'NFL context retrieval unavailable (' + type(exc).__name__ + ')'
-    if progress_queue is not None:
-        progress_queue.put(copy.deepcopy(result))
-    try:
-        from dual_agent.game_prediction_addons import enhance_result
-        result = enhance_result("NFL", result, odds_key, feature_games,on_props=publish_props)
-    except Exception as exc:
-        result['prop_issues'] = ['NFL add-ons unavailable ('+type(exc).__name__+'); winner predictions are preserved.']
-    result = merge_result('NFL',previous,result)
-    result.update(enrichment_pending=False,workspace_pending=False,workspace_saved_at=pd.Timestamp.now(tz='UTC').isoformat())
-    if progress_queue is not None: progress_queue.put(copy.deepcopy(result))
-    try:
-        track('NFL',result); checkpoint('NFL',result)
-    except Exception:
-        result['workspace_issue'] = 'NFL predictions are ready; local saving is unavailable.'
-    try:
-        from dual_agent.nfl_player_props_ui import cached_player_history
-        from dual_agent.sports_prop_workspace import settle_nfl
-        year = pd.Timestamp.now(tz='UTC').year
-        settle_nfl(cached_player_history((year-1,year)))
-    except Exception: pass
-    try: checkpoint('NFL',result,remote=True)
-    except Exception: pass
-    return result
-
-
-@st.fragment(run_every='3s')
-def render_nfl_enrichment_status():
-    drain_cross_updates('NFL')
-    current = st.session_state.get('nfl_prediction_pipeline_result') or {}
-    if current.get('workspace_pending') or current.get('enrichment_pending'):
-        st.caption('NFL props are updating in the background; saved cards remain visible.')
-    if current.get('workspace_issue'): st.caption(current['workspace_issue'])
-    render_cross_tracking('NFL')
-
-
-def run_nfl_prediction_with_addons(feature_games, historical_accuracy=None, historical_sample=None):
-    pending = st.session_state.get('nfl_enrichment_future')
-    if pending is not None and not pending.done():
-        return st.session_state.get('nfl_prediction_pipeline_result') or {}
-    feature_games = nfl_prediction_features()
-    previous = st.session_state.get("nfl_prediction_pipeline_result") or {}
-    remember_game_addons("NFL", previous)
-    result = run_nfl_prediction_pipeline(feature_games=feature_games,
-        historical_accuracy=historical_accuracy, historical_sample=historical_sample)
-    predictions = result.get('predictions')
-    if predictions is None or len(predictions) == 0:
-        result['enrichment_pending'] = False
-        return result
-    return start_cross_refresh('NFL',result,feature_games)
-
-
-def remember_game_addons(league, result):
-    """Seed frozen pregame attachments before a rescan replaces the result."""
-    if league == "NFL":
-        retain_nfl_picks(result.get("nfl_player_props"), "nfl_saved_prop_cards", "game_time", ("player", "market", "model_pick", "line"))
-        spread_rows = pd.DataFrame(result.get("spreads", {}).get("picks", []))
-        retain_nfl_picks(spread_rows, "nfl_saved_spread_cards")
-    else:
-        props = result.get("player_props", {})
-        retain_sport_picks(league, props.get("game_picks", props.get("picks", [])), kind="props", limit=None)
-        if league == "MLB":
-            retain_sport_picks(league, result.get("spreads", {}).get("picks", []), kind="spreads", limit=None)
-
-
-def select_nfl_prop_list(props, mode='probability'):
-    """Select most likely listed bets; prices never control eligibility or order."""
-    from dual_agent.preferred_sportsbooks import allowed, diversify
-    candidates = [p for p in props if allowed(p.get('best_sportsbook', p.get('Best sportsbook')))
-                  and len(p.get('sportsbook_offers', [])) >= 1
-                  and np.isfinite(float(p.get('historical_support', float('nan'))))
-                  and 0 <= float(p['historical_support']) <= 1]
-    candidates.sort(key=lambda p: (-float(p.get('historical_support', 0)),
-                                  -int(p.get('sample_size', p.get('Prior games', 0))), str(p.get('player', ''))))
-    return diversify(candidates, limit=5)
-
-
-def select_prop_category(state_key, category):
-    st.session_state[state_key] = category
-
-
-def render_prop_category_buttons(markets, state_key, all_label):
-    """Filter already-scored predictions; no network calls or regeneration."""
-    import hashlib
-    labels = [all_label]+list(markets)
-    st.caption('Find predictions by category · uses collected results, no new API scan')
-    for start in range(0, len(labels), 4):
-        for column, label in zip(st.columns(4), labels[start:start+4]):
-            with column:
-                st.button(label, key=state_key+'_button_'+hashlib.sha256(label.encode()).hexdigest()[:12],
-                          on_click=select_prop_category, args=(state_key, label))
-
-
-def prop_comparisons(props):
-    """Pair saved outcomes by exact game/player/market/line without new data calls."""
-    from dual_agent.preferred_sportsbooks import allowed
-    pairs = {}
-    candidates = []
-    for original in props:
-        if 'model_pick' in original:
-            prop = dict(original, Player=original.get('player'), Market=original.get('market'),
-                Pick=original.get('model_pick'), Line=original.get('line'),
-                **{'Estimated chance':original.get('historical_support'),
-                   'Best sportsbook':original.get('best_sportsbook'),
-                   'Best decimal odds':original.get('best_decimal_odds'),
-                   'Prior games':original.get('sample_size',0),
-                   'Game':str(original.get('away_team',''))+' @ '+str(original.get('home_team','')),
-                   'start_time':original.get('game_time'), '_nfl_original':original})
-            candidates.append(prop)
-            comparisons = original.get('outcome_comparison', [])
-            for outcome in comparisons if isinstance(comparisons, list) else []:
-                if not isinstance(outcome, dict): continue
-                detail = dict(prop, Pick=outcome.get('side'),
-                    **{'Estimated chance':outcome.get('chance'), 'Best sportsbook':outcome.get('book'),
-                       '_offered':bool(outcome.get('listed')), '_comparison':True})
-                price = outcome.get('american_odds')
+    root = Path('nba_player_history_cache'); root.mkdir(exist_ok=True)
+    archive_path = root/'player_histories_v3.json'
+    archive = _nba_load_history_archive(archive_path)
+    entries = archive.setdefault('players', {})
+    day = now.strftime('%Y%m%d')
+    base = 'https://api.balldontlie.io/nba/v1'
+    def notify(message):
+        if status: status(message)
+    def save(path, data):
+        temporary = path.with_suffix('.tmp')
+        temporary.write_text(json.dumps(data))
+        temporary.replace(path)
+    missing = []
+    known = {}
+    for name in dict.fromkeys(names):
+        key = nba_identity_key(name)
+        entry = entries.get(key, {})
+        # Migrate the previous complete daily caches instead of downloading again.
+        if not entry:
+            for legacy in sorted(root.glob(name_key(name)+'_bdl_v2_*.json'), reverse=True):
                 try:
-                    price = float(price)
-                    detail['Best decimal odds'] = 1+price/100 if price>0 else 1+100/abs(price)
-                except (TypeError, ValueError, ZeroDivisionError):
-                    detail['Best decimal odds'] = None
-                candidates.append(detail)
-        else:
-            candidates.append(original)
-            # The model may estimate both outcomes; an unlisted side is forecast-only.
-            raw_side=str(original.get('Pick','')).upper()
-            opposite='Under' if raw_side=='OVER' else 'Over' if raw_side=='UNDER' else None
-            chance=original.get((opposite+' chance') if opposite else '')
-            if opposite and chance is not None and original.get('Probability source')=='player_history':
-                detail=dict(original,Pick=opposite,**{'Estimated chance':chance,
-                    'Best sportsbook':None,'Best decimal odds':None,'_offered':False,'_comparison':True})
-                detail.pop('Historical wins',None)
-                candidates.append(detail)
-    for prop in candidates:
-        raw_side = str(prop.get('Pick','')).upper()
-        side = {'OVER':'Over','YES':'Over','UNDER':'Under','NO':'Under'}.get(raw_side)
-        if not side: continue
-        offered = prop.get('_offered', True) and allowed(prop.get('Best sportsbook'))
-        if not offered and not prop.get('_comparison'): continue
-        try:
-            chance = float(prop['Estimated chance']); line = float(prop['Line'])
-        except (KeyError, TypeError, ValueError): continue
-        if not np.isfinite(chance) or not 0 <= chance <= 1 or not np.isfinite(line): continue
-        stamp = pd.to_datetime(prop.get('start_time'), utc=True, errors='coerce')
-        identity = (prop.get('Game'), str(stamp), prop.get('Player'), prop.get('Market'),
-                    line, prop.get('Probability source','historical'))
-        pair = pairs.setdefault(identity, {'player':prop['Player'], 'market':prop['Market'],
-            'line':line, 'source':prop.get('Probability source','historical'), 'sides':{},
-            'binary':str(prop['Market']).lower() == 'anytime touchdown', 'identity':identity})
-        candidate = dict(prop, _offered=bool(offered), _raw_side=raw_side)
-        prior = pair['sides'].get(side)
-        if prior is None or (offered, chance) > (prior.get('_offered',False),float(prior['Estimated chance'])):
-            pair['sides'][side] = candidate
-    rows = [pair for pair in pairs.values() if any(p.get('_offered') for p in pair['sides'].values())]
-    # Forecast-only outcomes cannot outrank actually listed bets.
-    rows.sort(key=lambda pair:(-max(float(p['Estimated chance']) for p in pair['sides'].values() if p.get('_offered')),
-                               str(pair['player']),str(pair['market']),pair['line']))
-    return rows
-
-
-def record_nfl_comparison_prop(prop, pair, scope):
-    """Preserve the existing manual bet builder for each actually listed side."""
-    import hashlib
-    original = prop.get('_nfl_original')
-    if not original or not prop.get('_offered'): return
-    side = prop.get('_raw_side','')
-    kickoff = pd.to_datetime(original.get('game_time'), utc=True, errors='coerce')
-    identity = repr((scope,pair['identity'],side))
-    button_key = 'attached_nfl_comparison_'+hashlib.sha256(identity.encode()).hexdigest()[:24]
-    if st.button('Record this player prop', key=button_key,
-                 disabled=pd.isna(kickoff) or kickoff <= pd.Timestamp.now(tz='UTC')):
-        st.session_state.update({'bet_builder_mode':'Single','single_sport':'NFL',
-            'single_market':{'Passing yards':'Passing Yards','Rushing yards':'Rushing Yards',
-                'Receiving yards':'Receiving Yards','Receptions':'Receptions','Anytime touchdown':'Anytime Touchdown'}.get(pair['market'],'Other'),
-            'single_player':str(pair['player']),'single_team':'',
-            'single_direction':{'OVER':'Over','UNDER':'Under','YES':'Yes','NO':'No'}.get(side,'Other'),
-            'single_line':pair['line'],
-            'single_description':f"{pair['player']} {side} {pair['line']:g} {pair['market']} — {original.get('away_team','')} @ {original.get('home_team','')}",
-            'main_navigation':'🎟️ My Bets'})
-        st.rerun()
-
-
-def render_prop_comparisons(props, pending=False, limit=5, scope='main'):
-    """Shared YES/NO card renderer; probabilities keep their original source."""
-    rows = prop_comparisons(props)[:limit]
-    if not rows:
-        st.caption('Still collecting sportsbook props…' if pending else 'No priced sportsbook sides are available for this selection.')
-        return
-    st.caption('For numeric props, YES means above the line and NO means below it; equality may be a push. For anytime touchdowns, YES means scores at least one and NO means scores none. No 65% cutoff applies.')
-    for rank, pair in enumerate(rows,1):
-        with st.container(border=True):
-            title = f"{pair['player']} · {pair['market']}" if pair['binary'] else f"{pair['player']} · {pair['line']:g} {pair['market']}"
-            st.markdown(f'**#{rank} · {title}**')
-            st.caption('Sportsbook-implied probabilities · not an independent player forecast' if pair['source']=='sportsbook_implied' else ('Minutes-adjusted count forecast · conditional on playing and no push; uncalibrated' if any(p.get('NBA prop model version')==2 for p in pair['sides'].values()) else 'Historical estimates · conditional on participation and no push; not calibrated'))
-            for column,side,label in zip(st.columns(2),('Over','Under'),('YES','NO')):
-                with column:
-                    prop = pair['sides'].get(side)
-                    st.markdown('**'+label+'**')
-                    if prop is None:
-                        st.write('Probability unavailable')
-                        st.caption('No saved probability for this side. This does not mean 0%.')
-                        continue
-                    st.markdown(f"### {float(prop['Estimated chance']):.1%}")
-                    st.caption(('Scores at least one touchdown' if side=='Over' else 'Does not score a touchdown') if pair['binary'] else side+' '+format(pair['line'],'g'))
-                    if prop.get('_offered'):
-                        price = prop.get('Best decimal odds')
-                        st.caption(str(prop['Best sportsbook']) + (' · '+decimal_to_american_label(float(price)) if price is not None and np.isfinite(float(price)) and float(price)>1 else ''))
-                    else:
-                        st.caption('Forecast only · no matching sportsbook bet found')
-                    if prop.get('Statistics source'): st.caption('Statistics: '+prop['Statistics source'])
-                    if prop.get('Estimate method'): st.caption(prop['Estimate method'])
-                    if prop.get('Availability status'): st.caption(prop['Availability status'])
-                    if prop.get('NBA prop model version') == 2:
-                        st.caption(f"Estimated minutes: {prop['Expected minutes']:.1f} · recent {prop['Minutes sample']} appearances · projected stat: {prop['Projected stat']:.2f}")
-                        st.caption(prop.get('Opponent context','Opponent context unavailable'))
-                    if prop.get('Historical wins') is not None:
-                        st.caption(f"Covered in {int(prop['Historical wins'])} of {int(prop['Non-push games'])} non-push appearances")
-                    elif prop.get('Prior games'):
-                        st.caption(f"{int(prop['Prior games'])} prior appearances")
-                    participation = prop.get('Participation status')
-                    if participation:
-                        st.caption(participation)
-                        if participation not in ('Confirmed lineup','Recorded starter'):
-                            st.warning('Provisional participation—recheck the lineup or starter.')
-                    if prop.get('Best sportsbook') in ('prizepicks','underdog'):
-                        st.caption('Pick’em listing · feed price is indicative; entry rules determine returns.')
-                    record_nfl_comparison_prop(prop,pair,scope)
-            sides = pair['sides']
-            offered = [(side,float(prop['Estimated chance'])) for side,prop in sides.items() if prop.get('_offered')]
-            best = max(offered,key=lambda row:row[1])
-            if len(offered)==2 and abs(offered[0][1]-offered[1][1])<1e-9:
-                st.caption('Even probabilities')
-            else:
-                st.caption('Higher-probability listed side: '+('YES' if best[0]=='Over' else 'NO'))
-            if pair['source']=='sportsbook_implied' and any('margin remains' in str(p.get('Estimate method','')) for p in sides.values()):
-                st.caption('One-sided quoted prices include margin; displayed percentages may not total 100%.')
-
-
-def render_prop_category_rankings(props, league):
-    """Show independent top-five likelihood/value lists for every available category."""
-    markets = sorted({str(p.get('market', '')) for p in props})
-    if not markets:
-        return
-    with st.expander('Best player props by category', expanded=True):
-        market_only = any(p.get('Probability source') == 'sportsbook_implied' for p in props)
-        st.caption('Ranked by sportsbook-implied probability, not an independent player model.' if market_only else 'Each category ranks by estimated cover chance. Odds are reference only; one exact listed offer is enough.')
-        for market in markets:
-            group = [p for p in props if str(p.get('market', '')) == market]
-            with st.expander(market, expanded=False):
-                if league in ('NBA','MLB','NFL'):
-                    render_prop_comparisons(group, scope=league+'_category_'+market)
+                    rows = json.loads(legacy.read_text())
+                    ids = {r['player']['id'] for r in rows}
+                    if rows and len(ids) == 1:
+                        entry = {'player_id': ids.pop(), 'rows': rows,
+                                 'checked_at': pd.Timestamp(legacy.stat().st_mtime, unit='s', tz='UTC').isoformat()}
+                        entries[key] = entry
+                        break
+                except (OSError, ValueError, KeyError, TypeError):
                     continue
-                for column, mode, title in zip([st.container()], ['probability'], ['Most likely to cover · top 5']):
-                    with column:
-                        st.markdown('**'+('Highest sportsbook-implied probability · top 5' if market_only else title)+'**')
-                        chosen = select_nfl_prop_list(group, mode)
-                        if not chosen:
-                            st.caption('No listed bet meets this list’s criteria.')
-                        for rank, prop in enumerate(chosen, 1):
-                            with st.container(border=True):
-                                player = prop.get('player', prop.get('Player'))
-                                side = prop.get('model_pick', prop.get('Pick'))
-                                line = prop.get('line', prop.get('Line'))
-                                chance = prop.get('historical_support', prop.get('Estimated chance'))
-                                book = prop.get('best_sportsbook', prop.get('Best sportsbook'))
-                                st.markdown(f'**#{rank} · {player}**')
-                                if prop.get('Probability source') == 'sportsbook_implied':
-                                    st.write(f'Sportsbook-implied probability: {float(chance):.1%}')
-                                    st.caption(prop.get('Estimate method', ''))
-                                else:
-                                    st.write(prop_outcome_sentence(player, market, side, line, chance))
-                                if prop.get('Probability source') != 'sportsbook_implied' and float(chance) < .65:
-                                    st.caption('Below 65% estimated cover chance · lower-confidence prediction')
-                                odds = prop.get('best_american_odds')
-                                label = f'{float(odds):+g}' if odds is not None else decimal_to_american_label(float(prop['Best decimal odds']))
-                                st.caption(f'{book} · {side} {float(line):g} · {label}')
-                                if book in ('prizepicks', 'underdog'):
-                                    st.caption('Pick’em listing · feed price is indicative; actual entry rules determine returns.')
-
-
-def prop_outcome_sentence(player, market, side, line, chance):
-    """Explain the exact direction without treating an unlisted opposite as a bet."""
-    side = str(side).upper()
-    if str(market).lower() == 'anytime touchdown':
-        outcome = 'will score a touchdown' if side == 'YES' else 'will NOT score a touchdown'
-    else:
-        direction = {'OVER': 'OVER', 'UNDER': 'UNDER', 'YES': 'meet', 'NO': 'not meet'}.get(side, side)
-        outcome = f"will finish {direction} {float(line):g} {str(market).lower()}"
-    return f"Estimated {float(chance):.0%} chance {player} {outcome}."
-
-
-def render_nfl_prop_diagnostics(game, result, selected_market, displayed_count):
-    """Explain the selected category from saved scan data; no API calls."""
-    from dual_agent.game_prediction_addons import matching_game_rows
-    diagnostics = matching_game_rows(game, (result or {}).get('prop_diagnostics', []))
-    if selected_market != 'All qualifying markets':
-        diagnostics = [row for row in diagnostics if row['market'] == selected_market]
-    else:
-        active = [row for row in diagnostics if row['source_listings'] or row['calculated_predictions']]
-        diagnostics = active or diagnostics[:1]
-    if not diagnostics:
-        return False
-    for row in diagnostics:
-        st.markdown('**'+row['market']+' · scan result**')
-        st.caption(row['reason'])
-        st.caption(f"{row['source_listings']} returned listings → {row['accepted_lines']} lines passed quote checks → "
-                   f"{row['players_with_usable_history']} players with usable history → {row['calculated_predictions']} calculated predictions")
-        if displayed_count == 0 and row['calculated_predictions']:
-            st.warning('Predictions were calculated but did not reach this card. The issue is in game matching or display filtering, not a missing sportsbook line.')
-    return True
-
-
-def render_game_addons(league, game, result):
-    """Place independently estimated spreads and eligible props inside their game."""
-    if league not in ("NFL", "MLB", "NBA"):
+        known[name] = entry
+        checked = pd.to_datetime(entry.get('checked_at'), utc=True, errors='coerce')
+        if entry.get('player_id') and isinstance(entry.get('rows'), list) and pd.notna(checked) and pd.Timedelta(0) <= now-checked < pd.Timedelta(minutes=30):
+            yield name, entry['rows'], None if entry['rows'] else 'No completed played-game statistics returned for '+name+'.'
+        else:
+            missing.append(name)
+    if not missing:
+        if not archive_path.exists():
+            save(archive_path, archive)
+            _nba_save_remote_history_archive(archive)
+            save(archive_path, archive)
         return
-    try:
-        from dual_agent.game_prediction_addons import matching_game_rows
-    except ImportError:
-        st.caption("Deploy game_prediction_addons.py to show this game's spreads and props.")
-        return
-    remember_game_addons(league, result or {})
-    spread_key = "nfl_saved_spread_cards" if league == "NFL" else "mlb_saved_spreads_cards"
-    if league == 'MLB':
-        with st.expander('📏 Run-line predictions and platform offers', expanded=True):
-            # Compute the display fallback without any paid request, including older saved results.
-            from dual_agent.game_prediction_addons import generate_mlb_run_lines
-            saved = matching_game_rows(game, st.session_state.get(spread_key))
-            spread = next((r for r in saved if 'model_lines' in r), None)
-            if spread is None:
-                forecast = generate_mlb_run_lines([game], [], pd.Timestamp.now(tz='UTC'))
-                spread = forecast['picks'][0] if forecast['picks'] else {}
-            if spread.get('model_lines'):
-                st.caption('Model-only reference lines · not sportsbook listings')
-                for forecast in spread['model_lines']:
-                    st.markdown(f"**{forecast['team']} {forecast['line']:+g} · {forecast['chance']:.1%} estimated cover chance**")
-                if spread.get('provisional'):
-                    st.warning('Provisional model inputs · forecast only; participation information is incomplete.')
-            else:
-                st.info('Run-line panel available; estimate unavailable because projected runs are missing or unusable.')
-            if spread.get('projected_total_runs') is not None:
-                st.markdown('**Game total runs · Over / Under**')
-                st.write(f"Projected combined runs: {spread['projected_total_runs']:.1f}")
-                totals = spread.get('total_offers', [])
-                for offer in sorted(totals, key=lambda o:(o['platform'] != 'polymarket', -o['chance'])):
-                    st.markdown(f"**{offer['platform']} · {offer['side']} {offer['line']:g} total runs · {offer['chance']:.1%} estimated cover chance**")
-                    st.caption(f"Feed odds {decimal_to_american_label(float(offer['decimal_odds']))} · quote {offer['quote_updated_at']}")
-                    stamp = pd.to_datetime(offer['quote_updated_at'], utc=True, errors='coerce')
-                    if pd.isna(stamp) or pd.Timestamp.now(tz='UTC')-stamp > pd.Timedelta(minutes=30):
-                        st.warning('Saved total-runs quote is stale; verify the current line before using it.')
-                if not totals:
-                    st.caption('No matching total-runs line returned. Projected combined runs are informational only.')
-                st.caption('Total-runs estimates use the saved projected run rates and an independent Poisson approximation; accuracy is not established.')
-            offers = spread.get('offers', [])
-            if offers:
-                st.markdown('**Actual preferred-platform run-line offers**')
-                for offer in sorted(offers, key=lambda o:(o['platform'] != 'polymarket', o['platform'], -o['chance'])):
-                    stamp = pd.to_datetime(offer.get('quote_updated_at'), utc=True, errors='coerce')
-                    fresh = pd.notna(stamp) and pd.Timedelta(0) <= pd.Timestamp.now(tz='UTC')-stamp <= pd.Timedelta(minutes=30)
-                    with st.container(border=True):
-                        st.markdown(f"**{offer['platform']} · {offer['team']} {offer['line']:+g}**")
-                        st.write(f"Estimated {offer['chance']:.1%} chance of covering this exact run line")
-                        st.caption(f"Feed odds {decimal_to_american_label(float(offer['decimal_odds']))} · checked {offer.get('quote_updated_at')}")
-                        if not fresh:
-                            st.warning('Saved quote is stale. Generate again to verify current availability.')
-                        if not offer.get('value_eligible', True):
-                            st.caption('Pick’em listing · entry rules determine actual returns.')
-                if not any(o['platform'] == 'polymarket' for o in offers):
-                    st.caption('No matching Polymarket run-line offer was returned and accepted for this game.')
-            else:
-                st.caption('No matching preferred-platform run-line offer found. Reference forecasts above are informational, not verified bets.')
-            st.caption('Cover estimates exclude pushes. Run-line accuracy is not established.')
-    if league == "NFL":
-        spreads = matching_game_rows(game, st.session_state.get(spread_key))
-        with st.expander("📏 Spread prediction" if league == "NFL" else "📏 Run-line prediction", expanded=False):
-            if spreads:
-                spread = spreads[0]
-                kickoff = pd.to_datetime(spread["commence_time"], utc=True, errors="coerce")
-                captured = pd.to_datetime(spread.get("captured_at"), utc=True, errors="coerce")
-                current = pd.Timestamp.now(tz="UTC")
-                fresh = pd.notna(captured) and pd.Timedelta(0) <= current-captured <= pd.Timedelta(minutes=30)
-                if kickoff <= current or fresh:
-                    st.markdown(f"**{spread['spread_team']} {spread['spread_line']:+g}**")
-                    st.metric("Estimated cover chance · excludes pushes", f"{spread['cover_chance']:.1%}")
-                    st.caption(f"Push chance {spread['push_chance']:.1%} · {spread['books']} sportsbooks at this line")
-                    st.caption(f"Projected home margin: {spread['projected_home_margin']:+.1f}")
-                    st.caption("New spread estimate; accuracy is not established. " + spread["method"] + ".")
-                else:
-                    st.info("Spread line is stale. Generate again for a fresh estimate.")
-            else:
-                reasons = (result or {}).get("spreads", {}).get("issues", [])
-                text = next((r for r in reasons if str(game.get("away_team", "")) in r and str(game.get("home_team", "")) in r), None)
-                st.info(text or (reasons[0] if reasons and len(reasons)==1 else "No eligible spread estimate: two fresh matching books and complete model inputs are required."))
-    if league in ('NFL', 'MLB', 'NBA'):
-        import hashlib
-        refresh_identity = '|'.join(str(game.get(k, '')) for k in ('home_team', 'away_team', 'commence_time'))
-        if st.button('Refresh and generate NBA player props' if league == 'NBA' else 'Refresh prop odds for this game', key='refresh_prop_odds_'+league+hashlib.sha256(refresh_identity.encode()).hexdigest()[:16]):
-            from dual_agent.odds_request_cache import refresh_game_props
-            matched = refresh_game_props(game.get('home_team'), game.get('away_team'))
-            if league == 'NBA':
-                started = start_nba_prop_loading(st.session_state.get('nba_prediction_pipeline_result') or result)
-                if started:
-                    st.rerun()
-                else:
-                    st.info('An NBA prop scan is already running. Its progress is shown above.')
-            elif league in ('NFL','MLB'):
-                start_cross_refresh(league,st.session_state.get(cross_sport_state(league)) or result)
-                st.info('Refreshing props in the background. Existing cards remain visible.')
-            else:
-                st.info('No cached sportsbook event matched this game. Generate predictions to collect its available listings.')
-        st.caption('Quotes may be up to 30 minutes old. Refresh and regenerate before using current betting odds.')
-    if league in ('NFL','MLB'):
-        render_cross_prop_cards(league,game,result)
-        return
-    if league == 'NBA':
-        render_nba_live_prop_cards(game, result)
-        return
-    props_key = "nfl_saved_prop_cards" if league == "NFL" else f"{league.lower()}_saved_props_cards"
-    props = matching_game_rows(game, st.session_state.get(props_key))
-    if league == 'NFL' and not props:
-        # Completed background results are usable even before the session-card
-        # archive has been seeded. Still require exact teams and kickoff.
-        props = matching_game_rows(game, (result or {}).get('nfl_player_props'))
-    from dual_agent.preferred_sportsbooks import allowed, diversify
-    props = [p for p in props if allowed(p.get('best_sportsbook', p.get('Best sportsbook')))]
-    if league in ('NBA', 'MLB'):
-        normalized = [dict(p, event_id=p.get('Game'), player=p.get('Player'), market=p.get('Market'),
-                           historical_support=p.get('Estimated chance', 0), estimated_return_per_unit=p.get('Estimated return per unit', 0),
-                           sportsbook_offers=p.get('Sportsbook offers', [])) for p in props]
-        with st.expander(f'🎯 {league} player props · '+('sportsbook-implied rankings' if (result or {}).get('player_props', {}).get('probability_source') == 'sportsbook_implied' else 'ranked by estimated cover chance'), expanded=True):
-            if league == 'NBA' and (result or {}).get('nba_props_pending'):
-                progress = (result or {}).get('player_props', {}).get('loading_progress', {})
-                completed, total = progress.get('completed', 0), progress.get('total', 0)
-                if progress.get('stage'):
-                    st.caption(progress['stage'])
-                failures = [e for e in (result or {}).get('player_props', {}).get('errors', []) if not any(t in str(e) for t in ('No unique NBA player identity', 'No completed played-game statistics', 'Player identity for', 'NBA stats for'))]
-                if failures:
-                    with st.expander('Player-data issues', expanded=True):
-                        for issue in failures[-5:]:
-                            st.warning(str(issue))
-                if total:
-                    st.progress(min(completed / total, 1.0),
-                                text=f'Player history checked: {completed} of {total}. Rankings update as players finish.')
-                else:
-                    st.info('Finding sportsbook lines and players. Player props are loading in the background.')
-            st.caption('Preferred platforms: Polymarket, Underdog, DraftKings, PrizePicks, FanDuel · overall strongest picks plus independent category rankings.')
-            market_only = (result or {}).get('player_props', {}).get('probability_source') == 'sportsbook_implied'
-            st.caption('Sportsbook-implied probabilities · no 65% cutoff · actual offered sides only · no player-stat subscription required.' if market_only else 'Strongest available estimates in each category · no probability cutoff · one exact listed offer and sufficient usable history required. Odds do not affect ranking.')
-            render_prop_category_rankings(normalized, league)
-            from dual_agent.sports_player_prop_predictions import MARKETS
-            markets = sorted({value[0] for value in MARKETS[league].values()} | {p['market'] for p in normalized})
-            import hashlib
-            choice_key = hashlib.sha256(str(game.get('commence_time')).encode()+str(game.get('home_team')).encode()).hexdigest()[:16]
-            render_prop_category_buttons(markets, league.lower()+'_market_'+choice_key, 'All supported markets')
-            selected = st.selectbox(league+' prop market', ['All supported markets']+markets, key=league.lower()+'_market_'+choice_key)
-            if selected != 'All supported markets':
-                normalized = [p for p in normalized if p['market'] == selected]
-            if league in ('NBA','MLB'):
-                st.markdown('### Yes / No · side-by-side probabilities')
-                render_prop_comparisons(normalized, pending=(result or {}).get('nba_props_pending', False), scope=league+'_game')
-            else:
-                for column, mode, title in zip([st.container()], ['probability'], ['Most likely to cover · top 5']):
-                    with column:
-                        st.markdown('### '+('Highest sportsbook-implied probability · top 5' if market_only else title))
-                        chosen = select_nfl_prop_list(normalized, mode)
-                        if not chosen:
-                            if league == 'NBA' and (result or {}).get('nba_props_pending'):
-                                st.caption('Still checking players for this game and category…')
-                            else:
-                                st.info('No listed bets meet this list’s criteria.')
-                        for rank, prop in enumerate(chosen, 1):
-                            with st.container(border=True):
-                                st.markdown(f"**#{rank} · {prop['Player']} · {prop['Pick']} {float(prop['Line']):g} {prop['Market']}**")
-                                if prop.get('Probability source') == 'sportsbook_implied':
-                                    st.write(f"Sportsbook-implied probability: {prop['Estimated chance']:.1%}")
-                                    st.caption(prop.get('Estimate method', ''))
-                                else:
-                                    st.write(prop_outcome_sentence(prop['Player'], prop['Market'], prop['Pick'], prop['Line'], prop['Estimated chance']))
-                                if league == 'NBA' and prop.get('Over chance') is not None:
-                                    st.caption(f"Over {float(prop['Line']):g}: {prop['Over chance']:.1%} · Under {float(prop['Line']):g}: {prop['Under chance']:.1%} · conditional on no push")
-                                    if not prop.get('Opposite side offered'):
-                                        st.caption('Opposite-side probability is a statistical estimate; an offer for that side was not found.')
-                                if prop.get('Probability source') != 'sportsbook_implied' and float(prop['Estimated chance']) < .65:
-                                    st.caption('Below 65% estimated cover chance · lower-confidence prediction')
-                                if prop.get('Historical wins') is not None:
-                                    st.caption(f"Covered this side in {int(prop['Historical wins'])} of {int(prop['Non-push games'])} prior non-push appearances")
-                                if prop.get('Projected stat') is not None:
-                                    st.caption(f"Projection {float(prop['Projected stat']):.2f} · {prop['Prior games']} prior appearances")
-                                st.caption(f"{prop.get('Best sportsbook')} · {decimal_to_american_label(float(prop['Best decimal odds']))}")
-                                participation = prop.get('Participation status')
-                                if participation:
-                                    st.caption(participation)
-                                    if participation not in ('Confirmed lineup', 'Recorded starter'):
-                                        st.warning('Provisional participation—recheck the lineup or starter.')
-                                if prop.get('Best sportsbook') in ('prizepicks', 'underdog'):
-                                    st.caption('Pick’em selection · entry rules determine actual returns; feed price is indicative.')
-            if league in ('MLB','NBA') and not normalized:
-                reasons = (result or {}).get('player_props', {}).get('exclusions', [])
-                matching_reasons = [r for r in reasons if r.get('Game') == str(game.get('away_team'))+' @ '+str(game.get('home_team')) and (selected == 'All supported markets' or r.get('Market') == selected)]
-                for reason in (matching_reasons[:5] if league != 'NBA' else []):
-                    st.caption(f"{reason.get('Player', '')}: {reason.get('Reason', '')}")
-            game_label = str(game.get('away_team'))+' @ '+str(game.get('home_team'))
-            game_time = pd.to_datetime(game.get('commence_time', game.get('start_time')), utc=True, errors='coerce')
-            shown_issues = 0
-            for issue in (result or {}).get('player_props', {}).get('errors', []):
-                if isinstance(issue, dict):
-                    issue_time = pd.to_datetime(issue.get('MLB start UTC'), utc=True, errors='coerce')
-                    if issue.get('Game') != game_label or (pd.notna(issue_time) and pd.notna(game_time) and abs(issue_time-game_time) > pd.Timedelta(minutes=15)):
-                        continue
-                    if issue.get('Market') and selected != 'All supported markets' and issue['Market'] != selected:
-                        continue
-                    st.caption(str(issue.get('Reason', 'Sportsbook offer unavailable for this game.')))
-                else:
-                    st.caption(str(issue))
-                shown_issues += 1
-                if shown_issues >= 3:
-                    break
-            unpriced = [p for p in (result or {}).get('player_props', {}).get('unpriced_listings', []) if p.get('Game') == game_label and pd.to_datetime(p.get('start_time'), utc=True) == game_time and (selected == 'All supported markets' or p['Market'] == selected)]
-            if unpriced:
-                with st.expander('Pick’em listings · probability unavailable from indicative prices'):
-                    for offer in unpriced:
-                        st.write(f"{offer['Player']} · {offer['Pick']} {offer['Line']:g} {offer['Market']} · {offer['Best sportsbook']}")
-            st.caption('Market-implied percentages reflect sportsbook prices, not independent model confidence. One-sided prices include margin.' if market_only else 'Estimates are conditional on participation and exclude pushes; they are not calibrated future probabilities.')
-        return
-
-    if league == "NFL":
-        current = pd.Timestamp.now(tz="UTC")
-        props = [p for p in props if pd.to_datetime(p.get("game_time"), utc=True, errors="coerce") <= current
-                 or len(p.get("sportsbook_offers", [])) >= 1]
-    score = "historical_support" if league == "NFL" else "Estimated chance"
-    value_key = "estimated_return_per_unit" if league == "NFL" else "Estimated return per unit"
-    if league == 'MLB':
-        import hashlib
-        from dual_agent.sports_player_prop_predictions import MARKETS
-        category_key = 'mlb_category_'+hashlib.sha256('|'.join(str(game.get(k, '')) for k in ('home_team', 'away_team', 'commence_time')).encode()).hexdigest()[:16]
-        categories = sorted({value[0] for value in MARKETS['MLB'].values()})
-        render_prop_category_buttons(categories, category_key, 'All supported markets')
-        selected_category = st.selectbox('MLB prop market', ['All supported markets']+categories, key=category_key)
-        if selected_category != 'All supported markets':
-            props = [p for p in props if p.get('Market') == selected_category]
-
-    if league == "NFL":
-        render_prop_category_rankings(props, 'NFL')
-        from dual_agent.nfl_player_props import MARKETS
-        markets = sorted(set(MARKETS) | {str(p.get('market','')) for p in props})
-        import hashlib
-        filter_id = hashlib.sha256('|'.join(str(game.get(k,'')) for k in ['home_team','away_team','commence_time']).encode()).hexdigest()[:16]
-        render_prop_category_buttons(markets, 'nfl_prop_market_'+filter_id, 'All qualifying markets')
-        selected_market = st.selectbox('Player-prop market', ['All qualifying markets']+markets, key='nfl_prop_market_'+filter_id)
-        if selected_market != 'All qualifying markets':
-            props = [p for p in props if p.get('market')==selected_market]
-    if league == 'NFL':
-        with st.expander('🎯 NFL player props · Yes / No probabilities', expanded=True):
-            st.markdown('### Yes / No · side-by-side probabilities')
-            render_prop_comparisons(props, pending=(result or {}).get('enrichment_pending', False), scope='NFL_game')
-            if not props and not (result or {}).get('enrichment_pending'):
-                render_nfl_prop_diagnostics(game,result,selected_market,0)
-            issues = (result or {}).get('prop_issues', [])
-            matching = [issue for issue in issues if str(game.get('home_team','')) in str(issue) and str(game.get('away_team','')) in str(issue)]
-            if matching:
-                with st.expander('Other scan notes for this game'):
-                    for issue in matching: st.caption(str(issue))
-        return
-    if league == 'NFL':
-        probability_props = select_nfl_prop_list(props, 'probability')
-    else:
-        props = diversify(sorted(props, key=lambda row: (-float(row.get(score, 0)), -float(row.get(value_key, 0)))), limit=10, market_key='Market', identity_keys=('Game','Player','Market'))
-    with st.expander("🎯 Player props for this game · loading" if league == "NFL" and (result or {}).get("enrichment_pending") and not props else f"🎯 Player props for this game ({len(props)})", expanded=True):
-        st.caption('Preferred platforms: Polymarket, Underdog, DraftKings, PrizePicks, FanDuel · overall strongest picks plus independent category rankings.')
-        st.caption('Ranked by estimated cover chance · no probability cutoff · exact side listed on one preferred platform · odds are reference only.')
-        if league == 'NFL':
-            st.markdown('### Most likely to cover · top 5')
-            props = [dict(p, _list_name='probability', _list_rank=i) for i, p in enumerate(probability_props, 1)]
-        if not props:
-            issues = (result or {}).get("prop_issues", []) if league == "NFL" else (result or {}).get("player_props", {}).get("errors", [])
-            if league == 'NFL':
-                if (result or {}).get('enrichment_pending'):
-                    st.info('Collecting sportsbook lines and scoring player props…')
-                elif not render_nfl_prop_diagnostics(game, result, selected_market, len(props)):
-                    st.info('No saved scan details for this game/category. Generate predictions once to collect its category-specific results.')
-            else:
-                st.info('No eligible player props for this matchup yet. A listed exact bet and usable history are required; no probability cutoff applies. Odds are reference only.')
-            if league == "MLB":
-                from collections import Counter
-                exclusions = (result or {}).get('player_props', {}).get('exclusions', [])
-                matchup = str(game.get('away_team','')) + ' @ ' + str(game.get('home_team',''))
-                reasons = Counter(str(e.get('Reason','')) for e in exclusions if e.get('Game') == matchup)
-                for reason, count in reasons.most_common(3):
-                    st.caption(f'{count} candidates: {reason}')
-            if issues and league == "NFL":
-                matching = [issue for issue in issues if str(game.get("home_team", "")) in issue and str(game.get("away_team", "")) in issue]
-                if matching:
-                    with st.expander('Other scan notes for this game', expanded=False):
-                        for issue in matching:
-                            if 'Listed markets awaiting a matching history/scoring model:' in str(issue):
-                                st.caption('Some listed quarter, half, fantasy or other markets do not yet have a matching statistical model. This does not explain an empty full-game category above.')
-                            else:
-                                st.caption(str(issue))
-                elif any('NFL_PROP_PROBABILITY_VERSION' in str(issue) for issue in issues):
-                    st.warning('The NFL prop pipeline needs updating. Deploy the supplied nfl_player_prop_prediction_pipeline.py before generating again.')
-        from contextlib import nullcontext
-        for rank, prop in enumerate(props, 1):
-            with prop.get("_display_column", nullcontext()), st.container(border=True):
-                rank = prop.get("_list_rank", rank)
-                if league == "NFL":
-                    side = str(prop["model_pick"])
-                    pick = side if side in ("YES", "NO") else f"{side} {float(prop['line']):g}"
-                    st.markdown(f"**#{rank} · {prop['player']} · {pick} {prop['market']}**")
-                    st.markdown(prop_outcome_sentence(prop["player"], prop["market"], side, prop["line"], prop["historical_support"]))
-                    if float(prop['historical_support']) < .65:
-                        st.caption('Below 65% estimated cover chance · lower-confidence prediction')
-                    st.caption(f"Projection {float(prop['projected_value']):.1f} · {int(prop.get('sample_size', 0))} prior games")
-                    st.caption(f"Estimated cover chance {float(prop['historical_support']):.1%} · historical estimate, not calibrated")
-                    if prop.get('best_sportsbook') in ('prizepicks', 'underdog'):
-                        st.caption('Pick’em selection · feed price is indicative; entry rules determine actual returns. Odds are reference only.')
-                    if prop.get("best_sportsbook"):
-                        st.caption(f"Best available odds: {prop['best_sportsbook']} · {float(prop['best_american_odds']):+g}")
-                    offers = prop.get("sportsbook_offers", [])
-                    if len(offers) == 1:
-                        st.caption("Available at one sportsbook · meets our listing requirement")
-                    if offers:
-                        st.caption("Offered at: " + ", ".join(str(o['bookmaker_key']) + " (" + format(float(o['american_odds']), '+g') + ")" for o in offers))
-                    st.caption('Ranked by estimated cover chance · odds are reference only.')
-                    comparisons = prop.get('outcome_comparison', [])
-                    if isinstance(comparisons, list) and comparisons:
-                        with st.expander('Compare both outcomes'):
-                            for outcome in comparisons:
-                                st.write(prop_outcome_sentence(prop['player'], prop['market'], outcome['side'], prop['line'], outcome['chance']))
-                                if outcome.get('listed'):
-                                    st.caption(f"{outcome['book']} · {float(outcome['american_odds']):+g} · {outcome['reason']}")
-                                else:
-                                    st.caption('Forecast only · no matching sportsbook bet found')
-                    # Keep the existing manual bet-record workflow available.
-                    import hashlib
-                    identity = "|".join(str(prop.get(c, "")) for c in ("event_id", "game_time", "player", "market", "model_pick", "line"))
-                    button_key = "attached_nfl_prop_" + str(prop.get("_list_name", "probability")) + hashlib.sha256(identity.encode()).hexdigest()[:20]
-                    kickoff = pd.to_datetime(prop.get("game_time"), utc=True, errors="coerce")
-                    if st.button("Record this player prop", key=button_key, disabled=pd.isna(kickoff) or kickoff <= pd.Timestamp.now(tz="UTC")):
-                        st.session_state.update({"bet_builder_mode": "Single", "single_sport": "NFL",
-                            "single_market": {"Passing yards":"Passing Yards", "Rushing yards":"Rushing Yards", "Receiving yards":"Receiving Yards", "Receptions":"Receptions", "Anytime touchdown":"Anytime Touchdown"}.get(prop["market"], "Other"),
-                            "single_player": str(prop["player"]), "single_team": "", "single_direction": {"OVER":"Over", "UNDER":"Under", "YES":"Yes", "NO":"No"}.get(side.upper(), "Other"),
-                            "single_line": float(prop["line"]), "single_description": f"{prop['player']} {pick} {prop['market']} — {prop.get('away_team', '')} @ {prop.get('home_team', '')}", "main_navigation": "🎟️ My Bets"})
-                        st.rerun()
-                else:
-                    st.markdown(f"**#{rank} · {prop['Player']} · {prop['Pick']} {prop['Line']:g} {prop['Market']}**")
-                    st.markdown(prop_outcome_sentence(prop['Player'], prop['Market'], prop['Pick'], prop['Line'], prop['Estimated chance']))
-                    st.caption(f"Estimated chance {prop['Estimated chance']:.1%} · projection {prop['Projected stat']:.1f} · {prop['Prior games']} prior appearances · {prop['Books']} books")
-                    if prop.get("Best sportsbook"):
-                        st.caption(f"Best available odds: {prop['Best sportsbook']} · odds {decimal_to_american_label(float(prop['Best decimal odds']))}")
-                    offers = prop.get("Sportsbook offers", [])
-                    if offers:
-                        st.caption("Offered at: " + ", ".join(str(o['book']) + " (" + decimal_to_american_label(float(o['decimal_odds'])) + ")" for o in offers))
-                    if "neutral" in str(prop.get("Estimate method", "")):
-                        st.caption("One-sided listing · estimate uses prior appearances and a neutral prior; a margin-free market probability is unavailable.")
-                    decisions = int(prop.get("Non-push games", prop.get("Prior games", 0)-prop.get("Historical pushes", 0)))
-                    if league == "MLB" and decisions in (8, 9):
-                        st.caption(f"Smaller sample · {decisions} non-push results from {prop['Prior games']} prior appearances")
-                    participation = prop.get("Participation status")
-                    if participation:
-                        st.caption(participation)
-                        if participation not in ("Confirmed lineup", "Recorded starter"):
-                            st.warning("Provisional participation—recheck the lineup or starter.")
-                st.caption(prop.get("pick_game_status", "Upcoming"))
-        if props:
-            st.caption("Ranked by estimated cover chance. Estimates are not calibrated future probabilities." if league == "NFL" else "Ordered from strongest to weakest within this game. Prop estimates and ranking scores are not calibrated future probabilities.")
-
-
-def nfl_prediction_features():
-    """Rebuild from refreshed final results; session history is never the authority."""
-    from dual_agent.nfl_live_context import fresh_schedule, completed_history
-    schedule, fetched = fresh_schedule()
-    history = completed_history(schedule)
-    if history.empty:
-        raise ValueError('Current NFL completed-game history unavailable; stale features were not silently reused.')
-    signature = pd.util.hash_pandas_object(history[['game_id','home_score','away_score']],index=False).sum().item()
-    if st.session_state.get('nfl_history_signature') != signature or st.session_state.get('nfl_live_feature_games') is None:
-        features = build_nfl_pregame_features(history)
-        if features is None or features.empty:
-            raise ValueError('Fresh NFL completed results produced no usable features.')
-        st.session_state['nfl_live_feature_games'] = features
-        st.session_state['nfl_feature_games'] = features
-        st.session_state['multi_nfl_games'] = history
-        st.session_state['nfl_history_signature'] = signature
-    st.session_state['nfl_history_fetched_at'] = fetched
-    st.session_state['nfl_latest_completed_game'] = history.start_time.max().isoformat()
-    return st.session_state['nfl_live_feature_games']
-
-
-@st.fragment(run_every='180s')
-def render_nfl_freshness_monitor():
-    try:
-        nfl_prediction_features()
-        stamp = pd.Timestamp(st.session_state['nfl_history_fetched_at']).tz_convert('America/Chicago')
-        latest = pd.Timestamp(st.session_state['nfl_latest_completed_game']).tz_convert('America/Chicago')
-        st.caption(f"History checked {stamp.strftime('%b %d · %I:%M %p CT')} · latest completed game {latest.strftime('%b %d, %Y')} · checks every 3 minutes while this page is open")
-    except Exception as exc:
-        st.warning('NFL history refresh unavailable: ' + str(exc))
-
-
-@st.fragment(run_every='3s')
-def render_nfl_game_context(game):
-    from dual_agent.game_prediction_addons import matching_game_rows
-    latest = (st.session_state.get('nfl_prediction_pipeline_result') or {}).get('predictions')
-    matching = matching_game_rows(game,latest)
-    if matching: game = matching[0]
-    context = game.get('game_context')
-    with st.expander('Quarterbacks, injuries & game conditions', expanded=True):
-        if not isinstance(context,dict):
-            st.info('Loading current quarterback and game context…' if st.session_state.get('nfl_enrichment_future') is not None else 'Generate fresh NFL predictions to retrieve current game context.')
-            return
-        st.caption('Context fetched ' + str(context.get('fetched_at','Not available')))
-        for side in ['away','home']:
-            team = context.get(side,{})
-            st.markdown('**' + str(team.get('team',game.get(side+'_team','Team'))) + '**')
-            qb=team.get('qb')
-            if qb:
-                st.write(f"Expected QB: **{qb['name']}**")
-                st.caption(f"Injury: {qb['injury_status']} · Practice: {qb['practice_status']}")
-                st.caption(qb['designation'] + ' · depth chart ' + str(team.get('depth_updated_at','Not verified')))
-                if qb.get('report_updated_at'):st.caption('QB report updated ' + qb['report_updated_at'])
-                with st.container(border=True):
-                    st.markdown('**Quarterback forecast**')
-                    forecasts = qb.get('forecasts', [])
-                    for forecast in forecasts:
-                        st.markdown(f"**{forecast['pick']} {forecast['line']:g} {forecast['market']} · {forecast['chance']:.1%} estimated cover chance**")
-                        st.caption(f"Projection {forecast['projection']:.1f} · {forecast['sample_size']} prior passing appearances · {forecast['book']} ({forecast['american_odds']:+g})")
-                        if forecast['chance'] < .65:
-                            st.caption('Below 65% estimated cover chance · lower-confidence forecast.')
-                    covered = {f['market'] for f in forecasts}
-                    projections = qb.get('projections', [])
-                    for projection in projections:
-                        if projection['market'] not in covered:
-                            st.write(f"{projection['market']}: projected {projection['projection']:.1f} · {projection['sample_size']} prior appearances")
-                    if not forecasts:
-                        st.caption('No fresh matching sportsbook cover estimate. Projections remain visible when history is available; line estimates need at least 8 usable appearances.')
-                    if not projections:
-                        st.caption('QB historical projections are unavailable. Generate again to collect the updated forecast panel.')
-                    st.caption(qb.get('forecast_note','Expected starter forecast; availability still needs verification.'))
-                    st.caption('Cover estimates exclude pushes and assume participation. Historical support is not calibrated prediction accuracy.')
-
-            else:
-                st.warning('Expected starting QB not verified from the retrieved depth chart.')
-            with st.expander('Injury & practice report · ' + str(team.get('team',side))):
-                reports=team.get('injuries',[])
-                if reports:st.dataframe(pd.DataFrame(reports).drop(columns=['gsis_id'],errors='ignore'),hide_index=True,use_container_width=True)
-                else:st.caption('No current-week report returned. This does not establish that the team is healthy.')
-            with st.expander('Depth chart · ' + str(team.get('team',side))):
-                if team.get('depth'):st.dataframe(pd.DataFrame(team['depth']),hide_index=True,use_container_width=True)
-                else:st.caption('Current depth chart unavailable.')
-        weather=context.get('weather',{})
-        if weather.get('source'):
-            st.markdown('**Kickoff weather · ' + str(weather['venue']) + '**')
-            st.caption(f"{weather['temperature_f']}°F · wind {weather['wind_mph']} mph · rain chance {weather['rain_chance']}%")
-            st.caption(weather['source'] + ' · ' + weather['fetched_at'])
-            st.caption('Roof type: ' + str(weather['roof_type']) + ' · ' + weather['roof_status'] + '. Outdoor forecast may not affect an enclosed field.')
-        market=context.get('market',{})
-        if market.get('books'):
-            st.markdown('**Sportsbook comparison · margin removed**')
-            st.caption(f"{game['home_team']}: {market['home_probability']:.1%} · {game['away_team']}: {market['away_probability']:.1%}")
-            st.caption(f"Model–market gap: {market['gap']*100:.1f} percentage points · {len(market['books'])} books")
-            st.dataframe(pd.DataFrame(market['books'])[['sportsbook','home_moneyline','away_moneyline']],hide_index=True,use_container_width=True)
-        elif market.get('issue'):st.caption(market['issue'])
-        for issue in dict.fromkeys(context.get('issues',[])):st.warning(issue)
-        st.caption(context.get('probability_use',''))
-
-
-
-def render_mlb_update_notice(location):
-    st.caption('Saved props stay visible. A stale workspace refreshes in the background when opened; sportsbook responses are reused for up to 30 minutes.')
-
-
-@st.fragment
-def render_mlb_prediction_center(location):
-    st.subheader("⚾ MLB Prediction Center")
-    st.caption("Current lineups, starters, team form and available game conditions feed the saved matchup equation.")
-    with st.expander("Saved MLB model setup", expanded=False):
-        st.caption("Activate your full saved matchup model JSON once. Predictions reuse it after app restarts.")
-        model_upload = st.file_uploader("Saved matchup model", type=["json"], key=location + "_model_upload")
-        if model_upload is not None and st.button("Use this MLB model", key=location + "_activate"):
+    catalog = []
+    if any(not known[name].get('player_id') for name in missing):
+        catalog_path = root/('active_players_'+day+'.json')
+        try:
+            catalog = json.loads(catalog_path.read_text())
+            if not isinstance(catalog, list): raise ValueError('Invalid player catalog')
+        except (OSError, ValueError):
+            catalog = []; cursor = None; seen = set()
             try:
-                activated = load_mlb_prediction_pipeline().activate_model(__import__("json").load(model_upload))
-                st.success("MLB model activated.")
-                st.session_state.pop("mlb_live_pipeline_result", None)
-                st.session_state.pop("mlb_pending_pipeline_result", None)
+                for page in range(1, 101):
+                    notify(f'Resolving player identities · roster page {page}')
+                    params = {'per_page': 100}
+                    if cursor is not None: params['cursor'] = cursor
+                    payload = _get(base+'/players/active', api_key, params, True)
+                    catalog.extend(payload.get('data', []))
+                    cursor = payload.get('meta', {}).get('next_cursor')
+                    if cursor is None: break
+                    if str(cursor) in seen: raise RuntimeError('Repeated roster cursor')
+                    seen.add(str(cursor))
+                else: raise RuntimeError('Player identity pagination incomplete')
+                save(catalog_path, catalog)
             except Exception as exc:
-                st.error("Unable to activate MLB model: " + str(exc))
-    st.caption("Scores the next seven days of games. The strongest ten lead the slate; ranked sportsbook props appear inside each game.")
-    previous = restore_cross_result('MLB')
-    generated = st.button('⚾ Generate MLB Predictions · Next 7 Days',key=location+'_generate',type='primary',use_container_width=True)
-    saved = pd.to_datetime((previous or {}).get('workspace_saved_at',(previous or {}).get('saved_at')),utc=True,errors='coerce')
-    needs_refresh = previous and pd.notna(saved) and pd.Timestamp.now(tz='UTC')-saved>pd.Timedelta(minutes=30)
-    if generated or (needs_refresh and st.session_state.get('mlb_enrichment_future') is None):
-        try:
-            start_cross_refresh('MLB',previous or {})
-        except Exception as exc:
-            st.error('Unable to start MLB refresh ('+type(exc).__name__+'). Saved cards are preserved.')
-    st.caption('Saved cards appear first. Refreshes run in the background; opening a category makes no API request.')
-    render_mlb_live_workspace(location)
-
-
-
-if page == "🏠 Home":
-
-    st.title("Your prediction hub")
-
-    st.write(
-        "Generate the next seven days of picks. Review winners, spreads and "
-        "player props together, then track your results in My Bets."
-    )
-
-# ============================================
-# HOME — PREDICTION CONTROL CENTER
-# ============================================
-
-if page == "🏠 Home":
-
-    # ============================================
-    # NFL ONE-CLICK PREDICTION CENTER
-    # ============================================
-    
-    st.subheader("🏈 NFL Prediction Center")
-    
-    st.caption(
-        "Rank NFL games in the next seven days, shop available "
-        "moneylines, and analyze model-vs-market opportunities."
-    )
-    
-    if st.button(
-        "🏈 Generate NFL Predictions · Next 7 Days",
-        key="generate_nfl_predictions_one_click",
-        type="primary",
-        use_container_width=True,
-    ):
-        try:
-    
-            feature_games = st.session_state.get(
-                "nfl_feature_games"
-            )
-
-            # ============================================
-            # AUTO-PREPARE NFL HISTORICAL FEATURES
-            # ============================================
-
-            feature_games = nfl_prediction_features()
-
-            with st.spinner(
-                "Generating NFL predictions and analyzing markets..."
-            ):
-    
-                nfl_pipeline_result = (
-                    run_nfl_prediction_with_addons(
-                        feature_games=feature_games,
-                        historical_accuracy=st.session_state.get(
-                            "nfl_historical_accuracy"
-                        ),
-                        historical_sample=st.session_state.get(
-                            "nfl_historical_sample"
-                        ),
-                    )
-                )
-    
-                retain_nfl_picks(st.session_state.get("nfl_prediction_pipeline_result", {}).get("predictions"), "nfl_saved_team_cards")
-                retain_nfl_picks(nfl_pipeline_result.get("predictions"), "nfl_saved_team_cards")
-                st.session_state[
-                    "nfl_prediction_pipeline_result"
-                ] = nfl_pipeline_result
-    
-                st.session_state[
-                    "live_nfl_moneylines"
-                ] = nfl_pipeline_result[
-                    "live_odds"
-                ]
-    
-                st.session_state[
-                    "best_nfl_moneylines"
-                ] = nfl_pipeline_result[
-                    "best_lines"
-                ]
-    
-                st.session_state[
-                    "live_nfl_predictions"
-                ] = nfl_pipeline_result[
-                    "predictions"
-                ]
-    
-                st.session_state[
-                    "live_nfl_opportunities"
-                ] = nfl_pipeline_result[
-                    "opportunities"
-                ]
-
-        
-    
-        except Exception as error:
-    
-            st.error(
-                f"NFL prediction pipeline failed: {error}"
-            )
-    
-            st.exception(error)
-    
-    # ============================================
-    # NFL PREDICTION RESULTS
-    # ============================================
-    
-    nfl_pipeline_result = st.session_state.get(
-        "nfl_prediction_pipeline_result",
-        None,
-    )
-    if nfl_pipeline_result is None:
-        nfl_pipeline_result = restore_cross_result('NFL')
-    
-    if nfl_pipeline_result is not None:
-    
-        predictions = visible_prediction_rows(retain_nfl_picks(nfl_pipeline_result.get("predictions"), "nfl_saved_team_cards"))
-    
-        opportunities = nfl_pipeline_result.get(
-            "opportunities"
-        )
-    
-        if (
-            predictions is not None
-            and not predictions.empty
-        ):
-    
-            prediction_count = len(predictions)
-
-        # ========================================
-        # COLLAPSIBLE GAME PREDICTIONS
-        # ========================================
-
-        with st.expander(
-            f"🏈 Upcoming NFL Game Predictions "
-            f"({prediction_count})",
-            expanded=True,
-        ):
-
-            st.caption(
-                "Strongest model picks first, for games in the next seven days."
-            )
-
-            # ------------------------------------
-            # PREDICTION SUMMARY
-            # ------------------------------------
-
-            high_confidence_count = int(
-                (
-                    predictions["confidence"]
-                    >= 0.70
-                ).sum()
-            )
-
-            moderate_count = int(
-                (
-                    (
-                        predictions["confidence"]
-                        >= 0.58
-                    )
-                    & (
-                        predictions["confidence"]
-                        < 0.70
-                    )
-                ).sum()
-            )
-
-            close_count = int(
-                (
-                    predictions["confidence"]
-                    < 0.58
-                ).sum()
-            )
-
-            (
-                summary_col1,
-                summary_col2,
-                summary_col3,
-                summary_col4,
-            ) = st.columns(4)
-
-            summary_col1.metric(
-                "Games",
-                prediction_count,
-            )
-
-            summary_col2.metric(
-                "High Confidence",
-                high_confidence_count,
-            )
-
-            summary_col3.metric(
-                "Moderate",
-                moderate_count,
-            )
-
-            summary_col4.metric(
-                "Close Matchups",
-                close_count,
-            )
-
-            st.markdown("")
-
-                        # ------------------------------------
-            # GAME CARDS
-            # MOST FAVORABLE → LEAST FAVORABLE
-            # ------------------------------------
-
-            sorted_predictions = predictions.sort_values(
-                by="confidence",
-                ascending=False,
-            ).reset_index(drop=True)
-
-            render_prediction_workspace("NFL", sorted_predictions, nfl_pipeline_result)
-
-            st.markdown("---")
-
-            st.caption(
-                "The strongest ten picks appear first; the remaining games are ranked by "
-                "model confidence. Confidence "
-                "represents estimated win probability and does not "
-                "by itself indicate betting value."
-            )
-
-            # ------------------------------------
-            # MARKET OPPORTUNITIES
-            # ------------------------------------
-
-            if (
-                opportunities is not None
-                and not opportunities.empty
-            ):
-
-                with st.expander(
-                    "💰 Market Opportunities",
-                    expanded=False,
-                ):
-
-                    st.caption(
-                        "Model-vs-market analysis "
-                        "using available sportsbook "
-                        "moneylines."
-                    )
-
-                    st.dataframe(
-                        opportunities,
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-
-
-# ============================================
-# NFL PLAYER PROP PREDICTIONS
-# ============================================
-
-if page == "🏠 Home":
-    st.caption("NFL props and spread estimates load with the game predictions and appear inside each game card.")
-
-
-# ============================================
-# SPORTS CENTER — LEAGUE PREDICTION HUB
-# ============================================
-
-if page in ["🏈 NFL", "🏀 NBA", "⚾ MLB"]:
-    selected_league = page
-    st.title(page + " Center")
-    st.caption("Game predictions, player props, and current game information.")
-
-    st.divider()
-
-    # ========================================
-    # NFL
-    # ========================================
-
-    if selected_league == "🏈 NFL":
-
-        st.subheader(
-            "🏈 NFL Prediction Center"
-        )
-
-        st.caption(
-            "Generate upcoming NFL game predictions, "
-            "shop available moneylines, and analyze "
-            "model-vs-market opportunities."
-        )
-
-        if st.button("🏈 Generate NFL Predictions · Next 7 Days", key="nfl_sidebar_generate", type="primary"):
+                for name in missing: yield name, [], 'NBA player directory: '+_nba_request_issue(exc)
+                return
+    index = {}
+    for player in catalog:
+        index.setdefault(nba_identity_key(player.get('first_name','')+' '+player.get('last_name','')), {})[player['id']] = player
+    resolved = []
+    for name in missing:
+        if known[name].get('player_id'):
+            resolved.append((name, known[name]['player_id']))
+            continue
+        matches = list(index.get(nba_identity_key(name), {}).values())
+        if len(matches) != 1:
+            # Search is first OR last name, not an assumed full-name match.
+            notify('Resolving player identity · '+name)
             try:
-                with st.spinner("Generating NFL predictions..."):
-                    result = run_nfl_prediction_with_addons(
-                        feature_games=nfl_prediction_features(),
-                        historical_accuracy=st.session_state.get("nfl_historical_accuracy"),
-                        historical_sample=st.session_state.get("nfl_historical_sample"),
-                    )
-                    retain_nfl_picks(st.session_state.get("nfl_prediction_pipeline_result", {}).get("predictions"), "nfl_saved_team_cards")
-                    retain_nfl_picks(result.get("predictions"), "nfl_saved_team_cards")
-                    st.session_state["nfl_prediction_pipeline_result"] = result
-                    for session_key, result_key in [("live_nfl_moneylines", "live_odds"),
-                        ("best_nfl_moneylines", "best_lines"), ("live_nfl_predictions", "predictions"),
-                        ("live_nfl_opportunities", "opportunities")]:
-                        st.session_state[session_key] = result.get(result_key)
+                payload = _get(base+'/players', api_key,
+                               {'search': re.sub(r'\s+(?:jr\.?|sr\.?|ii|iii|iv)$', '', name, flags=re.I).split()[-1], 'per_page': 100}, True)
+                matches = [r for r in payload.get('data', []) if nba_identity_key(r.get('first_name','')+' '+r.get('last_name','')) == nba_identity_key(name)]
             except Exception as exc:
-                st.error("NFL prediction pipeline failed: " + str(exc))
-
-        nfl_result = st.session_state.get(
-            "nfl_prediction_pipeline_result"
-        )
-
-        render_league_prediction_results(
-            league_name="NFL",
-            league_icon="🏈",
-            pipeline_result=nfl_result,
-        )
-
-        st.caption("Player props load automatically inside their matching game cards.")
-
-    # ========================================
-    # NBA
-    # ========================================
-
-    elif selected_league == "🏀 NBA":
-
-        st.subheader(
-            "🏀 NBA Prediction Center"
-        )
-
-        st.caption(
-            "Generate upcoming NBA game predictions "
-            "and analyze model-vs-market opportunities."
-        )
-
-        if st.button(
-            "🏀 Generate NBA Predictions · Next 7 Days",
-            key="sports_center_generate_nba",
-            type="primary",
-            use_container_width=True,
-        ):
-
-            try:
-
-                status_box = st.empty()
-
-                def update_nba_status(
-                    stage,
-                    elapsed,
-                ):
-                    status_box.info(
-                        f"🏀 {stage} — "
-                        f"{elapsed:.1f} seconds"
-                    )
-
-                nba_result = (
-                    run_nba_prediction_with_props(
-                        progress_callback=update_nba_status,
-                    )
-                )
-
-                st.session_state[
-                    "nba_prediction_pipeline_result"
-                ] = nba_result
-
-                status_box.success(
-                    "✅ NBA predictions generated successfully."
-                )
-
-            except Exception as error:
-
-                st.error(
-                    "NBA prediction pipeline failed: "
-                    f"{error}"
-                )
-
-                st.exception(error)
-
-        nba_result = st.session_state.get(
-            "nba_prediction_pipeline_result"
-        )
-
-        render_league_prediction_results(
-            league_name="NBA",
-            league_icon="🏀",
-            pipeline_result=nba_result,
-        )
-        # NBA props are attached to matching game cards.
-
-    # ========================================
-    # MLB
-    # ========================================
-
-    elif selected_league == "⚾ MLB":
-
-        render_mlb_prediction_center("mlb_sidebar")
-        render_mlb_update_notice("mlb_sidebar")
-
-
-# ============================================
-# NBA ONE-CLICK PREDICTION CENTER
-# ============================================
-
-if page == "🏠 Home":
-
-    st.divider()
-    st.subheader("🏀 NBA Prediction Center")
-    
-    
-    st.caption(
-        "Rank NBA games in the next seven days and review "
-        "player props beneath each matching game."
-    )
-    
-    if st.button(
-        "🏀 Generate NBA Predictions · Next 7 Days",
-        key="generate_nba_predictions_one_click",
-        type="primary",
-        use_container_width=True,
-    ):
-    
-        try:
-            status_box = st.empty()
-    
-            def update_nba_status(
-                stage,
-                elapsed,
-            ):
-                status_box.info(
-                    f"🏀 {stage} — "
-                    f"{elapsed:.1f} seconds"
-                )
-    
-            nba_pipeline_result = (
-                run_nba_prediction_with_props(
-                    progress_callback=update_nba_status,
-                )
-            )
-    
-            st.session_state[
-                "nba_prediction_pipeline_result"
-            ] = nba_pipeline_result
-    
-            status_box.success(
-                "✅ NBA predictions generated successfully."
-            )
-    
-        except Exception as error:
-            st.error(
-                f"NBA prediction pipeline failed: {error}"
-            )
-    
-            st.exception(error)
-
-# ============================================
-# NBA PREDICTION RESULTS
-# ============================================
-
-nba_pipeline_result = st.session_state.get(
-    "nba_prediction_pipeline_result",
-    None,
-)
-
-if page == "🏠 Home" and nba_pipeline_result is not None:
-    render_league_prediction_results("NBA", "🏀", nba_pipeline_result)
-    # NBA props are attached to matching game cards.
-
-
-if page == "🏈 NFL":
-    sports_tab = st.radio(
-        "Sports Center Navigation",
-        [
-            "🎯 Today's Picks",
-            "🎟️ My Bets",
-            "📊 Model Performance",
-        ],
-        horizontal=True,
-        label_visibility="collapsed",
-        key="sports_center_tabs",
-    )
-
-    
-    # Keep Sports Center tabs local; sidebar pages use the main navigation radio.
-    show_today = sports_tab == "🎯 Today's Picks"
-    show_bets = sports_tab == "🎟️ My Bets"
-    show_performance = sports_tab == "📊 Model Performance"
-
-    st.divider()
-
-    # Dashboard summary
-
-    col1, col2, col3, col4 = st.columns(4)
-
-    with col1:
-        st.metric(
-            "Today's Opportunities",
-            "—"
-        )
-
-    with col2:
-        st.metric(
-            "My Win Rate",
-            "—"
-        )
-
-    with col3:
-        st.metric(
-            "Total Profit / Loss",
-            "—"
-        )
-
-    with col4:
-        st.metric(
-            "Active Bets",
-            "—"
-        )
-
-
-    if show_today:
-        st.caption("Use Generate NFL Predictions above for winners, spreads and automatic player props.")
-        st.divider()
-        st.subheader("Today's Picks")
-
-    
-
-        st.divider()
-
-        # Sports selection
-
-        sport = "NFL Football"
-
-        # Betting market selection
-
-        st.subheader("Choose Your Betting Market")
-
-        market = st.selectbox(
-            "What type of bet are you interested in?",
-            ["Game Winner", "Player Passing Yards", "Player Rushing Yards",
-             "Player Receiving Yards", "Player Receptions", "Player Passing Touchdowns",
-             "Player Anytime Touchdown", "Player Rushing + Receiving Yards",
-             "Player Passing Completions", "Player Interceptions Thrown",
-             "Game Total Points", "Point Spread", "Other"],
-            key="nfl_betting_market",
-        )
-
-        st.divider()
-
-        
-        st.divider()
-
-        # ==========================================
-        # TODAY'S BETTING OPPORTUNITIES
-        # ==========================================
-
-        st.subheader("Today's Betting Opportunities")
-
-        st.info(
-            f"Selected sport: {sport}\n\n"
-            f"Selected betting market: {market}"
-        )
-
-        # ------------------------------------------
-        # CONNECT NFL PLAYER PROP FORECASTS
-        # ------------------------------------------
-
-        dashboard_market_map = {
-            "Player Passing Yards": "Passing yards",
-            "Player Rushing Yards": "Rushing yards",
-            "Player Receiving Yards": "Receiving yards",
-            "Player Receptions": "Receptions",
-            "Player Passing Touchdowns": "Passing touchdowns",
-            "Player Anytime Touchdown": "Anytime touchdown",
-            "Player Rushing + Receiving Yards": "Rushing + receiving yards",
-            "Player Passing Completions": "Passing completions",
-            "Player Interceptions Thrown": "Interceptions thrown",
-        }
-
-        if sport == "NFL Football":
-
-            selected_prop_market = dashboard_market_map.get(
-                market
-            )
-
-            if selected_prop_market is None:
-                if market == "Game Winner":
-                    nfl_picks = (st.session_state.get("nfl_prediction_pipeline_result") or {}).get("predictions")
-                    if nfl_picks is not None and not pd.DataFrame(nfl_picks).empty:
-                        choices = pd.DataFrame(nfl_picks).to_dict("records")
-                        now = pd.Timestamp.now(tz="UTC")
-                        choices = [r for r in choices if pd.to_datetime(r.get("commence_time"), utc=True, errors="coerce") > now]
-                        if choices:
-                            selected_pick = st.selectbox("Choose an NFL winner to record", range(len(choices)),
-                                format_func=lambda i: f"{choices[i]['away_team']} @ {choices[i]['home_team']} — {choices[i]['predicted_team']}",
-                                key="nfl_winner_to_record")
-                            if st.button("Record this NFL bet", key="nfl_record_winner", type="primary"):
-                                pick = choices[selected_pick]
-                                st.session_state["bet_builder_mode"] = "Single"
-                                st.session_state["single_sport"] = "NFL"
-                                st.session_state["single_market"] = "Game Winner"
-                                st.session_state["single_team"] = pick["predicted_team"]
-                                st.session_state["single_player"] = ""
-                                st.session_state["single_description"] = f"{pick['predicted_team']} moneyline — {pick['away_team']} @ {pick['home_team']}"
-                                st.session_state["single_direction"] = "Moneyline"
-                                st.session_state["single_line"] = 0.0
-                                st.session_state["main_navigation"] = "🎟️ My Bets"
-                                st.rerun()
-                        else:
-                            st.info("Generate NFL predictions above to get upcoming game winners.")
-                    else:
-                        st.info("Generate NFL predictions above to view game winners, then record your bet here or in My Bets.")
-                else:
-                    st.info("Record this market through My Bets. Player forecasts are available for the listed NFL prop markets.")
-                if st.button("Open NFL bet entry", key="nfl_open_bet_entry"):
-                    st.session_state["single_sport"] = "NFL"
-                    st.session_state["main_navigation"] = "🎟️ My Bets"
-                    st.rerun()
-
-            else:
-
-                # Retrieve forecasts generated by
-                # NFL Player Props Research.
-
-                saved_forecasts = st.session_state.get(
-                    "nfl_dashboard_forecasts",
-                    {}
-                )
-
-                matching_forecasts = []
-
-                for forecast in saved_forecasts.values():
-
-                    if (
-                        forecast.get("market")
-                        == selected_prop_market
-                    ):
-
-                        matching_forecasts.append(
-                            forecast
-                        )
-
-                # ----------------------------------
-                # DISPLAY AVAILABLE FORECASTS
-                # ----------------------------------
-
-                if not matching_forecasts:
-
-                    st.info(
-                        "No forecasts have been generated "
-                        "for this NFL player prop market. "
-                        "Open NFL Player Props Research, "
-                        "load the upcoming game and "
-                        "historical statistics, then "
-                        "generate a player forecast."
-                    )
-
-                else:
-
-                    st.success(
-                        f"{len(matching_forecasts)} "
-                        "player prop forecast(s) available."
-                    )
-
-                    # Display saved forecasts from highest estimated chance to lowest.
-                    matching_forecasts = sorted(
-                        matching_forecasts,
-                        key=lambda item: (float(item.get("estimated_chance",0)),item.get("generated_at","")),
-                        reverse=True,
-                    )
-
-                    for forecast_index, forecast in enumerate(matching_forecasts):
-
-                        player_name = forecast["player"]
-                        game_name = forecast["game"]
-                        prop_side = forecast["side"]
-                        prop_line = forecast["line"]
-
-                        projected = forecast[
-                            "projected_value"
-                        ]
-
-                        chance = forecast[
-                            "estimated_chance"
-                        ]
-
-                        difference = forecast[
-                            "projection_difference"
-                        ]
-
-                        sample_size = forecast[
-                            "sample_size"
-                        ]
-
-                        historical_hits = forecast[
-                            "historical_hits"
-                        ]
-
-                        eligible_games = forecast[
-                            "eligible_games"
-                        ]
-
-                        # --------------------------
-                        # PLAYER FORECAST CARD
-                        # --------------------------
-
-                        with st.container(border=True):
-
-                            st.markdown(
-                                f"### 🏈 {player_name}"
-                            )
-
-                            st.caption(game_name)
-
-                            st.write(
-                                f"**Market:** "
-                                f"{selected_prop_market}"
-                            )
-
-                            st.write(
-                                f"**Prop:** {prop_side} "
-                                f"{prop_line:g}"
-                            )
-
-                            # ----------------------
-                            # FORECAST METRICS
-                            # ----------------------
-
-                            c1, c2 = st.columns(2)
-
-                            c1.metric(
-                                "Projected Player Performance",
-                                f"{projected:.1f}"
-                            )
-
-                            c2.metric(
-                                "Sportsbook Line",
-                                f"{prop_line:g}"
-                            )
-
-                            c3, c4 = st.columns(2)
-
-                            c3.metric(
-                                "Chances Player Will Make the Prop",
-                                f"{chance:.1%}"
-                            )
-
-                            c4.metric(
-                                "Projection vs. Line",
-                                f"{difference:+.1f}"
-                            )
-
-                            st.progress(
-                                max(
-                                    0.0,
-                                    min(1.0, chance)
-                                )
-                            )
-
-                            # ----------------------
-                            # HISTORICAL SUPPORT
-                            # ----------------------
-
-                            st.caption(
-                                f"Historical sample: "
-                                f"{sample_size} games | "
-                                f"Historical hits: "
-                                f"{historical_hits}/"
-                                f"{eligible_games}"
-                            )
-
-                            st.caption(
-                                "The displayed chance is "
-                                "a preliminary estimate "
-                                "based on historical hit "
-                                "frequency. It is not a "
-                                "calibrated probability "
-                                "or a guaranteed outcome."
-                            )
-
-                            st.caption(
-                                "Forecast generated: "
-                                f"{forecast['generated_at']}"
-                            )
-                            if st.button("Record this player prop", key=f"nfl_record_prop_{forecast_index}"):
-                                st.session_state["bet_builder_mode"] = "Single"
-                                st.session_state["single_sport"] = "NFL"
-                                st.session_state["single_market"] = {"Passing yards": "Passing Yards", "Rushing yards": "Rushing Yards",
-                                    "Receiving yards": "Receiving Yards", "Receptions": "Receptions",
-                                    "Anytime touchdown": "Anytime Touchdown"}.get(selected_prop_market, "Other")
-                                st.session_state["single_player"] = player_name
-                                st.session_state["single_team"] = ""
-                                st.session_state["single_description"] = f"{player_name} {prop_side} {prop_line:g} {selected_prop_market} — {game_name}"
-                                st.session_state["single_direction"] = prop_side if prop_side in ["Over", "Under", "Yes", "No"] else "Other"
-                                st.session_state["single_line"] = float(prop_line)
-                                st.session_state["main_navigation"] = "🎟️ My Bets"
-                                st.rerun()
-
-
-        else:
-
-            st.info(
-                "NFL player prop forecasts are "
-                "currently available through "
-                "this dashboard connection. "
-                "Other sports will be connected "
-                "separately."
-            )
-
-    # The NFL My Bets tab renders the shared bet builder below.
-
-    if show_performance:
-        st.subheader("Model Performance")
-        st.info("Open Performance in the sidebar for recorded betting results. Model validation remains in Research Lab.")
-        if st.button("Open Performance", key="sports_open_performance"):
-            st.session_state["main_navigation"] = "📊 Performance"
-            st.rerun()
-
-if page == "🏠 Home":
-    st.divider()
-    render_mlb_prediction_center("mlb_home")
-    render_mlb_update_notice("mlb_home")
-
-if page == "📈 Stocks":
-    from dual_agent.stock_opportunities_ui import render_stock_opportunities
-    render_stock_opportunities()
-
-
-if page == "🏀 NBA":
-    with st.expander("Advanced NBA matchup tools", expanded=False):
-
-        # ============================================
-        # NBA PREDICTION CENTER
-        # ============================================
-
-        if page == "🏀 NBA":
-
-            st.divider()
-            st.subheader("🏀 NBA Prediction Center")
-
-            st.caption(
-                "NBA game predictions, sportsbook comparison, "
-                "and potential wager payouts."
-            )
-
-            NBA_TEAMS = [
-            "Atlanta Hawks",
-            "Boston Celtics",
-            "Brooklyn Nets",
-            "Charlotte Hornets",
-            "Chicago Bulls",
-            "Cleveland Cavaliers",
-            "Dallas Mavericks",
-            "Denver Nuggets",
-            "Detroit Pistons",
-            "Golden State Warriors",
-            "Houston Rockets",
-            "Indiana Pacers",
-            "Los Angeles Clippers",
-            "Los Angeles Lakers",
-            "Memphis Grizzlies",
-            "Miami Heat",
-            "Milwaukee Bucks",
-            "Minnesota Timberwolves",
-            "New Orleans Pelicans",
-            "New York Knicks",
-            "Oklahoma City Thunder",
-            "Orlando Magic",
-            "Philadelphia 76ers",
-            "Phoenix Suns",
-            "Portland Trail Blazers",
-            "Sacramento Kings",
-            "San Antonio Spurs",
-            "Toronto Raptors",
-            "Utah Jazz",
-            "Washington Wizards",
-        ]
-
-        nba_home = st.selectbox(
-            "Home Team",
-            NBA_TEAMS,
-            index=None,
-            placeholder="Select the home team",
-            key="nba_home_team",
-        )
-
-        nba_away = st.selectbox(
-            "Away Team",
-            NBA_TEAMS,
-            index=None,
-            placeholder="Select the away team",
-            key="nba_away_team",
-        )
-
-        if nba_home and nba_away:
-            if nba_home == nba_away:
-                st.error(
-                    "The home and away teams must be different."
-                )
-            else:
-                st.info(
-                    f"Selected Matchup: {nba_away} at {nba_home}"
-                )
-
-        nba_wager = st.number_input(
-            "Wager Amount ($)",
-            min_value=1.0,
-            value=100.0,
-            step=10.0,
-            key="nba_wager"
-        )
-
-        nba_odds = st.number_input(
-            "American Odds",
-            value=-110,
-            step=5,
-            key="nba_odds"
-        )
-
-    
-    
-        # ==========================================
-        # NBA GAME DATE
-        # ==========================================
-
-        nba_game_date = st.date_input(
-            "NBA Game Date",
-            value="today",
-            key="nba_game_date",
-        )
-
-        # ==========================================
-        # HISTORICAL NBA DATA
-        # ==========================================
-
-        @st.cache_data(ttl=86400, show_spinner=False)
-        def load_nba_prediction_history(seasons):
-
-            games, summary, requests = (
-                get_multiple_historical_seasons(
-                    list(seasons)
-                )
-            )
-
-            return games
-
-        # ==========================================
-        # GENERATE NBA PREDICTION
-        # ==========================================
-
-        if st.button(
-            "Generate NBA Prediction",
-            key="generate_nba_prediction",
-        ):
-
-            if not nba_home or not nba_away:
-
-                st.warning(
-                    "Please select both NBA teams."
-                )
-
-            elif nba_home == nba_away:
-
-                st.warning(
-                    "Home and away teams must be different."
-                )
-
-            elif abs(nba_odds) < 100:
-
-                st.warning(
-                    "Enter valid American odds, "
-                    "such as -110 or +150."
-                )
-
-            else:
-
-                try:
-
-                    with st.spinner(
-                        "Loading NBA history and "
-                        "generating your prediction..."
-                    ):
-
-                        # ----------------------------------
-                        # 1. Convert NBA team names
-                        # ----------------------------------
-
-                        home_code = (
-                            normalize_nba_team_name(
-                                nba_home
-                            )
-                        )
-
-                        away_code = (
-                            normalize_nba_team_name(
-                                nba_away
-                            )
-                        )
-
-                        if not home_code or not away_code:
-                            raise ValueError(
-                                "Unable to identify one "
-                                "of the selected NBA teams."
-                            )
-
-                        # ----------------------------------
-                        # 2. Load historical NBA games
-                        # ----------------------------------
-
-                        game_year = nba_game_date.year
-
-                        # NBA seasons cross calendar years.
-                        # September-December belongs to
-                        # the season starting that year.
-
-                        season_year = (
-                            game_year
-                            if nba_game_date.month >= 9
-                            else game_year - 1
-                        )
-
-                        seasons = tuple(
-                            range(
-                                season_year - 3,
-                                season_year + 1,
-                            )
-                        )
-
-                        historical_games = (
-                            load_nba_prediction_history(
-                                seasons
-                            )
-                        )
-
-                        # ----------------------------------
-                        # 3. Exclude games on or after
-                        #    the selected prediction date
-                        # ----------------------------------
-
-                        historical_games = (
-                            historical_games[
-                                pd.to_datetime(
-                                    historical_games[
-                                        "game_date"
-                                    ]
-                                )
-                                < pd.Timestamp(
-                                    nba_game_date
-                                )
-                            ].copy()
-                        )
-
-                        if historical_games.empty:
-                            raise ValueError(
-                                "No historical NBA games "
-                                "were available before "
-                                "the selected date."
-                            )
-
-                        # ----------------------------------
-                        # 4. Prepare historical data
-                        # ----------------------------------
-
-                        prepared_games = (
-                            prepare_balldontlie_games_for_research(
-                                historical_games
-                            )
-                        )
-
-                        feature_games = (
-                            build_balldontlie_pregame_features(
-                                prepared_games
-                            )
-                        )
-
-                        # ----------------------------------
-                        # 5. Build future matchup features
-                        # ----------------------------------
-
-                        matchup_features = (
-                            build_balldontlie_future_matchup_features(
-                                prepared_games,
-                                home_code,
-                                away_code,
-                                nba_game_date,
-                            )
-                        )
-
-                        # ----------------------------------
-                        # 6. Run the actual NBA model
-                        # ----------------------------------
-
-                        prediction = (
-                            predict_balldontlie_matchup(
-                                feature_games,
-                                matchup_features,
-                            )
-                        )
-
-                    # ==================================
-                    # DISPLAY NBA PREDICTION RESULTS
-                    # ==================================
-
-                    st.success(
-                        "NBA prediction generated successfully!"
-                    )
-
-                    st.subheader(
-                        f"{nba_away} at {nba_home}"
-                    )
-
-                    st.caption(
-                        f"Game date: {nba_game_date}"
-                    )
-
-                    home_probability = prediction[
-                        "home_win_probability"
-                    ]
-
-                    away_probability = prediction[
-                        "away_win_probability"
-                    ]
-
-                    predicted_side = prediction[
-                        "predicted_side"
-                    ]
-
-                    predicted_team = (
-                        nba_home
-                        if predicted_side == "HOME"
-                        else nba_away
-                    )
-
-                    st.markdown(
-                        "### Model Prediction"
-                    )
-
-                    st.write(
-                        f"**Predicted winner: "
-                        f"{predicted_team}**"
-                    )
-
-                    col1, col2 = st.columns(2)
-
-                    with col1:
-
-                        st.metric(
-                            nba_home,
-                            f"{home_probability:.1%}",
-                        )
-
-                    with col2:
-
-                        st.metric(
-                            nba_away,
-                            f"{away_probability:.1%}",
-                        )
-
-                    st.metric(
-                        "Model Confidence",
-                        f"{prediction['confidence']:.1%}",
-                    )
-
-                    st.caption(
-                        "Model confidence is an estimated "
-                        "probability, not a verified "
-                        "historical win rate."
-                    )
-
-                    st.write(
-                        "Historical training games:",
-                        prediction["training_games"],
-                    )
-
-                    # ==================================
-                    # SPORTSBOOK COMPARISON
-                    # ==================================
-
-                    st.divider()
-
-                    st.subheader(
-                        "Sportsbook Comparison"
-                    )
-
-                    betting_side = st.selectbox(
-                        "Which team do these odds apply to?",
-                        [nba_home, nba_away],
-                        key="nba_betting_side",
-                    )
-
-                    selected_probability = (
-                        home_probability
-                        if betting_side == nba_home
-                        else away_probability
-                    )
-
-                    if nba_odds > 0:
-
-                        implied_probability = (
-                            100 / (nba_odds + 100)
-                        )
-
-                        potential_profit = (
-                            nba_wager * nba_odds / 100
-                        )
-
-                    else:
-
-                        implied_probability = (
-                            abs(nba_odds)
-                            / (abs(nba_odds) + 100)
-                        )
-
-                        potential_profit = (
-                            nba_wager
-                            * 100 / abs(nba_odds)
-                        )
-
-                    estimated_edge = (
-                        selected_probability
-                        - implied_probability
-                    )
-
-                    total_payout = (
-                        nba_wager + potential_profit
-                    )
-
-                    col1, col2 = st.columns(2)
-
-                    with col1:
-
-                        st.metric(
-                            "Model Win Probability",
-                            f"{selected_probability:.1%}",
-                        )
-
-                    with col2:
-
-                        st.metric(
-                            "Sportsbook Implied Probability",
-                            f"{implied_probability:.1%}",
-                        )
-
-                    st.metric(
-                        "Model vs. Sportsbook Difference",
-                        f"{estimated_edge:+.1%}",
-                    )
-
-                    st.caption(
-                        "This difference compares the "
-                        "model estimate with the implied "
-                        "probability of the entered odds. "
-                        "It is not a validated betting edge."
-                    )
-
-                    # ==================================
-                    # POTENTIAL PAYOUT
-                    # ==================================
-
-                    st.divider()
-
-                    st.subheader(
-                        "Potential Wager Payout"
-                    )
-
-                    col1, col2, col3 = st.columns(3)
-
-                    with col1:
-
-                        st.metric(
-                            "Wager",
-                            f"${nba_wager:,.2f}",
-                        )
-
-                    with col2:
-
-                        st.metric(
-                            "Potential Profit",
-                            f"${potential_profit:,.2f}",
-                        )
-
-                    with col3:
-
-                        st.metric(
-                            "Total Payout",
-                            f"${total_payout:,.2f}",
-                        )
-
-                    st.caption(
-                        "Total payout includes your "
-                        "original wager. This assumes "
-                        "the selected bet wins."
-                    )
-
-                    st.warning(
-                        "Model validation status: "
-                        "Not verified for live betting. "
-                        "Review out-of-sample accuracy "
-                        "and calibration before relying "
-                        "on these probabilities."
-                    )
-
-                except Exception as e:
-
-                    st.error(
-                        "NBA prediction could not be generated."
-                    )
-
-                    st.error(
-                        f"Error details: {e}"
-                    )
-
-    
-        # ==========================================
-        # NBA LIVE MODEL HISTORICAL VALIDATION
-        # ==========================================
-
-        st.divider()
-        st.subheader("🏀 NBA Live Model Validation")
-
-        st.caption(
-            "Test the NBA prediction model against "
-            "completed historical games."
-        )
-
-    
-        nba_test_count = st.selectbox(
-            "Number of historical games to test",
-            options=[25, 50, 100, 250, 500, 1000],
-            index=4,
-            key="nba_live_validation_count",
-        )
-
-        if st.button(
-            "Run NBA Live Model Validation",
-            key="run_nba_live_validation",
-        ):
-
-            try:
-                from dual_agent import nba_research
-
-                if not hasattr(
-                    nba_research,
-                    "validate_live_nba_model",
-                ):
-                    st.error(
-                        "The live-model validation function "
-                        "is missing from nba_research.py. "
-                        "Confirm it is committed to main."
-                    )
-
-                else:
-                    with st.spinner(
-                        "Loading NBA history and "
-                        "running historical validation..."
-                    ):
-
-                        current_year = pd.Timestamp.now().year
-
-                        seasons = tuple(
-                            range(
-                                current_year - 4,
-                                current_year + 1,
-                            )
-                        )
-
-                        historical_games = (
-                            load_nba_prediction_history(
-                                seasons
-                            )
-                        )
-
-                        prepared_games = (
-                            prepare_balldontlie_games_for_research(
-                                historical_games
-                            )
-                        )
-
-                        feature_games = (
-                            build_balldontlie_pregame_features(
-                                prepared_games
-                            )
-                        )
-
-                        results = (
-                            nba_research.validate_live_nba_model(
-                                historical_games=prepared_games,
-                                feature_games=feature_games,
-                                minimum_training_games=500,
-                                test_games=nba_test_count,
-                            )
-                        )
-
-                        st.session_state[
-                            "nba_live_validation_results"
-                        ] = results
-
-                    st.success(
-                        "NBA historical validation completed!"
-                    )
-
-            except Exception as validation_error:
-
-                st.error(
-                    "NBA historical validation failed."
-                )
-
-                st.exception(validation_error)
-
-        # ==========================================
-        # DISPLAY HISTORICAL VALIDATION RESULTS
-        # ==========================================
-
-        if (
-            "nba_live_validation_results"
-            in st.session_state
-        ):
-
-            results = st.session_state[
-                "nba_live_validation_results"
-            ]
-
-            st.subheader("Historical Model Performance")
-
-            col1, col2, col3 = st.columns(3)
-
-            with col1:
-                st.metric(
-                    "Games Tested",
-                    results["games_tested"],
-                )
-
-            with col2:
-                st.metric(
-                    "Prediction Accuracy",
-                    f'{results["accuracy"]:.1%}',
-                )
-
-            with col3:
-                st.metric(
-                    "Brier Score",
-                    f'{results["brier_score"]:.4f}',
-                )
-
-            st.metric(
-                "Log Loss",
-                f'{results["log_loss"]:.4f}',
-            )
-
-            st.metric(
-                "Games Skipped",
-                results["games_skipped"],
-            )
-
-            st.subheader("Accuracy by Confidence Range")
-
-            st.dataframe(
-                results["confidence"],
-                use_container_width=True,
-                hide_index=True,
-            )
-
-            with st.expander(
-                "View Individual Historical Predictions"
-            ):
-
-        
-                # ==========================================
-                # NBA PICK CONFIDENCE ANALYSIS
-                # ==========================================
-    
-                st.subheader("🏀 NBA Pick Confidence Analysis")
-    
-                try:
-                    from dual_agent.nba_research import (
-                        analyze_nba_pick_confidence,
-                    )
-    
-                    historical_predictions = results["predictions"]
-    
-                    confidence_results = analyze_nba_pick_confidence(
-                        historical_predictions
-                    )
-    
-                    st.dataframe(
-                        confidence_results,
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-    
-                except Exception as confidence_error:
-                    st.warning(
-                        "NBA confidence analysis could not run."
-                    )
-                    st.exception(confidence_error)
-
-            
-                st.dataframe(
-                    results["predictions"],
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-            with st.expander(
-                "View Skipped Games"
-            ):
-                st.dataframe(
-                    results["skipped_games"],
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-        # ==========================================
-        # END NBA LIVE MODEL VALIDATION
-        # ==========================================
-
-
-elif page == "🎟️ My Bets" or (page == "🏈 NFL" and show_bets):
-
-    st.title("My Bets")
-    st.write(
-        "Record your wagers, track wins and losses, "
-        "and monitor your betting performance."
-    )
-
-    st.divider()
-
-        # ==========================================
-    # AUTOMATIC BET SETTLEMENT
-    # ==========================================
-
-    st.subheader("Automatic Results")
-
-    st.caption(
-        "Check completed NFL, NBA, MLB, and College Football "
-        "games and automatically settle eligible pending bets."
-    )
-
-    if st.button(
-        "🔄 Check Results",
-        key="check_bet_results",
-        use_container_width=True,
-    ):
-
-        with st.spinner(
-            "Checking completed games..."
-        ):
-
-            settlement_bets = get_all_bets()
-
-            # Support either the direct-list return style
-            # or the (success, result) return style.
-            if (
-                isinstance(settlement_bets, tuple)
-                and len(settlement_bets) == 2
-            ):
-                bets_success, settlement_bets = settlement_bets
-
-                if not bets_success:
-                    settlement_bets = []
-
-            if settlement_bets is None:
-                settlement_bets = []
-
-            settlement_report = auto_settle_bets(
-                settlement_bets
-            )
-
-        settled_count = settlement_report.get(
-            "settled",
-            0,
-        )
-
-        checked_count = settlement_report.get(
-            "checked",
-            0,
-        )
-
-        skipped_count = settlement_report.get(
-            "skipped",
-            0,
-        )
-
-        if settled_count > 0:
-
-            st.success(
-                f"Settled {settled_count} bet"
-                f"{'' if settled_count == 1 else 's'}."
-            )
-
-            for update in settlement_report.get(
-                "updated",
-                [],
-            ):
-
-                result = update.get(
-                    "result",
-                    ""
-                )
-
-                description = update.get(
-                    "description",
-                    "Bet"
-                )
-
-                profit_loss = float(
-                    update.get(
-                        "profit_loss",
-                        0,
-                    )
-                )
-
-                if result == "Won":
-                    icon = "✅"
-
-                elif result == "Lost":
-                    icon = "❌"
-
-                else:
-                    icon = "➖"
-
-                st.write(
-                    f"{icon} **{description}** — "
-                    f"{result} "
-                    f"(${profit_loss:+,.2f})"
-                )
-
-        else:
-
-            st.info(
-                "No eligible bets were ready "
-                "to settle."
-            )
-
-        st.caption(
-            f"Checked: {checked_count} • "
-            f"Skipped/unsupported: {skipped_count}"
-        )
-
-        # --------------------------------------
-        # API USAGE
-        # --------------------------------------
-
-        quota = settlement_report.get(
-            "quota",
-            {},
-        )
-
-        if quota:
-
-            with st.expander(
-                "API usage"
-            ):
-
-                for sport, usage in quota.items():
-
-                    remaining = usage.get(
-                        "remaining",
-                        "—",
-                    )
-
-                    used = usage.get(
-                        "used",
-                        "—",
-                    )
-
-                    last = usage.get(
-                        "last",
-                        "—",
-                    )
-
-                    st.write(
-                        f"**{sport}** — "
-                        f"Used: {used} | "
-                        f"Remaining: {remaining} | "
-                        f"Last request: {last}"
-                    )
-
-        # --------------------------------------
-        # ERRORS
-        # --------------------------------------
-
-        errors = settlement_report.get(
-            "errors",
-            [],
-        )
-
-        if errors:
-
-            with st.expander(
-                "Settlement warnings"
-            ):
-
-                for error in errors:
-                    st.warning(error)
-
-
-    st.subheader("Record a New Bet")
-
-    # ==========================================
-    # BET BUILDER STATE
-    # ==========================================
-
-    if "parlay_leg_count" not in st.session_state:
-        st.session_state["parlay_leg_count"] = 2
-
-    bet_mode = st.segmented_control(
-        "Bet Type",
-        options=[
-            "Single",
-            "Parlay",
-        ],
-        default="Single",
-        key="bet_builder_mode",
-    )
-
-    # ==========================================
-    # SINGLE BET
-    # ==========================================
-
-    if bet_mode == "Single":
-
-        with st.form("single_bet_form"):
-
-            sport = st.selectbox(
-                "Sport",
-                [
-                    "NFL",
-                    "NBA",
-                    "College Football",
-                    "MLB",
-                    "Other",
-                ],
-                key="single_sport",
-            )
-
-            betting_market = st.selectbox(
-                "Betting Market",
-                [
-                    "Game Winner",
-                    "Spread",
-                    "Game Total",
-                    "Player Points",
-                    "Player Rebounds",
-                    "Player Assists",
-                    "Passing Yards",
-                    "Rushing Yards",
-                    "Receiving Yards",
-                    "Receptions",
-                    "Anytime Touchdown",
-                    "Three-Pointers",
-                    "Other",
-                ],
-                key="single_market",
-            )
-
-            col1, col2 = st.columns(2)
-
-            with col1:
-                player_name = st.text_input(
-                    "Player Name (optional)",
-                    key="single_player",
-                )
-
-            with col2:
-                team_name = st.text_input(
-                    "Team Name (optional)",
-                    key="single_team",
-                )
-
-            bet_description = st.text_input(
-                "Describe Your Bet",
-                placeholder="Example: Ravens moneyline",
-                key="single_description",
-            )
-
-            col1, col2 = st.columns(2)
-
-            with col1:
-                bet_type = st.selectbox(
-                    "Bet Direction",
-                    [
-                        "Over",
-                        "Under",
-                        "Moneyline",
-                        "Spread",
-                        "Yes",
-                        "No",
-                        "Other",
-                    ],
-                    key="single_direction",
-                )
-
-            with col2:
-                betting_line = st.number_input(
-                    "Betting Line",
-                    value=0.0,
-                    step=0.5,
-                    key="single_line",
-                )
-
-            col1, col2 = st.columns(2)
-
-            with col1:
-                odds = st.number_input(
-                    "American Odds",
-                    value=-110,
-                    step=1,
-                    key="single_odds",
-                )
-
-            with col2:
-                wager = st.number_input(
-                    "Amount Wagered ($)",
-                    min_value=0.01,
-                    value=10.00,
-                    step=1.00,
-                    key="single_wager",
-                )
-
-            sportsbook = st.text_input(
-                "Sportsbook (optional)",
-                key="single_sportsbook",
-            )
-
-            notes = st.text_area(
-                "Notes (optional)",
-                key="single_notes",
-            )
-
-            submitted = st.form_submit_button(
-                "Save Single Bet",
-                type="primary",
-                use_container_width=True,
-            )
-
-        if submitted:
-
-            if not bet_description.strip():
-
-                st.error(
-                    "Please enter a description of your bet."
-                )
-
-            elif abs(odds) < 100:
-
-                st.error(
-                    "Enter valid American odds, "
-                    "such as -110 or +150."
-                )
-
-            else:
-
-                bet_data = {
-                    "sport": sport,
-                    "betting_market": betting_market,
-                    "player_name": player_name,
-                    "team_name": team_name,
-                    "bet_description": bet_description,
-                    "bet_type": bet_type,
-                    "betting_line": betting_line,
-                    "odds": odds,
-                    "wager": wager,
-                    "status": "Pending",
-                    "profit_loss": 0,
-                    "sportsbook": sportsbook,
-                    "strategy": betting_market,
-                    "notes": notes,
-                    "source": "Manual",
-                }
-
-                success, result = save_bet(
-                    bet_data
-                )
-
-                if success:
-
-                    st.success(
-                        "Your bet was saved successfully!"
-                    )
-
-                else:
-
-                    st.error(
-                        "Unable to save your bet."
-                    )
-
-    # ==========================================
-    # PARLAY BET BUILDER
-    # ==========================================
-
-    else:
-
-        st.markdown("### 🎟️ Parlay Builder")
-
-        st.caption(
-            "Add each selection as a separate leg. "
-            "The entire parlay will be saved as one ticket."
-        )
-
-        # --------------------------------------
-        # ADD / REMOVE LEG CONTROLS
-        # --------------------------------------
-
-        control_col1, control_col2, control_col3 = st.columns(
-            [1, 1, 3]
-        )
-
-        with control_col1:
-
-            if st.button(
-                "＋ Add Leg",
-                key="add_parlay_leg",
-                use_container_width=True,
-            ):
-
-                st.session_state["parlay_leg_count"] += 1
-                st.rerun()
-
-        with control_col2:
-
-            if (
-                st.session_state["parlay_leg_count"] > 2
-                and st.button(
-                    "− Remove Leg",
-                    key="remove_parlay_leg",
-                    use_container_width=True,
-                )
-            ):
-
-                st.session_state["parlay_leg_count"] -= 1
-                st.rerun()
-
-        st.divider()
-
-        # --------------------------------------
-        # PARLAY LEGS
-        # --------------------------------------
-
-        parlay_legs = []
-
-        for leg_index in range(
-            st.session_state["parlay_leg_count"]
-        ):
-
-            leg_number = leg_index + 1
-
-            with st.container(border=True):
-
-                st.markdown(f"#### LEG {leg_number}")
-
-                # ------------------------------
-                # SPORT + MARKET
-                # ------------------------------
-
-                col1, col2 = st.columns([1, 2])
-
-                with col1:
-                    leg_sport = st.selectbox(
-                        "Sport",
-                        [
-                            "NFL",
-                            "NBA",
-                            "College Football",
-                            "MLB",
-                            "Other",
-                        ],
-                        key=f"parlay_sport_{leg_index}",
-                    )
-
-                with col2:
-                    leg_market = st.selectbox(
-                        "Market",
-                        [
-                            "Game Winner",
-                            "Spread",
-                            "Game Total",
-                            "Player Points",
-                            "Player Rebounds",
-                            "Player Assists",
-                            "Passing Yards",
-                            "Rushing Yards",
-                            "Receiving Yards",
-                            "Receptions",
-                            "Anytime Touchdown",
-                            "Three-Pointers",
-                            "Other",
-                        ],
-                        key=f"parlay_market_{leg_index}",
-                    )
-
-                # ------------------------------
-                # GAME MARKETS
-                # ------------------------------
-
-                game_markets = [
-                    "Game Winner",
-                    "Spread",
-                    "Game Total",
-                ]
-
-                if leg_market in game_markets:
-
-                    if leg_market == "Game Total":
-
-                        col1, col2 = st.columns([2, 1])
-
-                        with col1:
-                            leg_team = st.text_input(
-                                "Matchup",
-                                placeholder="Example: Seahawks @ Cardinals",
-                                key=f"parlay_team_{leg_index}",
-                            )
-
-                        with col2:
-                            leg_direction = st.selectbox(
-                                "Pick",
-                                ["Over", "Under"],
-                                key=f"parlay_direction_{leg_index}",
-                            )
-
-                        leg_line = st.number_input(
-                            "Total",
-                            value=0.0,
-                            step=0.5,
-                            key=f"parlay_line_{leg_index}",
-                        )
-
-                        leg_player = ""
-
-                        leg_selection = (
-                            f"{leg_team} "
-                            f"{leg_direction} {leg_line:g}"
-                        ).strip()
-
-                    elif leg_market == "Spread":
-
-                        col1, col2 = st.columns([2, 1])
-
-                        with col1:
-                            leg_team = st.text_input(
-                                "Team",
-                                placeholder="Example: 49ers",
-                                key=f"parlay_team_{leg_index}",
-                            )
-
-                        with col2:
-                            leg_line = st.number_input(
-                                "Spread",
-                                value=0.0,
-                                step=0.5,
-                                key=f"parlay_line_{leg_index}",
-                            )
-
-                        leg_player = ""
-                        leg_direction = "Spread"
-
-                        if leg_team.strip():
-                            leg_selection = (
-                                f"{leg_team} {leg_line:+g}"
-                            )
-                        else:
-                            leg_selection = ""
-
-                    else:
-
-                        leg_team = st.text_input(
-                            "Team",
-                            placeholder="Example: Seahawks",
-                            key=f"parlay_team_{leg_index}",
-                        )
-
-                        leg_player = ""
-                        leg_direction = "Moneyline"
-                        leg_line = 0.0
-
-                        if leg_team.strip():
-                            leg_selection = (
-                                f"{leg_team} ML"
-                            )
-                        else:
-                            leg_selection = ""
-
-                # ------------------------------
-                # PLAYER PROP MARKETS
-                # ------------------------------
-
-                else:
-
-                    col1, col2 = st.columns([2, 1])
-
-                    with col1:
-                        leg_player = st.text_input(
-                            "Player",
-                            placeholder="Example: Jauan Jennings",
-                            key=f"parlay_player_{leg_index}",
-                        )
-
-                    with col2:
-                        leg_direction = st.selectbox(
-                            "Pick",
-                            [
-                                "Over",
-                                "Under",
-                                "Yes",
-                                "No",
-                            ],
-                            key=f"parlay_direction_{leg_index}",
-                        )
-
-                    leg_team = ""
-
-                    if leg_market == "Anytime Touchdown":
-
-                        leg_line = 0.0
-
-                        if leg_player.strip():
-                            leg_selection = (
-                                f"{leg_player} "
-                                f"Anytime TD — "
-                                f"{leg_direction.upper()}"
-                            )
-                        else:
-                            leg_selection = ""
-
-                    else:
-
-                        leg_line = st.number_input(
-                            "Line",
-                            value=0.0,
-                            step=0.5,
-                            key=f"parlay_line_{leg_index}",
-                        )
-
-                        if leg_player.strip():
-                            leg_selection = (
-                                f"{leg_player} "
-                                f"{leg_direction.upper()} "
-                                f"{leg_line:g} "
-                                f"{leg_market}"
-                            )
-                        else:
-                            leg_selection = ""
-
-                # ------------------------------
-                # TICKET PREVIEW
-                # ------------------------------
-
-                if leg_selection:
-
-                    st.caption(
-                        f"✓ {leg_selection}"
-                    )
-
-                parlay_legs.append(
-                    {
-                        "sport": leg_sport,
-                        "market": leg_market,
-                        "player": leg_player,
-                        "team": leg_team,
-                        "selection": leg_selection,
-                        "direction": leg_direction,
-                        "line": leg_line,
-                    }
-                )
-
-        # ======================================
-        # TICKET DETAILS
-        # ======================================
-
-        st.markdown("### Ticket Details")
-
-        col1, col2 = st.columns(2)
-
-        with col1:
-
-            parlay_odds = st.number_input(
-                "Combined American Odds",
-                value=200,
-                step=1,
-                key="parlay_combined_odds",
-            )
-
-        with col2:
-
-            parlay_wager = st.number_input(
-                "Amount Wagered ($)",
-                min_value=0.01,
-                value=10.00,
-                step=1.00,
-                key="parlay_wager",
-            )
-
-        parlay_sportsbook = st.text_input(
-            "Sportsbook (optional)",
-            key="parlay_sportsbook",
-        )
-
-        parlay_notes = st.text_area(
-            "Notes (optional)",
-            key="parlay_notes",
-        )
-
-        # --------------------------------------
-        # POTENTIAL PAYOUT
-        # --------------------------------------
-
-        if parlay_odds > 0:
-
-            potential_profit = (
-                parlay_wager
-                * parlay_odds
-                / 100
-            )
-
-        elif parlay_odds <= -100:
-
-            potential_profit = (
-                parlay_wager
-                * 100
-                / abs(parlay_odds)
-            )
-
-        else:
-
-            potential_profit = 0
-
-        potential_payout = (
-            parlay_wager
-            + potential_profit
-        )
-
-        metric_col1, metric_col2, metric_col3 = st.columns(3)
-
-        metric_col1.metric(
-            "Legs",
-            len(parlay_legs),
-        )
-
-        metric_col2.metric(
-            "Wager",
-            f"${parlay_wager:,.2f}",
-        )
-
-        metric_col3.metric(
-            "Potential Payout",
-            f"${potential_payout:,.2f}",
-        )
-
-        # ======================================
-        # SAVE PARLAY
-        # ======================================
-
-        if st.button(
-            "Save Parlay",
-            key="save_parlay_ticket",
-            type="primary",
-            use_container_width=True,
-        ):
-
-            valid_legs = [
-                leg
-                for leg in parlay_legs
-                if leg["selection"].strip()
-            ]
-
-            if len(valid_legs) < 2:
-
-                st.error(
-                    "A parlay must contain at least "
-                    "two completed legs."
-                )
-
-            elif abs(parlay_odds) < 100:
-
-                st.error(
-                    "Enter valid combined American odds, "
-                    "such as +250 or -110."
-                )
-
-            else:
-
-                # ----------------------------------
-                # Build readable ticket description.
-                #
-                # We intentionally use the existing
-                # bet record structure so no database
-                # changes are required.
-                # ----------------------------------
-
-                leg_descriptions = []
-
-                for index, leg in enumerate(
-                    valid_legs,
-                    start=1,
-                ):
-
-                    leg_descriptions.append(
-                        f"{index}. {leg['selection'].strip()}"
-                    )
-
-                parlay_description = " | ".join(
-                    leg_descriptions
-                )
-
-                sports = []
-
-                for leg in valid_legs:
-
-                    if leg["sport"] not in sports:
-                        sports.append(
-                            leg["sport"]
-                        )
-
-                if len(sports) == 1:
-                    parlay_sport = sports[0]
-                else:
-                    parlay_sport = "Multiple"
-
-                parlay_bet_data = {
-                    "sport": parlay_sport,
-                    "betting_market": "Parlay",
-                    "player_name": "",
-                    "team_name": "",
-                    "bet_description": parlay_description,
-                    "bet_type": "Parlay",
-                    "betting_line": 0,
-                    "odds": parlay_odds,
-                    "wager": parlay_wager,
-                    "status": "Pending",
-                    "profit_loss": 0,
-                    "sportsbook": parlay_sportsbook,
-                    "strategy": "Parlay",
-                    "notes": parlay_notes,
-                    "source": "Manual",
-                }
-
-                success, result = save_bet(
-                    parlay_bet_data
-                )
-
-                if success:
-
-                    st.success(
-                        f"Your {len(valid_legs)}-leg "
-                        "parlay was saved successfully!"
-                    )
-
-                else:
-
-                    st.error(
-                        "Unable to save your parlay."
-                    )
-    st.divider()
-
-    # -----------------------------------
-    # Betting history
-    # -----------------------------------
-
-    
-
-    # ---------------------------------
-    # Betting History and Full Payout
-    # ---------------------------------
-
-    st.subheader("Your Betting History")
-
-    bets = get_all_bets()
-
-    if not bets:
-        st.info("You haven't recorded any bets yet.")
-
-    else:
-        history = []
-
-        for bet in bets:
-
-            wager = float(bet.get("wager") or 0)
-            profit = float(bet.get("profit_loss") or 0)
-            status = bet.get("status", "Pending")
-
-            # Calculate total payout.
-            # A winning payout includes the original wager.
-
-            if status == "Won":
-                total_payout = round(
-                    wager + profit, 2
-                )
-
-            elif status == "Push":
-                total_payout = round(wager, 2)
-
-            elif status == "Lost":
-                total_payout = 0.0
-
-            else:
-                total_payout = None
-
-            # Build a readable betting history.
-
-            history.append({
-                "Bet ID": bet.get("id"),
-                "Sport": bet.get("sport"),
-                "Bet": bet.get("bet_description"),
-                "Market": bet.get("betting_market"),
-                "Odds": bet.get("odds"),
-                "Wager": round(wager, 2),
-                "Status": status,
-                "Profit / Loss": (
-                    round(profit, 2)
-                    if status != "Pending"
-                    else None
-                ),
-                "Total Payout": total_payout,
-            })
-
-        # Display complete betting history.
-
-        st.dataframe(
-            history,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Wager": st.column_config.NumberColumn(
-                    "Wager",
-                    format="$%.2f",
-                ),
-                "Profit / Loss": st.column_config.NumberColumn(
-                    "Profit / Loss",
-                    format="$%.2f",
-                ),
-                "Total Payout": st.column_config.NumberColumn(
-                    "Total Payout",
-                    format="$%.2f",
-                ),
-            },
-        )
-
-    st.divider()
-        # -----------------------------------
-        # Update bet results
-        # -----------------------------------
-
-
-    # ==========================================
-    # LOAD BETTING HISTORY
-    # ==========================================
-
-    bets = get_all_bets()
-
-    # ==========================================
-    # UPDATE A BET RESULT
-    # ==========================================
-
-    st.subheader("Update a Bet Result")
-
-    pending_bets = [
-        bet for bet in bets
-        if bet["status"] == "Pending"
-    ]
-
-    if pending_bets:
-
-        bet_options = {
-            (
-                f"#{bet['id']} - "
-                f"{bet['bet_description']}"
-            ): bet
-            for bet in pending_bets
-        }
-
-        selected_bet = st.selectbox(
-            "Select a Pending Bet",
-            list(bet_options.keys()),
-        )
-
-        selected_result = st.selectbox(
-            "What was the result?",
-            [
-                "Won",
-                "Lost",
-                "Push",
-            ],
-        )
-
-        if st.button("Save Bet Result"):
-
-            bet = bet_options[selected_bet]
-
-            wager_amount = float(
-                bet["wager"]
-            )
-
-            american_odds = int(
-                bet["odds"]
-            )
-
-            if selected_result == "Won":
-
-                if american_odds > 0:
-
-                    profit_loss = (
-                        wager_amount
-                        * american_odds / 100
-                    )
-
-                else:
-
-                    profit_loss = (
-                        wager_amount
-                        * 100 / abs(american_odds)
-                    )
-
-            elif selected_result == "Lost":
-
-                profit_loss = -wager_amount
-
-            else:
-
-                profit_loss = 0
-
-            success, result = update_bet_result(
-                bet["id"],
-                selected_result,
-                round(profit_loss, 2),
-            )
-
-            if success:
-
-                st.success(
-                    "Your betting result was updated!"
-                )
-
-                st.rerun()
-
-            else:
-
-                st.error(
-                    "Unable to update your bet."
-                )
-
-    else:
-
-        st.info(
-            "You have no pending bets to update."
-        )
-
-
-
-
-if page == "📊 Performance":
-    st.title("📊 Betting Performance")
-    st.caption("Recorded wager results, not model validation or future accuracy.")
-    try:
-        recorded_bets = get_all_bets() or []
-        settled = [b for b in recorded_bets if b.get("status") in ("Won", "Lost", "Push")]
-        decided = [b for b in settled if b.get("status") in ("Won", "Lost")]
-        wins = sum(b.get("status") == "Won" for b in decided)
-        pnl = sum(float(b.get("profit_loss") or 0) for b in settled)
-        pending = sum(b.get("status") == "Pending" for b in recorded_bets)
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Settled Bets", len(settled))
-        c2.metric("Win Rate (excludes pushes)", f"{wins / len(decided):.1%}" if decided else "—")
-        c3.metric("Realized Profit / Loss", f"${pnl:,.2f}")
-        c4.metric("Pending Bets", pending)
-        if recorded_bets:
-            st.dataframe(pd.DataFrame(recorded_bets), use_container_width=True, hide_index=True)
-        else:
-            st.info("No recorded bets yet. Use My Bets to add one.")
-    except Exception as e:
-        st.error(f"Could not load betting performance: {e}")
-
-
-if page == "📈 Stocks":
-    render_stock_connection()
-    with st.expander("Trade planning and existing five-day research tools", expanded=False):
-        render_trading_center(
-            latest_scan=latest_scan,
-            stock_decision=stock_decision,
-            universe=default,
-            clean_symbols=clean_symbols,
-            model=M,
-        )
-
-
-
-def render_research_lab():
-    if page == "🧪 Research Lab":
-        st.subheader("🧪 Research Lab - Optional Revalidation")
-
-        # ============================================================
-        # NFL V1 VS V2 MODEL BENCHMARK
-        # ============================================================
-
-        st.divider()
-
-        st.subheader("🏈 NFL V1 vs V2 Model Benchmark")
-
-        st.caption(
-            "Compare the current NFL winner model against the "
-            "expanded V2 model using the same leakage-safe "
-            "historical walk-forward validation."
-        )
-
-        st.info(
-            "This test does not replace the live NFL model. "
-            "V1 remains active while V2 is evaluated."
-        )
-
-        if st.button(
-            "Run NFL V1 vs V2 Benchmark",
-            key="run_nfl_v1_v2_benchmark",
-            type="primary",
-        ):
-
-            try:
-
-                feature_games = st.session_state.get(
-                    "nfl_feature_games"
-                )
-
-        
-                # ----------------------------------------------------
-                # BUILD HISTORICAL FEATURES IF THEY ARE NOT LOADED
-                # ----------------------------------------------------
-
-                if (
-                    feature_games is None
-                    or (
-                        hasattr(
-                            feature_games,
-                            "empty",
-                        )
-                        and feature_games.empty
-                    )
-                ):
-
-                    with st.spinner(
-                        "Loading NFL historical data..."
-                    ):
-
-                        season_ids = [
-                            "sr:season:115087",
-                            "sr:season:127985",
-                        ]
-
-                        multi_nfl = (
-                            get_multiple_nfl_seasons(
-                                season_ids
-                            )
-                        )
-
-                        historical_games = (
-                            multi_nfl["games"]
-                        )
-
-                        if (
-                            historical_games is None
-                            or historical_games.empty
-                        ):
-
-                            raise ValueError(
-                                "NFL historical download "
-                                "returned no games."
-                            )
-
-                        feature_games = (
-                            build_nfl_pregame_features(
-                                historical_games
-                            )
-                        )
-
-                        if feature_games.empty:
-
-                            raise ValueError(
-                                "NFL historical feature "
-                                "generation returned no data."
-                            )
-
-                        st.session_state[
-                            "nfl_feature_games"
-                        ] = feature_games
-
-                # ----------------------------------------------------
-                # RUN V1 VS V2
-                # ----------------------------------------------------
-
-                with st.spinner(
-                    "Running NFL V1 and V2 walk-forward "
-                    "validation..."
-                ):
-
-                    benchmark = compare_nfl_v1_v2(
-                        feature_games=feature_games,
-                        min_train_games=100,
-                        retrain_every=25,
-                    )
-
-                st.session_state[
-                    "nfl_v1_v2_benchmark"
-                ] = benchmark
-
-                st.success(
-                    "NFL V1 vs V2 benchmark completed."
-                )
-
-            except Exception as error:
-
-                st.error(
-                    "NFL V1 vs V2 benchmark failed."
-                )
-
-                st.exception(error)
-
-        # ============================================================
-        # DISPLAY SAVED BENCHMARK
-        # ============================================================
-
-        nfl_benchmark = st.session_state.get(
-            "nfl_v1_v2_benchmark"
-        )
-
-        if nfl_benchmark:
-
-            v1 = nfl_benchmark["v1"]
-            v2 = nfl_benchmark["v2"]
-
-            st.markdown(
-                "### 📊 Model Comparison"
-            )
-
-            # --------------------------------------------------------
-            # MODEL SUMMARY
-            # --------------------------------------------------------
-
-            (
-                v1_col,
-                v2_col,
-            ) = st.columns(2)
-
-            with v1_col:
-
-                st.markdown(
-                    "#### V1 — Current Model"
-                )
-
-                st.metric(
-                    "Accuracy",
-                    f"{v1['accuracy']:.1%}",
-                )
-
-                st.metric(
-                    "AUC",
-                    f"{v1['auc']:.3f}",
-                )
-
-                st.metric(
-                    "Brier Score",
-                    f"{v1['brier']:.3f}",
-                )
-
-                st.metric(
-                    "Log Loss",
-                    f"{v1['log_loss']:.3f}",
-                )
-
-                st.metric(
-                    "Features",
-                    len(
-                        v1["feature_columns"]
-                    ),
-                )
-
-                st.metric(
-                    "Predictions",
-                    v1["prediction_count"],
-                )
-
-            with v2_col:
-
-                st.markdown(
-                    "#### V2 — Expanded Model"
-                )
-
-                st.metric(
-                    "Accuracy",
-                    f"{v2['accuracy']:.1%}",
-                )
-
-                st.metric(
-                    "AUC",
-                    f"{v2['auc']:.3f}",
-                )
-
-                st.metric(
-                    "Brier Score",
-                    f"{v2['brier']:.3f}",
-                )
-
-                st.metric(
-                    "Log Loss",
-                    f"{v2['log_loss']:.3f}",
-                )
-
-                st.metric(
-                    "Features",
-                    len(
-                        v2["feature_columns"]
-                    ),
-                )
-
-                st.metric(
-                    "Predictions",
-                    v2["prediction_count"],
-                )
-
-            # --------------------------------------------------------
-            # CHANGE FROM V1 TO V2
-            # --------------------------------------------------------
-
-            st.markdown(
-                "### 🔬 V2 Change vs V1"
-            )
-
-            (
-                change_col1,
-                change_col2,
-                change_col3,
-                change_col4,
-            ) = st.columns(4)
-
-            accuracy_change = (
-                nfl_benchmark[
-                    "accuracy_change"
-                ]
-            )
-
-            auc_change = (
-                nfl_benchmark[
-                    "auc_change"
-                ]
-            )
-
-            brier_change = (
-                nfl_benchmark[
-                    "brier_change"
-                ]
-            )
-
-            log_loss_change = (
-                nfl_benchmark[
-                    "log_loss_change"
-                ]
-            )
-
-            change_col1.metric(
-                "Accuracy Change",
-                f"{accuracy_change:+.2%}",
-            )
-
-            if pd.notna(auc_change):
-
-                change_col2.metric(
-                    "AUC Change",
-                    f"{auc_change:+.3f}",
-                )
-
-            else:
-
-                change_col2.metric(
-                    "AUC Change",
-                    "—",
-                )
-
-            change_col3.metric(
-                "Brier Change",
-                f"{brier_change:+.3f}",
-            )
-
-            change_col4.metric(
-                "Log Loss Change",
-                f"{log_loss_change:+.3f}",
-            )
-
-            # --------------------------------------------------------
-            # HIGH CONFIDENCE PERFORMANCE
-            # --------------------------------------------------------
-
-            st.markdown(
-                "### 🔥 High-Confidence Performance"
-            )
-
-            (
-                confidence_col1,
-                confidence_col2,
-            ) = st.columns(2)
-
-            with confidence_col1:
-
-                st.markdown(
-                    "**V1**"
-                )
-
-                v1_high_count = (
-                    v1.get(
-                        "high_confidence_count",
-                        0,
-                    )
-                )
-
-                v1_high_accuracy = (
-                    v1.get(
-                        "high_confidence_accuracy"
-                    )
-                )
-
-                st.metric(
-                    "70%+ Predictions",
-                    v1_high_count,
-                )
-
-                if (
-                    v1_high_accuracy
-                    is not None
-                    and pd.notna(
-                        v1_high_accuracy
-                    )
-                ):
-
-                    st.metric(
-                        "70%+ Accuracy",
-                        f"{v1_high_accuracy:.1%}",
-                    )
-
-                else:
-
-                    st.metric(
-                        "70%+ Accuracy",
-                        "—",
-                    )
-
-            with confidence_col2:
-
-                st.markdown(
-                    "**V2**"
-                )
-
-                v2_high_count = (
-                    v2.get(
-                        "high_confidence_count",
-                        0,
-                    )
-                )
-
-                v2_high_accuracy = (
-                    v2.get(
-                        "high_confidence_accuracy"
-                    )
-                )
-
-                st.metric(
-                    "70%+ Predictions",
-                    v2_high_count,
-                )
-
-                if (
-                    v2_high_accuracy
-                    is not None
-                    and pd.notna(
-                        v2_high_accuracy
-                    )
-                ):
-
-                    st.metric(
-                        "70%+ Accuracy",
-                        f"{v2_high_accuracy:.1%}",
-                    )
-
-                else:
-
-                    st.metric(
-                        "70%+ Accuracy",
-                        "—",
-                    )
-
-            # --------------------------------------------------------
-            # FULL COMPARISON TABLE
-            # --------------------------------------------------------
-
-            comparison_df = (
-                nfl_benchmark[
-                    "comparison"
-                ].copy()
-            )
-
-            st.markdown(
-                "### 📋 Full Benchmark"
-            )
-
-            st.dataframe(
-                comparison_df,
-                use_container_width=True,
-                hide_index=True,
-            )
-
-            st.caption(
-                "Higher accuracy and AUC are better. "
-                "Lower Brier score and log loss are better. "
-                "V2 is experimental and has not replaced V1."
-            )
-
-                # ============================================================
-        # NFL PLAYER PROP V1 VS V2A BENCHMARK
-        # ============================================================
-
-        st.divider()
-
-        st.subheader(
-            "🏈 NFL Player Prop V1 vs V2A Benchmark"
-        )
-
-        st.caption(
-            "Leakage-safe historical comparison of the existing "
-            "mean player-prop projection against the experimental "
-            "V2A recency-weighted projection."
-        )
-
-        st.info(
-            "This benchmark does not change the live Player Prop "
-            "engine. Lower MAE and RMSE are better. Bias closer "
-            "to zero is better."
-        )
-
-        if st.button(
-            "Run NFL Player Prop V1 vs V2A Benchmark",
-            key="run_nfl_prop_v1_v2a_benchmark",
-            type="primary",
-        ):
-
-            try:
-
-                # ----------------------------------------------------
-                # LOAD PLAYER HISTORY
-                # ----------------------------------------------------
-
-                with st.spinner(
-                    "Loading historical NFL player data..."
-                ):
-
-                    current_nfl_season = pd.Timestamp.now().year
-
-                    prop_history = load_player_history(
-                        [
-                            current_nfl_season - 2,
-                            current_nfl_season - 1,
-                            current_nfl_season,
-                        ]
-                    )
-
-                if (
-                    prop_history is None
-                    or prop_history.empty
-                ):
-
-                    raise ValueError(
-                        "NFL player history returned no data."
-                    )
-
-                # ----------------------------------------------------
-                # RUN PAIRED WALK-FORWARD TEST
-                # ----------------------------------------------------
-
-                with st.spinner(
-                    "Running NFL player-prop V1 vs V2A "
-                    "walk-forward benchmark..."
-                ):
-
-                    prop_benchmark = (
-                        compare_v1_v2_walkforward(
-                            history=prop_history,
-                            window=12,
-                            min_games=6,
-                            decay=0.88,
-                        )
-                    )
-
-                if (
-                    prop_benchmark is None
-                    or prop_benchmark.get(
-                        "comparison"
-                    ) is None
-                    or prop_benchmark[
-                        "comparison"
-                    ].empty
-                ):
-
-                    raise ValueError(
-                        "Player-prop benchmark produced "
-                        "no comparison results."
-                    )
-
-                st.session_state[
-                    "nfl_prop_v1_v2a_benchmark"
-                ] = prop_benchmark
-
-                st.success(
-                    "NFL player-prop V1 vs V2A "
-                    "benchmark completed."
-                )
-
-            except Exception as error:
-
-                st.error(
-                    "NFL player-prop benchmark failed."
-                )
-
-                st.exception(
-                    error
-                )
-
-        # ============================================================
-        # DISPLAY SAVED PLAYER PROP BENCHMARK
-        # ============================================================
-
-        prop_benchmark = st.session_state.get(
-            "nfl_prop_v1_v2a_benchmark"
-        )
-
-        if prop_benchmark:
-
-            prop_v1 = prop_benchmark.get(
-                "v1"
-            )
-
-            prop_v2 = prop_benchmark.get(
-                "v2"
-            )
-
-            if (
-                prop_v1 is not None
-                and prop_v2 is not None
-            ):
-
-                st.markdown(
-                    "### 📊 Player Prop Projection Comparison"
-                )
-
-                (
-                    prop_v1_col,
-                    prop_v2_col,
-                ) = st.columns(2)
-
-                # ----------------------------------------------------
-                # V1
-                # ----------------------------------------------------
-
-                with prop_v1_col:
-
-                    st.markdown(
-                        "#### V1 — Mean Baseline"
-                    )
-
-                    st.metric(
-                        "Predictions",
-                        f"{prop_v1['prediction_count']:,}",
-                    )
-
-                    st.metric(
-                        "MAE",
-                        f"{prop_v1['mae']:.3f}",
-                    )
-
-                    st.metric(
-                        "RMSE",
-                        f"{prop_v1['rmse']:.3f}",
-                    )
-
-                    st.metric(
-                        "Bias",
-                        f"{prop_v1['bias']:+.3f}",
-                    )
-
-                # ----------------------------------------------------
-                # V2A
-                # ----------------------------------------------------
-
-                with prop_v2_col:
-
-                    st.markdown(
-                        "#### V2A — Recency Weighted"
-                    )
-
-                    st.metric(
-                        "Predictions",
-                        f"{prop_v2['prediction_count']:,}",
-                    )
-
-                    st.metric(
-                        "MAE",
-                        f"{prop_v2['mae']:.3f}",
-                    )
-
-                    st.metric(
-                        "RMSE",
-                        f"{prop_v2['rmse']:.3f}",
-                    )
-
-                    st.metric(
-                        "Bias",
-                        f"{prop_v2['bias']:+.3f}",
-                    )
-
-                # ----------------------------------------------------
-                # CHANGE
-                # ----------------------------------------------------
-
-                st.markdown(
-                    "### 🔬 V2A Change vs V1"
-                )
-
-                (
-                    prop_change_1,
-                    prop_change_2,
-                ) = st.columns(2)
-
-                prop_mae_change = (
-                    prop_benchmark.get(
-                        "mae_change"
-                    )
-                )
-
-                prop_rmse_change = (
-                    prop_benchmark.get(
-                        "rmse_change"
-                    )
-                )
-
-                if prop_mae_change is not None:
-
-                    prop_change_1.metric(
-                        "MAE Change",
-                        f"{prop_mae_change:+.3f}",
-                    )
-
-                else:
-
-                    prop_change_1.metric(
-                        "MAE Change",
-                        "—",
-                    )
-
-                if prop_rmse_change is not None:
-
-                    prop_change_2.metric(
-                        "RMSE Change",
-                        f"{prop_rmse_change:+.3f}",
-                    )
-
-                else:
-
-                    prop_change_2.metric(
-                        "RMSE Change",
-                        "—",
-                    )
-
-                # ----------------------------------------------------
-                # FULL OVERALL COMPARISON
-                # ----------------------------------------------------
-
-                st.markdown(
-                    "### 📋 Overall Benchmark"
-                )
-
-                prop_comparison_df = (
-                    prop_benchmark[
-                        "comparison"
-                    ].copy()
-                )
-
-                st.dataframe(
-                    prop_comparison_df,
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-                # ----------------------------------------------------
-                # MARKET-BY-MARKET ANALYSIS
-                # ----------------------------------------------------
-
-                paired_prop_predictions = (
-                    prop_benchmark.get(
-                        "paired_predictions"
-                    )
-                )
-
-                if (
-                    paired_prop_predictions
-                    is not None
-                    and not paired_prop_predictions.empty
-                ):
-
-                    market_rows = []
-
-                    for (
-                        prop_market,
-                        prop_market_df,
-                    ) in paired_prop_predictions.groupby(
-                        "market"
-                    ):
-
-                        v1_market_mae = (
-                            prop_market_df[
-                                "v1_absolute_error"
-                            ].mean()
-                        )
-
-                        v2_market_mae = (
-                            prop_market_df[
-                                "v2_absolute_error"
-                            ].mean()
-                        )
-
-                        v1_market_rmse = (
-                            np.sqrt(
-                                prop_market_df[
-                                    "v1_squared_error"
-                                ].mean()
-                            )
-                        )
-
-                        v2_market_rmse = (
-                            np.sqrt(
-                                prop_market_df[
-                                    "v2_squared_error"
-                                ].mean()
-                            )
-                        )
-
-                        v1_market_bias = (
-                            prop_market_df[
-                                "v1_error"
-                            ].mean()
-                        )
-
-                        v2_market_bias = (
-                            prop_market_df[
-                                "v2_error"
-                            ].mean()
-                        )
-
-                        market_rows.append(
-                            {
-                                "Market":
-                                    prop_market,
-
-                                "Predictions":
-                                    len(
-                                        prop_market_df
-                                    ),
-
-                                "V1 MAE":
-                                    round(
-                                        v1_market_mae,
-                                        3,
-                                    ),
-
-                                "V2A MAE":
-                                    round(
-                                        v2_market_mae,
-                                        3,
-                                    ),
-
-                                "MAE Change":
-                                    round(
-                                        v2_market_mae
-                                        - v1_market_mae,
-                                        3,
-                                    ),
-
-                                "V1 RMSE":
-                                    round(
-                                        v1_market_rmse,
-                                        3,
-                                    ),
-
-                                "V2A RMSE":
-                                    round(
-                                        v2_market_rmse,
-                                        3,
-                                    ),
-
-                                "RMSE Change":
-                                    round(
-                                        v2_market_rmse
-                                        - v1_market_rmse,
-                                        3,
-                                    ),
-
-                                "V1 Bias":
-                                    round(
-                                        v1_market_bias,
-                                        3,
-                                    ),
-
-                                "V2A Bias":
-                                    round(
-                                        v2_market_bias,
-                                        3,
-                                    ),
-                            }
-                        )
-
-                    market_comparison_df = (
-                        pd.DataFrame(
-                            market_rows
-                        )
-                    )
-
-                    if not market_comparison_df.empty:
-
-                        market_comparison_df = (
-                            market_comparison_df
-                            .sort_values(
-                                "MAE Change"
-                            )
-                            .reset_index(
-                                drop=True
-                            )
-                        )
-
-                        st.markdown(
-                            "### 🧬 Performance by Prop Market"
-                        )
-
-                        st.caption(
-                            "Negative MAE/RMSE change means "
-                            "V2A improved over V1 for that "
-                            "specific market."
-                        )
-
-                        st.dataframe(
-                            market_comparison_df,
-                            use_container_width=True,
-                            hide_index=True,
-                        )
-
-                        # --------------------------------------------
-                        # MARKET SUMMARY
-                        # --------------------------------------------
-
-                        improved_markets = (
-                            market_comparison_df[
-                                market_comparison_df[
-                                    "MAE Change"
-                                ] < 0
-                            ]
-                        )
-
-                        worse_markets = (
-                            market_comparison_df[
-                                market_comparison_df[
-                                    "MAE Change"
-                                ] > 0
-                            ]
-                        )
-
-                        (
-                            improved_col,
-                            worse_col,
-                        ) = st.columns(2)
-
-                        improved_col.metric(
-                            "Markets Improved",
-                            len(
-                                improved_markets
-                            ),
-                        )
-
-                        worse_col.metric(
-                            "Markets Worse",
-                            len(
-                                worse_markets
-                            ),
-                        )
-
-                st.caption(
-                    "This test evaluates statistical projection "
-                    "accuracy only. It does not yet measure "
-                    "historical sportsbook ROI because historical "
-                    "prop lines and prices are not currently part "
-                    "of the player-history dataset."
-                )
-
-# ==========================================
-# NFL PLAYER PROP V1 VS V2A VS V2B BENCHMARK
-# ==========================================
-
-if page == "🏈 NFL":
-    st.divider()
-
-    st.subheader(
-        "🏈 NFL Player Prop V1 vs V2A vs V2B Benchmark"
-    )
-
-    st.caption(
-        "Leakage-safe historical comparison of the mean baseline, "
-        "recency-weighted model, and opponent matchup-adjusted model."
-    )
-
-    st.info(
-        "V2B adds opponent defensive context to V2A. "
-        "Lower MAE and RMSE are better. "
-        "Bias closer to zero is better."
-    )
-
-    if st.button(
-        "Run NFL Player Prop V2B Benchmark",
-        key="run_nfl_prop_v2b_benchmark",
-    ):
-
-        with st.spinner(
-            "Running V1 vs V2A vs V2B walk-forward benchmark..."
-        ):
-
-            current_nfl_season = pd.Timestamp.now().year
-
-            prop_history_v2b = load_player_history(
-                [
-                    current_nfl_season - 2,
-                    current_nfl_season - 1,
-                    current_nfl_season,
-                ]
-            )
-
-            v2b_benchmark = (
-                compare_v1_v2a_v2b_walkforward(
-                    history=prop_history_v2b,
-                    window=12,
-                    min_games=6,
-                    decay=0.88,
-                )
-            )
-
-            st.session_state[
-                "nfl_prop_v2b_benchmark"
-            ] = v2b_benchmark
-
-            st.success(
-                "NFL Player Prop V2B benchmark completed."
-            )
-
-
-    v2b_benchmark = st.session_state.get(
-        "nfl_prop_v2b_benchmark"
-    )
-
-if page == "🏈 NFL" and st.session_state.get("nfl_prop_v2b_benchmark"):
-
-    v1 = v2b_benchmark.get("v1")
-    v2a = v2b_benchmark.get("v2a")
-    v2b = v2b_benchmark.get("v2b")
-
-    if (
-        v1 is not None
-        and v2a is not None
-        and v2b is not None
-    ):
-
-        st.subheader(
-            "📊 V1 vs V2A vs V2B"
-        )
-
-        col1, col2, col3 = st.columns(3)
-
-        with col1:
-
-            st.markdown(
-                "### V1 — Mean Baseline"
-            )
-
-            st.metric(
-                "Predictions",
-                f"{v1['prediction_count']:,}",
-            )
-
-            st.metric(
-                "MAE",
-                f"{v1['mae']:.3f}",
-            )
-
-            st.metric(
-                "RMSE",
-                f"{v1['rmse']:.3f}",
-            )
-
-            st.metric(
-                "Bias",
-                f"{v1['bias']:+.3f}",
-            )
-
-        with col2:
-
-            st.markdown(
-                "### V2A — Recency Weighted"
-            )
-
-            st.metric(
-                "Predictions",
-                f"{v2a['prediction_count']:,}",
-            )
-
-            st.metric(
-                "MAE",
-                f"{v2a['mae']:.3f}",
-            )
-
-            st.metric(
-                "RMSE",
-                f"{v2a['rmse']:.3f}",
-            )
-
-            st.metric(
-                "Bias",
-                f"{v2a['bias']:+.3f}",
-            )
-
-        with col3:
-
-            st.markdown(
-                "### V2B — Matchup Adjusted"
-            )
-
-            st.metric(
-                "Predictions",
-                f"{v2b['prediction_count']:,}",
-            )
-
-            st.metric(
-                "MAE",
-                f"{v2b['mae']:.3f}",
-            )
-
-            st.metric(
-                "RMSE",
-                f"{v2b['rmse']:.3f}",
-            )
-
-            st.metric(
-                "Bias",
-                f"{v2b['bias']:+.3f}",
-            )
-
-        st.subheader(
-            "🔬 V2B Change"
-        )
-
-        change_col1, change_col2 = (
-            st.columns(2)
-        )
-
-        with change_col1:
-
-            st.metric(
-                "MAE vs V2A",
-                (
-                    f"{v2b_benchmark['v2b_vs_v2a_mae_change']:+.3f}"
-                ),
-            )
-
-            st.metric(
-                "MAE vs V1",
-                (
-                    f"{v2b_benchmark['v2b_vs_v1_mae_change']:+.3f}"
-                ),
-            )
-
-        with change_col2:
-
-            st.metric(
-                "RMSE vs V2A",
-                (
-                    f"{v2b_benchmark['v2b_vs_v2a_rmse_change']:+.3f}"
-                ),
-            )
-
-            st.metric(
-                "RMSE vs V1",
-                (
-                    f"{v2b_benchmark['v2b_vs_v1_rmse_change']:+.3f}"
-                ),
-            )
-
-        st.metric(
-            "Matchup Coverage",
-            (
-                f"{v2b_benchmark['matchup_coverage'] * 100:.1f}%"
-            ),
-        )
-
-        st.subheader(
-            "📋 Overall Benchmark"
-        )
-
-        comparison = (
-            v2b_benchmark[
-                "comparison"
-            ].copy()
-        )
-
-        numeric_columns = [
-            "mae",
-            "rmse",
-            "bias",
-            "average_forecast",
-        ]
-
-        for column in numeric_columns:
-
-            if column in comparison.columns:
-
-                comparison[column] = (
-                    comparison[column]
-                    .round(4)
-                )
-
-        st.dataframe(
-            comparison,
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        paired = (
-            v2b_benchmark[
-                "paired_predictions"
-            ].copy()
-        )
-
-        if not paired.empty:
-
-            st.subheader(
-                "🧬 Performance by Prop Market"
-            )
-
-            market_rows = []
-
-            for (
-                market,
-                market_data,
-            ) in paired.groupby(
-                "market"
-            ):
-
-                market_rows.append(
-                    {
-                        "Market":
-                            market,
-
-                        "Predictions":
-                            len(
-                                market_data
-                            ),
-
-                        "V1 MAE":
-                            market_data[
-                                "v1_absolute_error"
-                            ].mean(),
-
-                        "V2A MAE":
-                            market_data[
-                                "v2a_absolute_error"
-                            ].mean(),
-
-                        "V2B MAE":
-                            market_data[
-                                "v2b_absolute_error"
-                            ].mean(),
-
-                        "V2B vs V2A MAE":
-                            (
-                                market_data[
-                                    "v2b_absolute_error"
-                                ].mean()
-                                - market_data[
-                                    "v2a_absolute_error"
-                                ].mean()
-                            ),
-
-                        "V1 RMSE":
-                            np.sqrt(
-                                market_data[
-                                    "v1_squared_error"
-                                ].mean()
-                            ),
-
-                        "V2A RMSE":
-                            np.sqrt(
-                                market_data[
-                                    "v2a_squared_error"
-                                ].mean()
-                            ),
-
-                        "V2B RMSE":
-                            np.sqrt(
-                                market_data[
-                                    "v2b_squared_error"
-                                ].mean()
-                            ),
-
-                        "V2B vs V2A RMSE":
-                            (
-                                np.sqrt(
-                                    market_data[
-                                        "v2b_squared_error"
-                                    ].mean()
-                                )
-                                - np.sqrt(
-                                    market_data[
-                                        "v2a_squared_error"
-                                    ].mean()
-                                )
-                            ),
-
-                        "Matchup Coverage":
-                            market_data[
-                                "matchup_available"
-                            ].mean(),
-                    }
-                )
-
-            market_table = pd.DataFrame(
-                market_rows
-            )
-
-            market_table[
-                "Matchup Coverage"
-            ] = (
-                market_table[
-                    "Matchup Coverage"
-                ]
-                * 100.0
-            )
-
-            numeric_market_columns = [
-                "V1 MAE",
-                "V2A MAE",
-                "V2B MAE",
-                "V2B vs V2A MAE",
-                "V1 RMSE",
-                "V2A RMSE",
-                "V2B RMSE",
-                "V2B vs V2A RMSE",
-                "Matchup Coverage",
-            ]
-
-            market_table[
-                numeric_market_columns
-            ] = (
-                market_table[
-                    numeric_market_columns
-                ].round(3)
-            )
-
-            market_table = (
-                market_table
-                .sort_values(
-                    "V2B vs V2A MAE"
-                )
-                .reset_index(
-                    drop=True
-                )
-            )
-
-            st.dataframe(
-                market_table,
-                use_container_width=True,
-                hide_index=True,
-            )
-
-        st.caption(
-            "Negative V2B-vs-V2A MAE/RMSE changes mean "
-            "the matchup adjustment improved projection accuracy. "
-            "This remains a projection benchmark, not a historical "
-            "sportsbook ROI test."
-        )
-
-        # ==========================================
-        # STOCK MODEL TRAINING CENTER
-        # ==========================================
-
-        st.divider()
-        st.subheader("📈 Stock Model Training Center")
-
-        st.caption(
-            "Train and evaluate historical stock predictions "
-            "using Alpaca market data. No trades are placed."
-        )
-
-        stock_symbols = st.text_input(
-            "Stocks to train",
-            value="AAPL,MSFT,NVDA,AMZN,META",
-            key="stock_training_symbols",
-        )
-
-        symbols = [
-            symbol.strip().upper()
-            for symbol in stock_symbols.split(",")
-            if symbol.strip()
-        ]
-
-        st.write(
-            "Prediction horizons: 1, 5, and 20 trading days."
-        )
-
-        if st.button(
-            "Train Stock Prediction Models",
-            key="train_stock_models_button",
-            type="primary",
-        ):
-
-            if not symbols:
-                st.warning(
-                    "Enter at least one stock symbol."
-                )
-
-            else:
-                try:
-                    with st.spinner(
-                        "Downloading historical data and "
-                        "training stock prediction models..."
-                    ):
-
-                        results = train_stock_models(symbols)
-
-                    st.session_state[
-                        "stock_training_results"
-                    ] = results
-
-                    st.success(
-                        "Stock model training completed."
-                    )
-
-                except Exception as e:
-                    st.error(
-                        f"Stock model training failed: {e}"
-                    )
-
-        results = st.session_state.get(
-            "stock_training_results"
-        )
-
-        
-        if results:
-
-            st.subheader("📊 Stock Model Performance")
-
-            st.caption(
-                "Historical out-of-sample validation. "
-                "Results do not guarantee future performance."
-            )
-
-            for horizon, metrics in results.items():
-
-                st.divider()
-
-                st.subheader(
-                    f"📈 {horizon}-Day Prediction Model"
-                )
-
-                passed = metrics.get(
-                    "passes_benchmarks", False
-                )
-
-                if passed:
-                    st.success(
-                        "Validation benchmarks passed."
-                    )
-                else:
-                    st.error(
-                        "Validation benchmarks not passed. "
-                        "Model requires further evaluation."
-                    )
-
-                auc = metrics.get("auc")
-                test_rows = metrics.get("test_rows", 0)
-
-                model_brier = metrics.get("model_brier")
-                baseline_brier = metrics.get(
-                    "baseline_brier"
-                )
-
-                model_log_loss = metrics.get(
-                    "model_log_loss"
-                )
-
-                baseline_log_loss = metrics.get(
-                    "baseline_log_loss"
-                )
-
-                col1, col2 = st.columns(2)
-
-                with col1:
-                    st.metric(
-                        "AUC Score",
-                        f"{auc:.3f}"
-                        if auc is not None else "N/A"
-                    )
-
-                    st.metric(
-                        "Model Brier Score",
-                        f"{model_brier:.4f}"
-                        if model_brier is not None
-                        else "N/A",
-                        delta=(
-                            f"{baseline_brier - model_brier:+.4f}"
-                            if model_brier is not None
-                            and baseline_brier is not None
-                            else None
-                        ),
-                        delta_color="normal",
-                    )
-
-                with col2:
-                    st.metric(
-                        "Test Observations",
-                        f"{test_rows:,}"
-                    )
-
-                    st.metric(
-                        "Model Log Loss",
-                        f"{model_log_loss:.4f}"
-                        if model_log_loss is not None
-                        else "N/A",
-                        delta=(
-                            f"{baseline_log_loss - model_log_loss:+.4f}"
-                            if model_log_loss is not None
-                            and baseline_log_loss is not None
-                            else None
-                        ),
-                        delta_color="normal",
-                    )
-
-
-                # -----------------------------------------
-                # Prediction Diagnostics
-                # -----------------------------------------
-
-                st.markdown("### Prediction Diagnostics")
-
-                diagnostics = metrics.get(
-                    "prediction_diagnostics"
-                )
-
-                if diagnostics is not None:
-                    st.json(diagnostics)
-                else:
-                    st.warning(
-                        "Prediction diagnostics are not available. "
-                        "Retrain the stock models to generate them."
-                    )
-
-                # -----------------------------------------
-                # Historical Data Summary
-                # -----------------------------------------
-
-                st.markdown(
-                    "#### Historical Data Summary"
-                )
-
-                col3, col4, col5 = st.columns(3)
-
-                with col3:
-                    st.metric(
-                        "Training Observations",
-                        f"{metrics.get('train_rows', 0):,}"
-                    )
-
-                with col4:
-                    st.metric(
-                        "Calibration Observations",
-                        f"{metrics.get('calibration_rows', 0):,}"
-                    )
-
-                with col5:
-                    base_rate = metrics.get("base_rate")
-
-                    st.metric(
-                        "Positive Outcome Rate",
-                        f"{base_rate:.2%}"
-                        if base_rate is not None
-                        else "N/A"
-                    )
-
-                with st.expander(
-                    "View Detailed Validation Data"
-                ):
-                    st.json(metrics)
-
-        # -----------------------------------------
-        # Saved Stock Model Results
-        # -----------------------------------------
-
-        st.divider()
-
-        if st.button(
-            "View Saved Stock Model Results",
-            key="view_stock_model_results",
-        ):
-            try:
-                saved_metrics = stock_model_metrics()
-
-                if saved_metrics:
-                    st.json(saved_metrics)
-                else:
-                    st.info(
-                        "No saved stock model results found."
-                    )
-
-            except Exception as e:
-                st.error(
-                    f"Unable to load model results: {e}"
-                )
-
-        # ==========================================
-        # EXISTING NBA RESEARCH CONTINUES BELOW
-        # ==========================================
-        st.subheader("🧪 Research Lab – Optional Revalidation")
-
-        st.markdown("### 🏀 NBA Data Connection Test")
-
-        if st.button("Test NBA Data Sources"):
-            with st.spinner("Testing SportsDataIO and The Odds API..."):
-                nba_status = test_nba_connections()
-
-            for provider, info in nba_status.items():
-                if info["working"]:
-                    st.success(f"✅ {provider}: {info['message']}")
-                elif info["configured"]:
-                    st.error(f"❌ {provider}: {info['message']}")
-                else:
-                    st.warning(f"⚠️ {provider}: {info['message']}")
-
-        st.divider()
-        # Betting performance
-
-
-    # ============================================================
-    # MULTI-SEASON NBA VALIDATION
-    # ============================================================
-
-        st.markdown("### 🏀 BALLDONTLIE Historical Data Test")
-
-        if st.button("Test BALLDONTLIE Historical Data"):
-            try:
-                with st.spinner("Downloading 2023 NBA games from BALLDONTLIE..."):
-                    bdl_test = test_balldontlie_connection()
-
-                st.success(
-                    f"BALLDONTLIE connection successful — "
-                    f"{bdl_test['games_returned']} historical games returned."
-                )
-
-                st.write(
-                    "Season:",
-                    bdl_test["season"],
-                )
-
-                st.write(
-                    "Date range:",
-                    bdl_test["first_game"],
-                    "to",
-                    bdl_test["last_game"],
-                )
-
-                st.dataframe(
-                    bdl_test["sample"],
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-            except Exception as e:
-                st.error(
-                    f"BALLDONTLIE historical data error: {e}"
-                )
-        if st.button("Download Full 2023 NBA Season"):
-            try:
-                with st.spinner(
-                    "Downloading the full 2023 NBA season. "
-                    "This may take a couple of minutes..."
-                ):
-                    full_season_test = test_full_historical_season(2023)
-
-                st.success(
-                    f"Full season downloaded — "
-                    f"{full_season_test['games_returned']} games."
-                )
-
-                st.write(
-                    "API requests used:",
-                    full_season_test["requests_used"],
-                )
-
-                st.write(
-                    "Date range:",
-                    full_season_test["first_game"],
-                    "to",
-                    full_season_test["last_game"],
-                )
-
-                st.write(
-                    "Home win rate:",
-                    f"{full_season_test['home_win_rate']:.1%}",
-                )
-
-                st.dataframe(
-                    full_season_test["sample"],
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-            except Exception as e:
-                st.error(
-                    f"Full-season download error: {e}"
-                )
-
-
-
-        if st.button("Test 2022 + 2023 NBA Seasons"):
-            try:
-                with st.spinner(
-                    "Downloading 2022 and 2023 NBA seasons. "
-                    "This will take several minutes..."
-                ):
-                    multi_bdl_test = test_multiple_historical_seasons(
-                        [2022, 2023, 2024, 2025]
-                    )
-
-                st.success(
-                    f"Multi-season download successful - "
-                    f"{multi_bdl_test['games_returned']} total games."
-                )
-
-                st.write(
-                    "API requests used:",
-                    multi_bdl_test["total_requests"],
-                )
-
-                st.write(
-                    "Overall date range:",
-                    multi_bdl_test["first_game"],
-                    "to",
-                    multi_bdl_test["last_game"],
-                )
-
-                st.write(
-                    "Overall home win rate:",
-                    f"{multi_bdl_test['home_win_rate']:.1%}",
-                )
-
-                st.markdown("#### Season Summary")
-
-                st.dataframe(
-                    multi_bdl_test["season_summary"],
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-                # ==================================================
-                # RESEARCH PIPELINE BRIDGE
-                # ==================================================
-
-                st.markdown("#### 🧠 Research Pipeline Bridge Test")
-
-                research_games = prepare_balldontlie_games_for_research(
-                    multi_bdl_test["games"]
-                )
-
-                st.success(
-                    f"Research bridge successful - "
-                    f"{len(research_games)} games ready for modeling."
-                )
-
-                bridge_col1, bridge_col2, bridge_col3 = st.columns(3)
-
-                bridge_col1.metric(
-                    "Model-Ready Games",
-                    len(research_games),
-                )
-
-                bridge_col2.metric(
-                    "First Game",
-                    research_games["game_date"]
-                    .min()
-                    .strftime("%Y-%m-%d"),
-                )
-
-                bridge_col3.metric(
-                    "Last Game",
-                    research_games["game_date"]
-                    .max()
-                    .strftime("%Y-%m-%d"),
-                )
-
-                st.write(
-                    "Verified home-win rate:",
-                    f"{research_games['home_win'].mean():.1%}",
-                )
-
-                # ==================================================
-                # PRE-GAME FEATURE ENGINE
-                # ==================================================
-
-                st.markdown("#### 🧮 Pre-Game Feature Engine Test")
-
-                feature_games = build_balldontlie_pregame_features(
-                    multi_bdl_test["games"],
-                    min_games=5,
-                )
-
-                st.success(
-                    f"Feature engine successful - "
-                    f"{len(feature_games)} model-ready rows created."
-                )
-
-                feature_col1, feature_col2, feature_col3 = st.columns(3)
-
-                feature_col1.metric(
-                    "Feature Rows",
-                    len(feature_games),
-                )
-
-                feature_col2.metric(
-                    "First Feature Date",
-                    feature_games["game_date"]
-                    .min()
-                    .strftime("%Y-%m-%d"),
-                )
-
-                feature_col3.metric(
-                    "Last Feature Date",
-                    feature_games["game_date"]
-                    .max()
-                    .strftime("%Y-%m-%d"),
-                )
-
-                st.write(
-                    "Feature columns:",
-                    len(feature_games.columns),
-                )
-
-                st.dataframe(
-                    feature_games.head(10),
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-                # ==================================================
-                # LEAKAGE AUDIT
-                # ==================================================
-
-                st.markdown("#### 🔒 Pre-Game Leakage Audit")
-
-                leakage_audit = audit_balldontlie_pregame_features(
-                    feature_games
-                )
-
-                leak_col1, leak_col2, leak_col3 = st.columns(3)
-
-                leak_col1.metric(
-                    "Rows Audited",
-                    leakage_audit["total_rows"],
-                )
-
-                leak_col2.metric(
-                    "Model Features",
-                    leakage_audit["model_feature_count"],
-                )
-
-                leak_col3.metric(
-                    "Suspicious Features",
-                    len(
-                        leakage_audit[
-                            "suspicious_model_features"
-                        ]
-                    ),
-                )
-
-                st.write(
-                    "Model feature columns:",
-                    leakage_audit["model_features"],
-                )
-
-                if leakage_audit["suspicious_model_features"]:
-                    st.error(
-                        "Possible leakage detected: "
-                        + ", ".join(
-                            leakage_audit[
-                                "suspicious_model_features"
-                            ]
-                        )
-                    )
-                else:
-                    st.success(
-                        "No obvious current-game outcome leakage "
-                        "detected in the proposed model features."
-                    )
-
-                if len(
-                    leakage_audit["missing_feature_values"]
-                ) > 0:
-                    st.warning(
-                        "Missing values found in model features."
-                    )
-
-                    st.dataframe(
-                        leakage_audit[
-                            "missing_feature_values"
-                        ]
-                        .rename("missing_values")
-                        .reset_index()
-                        .rename(
-                            columns={
-                                "index": "feature"
-                            }
-                        ),
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-                else:
-                    st.success(
-                        "No missing values found in model features."
-                    )
-
-                # ==================================================
-                # WALK-FORWARD MODEL
-                # ==================================================
-
-                st.markdown("#### 🧠 Walk-Forward Model Test")
-
-                walkforward_results = (
-                    run_balldontlie_walkforward_model(
-                        feature_games
-                    )
-                )
-
-                st.success(
-                    f"Walk-forward validation successful - "
-                    f"{walkforward_results['games_predicted']} "
-                    f"unseen games predicted."
-                )
-                st.markdown("#### 📊 Walk-Forward Model Performance")
-    
-                perf_col1, perf_col2, perf_col3, perf_col4 = st.columns(4)
-    
-                perf_col1.metric(
-                    "Accuracy",
-                    f"{walkforward_results['accuracy']:.1%}",
-                )
-    
-                perf_col2.metric(
-                    "AUC",
-                    f"{walkforward_results['auc']:.3f}",
-                )
-    
-                perf_col3.metric(
-                    "Brier Score",
-                    f"{walkforward_results['brier']:.4f}",
-                )
-    
-                perf_col4.metric(
-                    "Log Loss",
-                    f"{walkforward_results['log_loss']:.4f}",
-                )
-    
-                st.markdown("##### Baseline Comparison")
-    
-                base_col1, base_col2, base_col3 = st.columns(3)
-    
-                base_col1.metric(
-                    "Baseline Accuracy",
-                    f"{walkforward_results['baseline_accuracy']:.1%}",
-                )
-    
-                base_col2.metric(
-                    "Baseline Brier",
-                    f"{walkforward_results['baseline_brier']:.4f}",
-                )
-    
-                base_col3.metric(
-                    "Baseline Log Loss",
-                    f"{walkforward_results['baseline_log_loss']:.4f}",
-                )
-                st.markdown("##### 🎚️ Walk-Forward Confidence Calibration")
-    
-                calibration_predictions = (
-                    walkforward_results["predictions"].copy()
-                )
-    
-                calibration_predictions["confidence"] = (
-                    calibration_predictions[
-                        "probability"
-                    ]
-                    .where(
-                        calibration_predictions["prediction"] == 1,
-                        1.0
-                        - calibration_predictions[
-                            "probability"
-                        ],
-                    )
-                )
-    
-                calibration_predictions["correct"] = (
-                    calibration_predictions["prediction"]
-                    == calibration_predictions["actual"]
-                ).astype(int)
-    
-                calibration_predictions["confidence_band"] = pd.cut(
-                    calibration_predictions["confidence"],
-                    bins=[
-                        0.50,
-                        0.55,
-                        0.60,
-                        0.65,
-                        0.70,
-                        0.75,
-                        0.80,
-                        0.85,
-                        0.90,
-                        0.95,
-                        1.01,
-                    ],
-                    labels=[
-                        "50–55%",
-                        "55–60%",
-                        "60–65%",
-                        "65–70%",
-                        "70–75%",
-                        "75–80%",
-                        "80–85%",
-                        "85–90%",
-                        "90–95%",
-                        "95–100%",
-                    ],
-                    include_lowest=True,
-                )
-    
-                calibration_table = (
-                    calibration_predictions
-                    .groupby(
-                        "confidence_band",
-                        observed=False,
-                    )
-                    .agg(
-                        games=("correct", "size"),
-                        actual_accuracy=("correct", "mean"),
-                        average_confidence=("confidence", "mean"),
-                    )
-                    .reset_index()
-                )
-    
-                calibration_table["actual_accuracy"] = (
-                    calibration_table["actual_accuracy"]
-                    .map(lambda value: f"{value:.1%}")
-                )
-    
-                calibration_table["average_confidence"] = (
-                    calibration_table["average_confidence"]
-                    .map(lambda value: f"{value:.1%}")
-                )
-    
-                st.dataframe(
-                    calibration_table,
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-            
-                st.markdown("#### 🔮 Future Matchup Feature Test")
-    
-                historical_test_game = feature_games.iloc[-1]
-    
-                future_test_features = (
-                    build_balldontlie_future_matchup_features(
-                        multi_bdl_test["games"],
-                        historical_test_game["home_team"],
-                        historical_test_game["away_team"],
-                        historical_test_game["game_date"],
-                    )
-                )
-    
-                st.success(
-                    "Future matchup feature builder successful."
-                )
-    
-                future_col1, future_col2, future_col3 = st.columns(3)
-    
-                future_col1.metric(
-                    "Home Team",
-                    historical_test_game["home_team"],
-                )
-    
-                future_col2.metric(
-                    "Away Team",
-                    historical_test_game["away_team"],
-                )
-    
-                future_col3.metric(
-                    "Feature Count",
-                    len(future_test_features.columns),
-                )
-    
-                st.write(
-                    "Prediction date:",
-                    historical_test_game["game_date"].strftime("%Y-%m-%d"),
-                )
-    
-                st.dataframe(
-                    future_test_features,
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-                st.write(
-                    "DEBUG future columns:",
-                    list(future_test_features.columns),
-                )
-
-                st.markdown("#### 🎯 NBA Matchup Prediction")
-    
-                live_prediction = predict_balldontlie_matchup(
-                    feature_games,
-                    future_test_features,
-                )
-    
-                pred_col1, pred_col2, pred_col3 = st.columns(3)
-    
-                pred_col1.metric(
-                    "Home Win Probability",
-                    f"{live_prediction['home_win_probability']:.1%}",
-                )
-    
-                pred_col2.metric(
-                    "Away Win Probability",
-                    f"{live_prediction['away_win_probability']:.1%}",
-                )
-    
-                pred_col3.metric(
-                    "Model Confidence",
-                    f"{live_prediction['confidence']:.1%}",
-                )
-    
-                st.write(
-                    "Predicted side:",
-                    live_prediction["predicted_side"],
-                )
-    
-                st.caption(
-                    f"Model trained on "
-                    f"{live_prediction['training_games']} historical games "
-                    f"using {live_prediction['feature_count']} features."
-                )
-                st.markdown("##### 🧪 No-Vig Edge Test")
-
-                test_edge = calculate_no_vig_model_edge(
-                    home_model_probability=0.71,
-                    home_american_odds=-150,
-                    away_american_odds=130,
-                )
-            
-                edge_col1, edge_col2, edge_col3 = st.columns(3)
-            
-                with edge_col1:
-                    st.metric(
-                        "Model Home Probability",
-                        f"{test_edge['home_model_probability']:.1%}",
-                    )
-            
-                with edge_col2:
-                    st.metric(
-                        "No-Vig Market Probability",
-                        f"{test_edge['home_market_probability']:.1%}",
-                    )
-            
-                with edge_col3:
-                    st.metric(
-                        "Model Edge",
-                        f"{test_edge['home_edge']:+.1%}",
-                    )
-            
-                st.write(
-                    f"Best model side: **{test_edge['best_side']}**"
-                )
-            
-                st.write(
-                    f"Sportsbook hold: "
-                    f"**{test_edge['sportsbook_hold']:.2%}**"
-                )
-            
-                # ==================================================
-                # HISTORICAL DATASET AUDIT
-                # ==================================================
-
-                st.markdown("#### 🔎 Historical Dataset Audit")
-
-                audit = audit_historical_games(
-                    multi_bdl_test["games"]
-                )
-
-                audit_col1, audit_col2, audit_col3 = st.columns(3)
-
-                audit_col1.metric(
-                    "Total Rows",
-                    audit["total_rows"],
-                )
-
-                audit_col2.metric(
-                    "Unique Game IDs",
-                    audit["unique_game_ids"],
-                )
-
-                audit_col3.metric(
-                    "Duplicate Game IDs",
-                    audit["duplicate_game_ids"],
-                )
-
-                audit_col4, audit_col5, audit_col6 = st.columns(3)
-
-                audit_col4.metric(
-                    "Missing Scores",
-                    audit["missing_scores"],
-                )
-
-                audit_col5.metric(
-                    "Tied Games",
-                    audit["tied_games"],
-                )
-
-                audit_col6.metric(
-                    "Teams Found",
-                    audit["teams_found"],
-                )
-
-                st.write(
-                    "Unusual teams:",
-                    audit["unusual_teams"]
-                    if audit["unusual_teams"]
-                    else "None",
-                )
-
-                st.markdown("##### Games by Month")
-
-                st.dataframe(
-                    audit["games_by_month"],
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-                st.markdown("##### Game Status")
-
-                st.dataframe(
-                    audit["status_summary"],
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-                if len(audit["suspicious_scores"]):
-                    st.warning(
-                        f"{len(audit['suspicious_scores'])} "
-                        f"games have suspicious scores."
-                    )
-                else:
-                    st.success(
-                        "No suspicious zero or missing scores found."
-                    )
-
-            except Exception as e:
-                st.error(
-                    f"Multi-season BALLDONTLIE error: {e}"
-                )
-    
-        st.divider()
-    
-
-
-    
-        st.markdown("### 🧪 NBA.com Historical Data Test")
-
-        if st.button("Test NBA.com Historical Data"):
-            try:
-                with st.spinner("Downloading 2024-25 NBA games from NBA.com..."):
-                    history_test = test_nba_history("2024-25")
-
-                st.success(
-                    f"NBA.com connection successful — "
-                    f"{history_test['games']} games loaded."
-                )
-
-                st.write(
-                    "Date range:",
-                    history_test["first_game"],
-                    "to",
-                    history_test["last_game"],
-                )
-
-                st.dataframe(
-                    history_test["sample"],
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-            except Exception as e:
-                st.error(f"NBA.com historical data error: {e}")
-
-        st.divider()
-
-
-
-    st.markdown("### 🏀 Multi-Season NBA Validation")
-
-    nba_seasons_text = st.text_input(
-        "NBA seasons to validate",
-        value="2022,2023,2024,2025",
-        help="Enter SportsDataIO NBA seasons separated by commas.",
-    )
-
-    if st.button("Run Multi-Season NBA Validation"):
-
-        seasons = [
-            int(x.strip())
-            for x in nba_seasons_text.split(",")
-            if x.strip()
-        ]
-
-        try:
-            with st.spinner(
-                "Downloading multiple NBA seasons and running walk-forward validation..."
-            ):
-                multi_bdl_result = test_multiple_historical_seasons(seasons)
-
-                historical_games = multi_bdl_result["games"]
-
-                prepared_games = prepare_balldontlie_games_for_research(
-                    historical_games
-                )
-
-                feature_games = build_balldontlie_pregame_features(
-                    prepared_games
-                )
-
-                multi_nba_result = run_balldontlie_walkforward_model(
-                    feature_games
-                )
-
-                st.session_state["multi_nba_research_result"] = multi_nba_result
-
-            st.success("Multi-season NBA validation complete.")
-
-        except Exception as e:
-            st.error(f"Multi-season NBA validation error: {e}")
-    if "multi_nba_research_result" in st.session_state:
-
-        mr = st.session_state["multi_nba_research_result"]
-
-        st.markdown("#### 🏀 Multi-Season Dataset")
-
-        m1, m2, m3, m4 = st.columns(4)
-
-        m1.metric(
-            "Games predicted",
-            mr["games_predicted"],
-        )
-
-        m2.metric(
-            "Accuracy",
-            f"{mr['accuracy']:.1%}",
-        )
-
-        m3.metric(
-            "AUC",
-            f"{mr['auc']:.3f}",
-        )
-
-        m4.metric(
-            "Features",
-            mr["feature_count"],
-        )
-
-        st.markdown("#### 📊 Walk-Forward Performance")
-
-        p1, p2, p3, p4 = st.columns(4)
-
-        p1.metric(
-            "Accuracy",
-            f"{mr['accuracy']:.1%}",
-        )
-
-        p2.metric(
-            "AUC",
-            f"{mr['auc']:.3f}",
-        )
-
-        p3.metric(
-            "Brier Score",
-            f"{mr['brier']:.4f}",
-        )
-
-        p4.metric(
-            "Log Loss",
-            f"{mr['log_loss']:.4f}",
-        )
-
-        st.markdown("#### ⚖️ Model vs Baseline")
-
-        comparison_df = pd.DataFrame(
-            [
-                {
-                    "Model": "NBA Walk-Forward Model",
-                    "Accuracy": mr["accuracy"],
-                    "Brier Score": mr["brier"],
-                    "Log Loss": mr["log_loss"],
-                },
-                {
-                    "Model": "Home Win Baseline",
-                    "Accuracy": mr["baseline_accuracy"],
-                    "Brier Score": mr["baseline_brier"],
-                    "Log Loss": mr["baseline_log_loss"],
-                },
-            ]
-        )
-
-        st.dataframe(
-            comparison_df,
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        st.markdown("#### 🎯 Probability Calibration")
-
-        calibration_result = nba_calibration_summary(
-            mr["predictions"]
-        )
-
-        calibration_table = calibration_result["calibration"]
-
-        if len(calibration_table):
-
-            calibration_display = calibration_table.copy()
-
-            for column in [
-                "avg_predicted_probability",
-                "actual_win_rate",
-                "calibration_gap",
-                "absolute_calibration_error",
-            ]:
-                if column in calibration_display.columns:
-                    calibration_display[column] = (
-                        calibration_display[column]
-                        .map(lambda x: f"{x:.1%}")
-                    )
-
-            st.dataframe(
-                calibration_display,
-                use_container_width=True,
-                hide_index=True,
-            )
-
-            weighted_error = calibration_result.get(
-                "weighted_calibration_error"
-            )
-
-            if weighted_error is not None:
-                st.metric(
-                    "Weighted Calibration Error",
-                    f"{weighted_error:.1%}",
-                )
-
-        else:
-            st.info(
-                "No calibration results were generated."
-            )
-
-        st.markdown("#### 🔬 High-Confidence Threshold Analysis")
-
-        high_confidence = calibration_result.get(
-            "high_confidence"
-        )
-
-        if (
-            high_confidence is not None
-            and len(high_confidence)
-        ):
-            threshold_display = high_confidence.copy()
-
-            for column in [
-                "minimum_probability",
-                "accuracy",
-                "avg_model_probability",
-                "calibration_gap",
-            ]:
-                if column in threshold_display.columns:
-                    threshold_display[column] = (
-                        threshold_display[column]
-                        .map(lambda x: f"{x:.1%}")
-                    )
-
-            st.dataframe(
-                threshold_display,
-                use_container_width=True,
-                hide_index=True,
-            )
-
-        else:
-            st.info(
-                "No high-confidence threshold results were generated."
-            )
-
-        st.divider()
-
-        st.markdown("### 🏀 NBA Historical Validation")
-
-        nba_season = st.text_input(
-            "NBA season",
-            value="2025",
-            help="SportsDataIO season to use for historical NBA research.",
-            key="single_nba_season",
-        )
-
-        if st.button("Run NBA Historical Validation", key="run_single_nba_validation"):
-            try:
-                with st.spinner(
-                    "Building historical NBA features and running walk-forward validation..."
-                ):
-                    nba_result = run_nba_research(
-                        nba_season,
-                        minimum_training_games=250,
-                        test_block_size=100,
-                    )
-
-                st.session_state["nba_research_result"] = nba_result
-                st.success("NBA historical validation complete.")
-
-            except Exception as e:
-                st.error(f"NBA validation error: {e}")
-
-        if "nba_research_result" in st.session_state:
-            r = st.session_state["nba_research_result"]
-
-            st.markdown("#### Dataset")
-
-            n1, n2, n3, n4 = st.columns(4)
-
-            n1.metric("Raw games", r["raw_games"])
-            n2.metric("Completed games", r["completed_games"])
-            n3.metric("Feature rows", r["feature_rows"])
-            n4.metric("Home win rate", f"{r['home_win_rate']:.1%}")
-
-            st.markdown("#### Walk-Forward Performance")
-
-            model = r["overall"]
-            baseline = r["baseline"]
-
-            m1, m2, m3, m4 = st.columns(4)
-
-            m1.metric("AUC", f"{model['auc']:.3f}")
-            m2.metric("Accuracy", f"{model['accuracy']:.1%}")
-            m3.metric("Brier Score", f"{model['brier']:.4f}")
-            m4.metric("Log Loss", f"{model['logloss']:.4f}")
-
-            st.markdown("#### Model vs Baseline")
-
-            comparison = pd.DataFrame(
-                [
-                    {
-                        "Model": "NBA Model",
-                        "Accuracy": model["accuracy"],
-                        "Brier": model["brier"],
-                        "Log Loss": model["logloss"],
-                        "AUC": model["auc"],
-                    },
-                    {
-                        "Model": "Home Win Base Rate",
-                        "Accuracy": baseline["accuracy"],
-                        "Brier": baseline["brier"],
-                        "Log Loss": baseline["logloss"],
-                        "AUC": baseline["auc"],
-                    },
-                ]
-            )
-
-            st.dataframe(
-                comparison,
-                use_container_width=True,
-                hide_index=True,
-            )
-
-            st.markdown("#### Confidence Analysis")
-
-            confidence = r["confidence"]
-
-            if len(confidence):
-                st.dataframe(
-                    confidence,
-                    use_container_width=True,
-                    hide_index=True,
-                )
-            else:
-                st.info("No confidence-band results were generated.")
-
-            with st.expander("Walk-Forward Folds"):
-                st.dataframe(
-                    r["folds"],
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-    st.markdown("### 🏀 NBA Betting Center")
-
-    st.caption(
-        "Live NBA moneylines, sportsbook odds, "
-        "and potential betting payouts."
-    )
-
-    try:
-        live_moneylines = get_live_nba_moneylines()
-
-        if live_moneylines:
-
-            moneyline_df = pd.DataFrame(live_moneylines)
-
-            moneyline_df["home_team_code"] = (
-                moneyline_df["home_team"].apply(
-                    normalize_nba_team_name
-                )
-            )
-
-            moneyline_df["away_team_code"] = (
-                moneyline_df["away_team"].apply(
-                    normalize_nba_team_name
-                )
-            )
-
-            unmapped_home = moneyline_df[
-                moneyline_df["home_team_code"].isna()
-            ]["home_team"].unique()
-
-            unmapped_away = moneyline_df[
-                moneyline_df["away_team_code"].isna()
-            ]["away_team"].unique()
-
-            unmapped_teams = sorted(
-                set(unmapped_home) | set(unmapped_away)
-            )
-
-            if unmapped_teams:
-                st.warning(
-                    "Unmapped NBA teams: "
-                    + ", ".join(unmapped_teams)
-                )
-            else:
-                st.success(
-                    "NBA team mapping successful — "
-                    "all live teams recognized."
-                )
-
-            st.success(
-                f"Live NBA odds retrieved — "
-                f"{len(moneyline_df)} sportsbook lines found."
-            )
-
-            st.subheader("Today's NBA Games")
-
-            st.dataframe(
-                moneyline_df,
-                width="stretch",
-                hide_index=True,
-            )
-
-            st.divider()
-
-            st.subheader("NBA Betting Payout Calculator")
-
-            st.caption(
-                "Select a sportsbook line to calculate "
-                "your potential return."
-            )
-
-            selected_index = st.selectbox(
-                "Select NBA Game",
-                options=list(moneyline_df.index),
-                format_func=lambda i: (
-                    f"{moneyline_df.loc[i, 'away_team']} "
-                    f"vs {moneyline_df.loc[i, 'home_team']}"
-                ),
-            )
-
-            selected_game = moneyline_df.loc[selected_index]
-
-
-            
-            # ========================================
-            # RETRIEVE SELECTED NBA GAME INFORMATION
-            # ========================================
-
-            selected_game = moneyline_df.loc[selected_index]
-
-            # Retrieve team names
-            home_team = str(selected_game["home_team"])
-            away_team = str(selected_game["away_team"])
-
-            # Retrieve sportsbook information
-            sportsbook = str(
-                selected_game.get("bookmaker", "Sportsbook")
-            )
-
-            # Retrieve American betting odds
-            home_odds = selected_game.get("home_odds")
-            away_odds = selected_game.get("away_odds")
-
-            # Format American betting odds
-            def format_moneyline(odds):
-
-                if pd.isna(odds):
-                    return "N/A"
-
-                odds = int(odds)
-
-                return f"{odds:+d}"
-
-            home_odds_display = format_moneyline(home_odds)
-            away_odds_display = format_moneyline(away_odds)
-
-
-            # ========================================
-            # MARKET EDGE AI - NBA MATCHUP CARD
-            # ========================================
-
-            st.markdown("### NBA Moneyline")
-
-            away_col, home_col = st.columns(
-                2,
-                gap="medium"
-            )
-
-            # ========================================
-            # AWAY TEAM
-            # ========================================
-
-            with away_col:
-                with st.container(border=True):
-
-                    st.caption("AWAY TEAM")
-
-                    st.subheader(away_team)
-
-                    st.metric(
-                        label="Moneyline Odds",
-                        value=away_odds_display,
-                    )
-
-            # ========================================
-            # HOME TEAM
-            # ========================================
-
-            with home_col:
-                with st.container(border=True):
-
-                    st.caption("HOME TEAM")
-
-                    st.subheader(home_team)
-
-                    st.metric(
-                        label="Moneyline Odds",
-                        value=home_odds_display,
-                    )
-
-            # ========================================
-            # TECHNICAL GAME DATA
-            # ========================================
-
-            
-
-            # ==========================================
-            # MARKET EDGE AI - GAME INFORMATION PANEL
-            # ==========================================
-
-            with st.expander(
-                "Game Information",
-                expanded=True,
-            ):
-
-                game_info = selected_game
-
-                # Retrieve game information
-                event_id = str(
-                    game_info.get("event_id", "N/A")
-                )
-
-                game_date = pd.to_datetime(
-                    game_info.get("commence_time"),
-                    utc=True,
-                    errors="coerce",
-                )
-
-                if pd.notna(game_date):
-
-                    game_date = game_date.tz_convert(
-                        "America/Chicago"
-                    )
-
-                    date_display = game_date.strftime(
-                        "%B %d, %Y"
-                    )
-
-                    time_display = game_date.strftime(
-                        "%I:%M %p %Z"
-                    )
-
-                else:
-
-                    date_display = "Not available"
-                    time_display = "Not available"
-
-                sportsbook_name = str(
-                    game_info.get("bookmaker", "N/A")
-                )
-
-                home_code = str(
-                    game_info.get("home_team_code", "N/A")
-                )
-
-                away_code = str(
-                    game_info.get("away_team_code", "N/A")
-                )
-
-                # ======================================
-                # GAME DETAILS
-                # ======================================
-
-                st.markdown("### Game Details")
-
-                col1, col2 = st.columns(2)
-
-                with col1:
-
-                    st.caption("GAME DATE")
-                    st.markdown(f"**{date_display}**")
-
-                    st.caption("AWAY TEAM")
-                    st.markdown(
-                        f"**{away_team} ({away_code})**"
-                    )
-
-                with col2:
-
-                    st.caption("GAME TIME")
-                    st.markdown(f"**{time_display}**")
-
-                    st.caption("HOME TEAM")
-                    st.markdown(
-                        f"**{home_team} ({home_code})**"
-                    )
-
-                st.divider()
-
-                # ======================================
-                # SPORTSBOOK INFORMATION
-                # ======================================
-
-                st.markdown(
-                    "### Sportsbook Information"
-                )
-
-                col3, col4 = st.columns(2)
-
-                with col3:
-
-                    st.caption("SPORTSBOOK")
-                    st.markdown(
-                        f"**{sportsbook_name}**"
-                    )
-
-                with col4:
-
-                    st.caption("MARKET")
-                    st.markdown("**NBA Moneyline**")
-
-                st.divider()
-
-                st.caption("EVENT ID")
-                st.code(
-                    event_id,
-                    language=None,
-                )
-    
-            st.divider()
-
-            # ========================================
-            # NBA PAYOUT CALCULATOR
-            # ========================================
-
-            st.subheader("Calculate Potential Payout")
-
-            wager_amount = st.number_input(
-                "Wager Amount ($)",
-                min_value=1.0,
-                value=10.0,
-                step=5.0,
-                key="nba_wager_amount",
-            )
-
-            american_odds = st.number_input(
-                "American Odds",
-                value=100,
-                step=10,
-                key="nba_american_odds",
-                help=(
-                    "Enter the odds shown by your sportsbook. "
-                    "For example, +120 or -150."
-                ),
-            )
-
-            if american_odds == 0:
-
-                st.error(
-                    "American odds cannot be zero."
-                )
-
-            else:
-
-                if american_odds > 0:
-
-                    potential_profit = (
-                        wager_amount
-                        * american_odds / 100
-                    )
-
-                else:
-
-                    potential_profit = (
-                        wager_amount
-                        * 100 / abs(american_odds)
-                    )
-
-                total_payout = (
-                    wager_amount + potential_profit
-                )
-
-                col1, col2, col3 = st.columns(3)
-
-                with col1:
-                    st.metric(
-                        "Your Wager",
-                        f"${wager_amount:,.2f}",
-                    )
-
-                with col2:
-                    st.metric(
-                        "Potential Profit",
-                        f"${potential_profit:,.2f}",
-                    )
-
-                with col3:
-                    st.metric(
-                        "Total Payout",
-                        f"${total_payout:,.2f}",
-                    )
-
-                st.info(
-                    "Total payout includes your original "
-                    "wager plus potential profit. "
-                    "This is a calculation, not a prediction."
-                )
-
-        else:
-
-            st.info(
-                "The Odds API connection worked, "
-                "but no NBA moneylines are currently available."
-            )
-
-    except Exception as e:
-
-        st.error(
-            f"Live NBA odds test failed: {e}"
-        )
-
-        st.divider()
-
-    st.markdown("---")
-    st.markdown("### 🏈 Football API Connection")
-
-    if st.button("Test Football API"):
-        try:
-            with st.spinner("Connecting to Sportradar..."):
-                football_test = test_sportradar_connection()
-
-            st.success(
-                f"Sportradar connection successful — "
-                f"{football_test['competition_count']} competitions found."
-            )
-
-            competitions_df = football_test["competitions"]
-
-            if not competitions_df.empty:
-                st.dataframe(
-                    competitions_df,
-                    use_container_width=True,
-                    hide_index=True,
-                )
-            else:
-                st.warning(
-                    "Connection succeeded, but no competitions were returned."
-                )
-
-        except Exception as e:
-            st.error(f"Sportradar connection error: {e}")
-
-    st.markdown("### 🏈 NFL Historical Seasons")
-
-    if st.button("Get NFL Seasons"):
-        try:
-            with st.spinner("Checking available NFL seasons..."):
-                nfl_season_test = get_nfl_seasons()
-
-            st.success(
-                f"NFL season lookup successful — "
-                f"{nfl_season_test['season_count']} seasons found."
-            )
-
-            nfl_seasons_df = nfl_season_test["seasons"]
-
-            if not nfl_seasons_df.empty:
-                st.dataframe(
-                    nfl_seasons_df,
-                    use_container_width=True,
-                    hide_index=True,
-                )
-            else:
-                st.warning(
-                    "Connection succeeded, but no NFL seasons were returned."
-                )
-
-        except Exception as e:
-            st.error(f"NFL season lookup error: {e}")
-
-    st.markdown("### 🏈 NFL Historical Games")
-
-    if st.button("Load 2024–25 NFL Games"):
-        try:
-            with st.spinner("Downloading 2024–25 NFL games..."):
-                nfl_games_test = get_nfl_season_games(
-                    "sr:season:115087"
-                )
-
-            st.success(
-                f"NFL historical game download successful — "
-                f"{nfl_games_test['game_count']} games found."
-            )
-
-            nfl_games_df = nfl_games_test["games"]
-
-            if not nfl_games_df.empty:
-                st.dataframe(
-                    nfl_games_df,
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-                nfl_audit = audit_nfl_games(nfl_games_df)
-
-                st.markdown("#### 🔍 NFL Dataset Audit")
-
-                col1, col2, col3, col4 = st.columns(4)
-
-                with col1:
-                    st.metric(
-                        "Total Games",
-                        nfl_audit["total_games"],
-                    )
-
-                with col2:
-                    st.metric(
-                        "Unique Games",
-                        nfl_audit["unique_game_ids"],
-                    )
-
-                with col3:
-                    st.metric(
-                        "Duplicates",
-                        nfl_audit["duplicate_games"],
-                    )
-
-                with col4:
-                    st.metric(
-                        "Teams",
-                        nfl_audit["team_count"],
-                    )
-
-                col5, col6, col7, col8 = st.columns(4)
-
-                with col5:
-                    st.metric(
-                        "Completed Games",
-                        nfl_audit["completed_games"],
-                    )
-
-                with col6:
-                    st.metric(
-                        "Missing Scores",
-                        nfl_audit["missing_home_scores"]
-                        + nfl_audit["missing_away_scores"],
-                    )
-
-                with col7:
-                    st.metric(
-                        "Ties",
-                        nfl_audit["ties"],
-                    )
-
-                with col8:
-                    home_win_rate = nfl_audit["home_win_rate"]
-
-                    st.metric(
-                        "Home Win Rate",
-                        (
-                            f"{home_win_rate:.1%}"
-                            if home_win_rate is not None
-                            else "N/A"
-                        ),
-                    )
-
-                st.write(
-                    "Date range:",
-                    nfl_audit["start_date"],
-                    "→",
-                    nfl_audit["end_date"],
-                ) 
-            else:
-                st.warning(
-                    "Connection succeeded, but no NFL games were returned."
-                )
-
-        except Exception as e:
-            st.error(f"NFL historical games error: {e}")
-
-    st.markdown("---")
-    st.markdown("### 🏈 Multi-Season NFL Dataset")
-
-    if st.button("Load Multi-Season NFL Dataset"):
-
-        try:
-            with st.spinner("Downloading multiple NFL seasons..."):
-
-                season_ids = [
-                    "sr:season:115087",  # 2024-25
-                    "sr:season:127985",  # 2025-26
-                ]
-
-                multi_nfl = get_multiple_nfl_seasons(
-                    season_ids
-                )
-
-                st.session_state["multi_nfl_games"] = multi_nfl["games"]
-
-            st.success(
-                f"Multi-season NFL download successful — "
-                f"{multi_nfl['game_count']} games found."
-            )
-
-            st.markdown("#### Season Summary")
-            st.dataframe(
-                multi_nfl["season_summary"],
-                use_container_width=True,
-                hide_index=True,
-            )
-
-        except Exception as e:
-            st.error(f"Multi-season NFL error: {e}")
-
-
-    if "multi_nfl_games" in st.session_state:
-
-        multi_games = st.session_state["multi_nfl_games"]
-
-        st.markdown("#### Combined NFL Games")
-
-        st.dataframe(
-            multi_games,
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        multi_audit = {
-        "total_games": len(multi_games),
-        "unique_games": multi_games["game_id"].nunique(),
-        "duplicate_games": multi_games["game_id"].duplicated().sum(),
-        "team_count": len(
-            set(multi_games["home_team"].dropna())
-            | set(multi_games["away_team"].dropna())
-        ),
-        "completed_games": (
-            multi_games["status"].astype(str).str.lower() == "closed"
-        ).sum(),
-        "missing_scores": (
-            multi_games["home_score"].isna()
-            | multi_games["away_score"].isna()
-        ).sum(),
-        "ties": (
-            multi_games["home_score"] == multi_games["away_score"]
-        ).sum(),
-        "home_win_rate": (
-            multi_games["home_score"] > multi_games["away_score"]
-        ).mean(),
-    }
-
-        st.markdown("### 🔍 Multi-Season NFL Audit")
-
-        c1, c2, c3, c4 = st.columns(4)
-
-        c1.metric(
-            "Total Games",
-            multi_audit["total_games"],
-        )
-
-        c2.metric(
-            "Unique Games",
-            multi_audit["unique_games"],
-        )
-
-        c3.metric(
-            "Duplicates",
-            multi_audit["duplicate_games"],
-        )
-
-        c4.metric(
-            "Teams",
-            multi_audit["team_count"],
-        )
-
-        c1, c2, c3, c4 = st.columns(4)
-
-        c1.metric(
-            "Completed Games",
-            multi_audit["completed_games"],
-        )
-
-        c2.metric(
-            "Missing Scores",
-            multi_audit["missing_scores"],
-        )
-
-        c3.metric(
-            "Ties",
-            multi_audit["ties"],
-        )
-
-        c4.metric(
-            "Home Win Rate",
-            f"{multi_audit['home_win_rate']:.1%}",
-        )
-
-    # ============================================================
-    # NFL PREGAME FEATURE ENGINE
-    # ============================================================
-
-    if "multi_nfl_games" in st.session_state:
-
-        st.markdown("---")
-        st.markdown("### 🧠 NFL Pregame Feature Engine")
-
-        if st.button("Build NFL Pregame Features"):
-
-            try:
-                with st.spinner(
-                    "Building leakage-safe NFL pregame features..."
-                ):
-                    nfl_feature_games = build_nfl_pregame_features(
-                        st.session_state["multi_nfl_games"]
-                    )
-
-                    st.session_state[
-                        "nfl_feature_games"
-                    ] = nfl_feature_games
-
-                st.success(
-                    f"NFL feature build complete — "
-                    f"{len(nfl_feature_games)} games processed."
-                )
-
-            except Exception as e:
-                st.error(
-                    f"NFL feature engine error: {e}"
-                )
-
-
-    if "nfl_feature_games" in st.session_state:
-
-        nfl_features = st.session_state[
-            "nfl_feature_games"
-        ]
-
-        st.markdown("#### 🧠 NFL Predictive Feature Dataset")
-
-        c1, c2, c3, c4 = st.columns(4)
-
-        c1.metric(
-            "Games",
-            len(nfl_features),
-        )
-
-        c2.metric(
-            "Predictive Features",
-            max(len(nfl_features.columns) - 6, 0),
-        )
-
-        c3.metric(
-            "Training Games",
-            nfl_features["home_win"].notna().sum(),
-        )
-
-        c4.metric(
-            "Ties Excluded",
-            nfl_features["home_win"].isna().sum(),
-        )
-
-        st.dataframe(
-            nfl_features,
-            use_container_width=True,
-            hide_index=True,
-        )
-
-    # ============================================================
-    # NFL WALK-FORWARD MODEL VALIDATION
-    # ============================================================
-
-    st.markdown("## 🧠 NFL Predictive Model Validation")
-
-    if "multi_nfl_games" not in st.session_state:
-        st.info(
-            "Load the multi-season NFL dataset first before "
-            "running predictive validation."
-        )
-
-    else:
-        nfl_model_games = st.session_state["multi_nfl_games"]
-
-        st.write(
-            f"Historical games available for modeling: "
-            f"{len(nfl_model_games):,}"
-        )
-
-        if st.button("Run NFL Walk-Forward Model"):
-
-            try:
-                with st.spinner(
-                    "Building leakage-safe features and "
-                    "running NFL walk-forward validation..."
-                ):
-
-                    nfl_features = build_nfl_pregame_features(
-                        nfl_model_games
-                    )
-
-                    nfl_model_result = run_nfl_walkforward_model(
-                        nfl_features
-                    )
-
-                    st.session_state[
-                        "nfl_walkforward_result"
-                    ] = nfl_model_result
-
-                    st.session_state[
-                        "nfl_feature_games"
-                    ] = nfl_features
-
-                st.success(
-                    "NFL walk-forward validation complete."
-                )
-
-            except Exception as e:
-                st.error(
-                    f"NFL walk-forward validation error: {e}"
-                )
-
-
-    if "nfl_walkforward_result" in st.session_state:
-
-        result = st.session_state[
-            "nfl_walkforward_result"
-        ]
-
-        st.markdown("### 🏈 NFL Model Performance")
-
-        c1, c2, c3, c4 = st.columns(4)
-
-        c1.metric(
-            "Predictions",
-            f"{result['prediction_count']:,}",
-        )
-
-        c2.metric(
-            "Accuracy",
-            f"{result['accuracy']:.1%}",
-        )
-
-        c3.metric(
-            "AUC",
-            f"{result['auc']:.3f}",
-        )
-
-        c4.metric(
-            "Brier Score",
-            f"{result['brier']:.3f}",
-        )
-
-        c1, c2, c3 = st.columns(3)
-
-        c1.metric(
-            "Log Loss",
-            f"{result['log_loss']:.3f}",
-        )
-
-        c2.metric(
-            "Home-Team Baseline",
-            f"{result['baseline_home_accuracy']:.1%}",
-        )
-
-        c3.metric(
-            "Accuracy vs Baseline",
-            f"{result['accuracy_vs_baseline']:+.1%}",
-        )
-
-
-        # ------------------------------------------
-        # NFL PROBABILITY-BAND VALIDATION
-        # ------------------------------------------
-
-        st.markdown("### 🎯 NFL Probability-Band Validation")
-
-        probability_bands = result.get("probability_bands")
-
-        if (
-            probability_bands is not None
-            and not probability_bands.empty
-        ):
-
-            display_bands = probability_bands.copy()
-
-            # Format percentages for dashboard display.
-
-            percentage_columns = [
-                "average_confidence",
-                "actual_win_rate",
-                "calibration_gap",
-                "win_rate_lower_95",
-                "win_rate_upper_95",
-            ]
-
-            for column in percentage_columns:
-                display_bands[column] = (
-                    display_bands[column] * 100
-                ).round(1)
-
-            display_bands = display_bands.rename(
-                columns={
-                    "confidence_band": "Confidence Band",
-                    "total_predictions": "Games",
-                    "correct_predictions": "Correct",
-                    "average_confidence": "Average Confidence (%)",
-                    "actual_win_rate": "Actual Win Rate (%)",
-                    "calibration_gap": "Calibration Gap (pp)",
-                    "win_rate_lower_95": "95% Lower Bound (%)",
-                    "win_rate_upper_95": "95% Upper Bound (%)",
-                }
-            )
-
-            st.dataframe(
-                display_bands,
-                use_container_width=True,
-                hide_index=True,
-            )
-
-            st.caption(
-                "Historical out-of-sample prediction accuracy "
-                "by model-confidence range. Confidence intervals "
-                "reflect sampling uncertainty and do not guarantee "
-                "future betting performance."
-            )
-
-        else:
-
-            st.info(
-                "Run the NFL Walk-Forward Model to generate "
-                "probability-band validation results."
-            )
-
-
-    
-        st.markdown("### 🔎 Walk-Forward Predictions")
-
-        prediction_table = result[
-            "predictions"
-        ].copy()
-
-        prediction_table[
-            "home_win_probability"
-        ] = prediction_table[
-            "probability"
-        ].map(
-            lambda x: f"{x:.1%}"
-        )
-
-        st.dataframe(
-            prediction_table[
-                [
-                    "start_time",
-                    "home_team",
-                    "away_team",
-                    "home_win_probability",
-                    "prediction",
-                    "actual",
-                    "correct",
-                ]
-            ],
-            use_container_width=True,
-            hide_index=True,
-        )
-
-    
-# =================================================
-# NFL ACCURACY AUDIT DASHBOARD
-# =================================================
-
-if page == "🏈 NFL":
-    st.markdown("---")
-
-    st.header("NFL Prediction Accuracy Audit")
-
-    st.caption(
-        "Historical out-of-sample model evaluation"
-    )
-
-    if st.button(
-        "Run NFL Accuracy Audit",
-        key="run_nfl_accuracy_audit",
-    ):
-
-        walkforward = st.session_state.get(
-            "nfl_walkforward_result"
-        )
-
-        if walkforward is None:
-            st.warning(
-                "Run the NFL walk-forward model first."
-            )
-
-        else:
-
-            try:
-
-                if isinstance(walkforward, dict):
-
-                    predictions = walkforward.get(
-                        "predictions"
-                    )
-
-                else:
-
-                    predictions = walkforward
-
-                if predictions is None:
-
-                    raise ValueError(
-                        "Walk-forward predictions are missing."
-                    )
-
-                audit_df = pd.DataFrame(
-                    predictions
-                ).copy()
-
-                # Normalize probability column.
-
-                if (
-                    "probability" not in audit_df.columns
-                    and "home_win_probability"
-                    in audit_df.columns
-                ):
-
-                    audit_df["probability"] = (
-                        audit_df["home_win_probability"]
-                    )
-
-                # Normalize actual outcome column.
-
-                if (
-                    "actual" not in audit_df.columns
-                    and "home_win" in audit_df.columns
-                ):
-
-                    audit_df["actual"] = (
-                        audit_df["home_win"]
-                    )
-
-                # Never audit unfinished games.
-
-                audit_df = audit_df.dropna(
-                    subset=["probability", "actual"]
-                )
-
-                audit = run_nfl_accuracy_audit(
-                    audit_df,
-                    min_samples=30,
-                )
-
-                st.session_state[
-                    "nfl_accuracy_audit"
-                ] = audit
-
-            except Exception as e:
-
-                st.error(
-                    f"NFL accuracy audit failed: {e}"
-                )
-
-
-    # =================================================
-    # DISPLAY AUDIT RESULTS
-    # =================================================
-
-    audit = st.session_state.get(
-        "nfl_accuracy_audit"
-    )
-
-if page == "🏈 NFL" and st.session_state.get("nfl_accuracy_audit") is not None:
-
-    overall = audit["overall"]
-
-    st.subheader(
-        "Overall Historical Performance"
-    )
-
-    col1, col2, col3, col4 = st.columns(4)
-
-    col1.metric(
-        "Predictions",
-        overall["total_predictions"],
-    )
-
-    col2.metric(
-        "Correct",
-        overall["correct_predictions"],
-    )
-
-    col3.metric(
-        "Accuracy",
-        f'{overall["accuracy"]:.1%}',
-    )
-
-    col4.metric(
-        "Brier Score",
-        f'{overall["brier_score"]:.4f}',
-    )
-
-    if not audit["sufficient_sample"]:
-
-        st.warning(
-            "Limited historical sample. "
-            "Interpret results cautiously."
-        )
-
-    st.markdown("---")
-
-    st.subheader(
-        "Accuracy by Confidence Threshold"
-    )
-
-    threshold_df = audit[
-        "confidence_thresholds"
-    ].copy()
-
-    st.dataframe(
-        threshold_df,
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    st.markdown("---")
-
-    st.subheader(
-        "Probability Calibration"
-    )
-
-    calibration_df = audit[
-        "calibration"
-    ].copy()
-
-    st.dataframe(
-        calibration_df,
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    st.markdown("---")
-
-    st.subheader(
-        "Historical Performance Over Time"
-    )
-
-    performance_df = audit[
-        "performance_over_time"
-    ]
-
-    if not performance_df.empty:
-
-        st.line_chart(
-            performance_df.set_index(
-                "month"
-            )["accuracy"]
-        )
-
-        st.dataframe(
-            performance_df,
-            use_container_width=True,
-            hide_index=True,
-        )
-
-    else:
-
-        st.info(
-            "Historical prediction dates are "
-            "not available."
-        )
-
-    st.markdown("---")
-
-    st.subheader(
-        "Baseline Comparison"
-    )
-
-    baseline = audit[
-        "baseline_comparison"
-    ]
-
-    if baseline is not None:
-
-        col1, col2 = st.columns(2)
-
-        col1.metric(
-            "Model Accuracy",
-            f'{baseline["model_accuracy"]:.1%}',
-        )
-
-        col2.metric(
-            "Baseline Accuracy",
-            f'{baseline["baseline_accuracy"]:.1%}',
-        )
-
-    else:
-
-        st.info(
-            "No pregame baseline probabilities "
-            "were supplied."
-        )
-
-    # ============================================================
-    # NFL CONFIDENCE CALIBRATION
-    # ============================================================
-
-    if "nfl_walkforward_result" in st.session_state:
-
-        st.markdown("## 🎯 NFL Confidence Calibration")
-
-        calibration_result = st.session_state[
-            "nfl_walkforward_result"
-        ]
-
-        calibration_df = calibration_result[
-            "predictions"
-        ].copy()
-
-        # Confidence = probability assigned to the predicted winner.
-        calibration_df["confidence"] = (
-            calibration_df["probability"].where(
-                calibration_df["prediction"] == 1,
-                1.0 - calibration_df["probability"],
-            )
-        )
-
-        calibration_df["correct"] = (
-            calibration_df["prediction"]
-            == calibration_df["actual"]
-        ).astype(int)
-
-        # Confidence bands.
-        calibration_df["confidence_band"] = pd.cut(
-            calibration_df["confidence"],
-            bins=[
-                0.50,
-                0.55,
-                0.60,
-                0.65,
-                0.70,
-                0.75,
-                0.80,
-                0.85,
-                0.90,
-                0.95,
-                1.01,
-            ],
-            labels=[
-                "50–55%",
-                "55–60%",
-                "60–65%",
-                "65–70%",
-                "70–75%",
-                "75–80%",
-                "80–85%",
-                "85–90%",
-                "90–95%",
-                "95–100%",
-            ],
-            include_lowest=True,
-        )
-
-        calibration_summary = (
-            calibration_df
-            .groupby(
-                "confidence_band",
-                observed=False,
-            )
-            .agg(
-                predictions=("correct", "size"),
-                correct=("correct", "sum"),
-                actual_accuracy=("correct", "mean"),
-                avg_confidence=("confidence", "mean"),
-            )
-            .reset_index()
-        )
-
-        calibration_summary["calibration_gap"] = (
-            calibration_summary["actual_accuracy"]
-            - calibration_summary["avg_confidence"]
-        )
-
-
-        # ------------------------------------------
-        # Store NFL historical confidence calibration
-        # for use by the live opportunity engine.
-        # ------------------------------------------
-
-        st.session_state["nfl_calibration_summary"] = (
-            calibration_summary.copy()
-        )
-    
-
-        display_calibration = calibration_summary.copy()
-
-        display_calibration["Average Confidence"] = (
-            display_calibration["avg_confidence"]
-            .map(
-                lambda x: f"{x:.1%}"
-                if pd.notna(x)
-                else "—"
-            )
-        )
-
-        display_calibration["Actual Accuracy"] = (
-            display_calibration["actual_accuracy"]
-            .map(
-                lambda x: f"{x:.1%}"
-                if pd.notna(x)
-                else "—"
-            )
-        )
-
-        display_calibration["Calibration Gap"] = (
-            display_calibration["calibration_gap"]
-            .map(
-                lambda x: f"{x:+.1%}"
-                if pd.notna(x)
-                else "—"
-            )
-        )
-
-        display_calibration = display_calibration[
-            [
-                "confidence_band",
-                "predictions",
-                "correct",
-                "Average Confidence",
-                "Actual Accuracy",
-                "Calibration Gap",
-            ]
-        ]
-
-        display_calibration = display_calibration.rename(
-            columns={
-                "confidence_band": "Confidence Band",
-                "predictions": "Predictions",
-                "correct": "Correct",
-            }
-        )
-
-        st.dataframe(
-            display_calibration,
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        # --------------------------------------------------------
-        # HIGH-CONFIDENCE PERFORMANCE
-        # --------------------------------------------------------
-
-        st.markdown("### 🔥 High-Confidence Performance")
-
-        confidence_thresholds = [
-            0.55,
-            0.60,
-            0.65,
-            0.70,
-            0.75,
-            0.80,
-        ]
-
-        threshold_rows = []
-
-        for threshold in confidence_thresholds:
-
-            subset = calibration_df[
-                calibration_df["confidence"] >= threshold
-            ]
-
-            if len(subset) == 0:
+                yield name, [], 'Player identity for '+name+': '+_nba_request_issue(exc)
                 continue
-
-            threshold_rows.append(
-                {
-                    "Minimum Confidence": threshold,
-                    "Predictions": len(subset),
-                    "Correct": int(
-                        subset["correct"].sum()
-                    ),
-                    "Accuracy": subset["correct"].mean(),
-                    "Average Confidence": subset[
-                        "confidence"
-                    ].mean(),
-                }
-            )
-    
-        threshold_df = pd.DataFrame(
-            threshold_rows
-        )
-
-        if not threshold_df.empty:
-
-            threshold_display = threshold_df.copy()
-
-            threshold_display[
-                "Minimum Confidence"
-            ] = threshold_display[
-                "Minimum Confidence"
-            ].map(
-                lambda x: f"{x:.0%}+"
-            )
-
-            threshold_display[
-                "Accuracy"
-            ] = threshold_display[
-                "Accuracy"
-            ].map(
-                lambda x: f"{x:.1%}"
-            )
-
-            threshold_display[
-                "Average Confidence"
-            ] = threshold_display[
-                "Average Confidence"
-            ].map(
-                lambda x: f"{x:.1%}"
-            )
-
-            st.dataframe(
-                threshold_display,
-                use_container_width=True,
-                hide_index=True,
-            )
-
-    # Save model predictions for later decision-engine/live-engine work.
-    calibration_result = st.session_state.get(
-        "nfl_walkforward_result"
-    )
-
-    if calibration_result is not None:
-        nfl_model_predictions = calibration_result[
-            "predictions"
-        ].copy()
-
-        if (
-            "home_win_probability" not in nfl_model_predictions.columns
-            and "probability" in nfl_model_predictions.columns
-        ):
-            nfl_model_predictions["home_win_probability"] = (
-                nfl_model_predictions["probability"]
-            )
-
-        st.session_state[
-        "nfl_historical_predictions"
-    ] = nfl_model_predictions
-
-    # Store historical calibration data separately
-    # from predictions for upcoming NFL games.
-
-
-    # ==========================================
-    # STORE NFL HISTORICAL PREDICTIONS
-    # ==========================================
-
-    nfl_model_predictions = st.session_state.get(
-        "nfl_model_predictions",
-        pd.DataFrame()
-    )
-
-    if (
-        isinstance(nfl_model_predictions, pd.DataFrame)
-        and not nfl_model_predictions.empty
-    ):
-
-        st.session_state[
-            "nfl_historical_predictions"
-        ] = nfl_model_predictions.copy()
-
-        st.session_state[
-            "nfl_calibration_predictions"
-        ] = nfl_model_predictions.copy()
-
-    
-    # ---------------------------------------------------------
-    # NFL DECISION ENGINE
-    # ---------------------------------------------------------
-
-    st.markdown("### 🧠 NFL Decision Engine")
-
-
-    try:
-        nfl_predictions = st.session_state.get(
-            "nfl_historical_predictions",
-            pd.DataFrame()
-        ).copy()
-
-        if nfl_predictions.empty:
-            raise ValueError(
-                "Run the NFL historical model first to load NFL model predictions."
-            )
-        if "home_win_probability" not in nfl_predictions.columns and "probability" in nfl_predictions.columns:
-            nfl_predictions["home_win_probability"] = nfl_predictions["probability"]
-    
-        if (
-            "home_win_probability" not in nfl_predictions.columns
-            and "probability" in nfl_predictions.columns
-        ):
-            nfl_predictions["home_win_probability"] = nfl_predictions["probability"]
-
-        decision_profile = build_nfl_confidence_profile(
-            nfl_predictions
-        )
-
-        decision_rows = []
-
-        for _, game in nfl_predictions.iterrows():
-
-            decision = get_nfl_decision(
-                home_team=game["home_team"],
-                away_team=game["away_team"],
-                home_win_probability=game["home_win_probability"],
-                confidence_profile=decision_profile,
-            )
-
-            decision_rows.append(
-                {
-                    "start_time": game["start_time"],
-                    "home_team": game["home_team"],
-                    "away_team": game["away_team"],
-                    "predicted_team": decision["predicted_team"],
-                    "confidence": decision["confidence"],
-                    "decision": decision["decision"],
-                    "historical_accuracy": decision["historical_accuracy"],
-                    "historical_sample": decision["historical_sample"],
-                    "reason": decision["reason"],
-                    "actual": game["actual"],
-                    "correct": game["correct"],
-                }
-            )
-
-        nfl_decisions = pd.DataFrame(decision_rows)
-
-        st.session_state["nfl_decisions"] = nfl_decisions
-        st.session_state["nfl_confidence_profile"] = decision_profile
-
-        bet_count = (nfl_decisions["decision"] == "BET").sum()
-        lean_count = (nfl_decisions["decision"] == "LEAN").sum()
-        pass_count = (nfl_decisions["decision"] == "PASS").sum()
-
-        c1, c2, c3 = st.columns(3)
-
-        c1.metric("BET", int(bet_count))
-        c2.metric("LEAN", int(lean_count))
-        c3.metric("PASS", int(pass_count))
-
-        bet_games = nfl_decisions[
-            nfl_decisions["decision"] == "BET"
-        ].copy()
-
-        if not bet_games.empty:
-
-            bet_accuracy = bet_games["correct"].mean()
-
-            st.markdown("#### 🔥 Historical BET Performance")
-
-            b1, b2, b3 = st.columns(3)
-
-            b1.metric("Qualified Bets", len(bet_games))
-            b2.metric("Correct", int(bet_games["correct"].sum()))
-            b3.metric("Accuracy", f"{bet_accuracy:.1%}")
-
-            display_bets = bet_games.copy()
-
-            display_bets["confidence"] = (
-                display_bets["confidence"]
-                .map(lambda x: f"{x:.1%}")
-            )
-
-            display_bets["historical_accuracy"] = (
-                display_bets["historical_accuracy"]
-                .map(
-                    lambda x: f"{x:.1%}"
-                    if pd.notna(x)
-                    else "—"
-                )
-            )
-
-            st.dataframe(
-                display_bets,
-                use_container_width=True,
-                hide_index=True,
-            )
-
+        if len(matches) != 1:
+            yield name, [], 'No unique NBA player identity for '+name+'.'
         else:
-            st.info(
-                "No historical predictions currently "
-                "qualify as BET decisions."
-            )
-
-    except Exception as e:
-        st.error(f"NFL Decision Engine error: {e}")
-
-    # --------------------------------------------------
-    # NFL MARKET EDGE TEST
-    # --------------------------------------------------
-
-    st.markdown("### 💰 NFL Market Edge Test")
-
-    test_home_probability = st.number_input(
-        "Home model probability",
-        min_value=0.01,
-        max_value=0.99,
-        value=0.70,
-        step=0.01,
-    )
-
-    test_home_odds = st.number_input(
-        "Home moneyline",
-        value=-150,
-        step=5,
-    )
-
-    test_away_odds = st.number_input(
-        "Away moneyline",
-        value=130,
-        step=5,
-    )
-
-    if st.button("Test NFL Market Edge"):
-
+            resolved.append((name, matches[0]['id']))
+    resolved.sort(key=lambda item: not bool(known[item[0]].get('checked_at')))
+    batches = []
+    for has_history in (True, False):
+        subset = [item for item in resolved if bool(known[item[0]].get('checked_at')) == has_history]
+        batches.extend(subset[i:i+8] for i in range(0, len(subset), 8))
+    for offset, batch in enumerate(batches):
+        ids = {pid for name, pid in batch}; rows_by_id = {pid: [] for pid in ids}
+        checked_dates = [pd.to_datetime(known[name].get('checked_at'), utc=True, errors='coerce') for name, pid in batch]
+        since = max(now-pd.Timedelta(days=365), min(checked_dates)-pd.Timedelta(days=3)) if all(pd.notna(d) for d in checked_dates) else now-pd.Timedelta(days=365)
         try:
-            edge_result = calculate_nfl_market_edge(
-                home_model_probability=test_home_probability,
-                home_odds=test_home_odds,
-                away_odds=test_away_odds,
-            )
-
-            if edge_result["best_side"] == "HOME":
-                selected_probability = edge_result[
-                    "home_model_probability"
-                ]
-                selected_market_probability = edge_result[
-                    "home_no_vig_probability"
-                ]
-            else:
-                selected_probability = edge_result[
-                    "away_model_probability"
-                ]
-                selected_market_probability = edge_result[
-                    "away_no_vig_probability"
-                ]
-
-            classification = classify_nfl_market_edge(
-                model_probability=selected_probability,
-                market_probability=selected_market_probability,
-                american_odds=edge_result["best_odds"],
-            )
-
-            col1, col2, col3, col4 = st.columns(4)
-
-            col1.metric(
-                "Best Side",
-                edge_result["best_side"],
-            )
-
-            col2.metric(
-                "Model Probability",
-                f"{selected_probability:.1%}",
-            )
-
-            col3.metric(
-                "Market No-Vig Probability",
-                f"{selected_market_probability:.1%}",
-            )
-
-            col4.metric(
-                "Model Edge",
-                f"{edge_result['best_edge']:+.1%}",
-            )
-
-            st.metric(
-                "Expected Value / $1",
-                f"{classification['expected_value']:+.3f}",
-            )
-
-            decision = classification["decision"]
-
-            if decision == "BET":
-                st.success(
-                    f"BET — {classification['reason']}"
-                )
-            elif decision == "LEAN":
-                st.warning(
-                    f"LEAN — {classification['reason']}"
-                )
-            else:
-                st.info(
-                    f"PASS — {classification['reason']}"
-                )
-
-        except Exception as e:
-            st.error(
-                f"NFL Market Edge Test error: {e}"
-            )
-
-    # --------------------------------------------------
-    # LIVE NFL MONEYLINES
-    # --------------------------------------------------
-
-    st.markdown("### 📡 Live NFL Moneylines")
-
-    if st.button("Load Live NFL Moneylines"):
-        try:
-            with st.spinner("Loading current NFL moneylines..."):
-                live_nfl_odds = get_live_nfl_moneylines()
-
-            if not live_nfl_odds:
-                st.info(
-                    "No current NFL moneyline markets were returned."
-                )
-            else:
-                live_nfl_odds_df = pd.DataFrame(live_nfl_odds)
-
-                st.success(
-                    f"Loaded {len(live_nfl_odds_df)} "
-                    "NFL sportsbook moneyline markets."
-                )
-
-                
-            # NFL SPORTSBOOK ODDS DASHBOARD
-
-            from zoneinfo import ZoneInfo
-
-            def display_nfl_moneyline(odds):
-                if pd.isna(odds):
-                    return "N/A"
-                return f"{int(odds):+d}"
-
-            st.markdown("### 🏈 NFL Sportsbook Odds Center")
-
-            st.caption(
-                "Compare moneyline odds across sportsbooks "
-                "and find the best available price for each team."
-            )
-
-            nfl_games = live_nfl_odds_df.groupby(
-                "game_id", sort=False
-            )
-
-            st.info(
-                f"Displaying {len(nfl_games)} NFL games "
-                f"across {len(live_nfl_odds_df)} sportsbook markets."
-            )
-
-            for game_id, game_lines in nfl_games:
-
-                game = game_lines.iloc[0]
-
-                home_team = str(game["home_team"])
-                away_team = str(game["away_team"])
-
-                game_time = pd.to_datetime(
-                    game["commence_time"],
-                    utc=True,
-                    errors="coerce",
-                )
-
-                if pd.notna(game_time):
-                    game_time_display = (
-                        game_time.tz_convert(
-                            ZoneInfo("America/Chicago")
-                        ).strftime("%b %d, %Y · %I:%M %p CT")
-                    )
-                else:
-                    game_time_display = "Time unavailable"
-
-                home_lines = game_lines.dropna(
-                    subset=["home_moneyline"]
-                )
-
-                away_lines = game_lines.dropna(
-                    subset=["away_moneyline"]
-                )
-
-                best_home = (
-                    home_lines.loc[
-                        home_lines["home_moneyline"].idxmax()
-                    ]
-                    if not home_lines.empty
-                    else None
-                )
-
-                best_away = (
-                    away_lines.loc[
-                        away_lines["away_moneyline"].idxmax()
-                    ]
-                    if not away_lines.empty
-                    else None
-                )
-
-                with st.container(border=True):
-
-                    st.caption(game_time_display)
-
-                    st.subheader(
-                        f"{away_team} @ {home_team}"
-                    )
-
-                    away_col, home_col = st.columns(2)
-
-                    with away_col:
-                        st.caption("AWAY TEAM")
-                        st.markdown(f"**{away_team}**")
-
-                        if best_away is not None:
-                            st.metric(
-                                "Best Moneyline",
-                                display_nfl_moneyline(
-                                    best_away["away_moneyline"]
-                                ),
-                            )
-
-                            st.caption(
-                                f"Sportsbook: {best_away['sportsbook']}"
-                            )
-                        else:
-                            st.info("Odds unavailable")
-
-                    with home_col:
-                        st.caption("HOME TEAM")
-                        st.markdown(f"**{home_team}**")
-
-                        if best_home is not None:
-                            st.metric(
-                                "Best Moneyline",
-                                display_nfl_moneyline(
-                                    best_home["home_moneyline"]
-                                ),
-                            )
-
-                            st.caption(
-                                f"Sportsbook: {best_home['sportsbook']}"
-                            )
-                        else:
-                            st.info("Odds unavailable")
-
-                    with st.expander(
-                        "View All Sportsbook Odds"
-                    ):
-
-                        comparison = game_lines[
-                            [
-                                "sportsbook",
-                                "away_moneyline",
-                                "home_moneyline",
-                            ]
-                        ].copy()
-
-                        comparison["away_moneyline"] = (
-                            comparison["away_moneyline"].apply(
-                                display_nfl_moneyline
-                            )
-                        )
-
-                        comparison["home_moneyline"] = (
-                            comparison["home_moneyline"].apply(
-                                display_nfl_moneyline
-                            )
-                        )
-
-                        comparison.columns = [
-                            "Sportsbook",
-                            away_team,
-                            home_team,
-                        ]
-
-                        st.dataframe(
-                            comparison,
-                            use_container_width=True,
-                            hide_index=True,
-                        )
-                st.session_state["live_nfl_odds"] = (
-                    live_nfl_odds_df
-                )
-
-        except Exception as e:
-            st.error(f"Live NFL odds error: {e}")
-
-    # --------------------------------------------------
-    # NFL BEST-LINE SHOPPER
-    # --------------------------------------------------
-
-    st.markdown("### 🛒 NFL Best-Line Shopper")
-
-    if "live_nfl_odds" not in st.session_state:
-        st.info(
-            "Load Live NFL Moneylines first."
-        )
-
-    else:
-        if st.button("Find Best NFL Moneylines"):
-            try:
-                odds_rows = (
-                    st.session_state["live_nfl_odds"]
-                    .to_dict("records")
-                )
-
-                best_lines = get_best_nfl_moneylines(
-                    odds_rows
-                )
-
-                best_lines_df = pd.DataFrame(best_lines)
-
-                st.session_state["nfl_best_lines"] = (
-                    best_lines_df
-
-                )
-
-                st.success(
-                    f"Found best available lines for "
-                    f"{len(best_lines_df)} NFL games."
-                )
-
-                st.dataframe(
-                    best_lines_df,
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-            except Exception as e:
-                st.error(
-                    f"NFL best-line error: {e}"
-                )
-
-    
-    # ============================================================
-    # LIVE NFL OPPORTUNITY ENGINE
-    # ============================================================
-
-    st.markdown("### 🧠 Live NFL Opportunity Engine")
-
-    best_lines = st.session_state.get("nfl_best_lines")
-    feature_games = st.session_state.get("nfl_feature_games")
-    historical_result = st.session_state.get(
-        "nfl_walkforward_result"
-    )
-
-    # ------------------------------------------------------------
-    # ENGINE STATUS
-    # ------------------------------------------------------------
-
-    st.caption("NFL Engine Status")
-
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
-        st.metric(
-            "Sportsbook Lines",
-            "Ready" if (
-                isinstance(best_lines, pd.DataFrame)
-                and not best_lines.empty
-            ) else "Not Loaded"
-        )
-
-    with col2:
-        st.metric(
-            "Historical Features",
-            "Ready" if (
-                isinstance(feature_games, pd.DataFrame)
-                and not feature_games.empty
-            ) else "Not Loaded"
-        )
-
-    with col3:
-        st.metric(
-            "Walk-Forward Validation",
-            "Ready" if historical_result else "Not Loaded"
-        )
-
-    # ------------------------------------------------------------
-    # GENERATE UPCOMING NFL PREDICTIONS
-    # ------------------------------------------------------------
-
-    if st.button(
-        "Generate Live NFL Predictions",
-        key="generate_live_nfl_predictions"
-    ):
-
-        try:
-
-            if (
-                best_lines is None
-                or best_lines.empty
-            ):
-                st.error(
-                    "Load NFL moneylines and run the "
-                    "Best-Line Shopper first."
-                )
-
-            elif (
-                feature_games is None
-                or feature_games.empty
-            ):
-                st.error(
-                    "Build NFL pregame features first."
-                )
-
-
-            else:
-
-                prediction_rows = []
-                prediction_errors = []
-
-                current_time = pd.Timestamp.now(tz="UTC")
-
-                with st.spinner(
-                    "Generating predictions for upcoming NFL games..."
-                ):
-
-                    for _, game in nfl_week_rows(best_lines, now=current_time).iterrows():
-
-                        home_team = game["home_team"]
-                        away_team = game["away_team"]
-
-                        game_time = pd.to_datetime(
-                            game["commence_time"],
-                            utc=True,
-                            errors="coerce"
-                        )
-
-                        if pd.isna(game_time):
-                            continue
-
-                        # Only predict games that have not started.
-                        if game_time <= current_time:
-                            continue
-
-                        try:
-
-                            # Build matchup features using
-                            # historical games before kickoff.
-
-                            future_features = (
-                                build_nfl_future_matchup_features(
-                                    feature_games,
-                                    home_team,
-                                    away_team,
-                                    game_time
-                                )
-                            )
-
-                            # Generate an actual model prediction.
-
-                            prediction = predict_nfl_matchup(
-                                feature_games,
-                                future_features
-                            )
-
-                            prediction_rows.append(
-                                {
-                                    "game_id": game.get("game_id"),
-                                    "commence_time": game_time,
-                                    "home_team": home_team,
-                                    "away_team": away_team,
-                                    "home_win_probability": prediction[
-                                        "home_win_probability"
-                                    ],
-                                    "away_win_probability": prediction[
-                                        "away_win_probability"
-                                    ],
-                                    "predicted_team": prediction[
-                                        "predicted_team"
-                                    ],
-                                    "confidence": prediction[
-                                        "confidence"
-                                    ],
-                                    "training_games": prediction[
-                                        "training_games"
-                                    ]
-                                }
-                            )
-
-                        except Exception as game_error:
-
-                            prediction_errors.append(
-                                f"{away_team} at {home_team}: "
-                                f"{game_error}"
-                            )
-
-                # ------------------------------------------------
-                # SAVE LIVE PREDICTIONS
-                # ------------------------------------------------
-
-                live_predictions = pd.DataFrame(
-                    prediction_rows
-                )
-
-                st.session_state[
-                    "nfl_live_predictions"
-                ] = live_predictions
-
-                # Clear previously generated opportunities
-                # so stale predictions cannot be displayed.
-
-                st.session_state.pop(
-                    "nfl_live_opportunities",
-                    None
-                )
-
-                if live_predictions.empty:
-
-                    st.warning(
-                        "No upcoming NFL predictions could "
-                        "be generated from the available data."
-                    )
-
-                else:
-
-                    st.success(
-                        f"Generated predictions for "
-                        f"{len(live_predictions)} upcoming NFL games."
-                    )
-
-                if prediction_errors:
-
-                    with st.expander(
-                        "Games that could not be predicted"
-                    ):
-
-                        for error in prediction_errors:
-                            st.write(error)
-
-        except Exception as e:
-
-            st.error(
-                f"NFL prediction error: {e}"
-            )
-
-    # ------------------------------------------------------------
-    # DISPLAY LIVE PREDICTIONS
-    # ------------------------------------------------------------
-
-    live_predictions = retain_nfl_picks(st.session_state.get("nfl_live_predictions"), "nfl_saved_research_cards")
-
-    
-    if (
-        isinstance(live_predictions, pd.DataFrame)
-        and not live_predictions.empty
-        and isinstance(best_lines, pd.DataFrame)
-        and not best_lines.empty
-        and isinstance(historical_result, dict)
-        and historical_result.get("success") is True
-    ):
-
-        st.markdown("### 🏈 Upcoming NFL Predictions")
-
-        display_predictions = live_predictions.copy()
-
-        display_predictions["commence_time"] = (
-            pd.to_datetime(
-                display_predictions["commence_time"],
-                utc=True
-            )
-            .dt.tz_convert("America/Chicago")
-            .dt.strftime("%b %d, %I:%M %p CT")
-        )
-
-        for column in [
-            "home_win_probability",
-            "away_win_probability",
-            "confidence"
-        ]:
-
-            display_predictions[column] = (
-                display_predictions[column]
-                .map(lambda x: f"{x:.1%}")
-            )
-
-        st.dataframe(
-            display_predictions[
-                [
-                    "commence_time",
-                    "away_team",
-                    "home_team",
-                    "predicted_team",
-                    "confidence",
-                    "home_win_probability",
-                    "away_win_probability",
-                    "training_games"
-                ]
-            ],
-            use_container_width=True,
-            hide_index=True
-        )
-
-        st.caption(
-            "Model probabilities are estimates, "
-            "not guaranteed outcomes."
-        )
-
-    # ------------------------------------------------------------
-    # LIVE NFL MARKET OPPORTUNITY ANALYSIS
-    # ------------------------------------------------------------
-
-    st.markdown("### 💰 NFL Market Opportunities")
-
-    if (
-        isinstance(live_predictions, pd.DataFrame)
-        and not live_predictions.empty
-        and isinstance(best_lines, pd.DataFrame)
-        and not best_lines.empty
-        and historical_result
-    ):
-
-        if st.button(
-            "Analyze Live NFL Opportunities",
-            key="analyze_live_nfl_opportunities"
-        ):
-
-            try:
-
-                with st.spinner(
-                    "Comparing NFL predictions against sportsbook odds..."
-                ):
-
-                    # Use live predictions, not historical
-                    # calibration predictions.
-
-                    live_opportunities = (
-                        build_live_nfl_opportunities(
-                            model_predictions=live_predictions,
-                            best_lines=best_lines,
-                            historical_accuracy=historical_result.get(
-                                "accuracy"
-                            ),
-                            historical_sample=historical_result.get(
-                                "prediction_count"
-                            )
-                        )
-                    )
-
-                    st.session_state[
-                        "nfl_live_opportunities"
-                    ] = live_opportunities
-
-                if live_opportunities.empty:
-
-                    st.warning(
-                        "No upcoming NFL games matched "
-                        "the available sportsbook markets."
-                    )
-
-                else:
-
-                    st.success(
-                        f"Analyzed {len(live_opportunities)} "
-                        "NFL market opportunities."
-                    )
-
-            except Exception as e:
-
-                st.error(
-                    f"NFL opportunity analysis error: {e}"
-                )
-
-    
-    else:
-
-        if (
-            isinstance(live_predictions, pd.DataFrame)
-            and not live_predictions.empty
-            and isinstance(best_lines, pd.DataFrame)
-            and not best_lines.empty
-        ):
-            st.info(
-                "Live NFL predictions are available. "
-                "Run the NFL Walk-Forward Model to enable "
-                "validated market opportunity analysis."
-            )
-
-        else:
-            st.info(
-                "Generate live NFL predictions and load "
-                "the Best-Line Shopper before analyzing opportunities."
-            )
-    # ------------------------------------------------------------
-    # DISPLAY NFL OPPORTUNITIES
-    # ------------------------------------------------------------
-
-    live_opportunities = st.session_state.get(
-        "nfl_live_opportunities"
-    )
-
-    if (
-        isinstance(live_opportunities, pd.DataFrame)
-        and not live_opportunities.empty
-    ):
-
-        st.markdown("### 📊 NFL Opportunity Results")
-
-        live_display = live_opportunities.copy()
-
-        for column in [
-            "home_win_probability",
-            "model_probability",
-            "market_no_vig_probability",
-            "model_edge"
-        ]:
-
-            if column in live_display.columns:
-
-                live_display[column] = (
-                    live_display[column]
-                    .map(
-                        lambda x: f"{x:.1%}"
-                        if pd.notna(x)
-                        else "—"
-                    )
-                )
-
-        if "expected_value" in live_display.columns:
-
-            live_display["expected_value"] = (
-                live_display["expected_value"]
-                .map(
-                    lambda x: f"{x:+.3f}"
-                    if pd.notna(x)
-                    else "—"
-                )
-            )
-
-        st.dataframe(
-            live_display,
-            use_container_width=True,
-            hide_index=True
-        )
-
-        st.caption(
-            "Expected value depends on model probability "
-            "accuracy and the sportsbook odds available "
-            "when the analysis was generated."
-        )
-
-if page == "🧪 Research Lab":
-    render_research_lab()
-
-
-
-# ==========================================
-# MLB V3 HISTORICAL PLAYER RESEARCH
-# ==========================================
-
-if page == "🧪 Research Lab":
-    st.divider()
-    st.subheader("⚾ MLB Historical Player Data")
-    st.caption(
-        "Build the permanent player-game warehouse used by the V3 "
-        "prediction engine. Each successful "
-        "250-game checkpoint is saved permanently to Supabase."
-    )
-
-    # V3 must also work before any V1 benchmark or V2A action has run.
-    mlb_v3_games = st.session_state.get("mlb_v3_games")
-    if mlb_v3_games is None or mlb_v3_games.empty:
-        mlb_v3_games = st.session_state.get("mlb_v2a_games")
-
-    v3_history_ready = False
-    try:
-        if mlb_v3_games is None or mlb_v3_games.empty:
-            with st.spinner("Loading MLB historical games for V3..."):
-                mlb_v3_games = fetch_mlb_games(
-                    start_date="2023-03-01",
-                    end_date="2026-09-30",
-                )
-
-        if mlb_v3_games is None or mlb_v3_games.empty:
-            st.warning(
-                "No completed MLB historical games were loaded. "
-                "Reload the page to retry before building V3 player history."
-            )
-        else:
-            st.session_state["mlb_v3_games"] = mlb_v3_games
-            if st.session_state.get("mlb_v3_player_logs") is None:
-                with st.spinner("Loading permanent MLB player history..."):
-                    st.session_state["mlb_v3_player_logs"] = load_mlb_player_history()
-
-            cached_player_logs = st.session_state.get("mlb_v3_player_logs")
-            if cached_player_logs is None:
-                raise RuntimeError("Permanent MLB player history did not load. Reload the page to retry.")
-
-            missing_player_games = get_missing_mlb_player_log_games(
-                mlb_v3_games,
-                existing_logs=cached_player_logs,
-            )
-            v3_history_ready = True
-    except Exception as exc:
-        st.error("MLB V3 history could not be initialized. Reload the page to retry.")
-        st.exception(exc)
-
-    if v3_history_ready:
-        player_total_games = len(mlb_v3_games)
-        player_completed_games = (
-            player_total_games
-            - len(missing_player_games)
-        )
-        player_coverage_pct = (
-            player_completed_games / player_total_games
-            if player_total_games
-            else 0.0
-        )
-
-        player_count = (
-            int(cached_player_logs["player_id"].nunique())
-            if (
-                cached_player_logs is not None
-                and not cached_player_logs.empty
-                and "player_id" in cached_player_logs.columns
-            )
-            else 0
-        )
-
-        player_col1, player_col2, player_col3, player_col4 = (
-            st.columns(4)
-        )
-
-        player_col1.metric(
-            "Player Rows Collected",
-            f"{len(cached_player_logs):,}",
-        )
-        player_col2.metric(
-            "Unique Players",
-            f"{player_count:,}",
-        )
-        player_col3.metric(
-            "Games Remaining",
-            f"{len(missing_player_games):,}",
-        )
-        player_col4.metric(
-            "V3 Data Progress",
-            f"{player_coverage_pct:.1%}",
-        )
-
-        st.progress(
-            min(max(player_coverage_pct, 0.0), 1.0)
-        )
-
-        if missing_player_games.empty:
-
-            st.success(
-                "Historical MLB player-game warehouse is 100% complete. "
-                "The permanent V3 cache is ready for historical feature "
-                "reconstruction and challenger-model validation."
-            )
-
-        else:
-
-            st.caption(
-                "The builder resumes from the permanent Supabase checkpoint, "
-                "fetches up to 10 MLB boxscores concurrently, skips games "
-                "already collected, and saves after every successful "
-                "250-game checkpoint."
-            )
-
-            if st.button(
-                "Build Remaining MLB Player History",
-                key="build_remaining_mlb_player_history",
-                type="primary",
-            ):
-
-                working_player_logs = cached_player_logs.copy()
-                total_player_requested = 0
-                total_player_new_rows = 0
-                player_batches = 0
-
-                player_progress_bar = st.progress(
-                    player_coverage_pct
-                )
-                player_status_box = st.empty()
-
-                try:
-
-                    while True:
-
-                        remaining_before = (
-                            get_missing_mlb_player_log_games(
-                                mlb_v3_games,
-                                existing_logs=working_player_logs,
-                            )
-                        )
-
-                        if remaining_before.empty:
-                            break
-
-                        player_batches += 1
-                        batch_target = min(
-                            250,
-                            len(remaining_before),
-                        )
-
-                        player_status_box.info(
-                            "Building MLB V3 player history — "
-                            f"checkpoint {player_batches:,} | "
-                            f"{len(remaining_before):,} games remaining..."
-                        )
-
-                        collection = collect_mlb_player_logs_batch(
-                            games=mlb_v3_games,
-                            existing_logs=working_player_logs,
-                            batch_size=batch_target,
-                        )
-
-                        batch_requested = int(
-                            collection.get("games_requested", 0)
-                        )
-                        new_logs = collection.get(
-                            "new_logs",
-                            pd.DataFrame(),
-                        )
-                        updated_logs = collection.get(
-                            "combined_logs",
-                            working_player_logs,
-                        )
-
-                        working_player_logs = updated_logs.copy()
-                        st.session_state[
-                            "mlb_v3_player_logs"
-                        ] = working_player_logs
-
-                        if (
-                            working_player_logs is not None
-                            and not working_player_logs.empty
-                        ):
-
-                            save_result = save_mlb_player_history(
-                                working_player_logs
-                            )
-
-                            if not save_result.get("success", False):
-                                raise RuntimeError(
-                                    "Player checkpoint was collected but could "
-                                    "not be permanently saved: "
-                                    f"{save_result.get('error')}"
-                                )
-
-                        batch_new_rows = (
-                            len(new_logs)
-                            if new_logs is not None
-                            else 0
-                        )
-                        total_player_requested += batch_requested
-                        total_player_new_rows += batch_new_rows
-
-                        remaining_after = (
-                            get_missing_mlb_player_log_games(
-                                mlb_v3_games,
-                                existing_logs=working_player_logs,
-                            )
-                        )
-
-                        completed_games = (
-                            player_total_games
-                            - len(remaining_after)
-                        )
-                        current_progress = (
-                            completed_games / player_total_games
-                            if player_total_games
-                            else 0.0
-                        )
-
-                        current_players = (
-                            int(working_player_logs["player_id"].nunique())
-                            if (
-                                not working_player_logs.empty
-                                and "player_id" in working_player_logs.columns
-                            )
-                            else 0
-                        )
-
-                        player_progress_bar.progress(
-                            min(max(current_progress, 0.0), 1.0)
-                        )
-                        player_status_box.info(
-                            "Building MLB V3 player history — "
-                            f"{len(working_player_logs):,} rows | "
-                            f"{current_players:,} players | "
-                            f"{len(remaining_after):,} games remaining | "
-                            f"{current_progress:.1%} complete"
-                        )
-
-                        if remaining_after.empty:
-                            break
-
-                        if collection.get("complete", False):
-                            break
-
-                        if len(remaining_after) >= len(remaining_before):
-                            st.warning(
-                                "Player-history build stopped because the latest "
-                                "checkpoint made no additional progress. All "
-                                "completed data was preserved in Supabase."
-                            )
-                            break
-
-                        if batch_requested == 0:
-                            break
-
-                except Exception as exc:
-
-                    st.session_state[
-                        "mlb_v3_player_logs"
-                    ] = working_player_logs
-
-                    player_status_box.error(
-                        "MLB V3 player-history build encountered an error. "
-                        "All successfully saved checkpoints were preserved."
-                    )
-                    st.exception(exc)
-
-                final_missing_players = (
-                    get_missing_mlb_player_log_games(
-                        mlb_v3_games,
-                        existing_logs=working_player_logs,
-                    )
-                )
-                final_player_coverage = (
-                    (player_total_games - len(final_missing_players))
-                    / player_total_games
-                    if player_total_games
-                    else 0.0
-                )
-                final_unique_players = (
-                    int(working_player_logs["player_id"].nunique())
-                    if (
-                        not working_player_logs.empty
-                        and "player_id" in working_player_logs.columns
-                    )
-                    else 0
-                )
-
-                st.session_state[
-                    "mlb_v3_last_player_collection"
-                ] = {
-                    "requested_games": total_player_requested,
-                    "new_player_rows": total_player_new_rows,
-                    "cached_player_rows": len(working_player_logs),
-                    "unique_players": final_unique_players,
-                    "remaining_games": len(final_missing_players),
-                    "coverage": final_player_coverage,
-                }
-
-                if final_missing_players.empty:
-                    player_progress_bar.progress(1.0)
-                    player_status_box.success(
-                        "MLB V3 historical player warehouse is 100% complete."
-                    )
-                    st.success(
-                        f"V3 player history complete — "
-                        f"{len(working_player_logs):,} player-game rows across "
-                        f"{final_unique_players:,} players are permanently saved."
-                    )
-                else:
-                    st.info(
-                        "Player-history checkpoint finished — "
-                        f"{total_player_requested:,} games processed this run, "
-                        f"{total_player_new_rows:,} player rows added, "
-                        f"{len(final_missing_players):,} games remain, "
-                        f"{final_player_coverage:.1%} complete."
-                    )
-
-
-
-def _mlb_pregame_storage_module():
-    import importlib
-    import dual_agent.supabase_db as storage
-    if getattr(storage, "MLB_PREGAME_STORAGE_VERSION", None) != 2:
-        importlib.invalidate_caches()
-        storage = importlib.reload(storage)
-    if getattr(storage, "MLB_PREGAME_STORAGE_VERSION", None) != 2:
-        raise RuntimeError("Deploy the matching dual_agent/supabase_db.py before saving captures.")
-    return storage
-
-
-def _save_mlb_captured_information(package):
-    try:
-        return _mlb_pregame_storage_module().save_mlb_pregame_intelligence(
-            package, snapshot_date=package.get("game_date")
-        )
-    except Exception as exc:
-        return {"success": False, "archive_saved": False, "latest_saved": False, "message": str(exc)}
-
-
-def _display_mlb_player_update_table(package):
-    rows = []
-    for game in package.get("games", []):
-        updates = game.get("current_information", {}) or {}
-        enriched = (game.get("enrichment", {}) or {}).get("players", {}) or {}
-        news = {str(x.get("player_id")): x for x in updates.get("player_news", [])}
-        context = game.get("team_context", {}) or {}
-        for side, team in updates.get("teams", {}).items():
-            lineup = set((context.get(side, {}) or {}).get("batting_order", []) or [])
-            transactions = team.get("transactions", [])
-            for entry in team.get("roster", []):
-                person = entry.get("person", {}) or {}; pid = person.get("id")
-                player = enriched.get(str(pid), {}) or {}
-                mentions = news.get(str(pid), {})
-                related = [t for t in transactions if (t.get("person", {}) or {}).get("id")==pid]
-                recent = player.get("recent_stats", {}) or {}
-                rows.append({"Game ID": game.get("game_id"), "Side": side, "Player": person.get("fullName"),
-                    "Roster status": (entry.get("status", {}) or {}).get("description") or "Unknown",
-                    "Listed in feed lineup": pid in lineup, "Recent transactions": len(related),
-                    "Latest transaction": max((str(t.get("date") or t.get("effectiveDate") or "") for t in related), default=None),
-                    "Recent stats available": bool(recent), "Profile available": bool(player.get("profile")),
-                    "Injury report": "Mention found — review" if mentions.get("report_match") else "Unverified",
-                    "Roster fetched UTC": team.get("roster_fetched_at"), "Stats collected in capture UTC": game.get("capture_finished_at") if recent else None})
-    return pd.DataFrame(rows)
-
-
-if page == "🧪 Research Lab":
-    st.divider()
-    st.subheader("MLB historical odds data")
-    st.caption("Collect and cache pregame sportsbook quotes for model setup. This section does not run accuracy tests or model comparisons.")
-    saved_model_file = st.file_uploader("Load saved matchup model for odds collection", type=["json"], key="mlb_odds_data_model_file")
-    if saved_model_file is not None:
-        try:
-            import json as mlb_saved_data_json
-            matchup = mlb_saved_data_json.load(saved_model_file)
-            if not isinstance(matchup, dict) or not matchup.get("retained_feature_rows"):
-                raise ValueError("Use the full saved matchup model JSON with retained features.")
-            odds_batch_limit = st.number_input("Maximum new historical odds requests per batch", min_value=1, max_value=200, value=10, step=1, key="mlb_historical_odds_limit")
-            st.caption(f"This batch can use up to {int(odds_batch_limit)*10:,} Odds API credits for US moneylines. Cached snapshots are reused. The first uncached request checks historical access; an access error stops the batch.")
-            if st.button("Collect historical odds for this saved model", key="mlb_historical_odds_collect"):
-                try:
-                    import os as mlb_odds_os
-                    import importlib as mlb_odds_importlib
-                    import dual_agent.mlb_historical_odds as mlb_odds_module
-                    mlb_odds_module = mlb_odds_importlib.reload(mlb_odds_module)
-                    odds_key = mlb_odds_os.environ.get("ODDS_API_KEY") or mlb_odds_os.environ.get("THE_ODDS_API_KEY")
-                    if not odds_key:
-                        odds_key = st.secrets.get("ODDS_API_KEY") or st.secrets.get("THE_ODDS_API_KEY")
-                    odds_progress = st.progress(0, text="Collecting historical moneyline snapshots...")
-                    odds_result = mlb_odds_module.collect_historical_odds(matchup, odds_key, max_requests=int(odds_batch_limit), progress=lambda done,total: odds_progress.progress(done/total, text=f"Checked {done} of {total} snapshots"))
-                    odds_result["source_archive"] = matchup.get("created_at")
-                    st.session_state["mlb_historical_odds_dataset"] = odds_result
-                    odds_progress.empty()
-                except Exception as exc:
-                    st.error("Historical odds collection stopped: " + str(exc))
-            collected_odds = st.session_state.get("mlb_historical_odds_dataset")
-            if collected_odds and collected_odds.get("source_archive") == matchup.get("created_at"):
-                st.json({key:collected_odds.get(key) for key in ["requests_used","credits_used_reported","credits_remaining","cached_snapshots","pending_snapshots","historical_access_verified","errors"]})
-                odds_coverage = pd.DataFrame(collected_odds.get("coverage", []))
-                if not odds_coverage.empty:
-                    st.dataframe(odds_coverage.groupby("season").agg(games=("game_id","count"),games_with_consensus=("eligible_books",lambda counts:int((counts>=2).sum()))).reset_index(), use_container_width=True, hide_index=True)
-                st.caption("Quotes are cached for model setup. Repeat collection to resume pending snapshots.")
-                st.download_button("Download collected historical odds", data=__import__("json").dumps(collected_odds), file_name="mlb_historical_odds.json", mime="application/json", key="mlb_historical_odds_download")
+            incremental = all(pd.notna(d) for d in checked_dates)
+            windows = [(since, now)] if incremental else [
+                (now-pd.Timedelta(days=90), now),
+                (now-pd.Timedelta(days=180), now-pd.Timedelta(days=90)),
+                (now-pd.Timedelta(days=365), now-pd.Timedelta(days=180))]
+            active_ids = set(ids)
+            for window_start, window_end in windows:
+                if not active_ids: break
+                cursor = None; seen = set()
+                for page in range(1, 101):
+                    notify(f"{'Updating new results' if incremental else 'Loading recent player history'} · batch {offset+1} of {len(batches)} · page {page}")
+                    params = {'player_ids[]': sorted(active_ids), 'per_page': 100,
+                              'start_date': window_start.strftime('%Y-%m-%d'),
+                              'end_date': window_end.strftime('%Y-%m-%d')}
+                    if cursor is not None: params['cursor'] = cursor
+                    payload = _get(base+'/stats', api_key, params, True)
+                    for row in payload.get('data', []):
+                        pid = (row.get('player') or {}).get('id'); game = row.get('game', {})
+                        date = pd.to_datetime(game.get('date'), utc=True, errors='coerce')
+                        played = nba_minutes(row.get('min')) is not None
+                        if pid in active_ids and str(game.get('status','')).startswith('Final') and pd.notna(date) and date<now and played:
+                            rows_by_id[pid].append(dict(row, source_date=date.isoformat(), history_provider='balldontlie'))
+                    cursor = payload.get('meta', {}).get('next_cursor')
+                    if cursor is None: break
+                    if str(cursor) in seen: raise RuntimeError('Repeated stats cursor')
+                    seen.add(str(cursor))
+                else: raise RuntimeError('Stats pagination incomplete')
+                if not incremental:
+                    # Finish each date window: provider ordering is not assumed.
+                    # Only extend history for players still short of 30 usable
+                    # results in at least one supported statistical category.
+                    for pid in list(active_ids):
+                        unique = {r['game']['id']: r for r in rows_by_id[pid]}.values()
+                        if all(sum(nba_market_value(r, stat) is not None for r in unique) >= 30
+                               for label, stat in MARKETS['NBA'].values()):
+                            active_ids.remove(pid)
         except Exception as exc:
-            st.error("Unable to open model data: " + str(exc))
+            # Discard all partial batch rows: incomplete samples must not drive picks.
+            for name, pid in batch:
+                yield name, [], 'NBA stats for '+name+': '+_nba_request_issue(exc)
+            continue
+        for name, pid in batch:
+            previous = known[name].get('rows', [])
+            rows = list({r['game']['id']: r for r in previous+rows_by_id[pid] if pd.Timestamp(r['source_date']) > now-pd.Timedelta(days=365)}.values())
+            rows.sort(key=lambda r:(r['source_date'], r['game']['id']))
+            entries[nba_identity_key(name)] = {'player_id': pid, 'checked_at': now.isoformat(), 'rows': rows}
+            # Checkpoint each completed player locally; partial batches are never saved.
+            save(archive_path, archive)
+            yield name, rows, None if rows else 'No completed played-game statistics returned for '+name+'.'
+
+    _nba_save_remote_history_archive(archive)
+    save(archive_path, archive)
+
+
+def mlb_prop_identities(snapshots):
+    """Resolve names within each game's teams; posted lineups override guesses."""
+    candidates = {}
+    for gid, snapshot in (snapshots or {}).items():
+        feed = snapshot.get('raw_feed', {})
+        box = feed.get('liveData', {}).get('boxscore', {}).get('teams', {})
+        people = feed.get('gameData', {}).get('players', {})
+        for side in ['home', 'away']:
+            team = box.get(side, {})
+            lineup = {int(pid) for pid in team.get('battingOrder', [])}
+            posted = len(lineup) == 9
+            pitchers = team.get('pitchers', [])
+            recorded = int(pitchers[0]) if pitchers else None
+            probable = (snapshot.get('probable_pitchers', {}).get(side) or {})
+            probable_id = int(probable['id']) if probable.get('id') else None
+            conflict = recorded is not None and probable_id is not None and recorded != probable_id
+            starter = None if conflict else recorded if recorded is not None else probable_id
+            players = dict(team.get('players', {}))
+            if starter is not None and 'ID'+str(starter) not in players:
+                person = people.get('ID'+str(starter), {})
+                players['ID'+str(starter)] = {'person': {'id': starter,
+                    'fullName': person.get('fullName') or probable.get('fullName')}, 'position': {'code': '1'}}
+            for player in players.values():
+                person = player.get('person', {})
+                if not person.get('id') or not person.get('fullName'):
+                    continue
+                pid = int(person['id'])
+                position = player.get('position', {})
+                # A sportsbook line is still required. Bench players are excluded
+                # once a full lineup is posted; unknown lineups stay provisional.
+                hitter = pid in lineup or (not posted and position.get('code') != '1'
+                    and position.get('abbreviation') != 'P')
+                pitching = pid == starter
+                hitting_status = 'Confirmed lineup' if pid in lineup else 'Provisional — lineup unannounced'
+                pitching_status = 'Recorded starter' if recorded == starter and starter is not None else 'Probable starter — subject to change'
+                value = (pid, hitter, pitching, hitting_status, pitching_status)
+                key = (int(gid), name_key(person['fullName']))
+                candidates.setdefault(key, {})[pid] = value
+    return {key: next(iter(values.values())) for key, values in candidates.items() if len(values) == 1}
+
+
+def nba_sportsbook_prop_picks(quotes, errors):
+    """Market probabilities only; never invent a player-history model or sample."""
+    groups = {}
+    for quote in quotes:
+        groups.setdefault((quote['event_id'], quote['player'], quote['market'], quote['line']), []).append(quote)
+    picks = []; listings = []
+    for (_, player, market, line), group in groups.items():
+        first = group[0]
+        # Pick'em indicative feed prices do not establish standalone win chances.
+        priced = {q['book']: q for q in group if standalone_value(q['book'])}
+        paired = [q['over_probability'] for q in priced.values() if q.get('over_probability') is not None]
+        for side, field in [('Over','over_decimal_odds'), ('Under','under_decimal_odds')]:
+            offered = [q for q in priced.values() if (q.get(field) or 0)>1]
+            unpriced = [q for q in group if not standalone_value(q['book']) and (q.get(field) or 0)>1]
+            for quote in unpriced:
+                listings.append({'Player':player, 'Market':MARKETS['NBA'][market][0], 'Pick':side,
+                    'Line':line, 'Best sportsbook':quote['book'],
+                    'Game':first['away_team']+' @ '+first['home_team'], 'start_time':first['start_time']})
+            if not offered: continue
+            if paired:
+                over = float(np.median(paired))
+                chance = over if side=='Over' else 1-over
+                method = 'Median of same-line, same-book paired implied probabilities with margin normalized out'
+            else:
+                chance = float(np.median([1/q[field] for q in offered]))
+                method = 'Single-side implied probability from quoted prices; bookmaker margin remains'
+            best = max(offered, key=lambda q:q[field])
+            picks.append({'Player':player, 'Market':MARKETS['NBA'][market][0], 'Pick':side,
+                'Line':line, 'Estimated chance':chance, 'Probability source':'sportsbook_implied',
+                'Estimate method':method, 'Prior games':0, 'Projected stat':None,
+                'Best sportsbook':best['book'], 'Best decimal odds':best[field],
+                'Sportsbook offers':[{'book':q['book'],'decimal_odds':q[field]} for q in offered],
+                'Books':len(offered), 'Game':first['away_team']+' @ '+first['home_team'],
+                'start_time':first['start_time'], 'Captured UTC':first['capture_time']})
+    picks.sort(key=lambda row:(-row['Estimated chance'],row['Player'],row['Market'],row['Line']))
+    return {'picks':picks[:10], 'game_picks':picks, 'errors':list(errors),
+        'probability_source':'sportsbook_implied', 'unpriced_listings':listings,
+        'message':f'{len(picks)} actual sportsbook sides ranked by market-implied probability.',
+        'note':'Sportsbook-implied probabilities are not independent model predictions. No player history or injury verification was used.'}
+
+
+def nba_minutes(value):
+    """Provider minutes may be MM:SS or decimal; missing is never zero."""
+    try:
+        if ':' in str(value):
+            minute, second = str(value).split(':')
+            if not 0 <= float(second) < 60: return None
+            total = float(minute)+float(second)/60
+        else:
+            total = float(value)
+        return total if np.isfinite(total) and 0 < total <= 70 else None
+    except (ValueError, TypeError):
+        return None
+
+
+def load_nba_matchup_context(api_key):
+    """One cached league injury snapshot; defense uses existing game cache only."""
+    now = pd.Timestamp.now(tz='UTC'); root = Path('nba_player_history_cache'); root.mkdir(exist_ok=True)
+    path = root/'injury_context_v1.json'; injury = None
+    try:
+        saved = json.loads(path.read_text())
+        stamp = pd.to_datetime(saved.get('checked_at'),utc=True,errors='coerce')
+        if pd.notna(stamp) and pd.Timedelta(0)<=now-stamp<pd.Timedelta(minutes=15): injury=saved
+    except (OSError,ValueError): pass
+    if injury is None:
+        try:
+            if not api_key: raise RuntimeError('Player-data API key unavailable')
+            items=[]; cursor=None; seen=set()
+            for page in range(20):
+                params={'per_page':100}
+                if cursor is not None: params['cursor']=cursor
+                payload=_get('https://api.balldontlie.io/v1/player_injuries',api_key,params,True)
+                batch=payload.get('data')
+                if not isinstance(batch,list): raise ValueError('Invalid injury response')
+                items.extend(batch); cursor=(payload.get('meta') or {}).get('next_cursor')
+                if cursor is None: break
+                if str(cursor) in seen: raise ValueError('Repeated injury cursor')
+                seen.add(str(cursor))
+            else: raise ValueError('Injury pagination incomplete')
+            injury={'checked_at':now.isoformat(),'complete':True,'records':items}
+        except Exception as exc:
+            injury={'checked_at':now.isoformat(),'complete':False,'records':[],
+                    'issue':'NBA injury feed unavailable: '+_nba_request_issue(exc)}
+        temp=path.with_suffix('.tmp'); temp.write_text(json.dumps(injury)); temp.replace(path)
+    from dual_agent.balldontlie_data import _setting
+    game_root=Path(_setting('NBA_HISTORY_CACHE_DIR','.market_edge_cache/nba_history'))
+    games={}; teams={}; player_teams={}
+    for cache in game_root.glob('season_*_v1.json'):
+        try:
+            saved=json.loads(cache.read_text())
+            if not saved.get('complete'): continue
+            for game in saved.get('games',[]):
+                if game.get('id') is not None: games[game['id']]=game
+                for side in ('home_team','visitor_team'):
+                    team=game.get(side) or {}
+                    if team.get('id') is not None: teams[team['id']]=team
+        except (OSError,ValueError): continue
+    # Cached active directory provides team membership without new roster calls.
+    for cache in sorted(root.glob('active_players_*.json'),reverse=True)[:1]:
+        try:
+            for player in json.loads(cache.read_text()):
+                team=player.get('team') or {}
+                if team.get('id') is not None:
+                    teams[team['id']]=team; player_teams[player['id']]=team['id']
+        except (OSError,ValueError,KeyError): pass
+    injuries={}; blocked=[]
+    for item in injury['records']:
+        player=item.get('player') or {}; pid=player.get('id')
+        if pid is not None:
+            injuries.setdefault(pid,[]).append(item)
+            if player.get('team_id') is not None: player_teams[pid]=player['team_id']
+        if (name_key(item.get('status')) in {'out','doubtful','suspended','inactive','injuredreserve'}
+                or re.search(r'(?:will be limited to (?:about )?\d+(?:-\d+)? minutes|on a minutes restriction|under a minutes restriction|minutes will be restricted)',str(item.get('description','')),re.I)):
+            blocked.append(nba_identity_key(player.get('first_name','')+' '+player.get('last_name','')))
+    return {'checked_at':injury['checked_at'],'injury_complete':injury['complete'],
+            'injuries':injuries,'blocked_player_names':blocked,'games':list(games.values()),
+            'teams':teams,'player_teams':player_teams,'issue':injury.get('issue')}
+
+
+def nba_availability(rows, context):
+    context=context or {}; ids={r.get('player',{}).get('id') for r in rows if r.get('player',{}).get('id') is not None}
+    if len(ids)!=1: return False,'Player availability identity unverified',False
+    pid=next(iter(ids)); reports=context.get('injuries',{}).get(pid,[])
+    statuses=[str(r.get('status','')) for r in reports]
+    blocked=any(name_key(s) in {'out','doubtful','suspended','inactive','injuredreserve'} for s in statuses)
+    restriction=any(re.search(r'(?:will be limited to (?:about )?\d+(?:-\d+)? minutes|on a minutes restriction|under a minutes restriction|minutes will be restricted)',str(r.get('description','')),re.I) for r in reports)
+    if reports:
+        status='Injury feed: '+', '.join(dict.fromkeys(statuses))+' · checked '+str(context.get('checked_at'))
+    elif context.get('injury_complete'):
+        status='No injury listing in checked feed; participation is not confirmed'
+    else:
+        status='Injury status unverified; forecast is conditional on playing'
+    if restriction: status+=' · minutes restriction reported; future cap unverified'
+    return blocked,status,restriction
+
+
+def nba_points_defense(rows, matchup, context, cutoff):
+    """Conservative points-only allowance adjustment, not defense by position."""
+    context=context or {}; teams=context.get('teams',{})
+    def team_key(value):
+        k=name_key(value)
+        return {'laclippers':'losangelesclippers'}.get(k,k)
+    ids={r.get('player',{}).get('id') for r in rows if r.get('player',{}).get('id') is not None}
+    pid=next(iter(ids)) if len(ids)==1 else None
+    own=context.get('player_teams',{}).get(pid)
+    if own is None and rows: own=(rows[-1].get('team') or {}).get('id')
+    own_team=teams.get(own) or next((r.get('team') for r in reversed(rows) if (r.get('team') or {}).get('id')==own),{})
+    own_name=team_key(own_team.get('full_name'))
+    home,away=team_key(matchup.get('home_team')),team_key(matchup.get('away_team'))
+    opponent_name=away if own_name==home else home if own_name==away else None
+    opponent_ids=[tid for tid,t in teams.items() if team_key(t.get('full_name'))==opponent_name]
+    if len(opponent_ids)!=1: return 1.,'Opponent team identity unverified; no defensive adjustment'
+    opponent=opponent_ids[0]; all_values=[]; all_weights=[]; against=[]
+    for game in context.get('games',[]):
+        if not str(game.get('status','')).startswith('Final') or game.get('season_type')=='preseason': continue
+        date=pd.to_datetime(game.get('date'),utc=True,errors='coerce')
+        # Date-only feeds cannot establish an intraday pregame cutoff.
+        if pd.isna(date) or date.date()>=cutoff.date() or date<cutoff-pd.Timedelta(days=365): continue
+        try: hs,vs=float(game['home_team_score']),float(game['visitor_team_score'])
+        except (KeyError,TypeError,ValueError): continue
+        if not np.isfinite([hs,vs]).all() or min(hs,vs)<=0: continue
+        weight=2**(-max(0.,(cutoff-date).total_seconds()/86400)/90.)
+        all_values.extend([hs,vs]);all_weights.extend([weight,weight])
+        h=(game.get('home_team') or {}).get('id');v=(game.get('visitor_team') or {}).get('id')
+        if h==opponent: against.append((date,vs,weight))
+        elif v==opponent: against.append((date,hs,weight))
+    against=sorted(against,key=lambda r:r[0])[-20:]
+    if len(against)<5 or len(all_values)<60:
+        return 1.,'Insufficient verified opponent scoring history; no defensive adjustment'
+    w=np.array([g[2] for g in against]);effective=w.sum()**2/(w*w).sum()
+    baseline=np.average(all_values,weights=all_weights)
+    allowance=np.average([g[1] for g in against],weights=w)
+    ratio=1+(allowance/baseline-1)*effective/(effective+20)
+    factor=float(np.clip(ratio,.92,1.08))
+    return factor,f'Points component only: {factor:.3f}× allowance factor · {len(against)} prior opponent games; not pace or position adjusted'
+
+
+def estimate_nba_matchup(rows, stat, line, side, matchup, context=None):
+    """Recency-weighted per-minute counts with a mixture of recent minutes.
+
+    Negative-binomial dispersion includes historical excess count variance and
+    rate-estimation uncertainty. Fixed weighting choices are not calibrated.
+    """
+    from scipy.stats import nbinom
+    if side not in ('Over','Under') or not np.isfinite(float(line)): return None
+    cutoff=min(pd.Timestamp(matchup['start_time']),pd.Timestamp(matchup['capture_time']))
+    prior=[r for r in rows if pd.Timestamp(r['source_date'])<cutoff]
+    prior.sort(key=lambda r:(r['source_date'],str((r.get('game') or {}).get('id'))))
+    player_ids={r.get('player',{}).get('id') for r in prior if r.get('player',{}).get('id') is not None}
+    if len(player_ids)!=1: return None
+    blocked,status,restriction=nba_availability(prior,context)
+    if blocked or restriction: return None
+    sample=[]
+    for row in prior:
+        minute=nba_minutes(row.get('min')); value=nba_market_value(row,stat)
+        if minute is not None and value is not None and value>=0: sample.append((row,minute,value))
+    sample=sample[-30:]
+    if len(sample)<10: return None
+    actual=np.array([r[2] for r in sample]); minutes=np.array([r[1] for r in sample])
+    baseline=estimate_nba_history(actual,line,side)
+    if baseline is None: return None
+    n=len(sample); weight=2**(-np.arange(n-1,-1,-1)/10.)
+    effective=weight.sum()**2/(weight*weight).sum(); weight*=effective/weight.sum()
+    total=float(weight@actual); exposure=float(weight@minutes)
+    rate=(total+.5)/(exposure+1.)
+    observed_mean=rate*minutes
+    excess=max(0.,float(np.average((actual-observed_mean)**2-observed_mean,weights=weight)))
+    denominator=float(np.average(observed_mean**2,weights=weight))
+    dispersion=(excess/denominator if denominator>0 else 0.)+1/(total+.5)
+    role=[nba_minutes(r.get('min')) for r in prior]
+    role=np.array([m for m in role if m is not None][-10:])
+    if len(role)<5: return None
+    role=np.clip(role,0,48)  # Regulation minutes; no overtime prediction.
+    role_weight=2**(-np.arange(len(role)-1,-1,-1)/3.); role_weight/=role_weight.sum()
+    factor,opponent_note=nba_points_defense(prior,matchup,context,cutoff)
+    components=stat if isinstance(stat,tuple) else (stat,)
+    if 'pts' in components and factor!=1:
+        points=np.array([nba_market_value(r[0],'pts') for r in sample],dtype=float)
+        if np.isfinite(points).all():
+            point_rate=float(weight@points)/max(exposure,1.)
+            rate=max(0.,rate+(factor-1)*point_rate)
+    elif 'pts' not in components:
+        opponent_note='No verified category-specific defensive adjustment for this market'
+    means=np.maximum(rate*role,1e-12); shape=1/max(dispersion,1e-9)
+    probability=shape/(shape+means)
+    above=1-nbinom.cdf(np.floor(line),shape,probability)
+    below=nbinom.cdf(np.ceil(line)-1,shape,probability)
+    push=nbinom.pmf(line,shape,probability) if float(line).is_integer() and line>=0 else np.zeros(len(role))
+    over=float(role_weight@above);under=float(role_weight@below);push=float(role_weight@push)
+    if over+under<=0: return None
+    chance=(over if side=='Over' else under)/(over+under)
+    baseline.update({'Estimated chance':float(chance),'Over chance':over/(over+under),'Under chance':under/(over+under),
+        'Projected stat':float(role_weight@means),'Expected minutes':float(role_weight@role),
+        'Minutes sample':len(role),'Effective historical games':round(float(effective),2),
+        'Estimated push chance':push,'Availability status':status,
+        'Opponent context':opponent_note,'NBA prop model version':2,
+        'Estimate method':'Recency-weighted per-minute negative-binomial model + recent-minutes mixture; uncalibrated; sportsbook prices excluded',
+        'Model calculated UTC':pd.Timestamp.now(tz='UTC').isoformat()})
+    return baseline
+
+
+def estimate_nba_history(values, line, side):
+    """Independent, smoothed prior-game frequency; no sportsbook probability input."""
+    estimate = estimate_prop(values,line,side,.5,minimum=10,minimum_decisions=10)
+    if estimate is None: return None
+    estimate['Estimated chance'] = (estimate['Historical wins']+1)/(estimate['Non-push games']+2)
+    estimate['Estimate method'] = 'Last 30 completed played-game results + Beta(1,1) smoothing; sportsbook prices excluded'
+    estimate['Probability source'] = 'player_history'
+    estimate['Statistics source'] = 'BALLDONTLIE'
+    estimate['Availability status'] = 'Participation and expected minutes not verified'
+    return estimate
+
+
+def load_nba_prop_tracking(restore=False):
+    path = Path('nba_player_history_cache')/'prop_tracking_v1.json'
+    try:
+        payload = json.loads(path.read_text())
+        if payload.get('version') == 1 and isinstance(payload.get('records'), dict): return payload
+    except (OSError, ValueError, AttributeError):
+        pass
+    if restore:
+        try:
+            from dual_agent.balldontlie_data import _setting
+            url, key = _setting('SUPABASE_URL', ''), _setting('SUPABASE_KEY', '')
+            if url and key:
+                response = requests.get(str(url).rstrip('/')+'/storage/v1/object/authenticated/market-edge-data/nba/props/tracking_v1.json',
+                    headers={'apikey': key, 'Authorization': 'Bearer '+key}, timeout=3)
+                payload = response.json() if response.status_code == 200 else {}
+                if payload.get('version') == 1 and isinstance(payload.get('records'), dict):
+                    path.parent.mkdir(exist_ok=True); path.write_text(json.dumps(payload)); return payload
+        except Exception:
+            pass
+    empty = {'version': 1, 'records': {}}
+    if restore:
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(json.dumps(empty))
+    return empty
+
+
+def update_nba_prop_tracking(props):
+    """Freeze one stronger offered side per exact line; settle verified finals only."""
+    import hashlib
+    with _NBA_PROP_HISTORY_LOCK:
+        ledger = load_nba_prop_tracking(restore=True)
+        records = ledger['records']; now = pd.Timestamp.now(tz='UTC')
+        candidates = sorted(props.get('game_picks', props.get('picks', [])),
+                            key=lambda r: -float(r.get('Estimated chance', 0)))
+        for row in candidates:
+            start = pd.to_datetime(row.get('start_time'), utc=True, errors='coerce')
+            capture = pd.to_datetime(row.get('Captured UTC'), utc=True, errors='coerce')
+            if pd.isna(start) or pd.isna(capture) or not capture <= now < start: continue
+            if now-capture > pd.Timedelta(minutes=30) or not row.get('Best sportsbook'): continue
+            identity = '|'.join([str(row.get('Game')), start.isoformat(), nba_identity_key(row.get('Player')), str(row.get('Market')), str(float(row['Line']))])
+            version = int(row.get('NBA prop model version',1))
+            legacy_id = hashlib.sha256(identity.encode()).hexdigest()
+            record_id = hashlib.sha256((identity+'|model='+str(version)).encode()).hexdigest()
+            if version==1 and legacy_id in records: continue
+            if record_id not in records:
+                records[record_id] = dict(row, **{'Tracking status': 'Pending',
+                    'Recorded UTC': now.isoformat(), 'Actual stat': None})
+        try:
+            archive = json.loads((Path('nba_player_history_cache')/'player_histories_v3.json').read_text())
+        except (OSError, ValueError):
+            archive = {'players': {}}
+        entries = archive.get('players', {})
+        # Resolve both teams from provider IDs/names already present in player logs.
+        teams = {}
+        def team_name(value):
+            key = name_key(value)
+            return {'laclippers': 'losangelesclippers'}.get(key, key)
+        for entry in entries.values():
+            for row in entry.get('rows', []):
+                team = row.get('team') or {}
+                if team.get('id') is not None and team.get('full_name'):
+                    teams[team['id']] = team_name(team['full_name'])
+        lookup = {label: stat for label, stat in MARKETS['NBA'].values()}
+        for record in records.values():
+            if record.get('Tracking status') != 'Pending': continue
+            start = pd.to_datetime(record.get('start_time'), utc=True, errors='coerce')
+            if pd.isna(start) or start >= now: continue
+            pair = str(record.get('Game', '')).split(' @ ', 1)
+            if len(pair) != 2: continue
+            away, home = map(team_name, pair)
+            entry = entries.get(nba_identity_key(record['Player']), {})
+            matches = {}
+            for row in entry.get('rows', []):
+                game = row.get('game') or {}
+                date = pd.to_datetime(game.get('date'), utc=True, errors='coerce')
+                if (not str(game.get('status','')).startswith('Final') or pd.isna(date)
+                        or date.date() != start.tz_convert('America/Chicago').date()): continue
+                if teams.get(game.get('home_team_id')) != home or teams.get(game.get('visitor_team_id')) != away: continue
+                matches[game.get('id')] = row
+            if len(matches) != 1 or record['Market'] not in lookup: continue
+            actual = nba_market_value(next(iter(matches.values())), lookup[record['Market']])
+            if actual is None: continue
+            line = float(record['Line']); side = record['Pick']
+            if side not in ('Over','Under'): continue
+            status = 'Push' if actual == line else ('Covered' if (actual > line) == (side == 'Over') else 'Missed')
+            record.update({'Tracking status': status, 'Actual stat': actual, 'Settled UTC': now.isoformat()})
+        root = Path('nba_player_history_cache'); root.mkdir(exist_ok=True)
+        path = root/'prop_tracking_v1.json'; temp = path.with_suffix('.tmp')
+        temp.write_text(pd.Series(ledger).to_json(date_format='iso')); temp.replace(path)
+        return ledger
+
+
+def save_nba_prop_results(result, remote=False):
+    """Checkpoint display results without changing their original quote times."""
+    try:
+        root = Path('nba_player_history_cache'); root.mkdir(exist_ok=True)
+        frame = result.get('all_predictions', result.get('predictions'))
+        rows = json.loads(frame.to_json(orient='records', date_format='iso')) if isinstance(frame, pd.DataFrame) else list(frame or [])
+        if not rows: return
+        payload = {'version': 1, 'saved_at': pd.Timestamp.now(tz='UTC').isoformat(),
+                   'predictions': rows, 'player_props': result.get('player_props', {})}
+        # pandas converts missing numeric values to JSON null.
+        data = pd.Series(payload).to_json(date_format='iso').encode()
+        path = root/'latest_prop_results_v1.json'
+        temporary = path.with_suffix('.tmp'); temporary.write_bytes(data); temporary.replace(path)
+        if remote:
+            from dual_agent.balldontlie_data import _setting
+            url, key = _setting('SUPABASE_URL', ''), _setting('SUPABASE_KEY', '')
+            if url and key:
+                requests.post(str(url).rstrip('/')+'/storage/v1/object/market-edge-data/nba/props/latest_results_v1.json',
+                    headers={'apikey': key, 'Authorization': 'Bearer '+key,
+                             'Content-Type': 'application/json', 'x-upsert': 'true'}, data=data, timeout=3)
+                ledger_path = root/'prop_tracking_v1.json'
+                if ledger_path.exists():
+                    requests.post(str(url).rstrip('/')+'/storage/v1/object/market-edge-data/nba/props/tracking_v1.json',
+                        headers={'apikey': key, 'Authorization': 'Bearer '+key,
+                                 'Content-Type': 'application/json', 'x-upsert': 'true'},
+                        data=ledger_path.read_bytes(), timeout=3)
+    except Exception:
+        pass  # Display/storage failure must not discard calculated predictions.
+
+
+def load_nba_prop_results():
+    """Restore last results for immediate display, not as verified current offers."""
+    path = Path('nba_player_history_cache')/'latest_prop_results_v1.json'
+    try:
+        payload = json.loads(path.read_text())
+    except (OSError, ValueError):
+        try:
+            from dual_agent.balldontlie_data import _setting
+            url, key = _setting('SUPABASE_URL', ''), _setting('SUPABASE_KEY', '')
+            if not url or not key: return None
+            response = requests.get(str(url).rstrip('/')+'/storage/v1/object/authenticated/market-edge-data/nba/props/latest_results_v1.json',
+                headers={'apikey': key, 'Authorization': 'Bearer '+key}, timeout=3)
+            if response.status_code != 200: return None
+            payload = response.json()
+        except Exception:
+            return None
+    if not isinstance(payload, dict) or payload.get('version') != 1: return None
+    frame = pd.DataFrame(payload.get('predictions', []))
+    if frame.empty or not {'home_team','away_team','commence_time','confidence'}.issubset(frame): return None
+    saved = pd.to_datetime(payload.get('saved_at'), utc=True, errors='coerce')
+    if pd.isna(saved): return None
+    times = pd.to_datetime(frame['commence_time'], utc=True, errors='coerce')
+    now = pd.Timestamp.now(tz='UTC')
+    # Existing status polling retires confirmed finals; bound old restore data.
+    frame = frame.loc[(times >= now-pd.Timedelta(days=1)) & (times <= now+pd.Timedelta(days=7))].copy()
+    if frame.empty: return None
+    return {'predictions': frame.head(10), 'all_predictions': frame,
+            'player_props': payload.get('player_props', {}), 'saved_props_at': saved.isoformat(),
+            'nba_props_pending': False, 'restored_saved_results': True}
+
+
+def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapshots=None, nba_key=None, progress=None, nba_history_enabled=True):
+    scan_started = time.perf_counter()
+    calculation_seconds = 0.0
+    timings = {}
+    if not odds_key and league != 'NBA':
+        return {'picks':[], 'message':'Player props need the configured Odds API key.', 'errors':[]}
+    if league == 'NBA' and progress:
+        progress({'picks': [], 'game_picks': [], 'errors': [], 'loading_progress': {'stage': 'Finding sportsbook lines', 'completed': 0, 'total': 0}})
+    try:
+        quotes, errors = fetch_prop_quotes(league, games, odds_key) if odds_key else ([], ['Sportsbook API key unavailable.'])
+    except Exception as exc:
+        if league != 'NBA':
+            raise
+        quotes, errors = [], [f'NBA sportsbook lines unavailable: {type(exc).__name__}: {exc}.']
+    timings['Sportsbook collection'] = time.perf_counter()-scan_started
+    if not quotes and league != 'NBA':
+        return {'picks':[], 'message':'No fresh eligible sportsbook player-prop lines are available for upcoming games.', 'errors':errors}
+    if league == 'NBA' and not nba_history_enabled:
+        return nba_sportsbook_prop_picks(quotes, errors)
+    groups = {}
+    for q in quotes:
+        groups.setdefault((q['event_id'],q['player'],q['market'],q['line']), []).append(q)
+    history_by_name = {}; identities = {}; mlb_histories = {}; nba_context = {}
+    if league=='NBA':
+        from dual_agent.nba_star_spotlight import collect_star_rosters, build_star_spotlights, key as star_key
+        context_started = time.perf_counter()
+        nba_context = load_nba_matchup_context(nba_key)
+        timings['Injury and opponent context'] = time.perf_counter()-context_started
+        if nba_context.get('issue'): errors.append(nba_context['issue'])
+        if progress:
+            progress({'picks': [], 'game_picks': [], 'errors': list(errors), 'loading_progress': {'stage': 'Finding team star rosters', 'completed': 0, 'total': 0}})
+        roster_started = time.perf_counter()
+        star_rosters = collect_star_rosters(games)
+        timings['Team rosters'] = time.perf_counter()-roster_started
+        if not nba_key:
+            errors.append('NBA projections need BALLDONTLIE_API_KEY and access to player game stats.')
+        # Fetch each unique player once, reusing the existing daily history cache.
+        # Stars remain visible even without any available sportsbook market.
+        names_by_key = {star_key(q['player']): q['player'] for q in quotes}
+        pending_ledger = load_nba_prop_tracking(restore=True)
+        for record in pending_ledger['records'].values():
+            kickoff = pd.to_datetime(record.get('start_time'), utc=True, errors='coerce')
+            if (record.get('Tracking status') == 'Pending' and pd.notna(kickoff)
+                    and kickoff < pd.Timestamp.now(tz='UTC')-pd.Timedelta(hours=2)):
+                names_by_key.setdefault(star_key(record['Player']), record['Player'])
+        for roster in star_rosters.values():
+            for player in roster['players']:
+                names_by_key.setdefault(star_key(player['player']), player['player'])
+        # Earliest games first; no games or candidates are removed from the scan.
+        priority = {}
+        for quote in quotes:
+            k = star_key(quote['player']); stamp = pd.Timestamp(quote['start_time'])
+            priority[k] = min(priority.get(k, stamp), stamp)
+        for game in games:
+            for side in ('home', 'away'):
+                for roster in star_rosters.values():
+                    if roster.get('team') == game[side+'_team']:
+                        for player in roster['players']:
+                            k = star_key(player['player']); stamp = pd.Timestamp(game['commence_time'])
+                            priority[k] = min(priority.get(k, stamp), stamp)
+        names = sorted(names_by_key.values(), key=lambda name:(priority.get(star_key(name), pd.Timestamp.max.tz_localize('UTC')), name)) if nba_key else []
+        completed = 0
+        last_scored = -1
+        last_publish = 0.0
+        def publish(stage):
+            nonlocal last_scored, last_publish, calculation_seconds
+            if not progress: return
+            # Network-page updates should not rescore the whole slate.
+            if completed == last_scored or (completed < len(names) and completed % 8 and time.monotonic()-last_publish < 3):
+                return
+            last_scored = completed
+            last_publish = time.monotonic()
+            by_key = {star_key(name): rows for name, rows in history_by_name.items()}
+            ready = {q['player']: by_key[star_key(q['player'])] for q in quotes if star_key(q['player']) in by_key}
+            ready.update(history_by_name)
+            ready_groups = {key: group for key, group in groups.items() if star_key(key[1]) in by_key}
+            scoring_started = time.perf_counter()
+            partial = _rank_prop_candidates('NBA', games, ready_groups,
+                ready, list(errors), star_rosters, {}, {}, nba_context=nba_context)
+            calculation_seconds += time.perf_counter()-scoring_started
+            partial.update(probability_source='player_history', statistics_source='BALLDONTLIE')
+            partial['loading_progress'] = {'completed': completed, 'total': len(names), 'stage': stage}
+            progress(partial)
+        history_started = time.perf_counter()
+        history_scoring_before = calculation_seconds
+        publish('Checking saved player histories')
+        for player, history, error in _nba_history_batches(names, nba_key, status=publish):
+            history_by_name[player] = history
+            completed += 1
+            if error: errors.append(error)
+            publish('Processed '+player)
+        timings['Player history and storage'] = max(0.0, time.perf_counter()-history_started-(calculation_seconds-history_scoring_before))
+        # Provider spellings may differ only in accents or punctuation.
+        by_key = {star_key(name): rows for name, rows in history_by_name.items()}
+        for q in quotes:
+            history_by_name[q['player']] = by_key.get(star_key(q['player']), [])
+    else:
+        if player_logs is None or player_logs.empty:
+            return {'picks':[], 'message':'MLB player warehouse is unavailable; no prop estimates generated.', 'errors':errors}
+        identities = mlb_prop_identities(snapshots)
+        wanted = {identity[0] for identity in identities.values()}
+        player_ids = pd.to_numeric(player_logs.player_id, errors='coerce')
+        subset = player_logs.loc[player_ids.isin(wanted)].copy()
+        subset['player_id'] = player_ids.loc[subset.index]
+        subset['prior_start'] = pd.to_datetime(subset.start_time, utc=True, errors='coerce')
+        subset['game_id'] = pd.to_numeric(subset.game_id, errors='coerce')
+        # Missing components stay unknown, rather than becoming fabricated zeros.
+        def number(column):
+            return pd.to_numeric(subset[column], errors='coerce') if column in subset else pd.Series(np.nan, index=subset.index)
+        singles = number('hits')-number('doubles')-number('triples')-number('batting_home_runs')
+        subset['singles'] = singles.where(singles >= 0)
+        subset['total_bases'] = subset['singles']+2*number('doubles')+3*number('triples')+4*number('batting_home_runs')
+        subset['hits_runs_rbis'] = number('hits')+number('batting_runs')+number('rbi')
+        mlb_histories = {int(pid): frame for pid,frame in subset.groupby('player_id')}
+    scoring_started = time.perf_counter()
+    if league == 'MLB' and progress:
+        # Publish completed games independently; reuse quote/history inputs.
+        scored = []; excluded_rows = []; pitcher_rows = []; result = {}
+        for game in sorted(games, key=lambda g:g.get('start_time',g.get('commence_time',''))):
+            game_groups = {key:group for key,group in groups.items() if group[0].get('game_id')==game.get('game_id')}
+            partial = _rank_prop_candidates(league,[game],game_groups,history_by_name,errors,{},identities,mlb_histories)
+            scored.extend(partial.get('game_picks', []))
+            excluded_rows.extend(partial.get('exclusions', [])); pitcher_rows.extend(partial.get('pitcher_forecasts', []))
+            ordered = sorted(scored,key=lambda r:(-r['Estimated chance'],-r['Prior games'],r['Player']))
+            result = dict(partial,game_picks=ordered,picks=ordered[:10],exclusions=list(excluded_rows),
+                          pitcher_forecasts=list(pitcher_rows),quoted_candidates=len(groups),
+                          message=f'{len(ordered)} player-prop estimates ranked from actual lines and prior appearances.')
+            progress(result)
+        if not result:
+            result = _rank_prop_candidates(league,games,groups,history_by_name,errors,{},identities,mlb_histories)
+    else:
+        result = _rank_prop_candidates(league, games, groups, history_by_name, errors,
+                                     star_rosters if league == 'NBA' else {}, identities, mlb_histories, nba_context=nba_context)
+    calculation_seconds += time.perf_counter()-scoring_started
+    if league == 'NBA':
+        timings['Prediction calculations'] = calculation_seconds
+        timings['Total'] = time.perf_counter()-scan_started
+        result['loading_timings_seconds'] = {label: round(seconds, 2) for label, seconds in timings.items()}
+        result['scan_complete'] = True
+        result.update(probability_source='player_history', statistics_source='BALLDONTLIE',
+            note='Experimental per-minute count forecasts, not calibrated probabilities. Recent minutes are estimated; injury reports do not confirm participation. Opponent allowance adjusts only points components.')
+        try:
+            stored = json.loads((Path('nba_player_history_cache')/'player_histories_v3.json').read_text())
+            result['history_storage_status'] = stored.get('storage_status', 'Player history saved locally.')
+        except (OSError, ValueError):
+            result['history_storage_status'] = 'History storage status unavailable.'
+    return result
+
+
+def _rank_prop_candidates(league, games, groups, history_by_name, errors,
+                          star_rosters, identities, mlb_histories, nba_context=None):
+    if league == 'NBA':
+        from dual_agent.nba_star_spotlight import build_star_spotlights
+    picks = []; exclusions = []; pitcher_forecasts = []
+    def excluded(first, player, market, line, reason):
+        exclusions.append({'Player': player, 'Market': MARKETS[league].get(market, (market, None))[0], 'Line': line,
+            'Game': first['away_team']+' @ '+first['home_team'], 'Reason': reason})
+    for (_,player,market,line), group in groups.items():
+        first = group[0]; start = pd.Timestamp(first['start_time'])
+        unique = {q['book']:q for q in group if q['book']}
+        if not unique:
+            if league == 'MLB': excluded(first, player, market, line, 'No sportsbook offers this exact line.')
+            continue
+        participation = None
+        paired_probabilities = [q['over_probability'] for q in unique.values() if q.get('over_probability') is not None]
+        # A one-sided quote cannot establish a margin-free market probability.
+        # Keep the ten-observation shrinkage, using an explicit neutral prior.
+        probability = float(np.median(paired_probabilities)) if paired_probabilities else .5
+        stat = MARKETS[league][market][1]
+        if league=='NBA':
+            nba_rows = history_by_name.get(player, [])
+            unavailable, availability_status, restricted = nba_availability(nba_rows,nba_context)
+            if unavailable or restricted:
+                excluded(first,player,market,line,availability_status)
+                continue
+            values = [nba_market_value(r, stat) for r in history_by_name.get(player, []) if pd.Timestamp(r['source_date'])+(pd.Timedelta(0) if r.get('history_provider') in {'api_sports','balldontlie'} else pd.Timedelta(hours=48))<min(start,pd.Timestamp(first['capture_time']))]
+        else:
+            identity = identities.get((int(first['game_id']),name_key(player)))
+            if not identity:
+                excluded(first, player, market, line, 'No unique player identity found in this game feed.')
+                continue
+            pitching_market = market.startswith('pitcher_')
+            if (not pitching_market and not identity[1]) or (pitching_market and not identity[2]):
+                excluded(first, player, market, line, 'Player is outside the posted lineup or is not a recorded/probable starter.')
+                continue
+            participation = identity[4] if pitching_market else identity[3]
+            logs = mlb_histories.get(identity[0])
+            if logs is None:
+                excluded(first, player, market, line, 'No saved prior appearances for this player.')
+                continue
+            cutoff = min(start,pd.Timestamp(first['capture_time']))-pd.Timedelta(hours=48)
+            logs = logs[(logs.prior_start<cutoff)&(logs.game_id!=int(first['game_id']))]
+            if pitching_market: logs = logs[pd.to_numeric(logs.games_started, errors='coerce')>0]
+            else: logs = logs[pd.to_numeric(logs.plate_appearances, errors='coerce')>0]
+            logs = logs.sort_values('prior_start').drop_duplicates('game_id', keep='last')
+            if stat not in logs:
+                excluded(first, player, market, line, 'Saved history is missing the statistics for this market.')
+                continue
+            values = pd.to_numeric(logs[stat], errors='coerce').tolist()
+        values = [float(v) for v in values if v is not None and np.isfinite(float(v))]
+        if league == 'MLB':
+            sample = values[-30:]
+            if not pitching_market and (len(sample) < 10 or sum(v != line for v in sample) < 8):
+                excluded(first, player, market, line, f'Need 10 prior appearances and 8 non-push results; found {len(sample)} appearances and {sum(v != line for v in sample)} non-push results.')
+                continue
+        qualified = False
+        for side,market_p in [('Over',probability),('Under',1-probability)]:
+            price_key = 'over_decimal_odds' if side == 'Over' else 'under_decimal_odds'
+            available = [q for q in unique.values() if (q.get(price_key) or 0) > 1]
+            if not available:
+                continue
+            estimate = estimate_prop(values,line,side,market_p,
+                minimum=1 if league == 'MLB' and pitching_market else 10,
+                minimum_decisions=8 if league == 'MLB' and not pitching_market else None)
+            if league == 'NBA':
+                estimate = estimate_nba_matchup(nba_rows,stat,line,side,first,nba_context)
+            if estimate and league == 'MLB' and pitching_market:
+                best_forecast = max(available, key=lambda q:q[price_key])
+                pitcher_forecasts.append({'game_id': int(first['game_id']), 'player_id': identity[0],
+                    'Player': player, 'Market': MARKETS[league][market][0], 'Pick': side, 'Line': line,
+                    'Best sportsbook': best_forecast['book'], 'Best decimal odds': best_forecast[price_key],
+                    'Estimated chance': estimate['Estimated chance'], 'Projected stat': estimate['Projected stat'],
+                    'Prior games': estimate['Prior games'],
+                    'Non-push games': estimate['Prior games']-estimate['Historical pushes'],
+                    'Participation status': participation,
+                    'start_time': first['start_time'], 'Captured UTC': first['capture_time'],
+                    'Estimate method': estimate['Estimate method'] if paired_probabilities else 'Prior appearances + neutral shrinkage; one-sided quote'})
+            required_decisions = 8 if league == 'MLB' and not pitching_market else 10
+            enough_history = estimate and estimate['Prior games'] >= 10 and estimate['Prior games']-estimate['Historical pushes'] >= required_decisions
+            if enough_history:
+
+                if league != 'NBA' and not paired_probabilities:
+                    estimate['Estimate method'] = 'Prior 30 appearances + neutral shrinkage; one-sided sportsbook quote'
+                best = max(available, key=lambda q:q[price_key])
+                if league == 'NBA':
+                    opposite = 'Under' if side == 'Over' else 'Over'
+                    # Both directions come from the same fitted predictive distribution.
+                    # Stored Over/Under chances already exclude the same push mass.
+                    estimate['Opposite side offered'] = any((q.get('under_decimal_odds' if side == 'Over' else 'over_decimal_odds') or 0) > 1 for q in unique.values())
+                value_eligible = False
+                push_chance = estimate.get('Estimated push chance',estimate['Historical pushes']/estimate['Prior games'])
+                expected_return = (1-push_chance)*(estimate['Estimated chance']*best[price_key]-1)
+                qualified = True
+                picks.append({'Player':player,'Market':MARKETS[league][market][0],'Pick':side,'Line':line,
+                              'Market chance':market_p,'Best sportsbook':best['book'],'Best decimal odds':best[price_key], 'Sportsbook offers':[{'book':q['book'], 'decimal_odds':q[price_key]} for q in available], 'Estimated return per unit':expected_return,'Value eligible':value_eligible,'Break-even cover chance':1/best[price_key],'Estimated push chance':push_chance,'Books':len(available),'Game':first['away_team']+' @ '+first['home_team'],
+                              'start_time':first['start_time'],'Captured UTC':first['capture_time'],
+                              **({'Participation status': participation, 'Event match': first.get('Event match'), 'game_id':int(first['game_id']), 'player_id':int(identity[0])} if league=='MLB' else {}), **estimate})
+        if league in ('MLB', 'NBA') and not qualified:
+            excluded(first, player, market, line, 'No offered side has sufficient usable history for an estimate.')
+    # One side of one line per player/market/game; avoid ranking duplicate books or alternatives.
+    picks.sort(key=lambda r:(-r['Estimated chance'],-r['Prior games'],r['Player']))
+    seen=set(); chosen=[]
+    for pick in picks:
+        key=(pick['Game'],pick['start_time'],pick['Player'],pick['Market']) + (pick['Pick'], pick['Line'])
+        if key not in seen:
+            seen.add(key);chosen.append(pick)
+        # Retain eligible picks for every matchup; the global list stays top ten.
+    return {'picks':chosen[:10],'game_picks':chosen,'errors':errors,
+            **({'star_spotlights': build_star_spotlights(games, star_rosters, history_by_name, chosen), 'unavailable_players':(nba_context or {}).get('blocked_player_names',[]), 'nba_prop_model_version':2} if league == 'NBA' else {}),
+            **({'exclusions': exclusions, 'quoted_candidates':len(groups), 'pitcher_forecasts':pitcher_forecasts} if league in ('MLB','NBA') else {}), 'message':f'{len(chosen)} player-prop estimates ranked from actual lines and prior appearances.',
+            'note':'Estimated chance is conditional on no push and player participation. Estimates are not calibrated; no availability or injury clearance is implied.'}
