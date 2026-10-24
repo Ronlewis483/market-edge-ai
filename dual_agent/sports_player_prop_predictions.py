@@ -5,6 +5,9 @@ not calibrated win probabilities from the game-winner model.
 """
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
+import time
+import threading
+import re
 from pathlib import Path
 import unicodedata
 
@@ -238,10 +241,71 @@ def _nba_request_issue(exc):
     return type(exc).__name__+': request could not complete'
 
 
+def nba_identity_key(name):
+    """Normalize suffixes and explicit aliases; require one unique provider ID."""
+    import re
+    clean = re.sub(r'\s+(?:jr\.?|sr\.?|ii|iii|iv)$', '', str(name).strip(), flags=re.I)
+    value = name_key(clean)
+    return {'alexsarr': 'alexandresarr', 'nicclaxton': 'nicolasclaxton'}.get(value, value)
+
+
+def _nba_load_history_archive(path):
+    """Disk first; restore the shared private archive only after local cache loss."""
+    try:
+        archive = json.loads(path.read_text())
+        if archive.get('version') == 3 and isinstance(archive.get('players'), dict):
+            return archive
+    except (OSError, ValueError, AttributeError):
+        pass
+    try:
+        from dual_agent.balldontlie_data import _setting
+        url, key = _setting('SUPABASE_URL', ''), _setting('SUPABASE_KEY', '')
+        if url and key:
+            response = requests.get(str(url).rstrip('/')+'/storage/v1/object/authenticated/market-edge-data/nba/props/player_histories_v3.json',
+                headers={'apikey': key, 'Authorization': 'Bearer '+key}, timeout=3)
+            if response.status_code == 200:
+                archive = response.json()
+                if archive.get('version') == 3 and isinstance(archive.get('players'), dict):
+                    path.write_text(json.dumps(archive))
+                    return archive
+    except Exception:
+        pass  # Optional remote storage must not prevent prop generation.
+    return {'version': 3, 'players': {}}
+
+
+def _nba_save_remote_history_archive(archive):
+    """One private archive write per completed scan, rather than per player."""
+    try:
+        from dual_agent.balldontlie_data import _setting
+        url, key = _setting('SUPABASE_URL', ''), _setting('SUPABASE_KEY', '')
+        if not url or not key:
+            archive['storage_status'] = 'Local history saved; remote storage is not configured.'
+            return
+        response = requests.post(str(url).rstrip('/')+'/storage/v1/object/market-edge-data/nba/props/player_histories_v3.json',
+            headers={'apikey': key, 'Authorization': 'Bearer '+key,
+                     'Content-Type': 'application/json', 'x-upsert': 'true'},
+            data=json.dumps(archive, allow_nan=False).encode(), timeout=3)
+        archive['storage_status'] = ('Player history backed up to Supabase.' if response.status_code in (200,201)
+            else 'Local history saved; remote backup unavailable (HTTP '+str(response.status_code)+').')
+    except Exception:
+        archive['storage_status'] = 'Local history saved; remote backup unavailable.'
+
+
+_NBA_PROP_HISTORY_LOCK = threading.RLock()
+
+
 def _nba_history_batches(names, api_key, status=None):
+    with _NBA_PROP_HISTORY_LOCK:
+        yield from _nba_history_batches_locked(names, api_key, status)
+
+
+def _nba_history_batches_locked(names, api_key, status=None):
     """Yield completed player histories; never cache an incomplete stats batch."""
     now = pd.Timestamp.now(tz='UTC')
     root = Path('nba_player_history_cache'); root.mkdir(exist_ok=True)
+    archive_path = root/'player_histories_v3.json'
+    archive = _nba_load_history_archive(archive_path)
+    entries = archive.setdefault('players', {})
     day = now.strftime('%Y%m%d')
     base = 'https://api.balldontlie.io/nba/v1'
     def notify(message):
@@ -251,52 +315,75 @@ def _nba_history_batches(names, api_key, status=None):
         temporary.write_text(json.dumps(data))
         temporary.replace(path)
     missing = []
-    for name in names:
-        path = root/(name_key(name)+'_bdl_v2_'+day+'.json')
-        try:
-            if now.timestamp()-path.stat().st_mtime > 1800:
-                raise ValueError('Player history cache expired')
-            rows = json.loads(path.read_text())
-            if not isinstance(rows, list) or not rows: raise ValueError('Empty or invalid history cache')
-            yield name, rows, None
-        except (OSError, ValueError):
+    known = {}
+    for name in dict.fromkeys(names):
+        key = nba_identity_key(name)
+        entry = entries.get(key, {})
+        # Migrate the previous complete daily caches instead of downloading again.
+        if not entry:
+            for legacy in sorted(root.glob(name_key(name)+'_bdl_v2_*.json'), reverse=True):
+                try:
+                    rows = json.loads(legacy.read_text())
+                    ids = {r['player']['id'] for r in rows}
+                    if rows and len(ids) == 1:
+                        entry = {'player_id': ids.pop(), 'rows': rows,
+                                 'checked_at': pd.Timestamp(legacy.stat().st_mtime, unit='s', tz='UTC').isoformat()}
+                        entries[key] = entry
+                        break
+                except (OSError, ValueError, KeyError, TypeError):
+                    continue
+        known[name] = entry
+        checked = pd.to_datetime(entry.get('checked_at'), utc=True, errors='coerce')
+        if entry.get('player_id') and isinstance(entry.get('rows'), list) and pd.notna(checked) and pd.Timedelta(0) <= now-checked < pd.Timedelta(minutes=30):
+            yield name, entry['rows'], None if entry['rows'] else 'No completed played-game statistics returned for '+name+'.'
+        else:
             missing.append(name)
-    if not missing: return
-    catalog_path = root/('active_players_'+day+'.json')
-    try:
-        catalog = json.loads(catalog_path.read_text())
-        if not isinstance(catalog, list): raise ValueError('Invalid player catalog')
-    except (OSError, ValueError):
-        catalog = []; cursor = None; seen = set()
+    if not missing:
+        if not archive_path.exists():
+            save(archive_path, archive)
+            _nba_save_remote_history_archive(archive)
+            save(archive_path, archive)
+        return
+    catalog = []
+    if any(not known[name].get('player_id') for name in missing):
+        catalog_path = root/('active_players_'+day+'.json')
         try:
-            for page in range(1, 101):
-                notify(f'Resolving player identities · roster page {page}')
-                params = {'per_page': 100}
-                if cursor is not None: params['cursor'] = cursor
-                payload = _get(base+'/players/active', api_key, params, True)
-                catalog.extend(payload.get('data', []))
-                cursor = payload.get('meta', {}).get('next_cursor')
-                if cursor is None: break
-                if str(cursor) in seen: raise RuntimeError('Repeated roster cursor')
-                seen.add(str(cursor))
-            else: raise RuntimeError('Player identity pagination incomplete')
-            save(catalog_path, catalog)
-        except Exception as exc:
-            for name in missing: yield name, [], 'NBA player directory: '+_nba_request_issue(exc)
-            return
+            catalog = json.loads(catalog_path.read_text())
+            if not isinstance(catalog, list): raise ValueError('Invalid player catalog')
+        except (OSError, ValueError):
+            catalog = []; cursor = None; seen = set()
+            try:
+                for page in range(1, 101):
+                    notify(f'Resolving player identities · roster page {page}')
+                    params = {'per_page': 100}
+                    if cursor is not None: params['cursor'] = cursor
+                    payload = _get(base+'/players/active', api_key, params, True)
+                    catalog.extend(payload.get('data', []))
+                    cursor = payload.get('meta', {}).get('next_cursor')
+                    if cursor is None: break
+                    if str(cursor) in seen: raise RuntimeError('Repeated roster cursor')
+                    seen.add(str(cursor))
+                else: raise RuntimeError('Player identity pagination incomplete')
+                save(catalog_path, catalog)
+            except Exception as exc:
+                for name in missing: yield name, [], 'NBA player directory: '+_nba_request_issue(exc)
+                return
     index = {}
     for player in catalog:
-        index.setdefault(name_key(player.get('first_name','')+' '+player.get('last_name','')), {})[player['id']] = player
+        index.setdefault(nba_identity_key(player.get('first_name','')+' '+player.get('last_name','')), {})[player['id']] = player
     resolved = []
     for name in missing:
-        matches = list(index.get(name_key(name), {}).values())
+        if known[name].get('player_id'):
+            resolved.append((name, known[name]['player_id']))
+            continue
+        matches = list(index.get(nba_identity_key(name), {}).values())
         if len(matches) != 1:
             # Search is first OR last name, not an assumed full-name match.
             notify('Resolving player identity · '+name)
             try:
                 payload = _get(base+'/players', api_key,
-                               {'search': name.split()[-1], 'per_page': 100}, True)
-                matches = [r for r in payload.get('data', []) if name_key(r.get('first_name','')+' '+r.get('last_name','')) == name_key(name)]
+                               {'search': re.sub(r'\s+(?:jr\.?|sr\.?|ii|iii|iv)$', '', name, flags=re.I).split()[-1], 'per_page': 100}, True)
+                matches = [r for r in payload.get('data', []) if nba_identity_key(r.get('first_name','')+' '+r.get('last_name','')) == nba_identity_key(name)]
             except Exception as exc:
                 yield name, [], 'Player identity for '+name+': '+_nba_request_issue(exc)
                 continue
@@ -304,15 +391,21 @@ def _nba_history_batches(names, api_key, status=None):
             yield name, [], 'No unique NBA player identity for '+name+'.'
         else:
             resolved.append((name, matches[0]['id']))
-    for offset in range(0, len(resolved), 8):
-        batch = resolved[offset:offset+8]
+    resolved.sort(key=lambda item: not bool(known[item[0]].get('checked_at')))
+    batches = []
+    for has_history in (True, False):
+        subset = [item for item in resolved if bool(known[item[0]].get('checked_at')) == has_history]
+        batches.extend(subset[i:i+8] for i in range(0, len(subset), 8))
+    for offset, batch in enumerate(batches):
         ids = {pid for name, pid in batch}; rows_by_id = {pid: [] for pid in ids}
+        checked_dates = [pd.to_datetime(known[name].get('checked_at'), utc=True, errors='coerce') for name, pid in batch]
+        since = max(now-pd.Timedelta(days=365), min(checked_dates)-pd.Timedelta(days=3)) if all(pd.notna(d) for d in checked_dates) else now-pd.Timedelta(days=365)
         cursor = None; seen = set()
         try:
             for page in range(1, 101):
-                notify(f'Loading stats batch {offset//8+1} of {(len(resolved)+7)//8} · page {page}')
+                notify(f"{'Updating new results' if all(pd.notna(d) for d in checked_dates) else 'Saving initial player history'} · batch {offset+1} of {len(batches)} · page {page}")
                 params = {'player_ids[]': list(ids), 'per_page': 100,
-                          'start_date': (now-pd.Timedelta(days=365)).strftime('%Y-%m-%d'),
+                          'start_date': since.strftime('%Y-%m-%d'),
                           'end_date': now.strftime('%Y-%m-%d')}
                 if cursor is not None: params['cursor'] = cursor
                 payload = _get(base+'/stats', api_key, params, True)
@@ -334,11 +427,16 @@ def _nba_history_batches(names, api_key, status=None):
                 yield name, [], 'NBA stats for '+name+': '+_nba_request_issue(exc)
             continue
         for name, pid in batch:
-            rows = list({r['game']['id']: r for r in rows_by_id[pid]}.values())
+            previous = known[name].get('rows', [])
+            rows = list({r['game']['id']: r for r in previous+rows_by_id[pid] if pd.Timestamp(r['source_date']) > now-pd.Timedelta(days=365)}.values())
             rows.sort(key=lambda r:(r['source_date'], r['game']['id']))
-            if rows:
-                save(root/(name_key(name)+'_bdl_v2_'+day+'.json'), rows)
+            entries[nba_identity_key(name)] = {'player_id': pid, 'checked_at': now.isoformat(), 'rows': rows}
+            # Checkpoint each completed player locally; partial batches are never saved.
+            save(archive_path, archive)
             yield name, rows, None if rows else 'No completed played-game statistics returned for '+name+'.'
+
+    _nba_save_remote_history_archive(archive)
+    save(archive_path, archive)
 
 
 def mlb_prop_identities(snapshots):
@@ -481,8 +579,16 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
                             priority[k] = min(priority.get(k, stamp), stamp)
         names = sorted(names_by_key.values(), key=lambda name:(priority.get(star_key(name), pd.Timestamp.max.tz_localize('UTC')), name)) if nba_key else []
         completed = 0
+        last_scored = -1
+        last_publish = 0.0
         def publish(stage):
+            nonlocal last_scored, last_publish
             if not progress: return
+            # Network-page updates should not rescore the whole slate.
+            if completed == last_scored or (completed < len(names) and completed % 8 and time.monotonic()-last_publish < 3):
+                return
+            last_scored = completed
+            last_publish = time.monotonic()
             by_key = {star_key(name): rows for name, rows in history_by_name.items()}
             ready = {q['player']: by_key[star_key(q['player'])] for q in quotes if star_key(q['player']) in by_key}
             ready.update(history_by_name)
@@ -525,6 +631,11 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
     if league == 'NBA':
         result.update(probability_source='player_history', statistics_source='BALLDONTLIE',
             note='Smoothed historical estimates; minutes, injuries and opponent adjustments are not verified inputs.')
+        try:
+            stored = json.loads((Path('nba_player_history_cache')/'player_histories_v3.json').read_text())
+            result['history_storage_status'] = stored.get('storage_status', 'Player history saved locally.')
+        except (OSError, ValueError):
+            result['history_storage_status'] = 'History storage status unavailable.'
     return result
 
 
