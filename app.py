@@ -898,6 +898,7 @@ TICKET_STANDARD_MARKETS = {
         'rushing + receiving yards', 'passing touchdowns', 'anytime touchdown',
         'passing completions', 'passing attempts', 'rushing attempts',
         'interceptions thrown', 'passing + rushing yards',
+        'rushing touchdowns', 'receiving touchdowns',
     },
     'NBA': {
         'points', 'rebounds', 'assists', 'three-pointers made',
@@ -987,7 +988,12 @@ def ticket_prop_candidates(results, now=None, diagnostics=None):
         for row in rows:
             count('saved props')
             start = stamp(row.get('game_time', row.get('start_time')))
-            if pd.isna(start) or not now < start <= end:
+            live = sport=='NFL' and row.get('game_phase')=='live'
+            if live:
+                snapshot_at=stamp(row.get('live_snapshot_at'))
+                if pd.isna(snapshot_at) or not zero<=now-snapshot_at<=pd.Timedelta(seconds=90):
+                    count('live snapshot needs refresh'); continue
+            if pd.isna(start) or (not live and not now < start <= end) or (live and start>now):
                 count('outside upcoming seven days')
                 continue
             player = row.get('player', row.get('Player'))
@@ -1058,11 +1064,12 @@ def ticket_prop_candidates(results, now=None, diagnostics=None):
                     count(book + ' missing quote time')
                     explain(book, 'Missing original sportsbook quote time', row, market)
                     continue
-                if now - updated > quote_age:
+                maximum_age=pd.Timedelta(seconds=90) if live else quote_age
+                if now - updated > maximum_age:
                     count(book + ' expired quote')
-                    explain(book, 'Awaiting a new quote (over 30 minutes old)', row, market, updated)
+                    explain(book, 'Awaiting a current live quote' if live else 'Awaiting a new quote (over 30 minutes old)', row, market, updated)
                     continue
-                if not zero <= now - updated or updated >= start:
+                if not zero <= now - updated or (not live and updated >= start) or (live and updated < start):
                     count(book + ' invalid quote time')
                     explain(book, 'Quote timestamp inconsistent with game time', row, market, updated)
                     continue
@@ -1090,6 +1097,14 @@ def ticket_prop_candidates(results, now=None, diagnostics=None):
                     'quote_time': updated.isoformat(),
                     'standard_market': ticket_is_standard(sport, market),
                 }
+                candidate.update({k:row[k] for k in ('neural_model_version','neural_training_end',
+                    'neural_calibration_end','estimate_method') if k in row})
+                if live:
+                    observed=stamp(offer.get('observed_at'))
+                    if pd.isna(observed) or not zero<=now-observed<=pd.Timedelta(seconds=90):
+                        count(book+' live offer needs refresh'); continue
+                    candidate.update({k:row.get(k) for k in ('game_phase','live_current','live_period','live_clock',
+                        'live_snapshot_at','live_remaining_seconds','estimate_method','projection')})
                 key = tuple(candidate[k] for k in
                             ('sport', 'book', 'game', 'start', 'player', 'market', 'side', 'line'))
                 if key not in candidates or candidate['quote_time'] > candidates[key]['quote_time']:
@@ -1181,12 +1196,38 @@ def ticket_cached_sources(sports=None):
         if not has_rows(result.get('all_predictions')) and not has_rows(result.get('predictions')):
             result['all_predictions']=saved.get('all_predictions',saved.get('predictions',[]))
         sources[sport]=result
+        if sport=='NFL':
+            # Dedicated ticket results never overwrite the regular NFL page.
+            book=st.session_state.get('ai_ticket_book')
+            ticket_result=st.session_state.get('ai_ticket_nfl_books',{}).get(book)
+            if ticket_result is not None:
+                sources[sport]=dict(result,**ticket_result)
     return sources
 
 
 def drain_ticket_prop_updates():
     """Nonblocking collection of sport results on explicit user interaction."""
     from queue import Empty
+    queue=st.session_state.get('ai_ticket_nfl_updates')
+    latest=None
+    if queue is not None:
+        for _ in range(50):
+            try: latest=queue.get_nowait()
+            except Empty: break
+    if latest is not None:
+        previous=st.session_state.get('ai_ticket_nfl_books',{}).get(latest['ticket_book'],{})
+        if len(latest.get('nfl_player_props',[]))==0 and not latest.get('ticket_scan_complete') and previous:
+            latest=dict(latest,nfl_player_props=previous.get('nfl_player_props',[]))
+        st.session_state.setdefault('ai_ticket_nfl_books',{})[latest['ticket_book']]=latest
+    future=st.session_state.get('ai_ticket_nfl_future')
+    if future is not None and future.done():
+        try:
+            result=future.result()
+            st.session_state.setdefault('ai_ticket_nfl_books',{})[result['ticket_book']]=result
+        except Exception as exc:
+            st.session_state['ai_ticket_refresh_issue']='NFL ticket collection failed ('+type(exc).__name__+'). Existing picks remain.'
+        st.session_state.pop('ai_ticket_nfl_future',None)
+        st.session_state.pop('ai_ticket_nfl_updates',None)
     for league, state in [('NFL', 'nfl_prediction_pipeline_result'),
                           ('MLB', 'mlb_live_pipeline_result'),
                           ('NBA', 'nba_prediction_pipeline_result')]:
@@ -1238,13 +1279,33 @@ def drain_ticket_prop_updates():
             st.session_state['live_nfl_predictions'] = current.get('predictions')
 
 
+@st.cache_resource(show_spinner=False)
+def nfl_ticket_pool():
+    from concurrent.futures import ThreadPoolExecutor
+    return ThreadPoolExecutor(max_workers=1)
+
+
+def start_nfl_ticket_refresh(book,include_specialty=False):
+    """Start selected-book props only; no full NFL context or winner pipeline."""
+    pending=st.session_state.get('ai_ticket_nfl_future')
+    if pending is not None and not pending.done(): return False
+    from queue import Queue
+    from dual_agent.nfl_live_ticket_props import collect_ticket_props
+    updates=Queue();key=prediction_api_key('ODDS_API_KEY','THE_ODDS_API_KEY')
+    st.session_state.pop('ai_ticket_refresh_issue',None)
+    st.session_state['ai_ticket_nfl_updates']=updates
+    st.session_state['ai_ticket_nfl_future']=nfl_ticket_pool().submit(
+        collect_ticket_props,key,book,include_specialty,updates.put)
+    return True
+
+
 def ticket_offer_fingerprint(candidates):
     """Detect changed/expired offers without touching provider endpoints."""
     import hashlib
     import json
     identity = [
         [r['sport'], r['book'], r['game'], r['player'], str(r['market']),
-         r['side'], r['line'], r['chance'], r['quote_time']]
+         r['side'], r['line'], r['chance'], r['quote_time'],r.get('live_snapshot_at')]
         for r in candidates
     ]
     identity.sort(key=lambda r: tuple(str(v) for v in r))
@@ -1271,7 +1332,7 @@ def ticket_quote_status(diagnostics, sports, book):
 def render_ai_ticket_builder():
     from dual_agent.preferred_sportsbooks import PLATFORMS
     st.title('🎫 AI Ticket Builder')
-    st.caption('Build 3–10 legs using fresh, exact sportsbook listings. Standard, commonly offered prop categories are preferred by default; cover chances are model estimates, not guarantees.')
+    st.caption('Build 3–10 legs from listed sportsbook props. NFL supports upcoming and active regulation games; live estimates use current stats and clock. Standard prop categories are preferred. Cover chances are estimates, not guarantees.')
     columns=st.columns(3)
     with columns[0]: legs=st.selectbox('Ticket size',list(range(3,11)),format_func=lambda n:f'{n} legs',key='ai_ticket_legs')
     # Controls appear before loading saved offers, with stable option identities.
@@ -1310,6 +1371,11 @@ def render_ai_ticket_results():
     active = [s for s in selected_sports if
               (st.session_state.get(s.lower() + '_enrichment_future') is not None
                and not st.session_state[s.lower() + '_enrichment_future'].done())]
+    ticket_future=st.session_state.get('ai_ticket_nfl_future')
+    if 'NFL' in selected_sports and ticket_future is not None and not ticket_future.done() and 'NFL' not in active:
+        active.append('NFL')
+    nfl_source=sources.get('NFL',{})
+    if nfl_source.get('ticket_collection_stage'): st.caption(nfl_source['ticket_collection_stage'])
     fingerprint = ticket_offer_fingerprint(eligible)
 
     st.caption(f'**Ready to build:** {len(eligible)} fresh, listed {PLATFORMS[book]} offers '
@@ -1364,13 +1430,17 @@ def render_ai_ticket_results():
             st.info('Insufficient independent legs under your one-pick-per-game setting. '
                     'Allowing multiple players from one game can increase correlation.')
         elif quote_status['saved'] == 0:
-            st.info('No saved model props were found. Generate the sport predictions first, '
-                    'then collect player props.')
+            st.info('No saved model props were found. NFL can collect active and upcoming games directly below. For NBA/MLB, generate game predictions first.')
         elif not offered and not active and not quote_status['listings']:
             st.info(f'The saved provider data contains no {PLATFORMS[book]} listings. '
                     'A new scan may help, but this sportsbook may not be in the provider feed.')
 
     with st.expander('Available sportsbooks and excluded offers'):
+        for issue in nfl_source.get('ticket_issues',[]): st.caption(str(issue))
+        for report in nfl_source.get('ticket_diagnostics',[]):
+            if report.get('excluded'):
+                st.caption(str(report.get('game'))+' · '+', '.join(str(v)+' '+k for k,v in report['excluded'].items()))
+            elif report.get('reason'): st.caption(str(report.get('game'))+' · '+report['reason'])
         for b, title in PLATFORMS.items():
             listed = [r for r in candidates if r['book'] == b]
             common = sum(ticket_is_standard(r['sport'], r['market']) for r in listed)
@@ -1409,6 +1479,14 @@ def render_ai_ticket_results():
         notices = []
         for s in selected_sports:
             result = sources.get(s, {})
+            if s=='NFL':
+                if not prediction_api_key('ODDS_API_KEY','THE_ODDS_API_KEY'):
+                    notices.append('NFL: sportsbook API key is missing.'); continue
+                try:
+                    start_nfl_ticket_refresh(book,include_specialty)
+                    notices.append('NFL: collecting only '+PLATFORMS[book]+' props for active and upcoming games. Check for completed props to load progress.')
+                except Exception as exc: notices.append('NFL ticket collector unavailable ('+type(exc).__name__+'). Install nfl_live_ticket_props.py and odds_request_cache.py.')
+                continue
             games = result.get('all_predictions', result.get('predictions', []))
             games = games.to_dict('records') if isinstance(games, pd.DataFrame) else list(games or [])
             now = pd.Timestamp.now(tz='UTC')
@@ -1469,6 +1547,14 @@ def render_ai_ticket_results():
             st.markdown(f'**Leg {i} · {leg["player"]} · {leg["side"]} '
                         f'{leg["line"]:g} {leg["market"]}**')
             st.write(f'Estimated cover chance: **{leg["chance"]:.1%}**')
+            if leg.get('neural_model_version'):
+                st.caption('Trained NFL neural model · '+str(leg['neural_model_version'])+' · chronological residual calibration. Accuracy at your sportsbook lines is not established.')
+            elif leg.get('sport')=='NFL' and leg.get('estimate_method'):
+                st.caption('Estimator: '+str(leg['estimate_method'])+' · neural model is not approved for this market and game phase.')
+            if leg.get('game_phase')=='live':
+                st.write(f'**LIVE · Q{leg["live_period"]} · {leg["live_clock"]} remaining in quarter** · Current total: **{leg["live_current"]:g}** · Projected final: **{leg["projection"]:.1f}**')
+                st.caption('Live estimate using current production, game clock and prior history. Possession, score effects, new substitutions/injuries and an explicit overtime process are not modeled. Stat corrections can change totals. '+('Neural residuals calibrated on later historical games.' if leg.get('neural_model_version') else 'Clock-based fallback; not calibrated.'))
+                st.caption('Stats checked '+pd.Timestamp(leg['live_snapshot_at']).tz_convert('America/Chicago').strftime('%I:%M:%S %p CT'))
             start = pd.Timestamp(leg['start'])
             quote = pd.Timestamp(leg['quote_time'])
             st.caption(f'{leg["sport"]} · {leg["game"]} · ' +
@@ -1478,7 +1564,9 @@ def render_ai_ticket_results():
                           else 'pick’em listing · entry rules determine returns')
             st.caption(f'{PLATFORMS[leg["book"]]} · {price_text} · quote ' +
                        quote.tz_convert('America/Chicago').strftime('%I:%M %p CT'))
-            if start <= now or now - quote > pd.Timedelta(minutes=30):
+            if ((leg.get('game_phase')!='live' and start <= now) or
+                now-quote>(pd.Timedelta(seconds=90) if leg.get('game_phase')=='live' else pd.Timedelta(minutes=30)) or
+                (leg.get('game_phase')=='live' and now-pd.Timestamp(leg['live_snapshot_at'])>pd.Timedelta(seconds=90))):
                 st.warning('This saved line is no longer current. Refresh the sportsbook '
                            'quotes before using it.')
     st.caption('Suggestion only. Verify every line and the entire combination in your '
