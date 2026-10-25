@@ -12,23 +12,27 @@ _entries = {}
 _locks = {}
 _guard = threading.RLock()
 
-def get(url, params=None, **kwargs):
+def get(url, params=None, cache_ttl=TTL, **kwargs):
     if not str(url).startswith('https://api.the-odds-api.com/'):
         return requests.get(url, params=params, **kwargs)
     params = dict(params or {})
     if str(url).rstrip('/').endswith(('/odds', '/markets')):
         params.pop('regions', None)
-        params['bookmakers'] = BOOKMAKERS
+        params.setdefault('bookmakers', BOOKMAKERS)
     identity = hashlib.sha256(json.dumps([url, params or {}], sort_keys=True, default=str).encode()).hexdigest()
     with _guard:
         lock = _locks.setdefault(identity, threading.Lock())
     with lock:
         with _guard:
             cached = _entries.get(identity)
-            if cached and time.monotonic()-cached[0] < TTL:
+            if cached and time.monotonic()-cached[0] < min(TTL, max(0, cache_ttl)):
                 return copy.deepcopy(cached[2])
         response = requests.get(url, params=params, **kwargs)
         if response.status_code == 200:
+            # Preserve actual retrieval time across cache hits; never relabel a
+            # saved response as freshly fetched by the caller.
+            from datetime import datetime, timezone
+            response.headers['X-Market-Edge-Fetched-At'] = datetime.now(timezone.utc).isoformat()
             with _guard:
                 _entries[identity] = (time.monotonic(), str(url), copy.deepcopy(response))
         return response
