@@ -965,6 +965,21 @@ def ticket_prop_candidates(results, now=None, diagnostics=None):
         def count(reason):
             counts[reason] = counts.get(reason, 0) + 1
 
+        def explain(book, reason, row, market, updated=None):
+            # Small diagnostic sample per sportsbook; no additional API calls.
+            if diagnostics is None:
+                return
+            samples = counts.setdefault('_examples', {}).setdefault(book, [])
+            if len(samples) >= 8:
+                return
+            age = ''
+            if updated is not None and pd.notna(updated):
+                delta = now - updated
+                age = f'{max(0, int(delta.total_seconds() // 60))} min old' if delta >= pd.Timedelta(0) else 'future timestamp'
+            samples.append({'Player': str(row.get('player', row.get('Player', 'Unknown'))),
+                            'Market': str(market), 'Why excluded': reason,
+                            'Quote age': age})
+
         payload = (result or {}).get('player_props', {})
         data = ((result or {}).get('nfl_player_props', []) if sport == 'NFL'
                 else payload.get('game_picks', payload.get('picks', [])))
@@ -1020,26 +1035,36 @@ def ticket_prop_candidates(results, now=None, diagnostics=None):
                 offered_side = offer.get('side', offer.get('model_pick'))
                 if offered_side is not None and str(offered_side).strip().upper() != side:
                     count(book + ' mismatched side')
+                    explain(book, 'Different side than the model', row, market)
                     continue
                 offered_market = offer.get('market', offer.get('market_name'))
                 if offered_market is not None and ticket_market_label(offered_market) != ticket_market_label(market):
                     count(book + ' mismatched market')
+                    explain(book, 'Different market than the model', row, market)
                     continue
                 offered_line = offer.get('line', offer.get('point'))
                 if offered_line is not None:
                     try:
                         if not np.isfinite(float(offered_line)) or abs(float(offered_line) - line) > 1e-6:
                             count(book + ' mismatched line')
+                            explain(book, 'Different line than the model', row, market)
                             continue
                     except (ValueError, TypeError):
                         count(book + ' invalid offered line')
+                        explain(book, 'Offered line was invalid', row, market)
                         continue
                 updated = stamp(offer.get('last_update', offer.get('updated_at', row.get('quote_updated_at'))))
                 if pd.isna(updated):
                     count(book + ' missing quote time')
+                    explain(book, 'Missing original sportsbook quote time', row, market)
                     continue
-                if not zero <= now - updated <= quote_age or updated >= start:
-                    count(book + ' expired or invalid quote time')
+                if now - updated > quote_age:
+                    count(book + ' expired quote')
+                    explain(book, 'Awaiting a new quote (over 30 minutes old)', row, market, updated)
+                    continue
+                if not zero <= now - updated or updated >= start:
+                    count(book + ' invalid quote time')
+                    explain(book, 'Quote timestamp inconsistent with game time', row, market, updated)
                     continue
                 try:
                     price = offer.get('decimal_odds')
@@ -1055,6 +1080,7 @@ def ticket_prop_candidates(results, now=None, diagnostics=None):
                     price = None
                 if price is None and book not in ('underdog', 'prizepicks'):
                     count(book + ' missing valid price')
+                    explain(book, 'Missing a valid sportsbook price', row, market, updated)
                     continue
                 candidate = {
                     'sport': sport, 'book': book, 'game': game,
@@ -1104,12 +1130,12 @@ def build_suggested_ticket(candidates, book, legs, same_game=False,
         for c in pool:
             try_take(c, family_cap=2)
             if len(chosen) == legs:
-                return chosen
+                return sorted(chosen, key=lambda r: (-r['chance'], r['start'], str(r['player'])))
     for c in pool:
         try_take(c)
         if len(chosen) == legs:
             break
-    return chosen
+    return sorted(chosen, key=lambda r: (-r['chance'], r['start'], str(r['player'])))
 
 
 def ticket_cached_sources(sports=None):
@@ -1159,31 +1185,87 @@ def ticket_cached_sources(sports=None):
 
 
 def drain_ticket_prop_updates():
-    """Read available updates only; no network calls or waiting for workers."""
+    """Nonblocking collection of sport results on explicit user interaction."""
     from queue import Empty
-    for league,state in [('NFL','nfl_prediction_pipeline_result'),
-                         ('MLB','mlb_live_pipeline_result'),
-                         ('NBA','nba_prediction_pipeline_result')]:
-        prefix=league.lower()
-        queue=st.session_state.get(prefix+'_enrichment_updates')
-        latest=None
+    for league, state in [('NFL', 'nfl_prediction_pipeline_result'),
+                          ('MLB', 'mlb_live_pipeline_result'),
+                          ('NBA', 'nba_prediction_pipeline_result')]:
+        prefix = league.lower()
+        queue = st.session_state.get(prefix + '_enrichment_updates')
+        latest = None
         if queue is not None:
-            # Bound UI work even if a producer keeps publishing new snapshots.
+            # Bounded reads so very long scans cannot block the ticket controls.
             for _ in range(50):
-                try: latest=queue.get_nowait()
-                except Empty: break
-        if latest is not None: st.session_state[state]=latest
-        future=st.session_state.get(prefix+'_enrichment_future')
+                try:
+                    latest = queue.get_nowait()
+                except Empty:
+                    break
+        if latest is not None:
+            st.session_state[state] = latest
+        future = st.session_state.get(prefix + '_enrichment_future')
         if future is not None and future.done():
-            try: st.session_state[state]=future.result()
-            except Exception:
-                st.session_state['ai_ticket_refresh_issue']=league+' prop refresh stopped. Saved picks remain available; check its sport page for provider details.'
-            st.session_state.pop(prefix+'_enrichment_future',None)
-            st.session_state.pop(prefix+'_enrichment_updates',None)
-        if league=='NFL' and st.session_state.get(state):
-            current=st.session_state[state]
-            st.session_state['nfl_auto_prop_predictions']=current.get('nfl_player_props',pd.DataFrame())
-            st.session_state['live_nfl_predictions']=current.get('predictions')
+            try:
+                completed = future.result()
+                if completed is not None:
+                    st.session_state[state] = completed
+                st.session_state.setdefault('ai_ticket_scan_status', {})[league] = {
+                    'state': 'finished',
+                    'time': pd.Timestamp.now(tz='UTC').isoformat(),
+                }
+                st.session_state.pop('ai_ticket_refresh_issue', None)
+                st.session_state.pop('ai_ticket_refresh_notice', None)
+            except Exception as exc:
+                current = dict(st.session_state.get(state) or {})
+                current.update(workspace_pending=False, enrichment_pending=False)
+                if league == 'NBA':
+                    current.update(nba_props_pending=False, nba_snapshot_pending=False)
+                current['workspace_issue'] = (
+                    league + ' prop scan could not finish (' + type(exc).__name__ + '). '
+                    'Existing estimates remain, but no new offers were verified.')
+                st.session_state[state] = current
+                st.session_state['ai_ticket_refresh_issue'] = current['workspace_issue']
+                st.session_state.pop('ai_ticket_refresh_notice', None)
+                st.session_state.setdefault('ai_ticket_scan_status', {})[league] = {
+                    'state': 'failed',
+                    'time': pd.Timestamp.now(tz='UTC').isoformat(),
+                }
+            finally:
+                st.session_state.pop(prefix + '_enrichment_future', None)
+                st.session_state.pop(prefix + '_enrichment_updates', None)
+        if league == 'NFL' and st.session_state.get(state):
+            current = st.session_state[state]
+            st.session_state['nfl_auto_prop_predictions'] = current.get('nfl_player_props', pd.DataFrame())
+            st.session_state['live_nfl_predictions'] = current.get('predictions')
+
+
+def ticket_offer_fingerprint(candidates):
+    """Detect changed/expired offers without touching provider endpoints."""
+    import hashlib
+    import json
+    identity = [
+        [r['sport'], r['book'], r['game'], r['player'], str(r['market']),
+         r['side'], r['line'], r['chance'], r['quote_time']]
+        for r in candidates
+    ]
+    identity.sort(key=lambda r: tuple(str(v) for v in r))
+    return hashlib.sha256(json.dumps(identity, default=str).encode()).hexdigest()
+
+
+def ticket_quote_status(diagnostics, sports, book):
+    """Present counted quote states, not guessed sportsbook inventory."""
+    counts = [diagnostics.get(s, {}) for s in sports]
+    def sum_count(label):
+        return sum(c.get(book + label, 0) for c in counts)
+    listings = sum_count(' listings')
+    expired = sum_count(' expired quote')
+    invalid = sum(sum_count(' ' + name) for name in (
+        'mismatched side', 'mismatched market', 'mismatched line',
+        'invalid offered line', 'missing quote time',
+        'invalid quote time', 'missing valid price'))
+    saved = sum(c.get('saved props', 0) for c in counts)
+    no_listing = sum(c.get('no saved sportsbook listing', 0) for c in counts)
+    return {'listings': listings, 'expired': expired,
+            'invalid': invalid, 'saved': saved, 'no_listing': no_listing}
 
 
 def render_ai_ticket_builder():
@@ -1206,102 +1288,201 @@ def render_ai_ticket_builder():
 @st.fragment
 def render_ai_ticket_results():
     from dual_agent.preferred_sportsbooks import PLATFORMS
-    st.button('Check for completed props',key='ai_ticket_check_completed',
-              help='Reads completed background results. Does not start a scan or use Odds API credits.')
+    st.button('Check for completed props', key='ai_ticket_check_completed',
+              help='Reads finished background results. No new Odds API requests.')
     drain_ticket_prop_updates()
-    sport=st.session_state['ai_ticket_sport']
-    selected_sports=['NFL','NBA','MLB'] if sport=='All sports' else [sport]
-    sources=ticket_cached_sources(selected_sports)
-    diagnostics={}
-    candidates=ticket_prop_candidates(sources,diagnostics=diagnostics)
-    legs=st.session_state['ai_ticket_legs'];book=st.session_state['ai_ticket_book']
-    same_game=st.session_state.get('ai_ticket_same_game',False)
-    include_specialty=st.session_state.get('ai_ticket_specialty',False)
-    diversify_markets=st.session_state.get('ai_ticket_diversify',True)
-    filtered=[r for r in candidates if sport=='All sports' or r['sport']==sport]
-    offered=[r for r in filtered if r['book']==book]
-    standard=[r for r in offered if ticket_is_standard(r['sport'],r['market'])]
-    eligible=offered if include_specialty else standard
-    possible=len(build_suggested_ticket(filtered,book,10,same_game,include_specialty,diversify_markets))
-    st.caption(f'{len(eligible)} eligible, fresh model-backed offers at {PLATFORMS[book]} · {len(standard)} standard / {len(offered)-len(standard)} specialty listings · up to {possible} compatible legs.')
-    # Keep ticket building ahead of collection controls and independent of its job.
-    if st.button('Build my ticket',type='primary',use_container_width=True,key='ai_build_ticket'):
-        picks=build_suggested_ticket(filtered,book,legs,same_game,include_specialty,diversify_markets)
-        st.session_state['ai_suggested_ticket']={'book':book,'requested':legs,'sport':sport,'same_game':same_game,
-            'created_at':pd.Timestamp.now(tz='UTC').isoformat(),'legs':picks,
-            'include_specialty':include_specialty,'diversify_markets':diversify_markets}
-    if possible<legs:
+    sport = st.session_state['ai_ticket_sport']
+    selected_sports = ['NFL', 'NBA', 'MLB'] if sport == 'All sports' else [sport]
+    sources = ticket_cached_sources(selected_sports)
+    diagnostics = {}
+    candidates = ticket_prop_candidates(sources, diagnostics=diagnostics)
+    legs = st.session_state['ai_ticket_legs']
+    book = st.session_state['ai_ticket_book']
+    same_game = st.session_state.get('ai_ticket_same_game', False)
+    include_specialty = st.session_state.get('ai_ticket_specialty', False)
+    diversify_markets = st.session_state.get('ai_ticket_diversify', True)
+    offered = [r for r in candidates if r['book'] == book]
+    standard = [r for r in offered if ticket_is_standard(r['sport'], r['market'])]
+    eligible = offered if include_specialty else standard
+    possible = len(build_suggested_ticket(candidates, book, 10, same_game,
+                                          include_specialty, diversify_markets))
+    quote_status = ticket_quote_status(diagnostics, selected_sports, book)
+    active = [s for s in selected_sports if
+              (st.session_state.get(s.lower() + '_enrichment_future') is not None
+               and not st.session_state[s.lower() + '_enrichment_future'].done())]
+    fingerprint = ticket_offer_fingerprint(eligible)
+
+    st.caption(f'**Ready to build:** {len(eligible)} fresh, listed {PLATFORMS[book]} offers '
+               f'({len(standard)} standard / {len(offered)-len(standard)} specialty) '
+               f'· up to {possible} compatible legs.')
+    st.caption(f'**Awaiting a new quote:** {quote_status["expired"]} expired listings '
+               f'· **Excluded due to mismatches or missing information:** {quote_status["invalid"]} listings '
+               f'· **Saved model props:** {quote_status["saved"]} '
+               f'({quote_status["no_listing"]} without any sportsbook listings).')
+    if active:
+        st.info('Refreshing ' + ', '.join(active) + ' in the background. These scans may '
+                'supply new offers; currently expired or missing lines are NOT being counted as playable.')
+    elif quote_status['listings'] == 0 and quote_status['saved']:
+        st.info(f'No {PLATFORMS[book]} quotes were found in the saved model results. '
+                'The data provider may not cover this sportsbook or its offered markets; '
+                'a refresh cannot guarantee coverage.')
+    elif not eligible and quote_status['expired']:
+        st.info('Only outdated or otherwise ineligible quotes were found for the chosen '
+                'settings. Collect fresh props below; do not place bets from expired prices.')
+
+    # Build only from verified cached offers; empty tickets are not valid output.
+    if st.button('Build my ticket', type='primary', use_container_width=True,
+                 key='ai_build_ticket'):
+        picks = build_suggested_ticket(candidates, book, legs, same_game,
+                                       include_specialty, diversify_markets)
+        if picks:
+            st.session_state['ai_suggested_ticket'] = {
+                'book': book, 'requested': legs, 'sport': sport,
+                'same_game': same_game,
+                'created_at': pd.Timestamp.now(tz='UTC').isoformat(),
+                'legs': picks, 'offer_fingerprint': fingerprint,
+                'include_specialty': include_specialty,
+                'diversify_markets': diversify_markets,
+            }
+            st.session_state.pop('ai_ticket_build_issue', None)
+        else:
+            st.session_state.pop('ai_suggested_ticket', None)
+            st.session_state['ai_ticket_build_issue'] = (
+                f'No fresh, verified {PLATFORMS[book]} picks are available. '
+                'Wait for the scan to complete and check its results, or '
+                'collect new sportsbook offers. No ticket was generated.')
+    if st.session_state.get('ai_ticket_build_issue'):
+        if not eligible:
+            st.warning(st.session_state['ai_ticket_build_issue'])
+        else:
+            st.session_state.pop('ai_ticket_build_issue', None)
+    if possible < legs:
         if not include_specialty and offered and not standard:
-            st.info('Only specialty markets are currently listed at this sportsbook. Standard-market mode excluded them. Refresh props or explicitly enable specialty markets.')
+            st.info('Only specialty markets are currently listed for this sportsbook. '
+                    'Standard-market mode excludes those markets; you may opt in explicitly.')
         elif eligible and not same_game:
-            st.info('The one-pick-per-game setting or lack of independent players leaves too few legs. You can allow different players from the same game; confirm the combination on your platform.')
-        elif not offered:
-            total=sum(diagnostics.get(s,{}).get('saved props',0) for s in selected_sports)
-            listed=sum(diagnostics.get(s,{}).get(book+' listings',0) for s in selected_sports)
-            if not total: st.info('No saved model player props are loaded for these sports yet. Collect props below if game predictions are saved, or generate game predictions in the sport first.')
-            elif not listed: st.info(f'Saved model props contain no {PLATFORMS[book]} listings. A refresh can check for listings, but cannot guarantee that the data provider supplies them.')
-            else: st.info('Saved listings were excluded. The quote-time and data checks below show why; collect props to check for newer offers.')
+            st.info('Insufficient independent legs under your one-pick-per-game setting. '
+                    'Allowing multiple players from one game can increase correlation.')
+        elif quote_status['saved'] == 0:
+            st.info('No saved model props were found. Generate the sport predictions first, '
+                    'then collect player props.')
+        elif not offered and not active and not quote_status['listings']:
+            st.info(f'The saved provider data contains no {PLATFORMS[book]} listings. '
+                    'A new scan may help, but this sportsbook may not be in the provider feed.')
+
     with st.expander('Available sportsbooks and excluded offers'):
-        for b,title in PLATFORMS.items():
-            st.write(f'{title}: {sum(r["book"]==b and ticket_is_standard(r["sport"],r["market"]) for r in filtered)} standard + {sum(r["book"]==b and not ticket_is_standard(r["sport"],r["market"]) for r in filtered)} specialty offers')
+        for b, title in PLATFORMS.items():
+            listed = [r for r in candidates if r['book'] == b]
+            common = sum(ticket_is_standard(r['sport'], r['market']) for r in listed)
+            report = ticket_quote_status(diagnostics, selected_sports, b)
+            st.write(f'{title}: {common} fresh standard / {len(listed)-common} fresh specialty '
+                     f'· {report["expired"]} outdated quotes · {report["invalid"]} invalid/mismatched')
         for s in selected_sports:
-            counts=diagnostics.get(s,{})
-            details=[f'{v} {k}' for k,v in counts.items() if k not in ('saved props',) and ('listings' not in k and 'eligible offers' not in k) and (not any(k.startswith(b) for b in PLATFORMS) or k.startswith(book))]
-            st.caption(s+': '+str(counts.get('saved props',0))+' saved model props'+(' · '+', '.join(details) if details else ''))
-            result=sources.get(s,{})
-            message=result.get('workspace_issue') or result.get('player_props',{}).get('message')
-            if message: st.caption(str(message))
-    active=[s for s in selected_sports if (st.session_state.get(s.lower()+'_enrichment_future') is not None and not st.session_state[s.lower()+'_enrichment_future'].done())]
-    if active: st.caption('Collecting props in the background: '+', '.join(active)+'. You can build from available picks now. Use “Check for completed props” when ready; this page does not refresh automatically.')
-    st.caption('Opening this page and building a ticket use saved data. Collecting props below may use API credits; existing caches and player histories are reused. All preferred books may be collected by the sport pipeline; ticket selection stays exclusive to your chosen book.')
-    if st.button('Collect / refresh props for selected sports',key='ai_ticket_collect_props',disabled=bool(active),use_container_width=True):
-        notices=[]
+            counts = diagnostics.get(s, {})
+            reasons = [(k, v) for k, v in counts.items()
+                       if isinstance(v, int) and v > 0
+                       and (not any(k.startswith(b + ' ') for b in PLATFORMS) or k.startswith(book + ' '))
+                       and k not in ('saved props',)]
+            st.caption(s + ': ' + str(counts.get('saved props', 0)) +
+                       ' saved model props' +
+                       (' · ' + ', '.join(f'{v} {k}' for k, v in reasons) if reasons else ''))
+            for example in counts.get('_examples', {}).get(book, []):
+                st.caption('Excluded · ' + example['Player'] + ' · ' + example['Market'] +
+                           ' · ' + example['Why excluded'] +
+                           (' (' + example['Quote age'] + ')' if example['Quote age'] else ''))
+            result = sources.get(s, {})
+            message = result.get('workspace_issue') or result.get('player_props', {}).get('message')
+            if message:
+                st.caption(str(message))
+    for s in selected_sports:
+        status = st.session_state.get('ai_ticket_scan_status', {}).get(s)
+        if status and s not in active:
+            st.caption(s + ' last background scan: ' + status['state'] +
+                       ' · ' + pd.Timestamp(status['time']).tz_convert('America/Chicago').strftime('%b %d, %I:%M %p CT'))
+
+    st.caption('Building a ticket uses saved data only. Refreshing props may spend API credits. '
+               'Player histories and cached predictions are reused where supported. '
+               'A provider listing must match the selected sportsbook; no substitute line is fabricated.')
+    if st.button('Collect / refresh props for selected sports',
+                 key='ai_ticket_collect_props', disabled=bool(active),
+                 use_container_width=True):
+        notices = []
         for s in selected_sports:
-            result=sources.get(s,{})
-            games=result.get('all_predictions',result.get('predictions',[]))
-            games=games.to_dict('records') if isinstance(games,pd.DataFrame) else list(games or [])
-            now=pd.Timestamp.now(tz='UTC')
-            games=[g for g in games if pd.notna(t:=pd.to_datetime(g.get('commence_time',g.get('start_time',g.get('game_time'))),utc=True,errors='coerce')) and now<t<=now+pd.Timedelta(days=7)]
+            result = sources.get(s, {})
+            games = result.get('all_predictions', result.get('predictions', []))
+            games = games.to_dict('records') if isinstance(games, pd.DataFrame) else list(games or [])
+            now = pd.Timestamp.now(tz='UTC')
+            games = [g for g in games if
+                     pd.notna(t := pd.to_datetime(g.get('commence_time', g.get('start_time', g.get('game_time'))),
+                                                   utc=True, errors='coerce'))
+                     and now < t <= now + pd.Timedelta(days=7)]
             if not games:
-                notices.append(s+': generate game predictions in its sport page first.');continue
-            if not prediction_api_key('ODDS_API_KEY','THE_ODDS_API_KEY'):
-                notices.append(s+': sportsbook API key is missing.');continue
-            refreshed=dict(result,all_predictions=pd.DataFrame(games) if s in ('NFL','NBA') else games,
-                           predictions=pd.DataFrame(games) if s in ('NFL','NBA') else games)
+                notices.append(s + ': generate game predictions in its sport page first.')
+                continue
+            if not prediction_api_key('ODDS_API_KEY', 'THE_ODDS_API_KEY'):
+                notices.append(s + ': sportsbook API key is missing.')
+                continue
+            refreshed = dict(result,
+                             all_predictions=pd.DataFrame(games) if s in ('NFL', 'NBA') else games,
+                             predictions=pd.DataFrame(games) if s in ('NFL', 'NBA') else games)
             try:
-                if s=='NBA': start_nba_prop_loading(refreshed)
-                else: start_cross_refresh(s,refreshed)
-                notices.append(s+': collecting props in the background.')
-            except Exception as exc: notices.append(s+': could not start collection ('+type(exc).__name__+').')
-        st.session_state['ai_ticket_refresh_notice']=' '.join(notices)
-    if st.session_state.get('ai_ticket_refresh_notice'): st.caption(st.session_state['ai_ticket_refresh_notice'])
-    if st.session_state.get('ai_ticket_refresh_issue'): st.warning(st.session_state['ai_ticket_refresh_issue'])
-    ticket=st.session_state.get('ai_suggested_ticket')
-    if not ticket: return
-    if (ticket.get('book')!=book or ticket.get('sport')!=sport or
-            ticket.get('requested')!=legs or ticket.get('same_game')!=same_game or
-            ticket.get('include_specialty')!=include_specialty or
-            ticket.get('diversify_markets')!=diversify_markets):
-        st.info('Your ticket settings changed. Press Build my ticket to apply the new selections.')
+                if s == 'NBA':
+                    started = start_nba_prop_loading(refreshed)
+                else:
+                    started = start_cross_refresh(s, refreshed)
+                st.session_state.setdefault('ai_ticket_scan_status', {}).pop(s, None)
+                notices.append(s + ': collecting props in the background.')
+            except Exception as exc:
+                notices.append(s + ': could not start collection (' + type(exc).__name__ + ').')
+        st.session_state['ai_ticket_refresh_notice'] = ' '.join(notices)
+    if st.session_state.get('ai_ticket_refresh_notice'):
+        st.caption(st.session_state['ai_ticket_refresh_notice'])
+    if st.session_state.get('ai_ticket_refresh_issue'):
+        st.warning(st.session_state['ai_ticket_refresh_issue'])
+
+    ticket = st.session_state.get('ai_suggested_ticket')
+    if not ticket:
+        return
+    if (ticket.get('book') != book or ticket.get('sport') != sport or
+            ticket.get('requested') != legs or ticket.get('same_game') != same_game or
+            ticket.get('include_specialty') != include_specialty or
+            ticket.get('diversify_markets') != diversify_markets):
+        st.info('Ticket settings changed. Press Build my ticket to apply the new selections.')
+        return
+    if ticket.get('offer_fingerprint') != fingerprint:
+        st.info('Available sportsbook offers have changed or expired since this ticket was built. '
+                'Press Build my ticket to recalculate using the current verified listings.')
         return
     st.subheader(f'{PLATFORMS[ticket["book"]]} · {len(ticket["legs"])} of {ticket["requested"]} legs')
-    if len(ticket['legs'])<ticket['requested']:
-        st.info('There are not enough eligible picks to complete this ticket. These are candidates only; the builder did not fill the remaining legs with conflicting or unlisted bets.')
-    if ticket['book'] in ('prizepicks','underdog'):
-        st.caption('Suggested pick’em entry. Entry size, offered lines and combination rules must be confirmed on the platform; feed prices are indicative.')
-    st.caption('Leg percentages are model estimates, not a guaranteed ticket win rate. No combined probability or payout is calculated because correlations and platform rules are not verified.')
-    now=pd.Timestamp.now(tz='UTC')
-    for i,leg in enumerate(ticket['legs'],1):
+    if len(ticket['legs']) < ticket['requested']:
+        st.info('Too few eligible offers to complete this ticket. No unlisted or conflicting '
+                'legs have been inserted.')
+    if ticket['book'] in ('prizepicks', 'underdog'):
+        st.caption('Suggested pick’em entry. Recheck exact offered lines and combination '
+                   'rules in the platform; the odds feed is not direct platform confirmation.')
+    st.caption('Individual leg percentages are model estimates, not guaranteed win rates. '
+               'No combined win probability or payout is calculated without a verified '
+               'correlation model and platform rules.')
+    now = pd.Timestamp.now(tz='UTC')
+    for i, leg in enumerate(ticket['legs'], 1):
         with st.container(border=True):
-            st.markdown(f'**Leg {i} · {leg["player"]} · {leg["side"]} {leg["line"]:g} {leg["market"]}**')
+            st.markdown(f'**Leg {i} · {leg["player"]} · {leg["side"]} '
+                        f'{leg["line"]:g} {leg["market"]}**')
             st.write(f'Estimated cover chance: **{leg["chance"]:.1%}**')
-            start=pd.Timestamp(leg['start']);quote=pd.Timestamp(leg['quote_time'])
-            st.caption(f'{leg["sport"]} · {leg["game"]} · '+start.tz_convert('America/Chicago').strftime('%b %d, %I:%M %p CT'))
-            price=leg.get('decimal_odds')
-            price_text=f'feed decimal odds {price:g}' if price is not None else 'pick’em listing · entry rules set the return'
-            st.caption(f'{PLATFORMS[leg["book"]]} · {price_text} · quote '+quote.tz_convert('America/Chicago').strftime('%I:%M %p CT'))
-            if start<=now or now-quote>pd.Timedelta(minutes=30): st.warning('This saved leg has started or its quote expired. Rebuild after refreshing its sport’s props.')
-    st.caption('Suggested ticket only. Verify every line and the complete combination in your sportsbook; this does not place or record a wager.')
+            start = pd.Timestamp(leg['start'])
+            quote = pd.Timestamp(leg['quote_time'])
+            st.caption(f'{leg["sport"]} · {leg["game"]} · ' +
+                       start.tz_convert('America/Chicago').strftime('%b %d, %I:%M %p CT'))
+            price = leg.get('decimal_odds')
+            price_text = (f'feed decimal odds {price:g}' if price is not None
+                          else 'pick’em listing · entry rules determine returns')
+            st.caption(f'{PLATFORMS[leg["book"]]} · {price_text} · quote ' +
+                       quote.tz_convert('America/Chicago').strftime('%I:%M %p CT'))
+            if start <= now or now - quote > pd.Timedelta(minutes=30):
+                st.warning('This saved line is no longer current. Refresh the sportsbook '
+                           'quotes before using it.')
+    st.caption('Suggestion only. Verify every line and the entire combination in your '
+               'sportsbook; this application does not place or record a wager.')
 
 
 def select_main_page(destination):
