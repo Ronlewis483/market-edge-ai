@@ -890,89 +890,225 @@ def render_league_prediction_results(
 # MARKET EDGE AI — NAVIGATION V2
 # ==========================================
 
+# Ticket-market policy: standard player props first; niche defensive/specialty
+# categories can be enabled explicitly. This policy does not manufacture odds.
+TICKET_STANDARD_MARKETS = {
+    'NFL': {
+        'passing yards', 'rushing yards', 'receiving yards', 'receptions',
+        'rushing + receiving yards', 'passing touchdowns', 'anytime touchdown',
+        'passing completions', 'passing attempts', 'rushing attempts',
+        'interceptions thrown', 'passing + rushing yards',
+    },
+    'NBA': {
+        'points', 'rebounds', 'assists', 'three-pointers made',
+        'points + rebounds + assists', 'points + rebounds',
+        'points + assists', 'rebounds + assists',
+    },
+    'MLB': {
+        'hits', 'home runs', 'total bases', 'rbis', 'runs scored',
+        'hits + runs + rbis', 'batter strikeouts', 'pitcher strikeouts',
+        'stolen bases', 'singles', 'batter walks', 'walks',
+    },
+}
+
+
+def ticket_market_label(value):
+    """Normalize feed labels without mixing solo tackles and assisted tackles."""
+    import re
+    name = re.sub(r'\s+', ' ', str(value or '').replace('_', ' ').strip().lower())
+    aliases = {
+        'player assists': 'assisted tackles',
+        'player receptions': 'receptions',
+        'player reception yds': 'receiving yards',
+        'player rush yds': 'rushing yards',
+        'player pass yds': 'passing yards',
+        'player anytime td': 'anytime touchdown',
+        'threes': 'three-pointers made',
+        'three pointers made': 'three-pointers made',
+        '3 pointers made': 'three-pointers made',
+        '3 point field goals': 'three-pointers made',
+        'home runs': 'home runs',
+        'runs batted in': 'rbis',
+        'strikeouts (pitcher)': 'pitcher strikeouts',
+    }
+    return aliases.get(name, name)
+
+
+def ticket_is_standard(sport, market):
+    return ticket_market_label(market) in TICKET_STANDARD_MARKETS.get(sport, set())
+
+
+def ticket_market_family(market):
+    """Used for diversification, not for matching sportsbook listings."""
+    return ticket_market_label(market)
+
+
 def ticket_prop_candidates(results, now=None, diagnostics=None):
-    """Use actual offered sides, exact lines and original quote timestamps only."""
+    """Use exact, fresh listed sportsbook offers; never invent a prop/side/line."""
     from dual_agent.preferred_sportsbooks import allowed
     now = pd.Timestamp.now(tz='UTC') if now is None else pd.Timestamp(now)
-    end = now+pd.Timedelta(days=7)
+    end = now + pd.Timedelta(days=7)
     quote_age = pd.Timedelta(minutes=30)
     zero = pd.Timedelta(0)
     timestamps = {}
+
     def stamp(value):
         key = str(value)
         if key not in timestamps:
-            timestamps[key] = pd.to_datetime(value,utc=True,errors='coerce')
+            timestamps[key] = pd.to_datetime(value, utc=True, errors='coerce')
         return timestamps[key]
+
     candidates = {}
     for sport, result in results.items():
         counts = diagnostics.setdefault(sport, {}) if diagnostics is not None else {}
-        def count(reason): counts[reason] = counts.get(reason, 0) + 1
-        payload = (result or {}).get('player_props',{})
-        data = (result or {}).get('nfl_player_props',[]) if sport=='NFL' else payload.get('game_picks',payload.get('picks',[]))
-        rows = data.to_dict('records') if isinstance(data,pd.DataFrame) else list(data or [])
+
+        def count(reason):
+            counts[reason] = counts.get(reason, 0) + 1
+
+        payload = (result or {}).get('player_props', {})
+        data = ((result or {}).get('nfl_player_props', []) if sport == 'NFL'
+                else payload.get('game_picks', payload.get('picks', [])))
+        rows = data.to_dict('records') if isinstance(data, pd.DataFrame) else list(data or [])
         for row in rows:
             count('saved props')
-            start = stamp(row.get('game_time',row.get('start_time')))
-            if pd.isna(start) or not now<start<=end:
-                count('outside upcoming seven days'); continue
-            player = row.get('player',row.get('Player'))
-            if sport=='NBA':
+            start = stamp(row.get('game_time', row.get('start_time')))
+            if pd.isna(start) or not now < start <= end:
+                count('outside upcoming seven days')
+                continue
+            player = row.get('player', row.get('Player'))
+            if sport == 'NBA':
                 from dual_agent.sports_player_prop_predictions import nba_identity_key
-                if nba_identity_key(player) in payload.get('unavailable_players',[]):
-                    count('unavailable player'); continue
-            side = str(row.get('model_pick',row.get('Pick',''))).upper()
-            if side not in {'OVER','UNDER','YES','NO'}:
-                count('missing predicted side'); continue
-            try: chance=float(row.get('historical_support',row.get('Estimated chance')));line=float(row.get('line',row.get('Line')))
-            except (ValueError,TypeError):
-                count('missing model estimate'); continue
-            if not np.isfinite([chance,line]).all() or not 0<chance<1 or not player:
-                count('invalid model estimate'); continue
-            market = row.get('market',row.get('Market'))
-            game = row.get('Game') or str(row.get('away_team'))+' @ '+str(row.get('home_team'))
-            offers = row.get('sportsbook_offers',row.get('Sportsbook offers',[])) or []
-            if not offers: count('no saved sportsbook listing')
+                if nba_identity_key(player) in payload.get('unavailable_players', []):
+                    count('unavailable player')
+                    continue
+            side = str(row.get('model_pick', row.get('Pick', ''))).strip().upper()
+            if side not in {'OVER', 'UNDER', 'YES', 'NO'}:
+                count('missing predicted side')
+                continue
+            try:
+                chance = float(row.get('historical_support', row.get('Estimated chance')))
+                line = float(row.get('line', row.get('Line')))
+            except (ValueError, TypeError):
+                count('missing model estimate')
+                continue
+            if not np.isfinite([chance, line]).all() or not 0 < chance < 1 or not player:
+                count('invalid model estimate')
+                continue
+            market = row.get('market', row.get('Market'))
+            if not market:
+                count('missing market')
+                continue
+            game = row.get('Game') or str(row.get('away_team')) + ' @ ' + str(row.get('home_team'))
+            offers = row.get('sportsbook_offers', row.get('Sportsbook offers', [])) or []
+            if not isinstance(offers, (list, tuple)):
+                count('invalid sportsbook listings')
+                continue
+            if not offers:
+                count('no saved sportsbook listing')
+
             for offer in offers:
-                book = str(offer.get('bookmaker_key',offer.get('book',''))).lower()
-                count(book+' listings')
-                updated=stamp(offer.get('last_update',offer.get('updated_at',row.get('quote_updated_at'))))
-                if not allowed(book): continue
-                if pd.isna(updated): count(book+' missing quote time'); continue
-                if not zero<=now-updated<=quote_age or updated>=start:
-                    count(book+' expired or invalid quote time'); continue
-                price = None
+                if not isinstance(offer, dict):
+                    count('invalid sportsbook listing')
+                    continue
+                book = str(offer.get('bookmaker_key', offer.get('book', ''))).strip().lower()
+                count(book + ' listings')
+                if not allowed(book):
+                    continue
+                # NFL offers were prefiltered for the exact model side and line
+                # upstream. Other feeds inherit those from the parent row.
+                # If a quote explicitly supplies any of these fields, validate it.
+                offered_side = offer.get('side', offer.get('model_pick'))
+                if offered_side is not None and str(offered_side).strip().upper() != side:
+                    count(book + ' mismatched side')
+                    continue
+                offered_market = offer.get('market', offer.get('market_name'))
+                if offered_market is not None and ticket_market_label(offered_market) != ticket_market_label(market):
+                    count(book + ' mismatched market')
+                    continue
+                offered_line = offer.get('line', offer.get('point'))
+                if offered_line is not None:
+                    try:
+                        if not np.isfinite(float(offered_line)) or abs(float(offered_line) - line) > 1e-6:
+                            count(book + ' mismatched line')
+                            continue
+                    except (ValueError, TypeError):
+                        count(book + ' invalid offered line')
+                        continue
+                updated = stamp(offer.get('last_update', offer.get('updated_at', row.get('quote_updated_at'))))
+                if pd.isna(updated):
+                    count(book + ' missing quote time')
+                    continue
+                if not zero <= now - updated <= quote_age or updated >= start:
+                    count(book + ' expired or invalid quote time')
+                    continue
                 try:
-                    price=offer.get('decimal_odds')
+                    price = offer.get('decimal_odds')
                     if price is None:
-                        american=float(offer['american_odds'])
-                        if abs(american)<100: raise ValueError('Invalid price')
-                        price=1+american/100 if american>0 else 1+100/abs(american)
-                    price=float(price)
-                except (ValueError,TypeError,KeyError,ZeroDivisionError): price = None
-                if price is not None and (not np.isfinite(price) or price<=1): price = None
-                # Pick'em entries do not require a per-leg moneyline price.
-                # An actual listing, original timestamp and model estimate still do.
-                if price is None and book not in ('underdog','prizepicks'):
-                    count(book+' missing valid price'); continue
-                candidate={'sport':sport,'book':book,'game':game,'start':start.isoformat(),'player':player,
-                    'market':market,'side':side,'line':line,'chance':chance,'decimal_odds':price,'quote_time':updated.isoformat()}
-                key=tuple(candidate[k] for k in ('sport','book','game','start','player','market','side','line'))
-                if key not in candidates or candidate['quote_time']>candidates[key]['quote_time']:
-                    candidates[key]=candidate
-                count(book+' eligible offers')
-    return sorted(candidates.values(),key=lambda r:(-r['chance'],r['start'],r['player']))
+                        american = float(offer['american_odds'])
+                        if abs(american) < 100:
+                            raise ValueError('Invalid American price')
+                        price = 1 + american / 100 if american > 0 else 1 + 100 / abs(american)
+                    price = float(price)
+                except (ValueError, TypeError, KeyError, ZeroDivisionError):
+                    price = None
+                if price is not None and (not np.isfinite(price) or price <= 1):
+                    price = None
+                if price is None and book not in ('underdog', 'prizepicks'):
+                    count(book + ' missing valid price')
+                    continue
+                candidate = {
+                    'sport': sport, 'book': book, 'game': game,
+                    'start': start.isoformat(), 'player': player,
+                    'market': market, 'side': side, 'line': line,
+                    'chance': chance, 'decimal_odds': price,
+                    'quote_time': updated.isoformat(),
+                    'standard_market': ticket_is_standard(sport, market),
+                }
+                key = tuple(candidate[k] for k in
+                            ('sport', 'book', 'game', 'start', 'player', 'market', 'side', 'line'))
+                if key not in candidates or candidate['quote_time'] > candidates[key]['quote_time']:
+                    candidates[key] = candidate
+                count(book + ' eligible offers')
+    return sorted(candidates.values(), key=lambda r: (-r['chance'], r['start'], r['player']))
 
 
-def build_suggested_ticket(candidates, book, legs, same_game=False):
-    if legs not in range(3,11): raise ValueError('Choose 3 to 10 legs.')
-    chosen=[]; players=set(); games=set()
-    for c in sorted(candidates,key=lambda r:(-r['chance'],r['start'],r['player'])):
-        if c['book']!=book: continue
-        game=(c['sport'],c['game'],c['start'])
-        player=game+(str(c['player']).casefold(),)
-        if player in players or (not same_game and game in games): continue
-        chosen.append(c);players.add(player);games.add(game)
-        if len(chosen)==legs: break
+def build_suggested_ticket(candidates, book, legs, same_game=False,
+                           include_specialty=False, diversify_markets=True):
+    """Rank listed offers, preferring common markets and avoiding prop clustering."""
+    if legs not in range(3, 11):
+        raise ValueError('Choose 3 to 10 legs.')
+    pool = [c for c in candidates if c['book'] == book and
+            (include_specialty or ticket_is_standard(c['sport'], c['market']))]
+    pool.sort(key=lambda r: (-r['chance'], r['start'], str(r['player'])))
+    chosen, players, games = [], set(), set()
+    family_counts = {}
+
+    def try_take(candidate, family_cap=None):
+        game = (candidate['sport'], candidate['game'], candidate['start'])
+        player = game + (str(candidate['player']).casefold(),)
+        family = (candidate['sport'], ticket_market_family(candidate['market']))
+        if player in players or (not same_game and game in games):
+            return False
+        if family_cap is not None and family_counts.get(family, 0) >= family_cap:
+            return False
+        chosen.append(candidate)
+        players.add(player)
+        games.add(game)
+        family_counts[family] = family_counts.get(family, 0) + 1
+        return True
+
+    # First take a maximum of two legs per stat market, then fill any remaining
+    # spaces from the same verified standard-market pool. This is preference,
+    # not a reason to pretend fewer valid listed props exist.
+    if diversify_markets:
+        for c in pool:
+            try_take(c, family_cap=2)
+            if len(chosen) == legs:
+                return chosen
+    for c in pool:
+        try_take(c)
+        if len(chosen) == legs:
+            break
     return chosen
 
 
@@ -1053,7 +1189,7 @@ def drain_ticket_prop_updates():
 def render_ai_ticket_builder():
     from dual_agent.preferred_sportsbooks import PLATFORMS
     st.title('🎫 AI Ticket Builder')
-    st.caption('Build a 3–10 leg suggested ticket from model player-prop predictions at one sportsbook. Ranked by estimated cover chance.')
+    st.caption('Build 3–10 legs using fresh, exact sportsbook listings. Standard, commonly offered prop categories are preferred by default; cover chances are model estimates, not guarantees.')
     columns=st.columns(3)
     with columns[0]: legs=st.selectbox('Ticket size',list(range(3,11)),format_func=lambda n:f'{n} legs',key='ai_ticket_legs')
     # Controls appear before loading saved offers, with stable option identities.
@@ -1061,6 +1197,8 @@ def render_ai_ticket_builder():
     with columns[1]: book=st.selectbox('Sportsbook',book_options,format_func=lambda b:PLATFORMS[b],key='ai_ticket_book')
     with columns[2]: sport=st.selectbox('Sports',['All sports','NFL','NBA','MLB'],key='ai_ticket_sport')
     st.checkbox('Allow different players from the same game',value=False,key='ai_ticket_same_game')
+    st.checkbox('Include specialty / defensive markets (e.g. assisted tackles)',value=False,key='ai_ticket_specialty')
+    st.checkbox('Spread picks across stat categories',value=True,key='ai_ticket_diversify')
     st.caption('One pick per game by default. Same-game picks can be correlated; the platform must confirm whether the combination is allowed. One leg per player per game prevents conflicting or overlapping player picks.')
     render_ai_ticket_results()
 
@@ -1078,18 +1216,25 @@ def render_ai_ticket_results():
     candidates=ticket_prop_candidates(sources,diagnostics=diagnostics)
     legs=st.session_state['ai_ticket_legs'];book=st.session_state['ai_ticket_book']
     same_game=st.session_state.get('ai_ticket_same_game',False)
+    include_specialty=st.session_state.get('ai_ticket_specialty',False)
+    diversify_markets=st.session_state.get('ai_ticket_diversify',True)
     filtered=[r for r in candidates if sport=='All sports' or r['sport']==sport]
     offered=[r for r in filtered if r['book']==book]
-    possible=len(build_suggested_ticket(filtered,book,10,same_game))
-    st.caption(f'{len(offered)} fresh model-backed offers at {PLATFORMS[book]} · up to {possible} compatible legs with your current settings.')
+    standard=[r for r in offered if ticket_is_standard(r['sport'],r['market'])]
+    eligible=offered if include_specialty else standard
+    possible=len(build_suggested_ticket(filtered,book,10,same_game,include_specialty,diversify_markets))
+    st.caption(f'{len(eligible)} eligible, fresh model-backed offers at {PLATFORMS[book]} · {len(standard)} standard / {len(offered)-len(standard)} specialty listings · up to {possible} compatible legs.')
     # Keep ticket building ahead of collection controls and independent of its job.
     if st.button('Build my ticket',type='primary',use_container_width=True,key='ai_build_ticket'):
-        picks=build_suggested_ticket(filtered,book,legs,same_game)
+        picks=build_suggested_ticket(filtered,book,legs,same_game,include_specialty,diversify_markets)
         st.session_state['ai_suggested_ticket']={'book':book,'requested':legs,'sport':sport,'same_game':same_game,
-            'created_at':pd.Timestamp.now(tz='UTC').isoformat(),'legs':picks}
+            'created_at':pd.Timestamp.now(tz='UTC').isoformat(),'legs':picks,
+            'include_specialty':include_specialty,'diversify_markets':diversify_markets}
     if possible<legs:
-        if offered and not same_game:
-            st.info('The one-pick-per-game setting leaves too few games. You can allow different players from the same game; confirm the combination on your platform.')
+        if not include_specialty and offered and not standard:
+            st.info('Only specialty markets are currently listed at this sportsbook. Standard-market mode excluded them. Refresh props or explicitly enable specialty markets.')
+        elif eligible and not same_game:
+            st.info('The one-pick-per-game setting or lack of independent players leaves too few legs. You can allow different players from the same game; confirm the combination on your platform.')
         elif not offered:
             total=sum(diagnostics.get(s,{}).get('saved props',0) for s in selected_sports)
             listed=sum(diagnostics.get(s,{}).get(book+' listings',0) for s in selected_sports)
@@ -1098,7 +1243,7 @@ def render_ai_ticket_results():
             else: st.info('Saved listings were excluded. The quote-time and data checks below show why; collect props to check for newer offers.')
     with st.expander('Available sportsbooks and excluded offers'):
         for b,title in PLATFORMS.items():
-            st.write(f'{title}: {sum(r["book"]==b for r in filtered)} eligible offers')
+            st.write(f'{title}: {sum(r["book"]==b and ticket_is_standard(r["sport"],r["market"]) for r in filtered)} standard + {sum(r["book"]==b and not ticket_is_standard(r["sport"],r["market"]) for r in filtered)} specialty offers')
         for s in selected_sports:
             counts=diagnostics.get(s,{})
             details=[f'{v} {k}' for k,v in counts.items() if k not in ('saved props',) and ('listings' not in k and 'eligible offers' not in k) and (not any(k.startswith(b) for b in PLATFORMS) or k.startswith(book))]
@@ -1133,6 +1278,12 @@ def render_ai_ticket_results():
     if st.session_state.get('ai_ticket_refresh_issue'): st.warning(st.session_state['ai_ticket_refresh_issue'])
     ticket=st.session_state.get('ai_suggested_ticket')
     if not ticket: return
+    if (ticket.get('book')!=book or ticket.get('sport')!=sport or
+            ticket.get('requested')!=legs or ticket.get('same_game')!=same_game or
+            ticket.get('include_specialty')!=include_specialty or
+            ticket.get('diversify_markets')!=diversify_markets):
+        st.info('Your ticket settings changed. Press Build my ticket to apply the new selections.')
+        return
     st.subheader(f'{PLATFORMS[ticket["book"]]} · {len(ticket["legs"])} of {ticket["requested"]} legs')
     if len(ticket['legs'])<ticket['requested']:
         st.info('There are not enough eligible picks to complete this ticket. These are candidates only; the builder did not fill the remaining legs with conflicting or unlisted bets.')
