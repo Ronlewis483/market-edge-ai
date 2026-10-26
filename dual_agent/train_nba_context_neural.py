@@ -123,6 +123,10 @@ def metrics(y,p):
 
 def load_candidate(package):
     """Safe NumPy-only loader for this candidate format, separate from live .npz files."""
+    if package.get('kind')=='nba_neural_context_adjustment':
+        if __package__: from .nba_context_residual import load
+        else: from nba_context_residual import load
+        return load(package)
     import numpy as np
     if package.get('kind')!='nba_context_neural_candidate' or package.get('schema')!=1:
         raise ValueError('Unsupported context candidate package')
@@ -153,8 +157,12 @@ def forward(arrays,x):
     return 1/(1+np.exp(-np.clip(logits,-30,30)))
 
 
-def predict_candidate(package,features,captured_at,scheduled_start):
+def predict_candidate(package,features,captured_at,scheduled_start,baseline_home_probability=None,baseline_model_id=None):
     """For a later prospective comparison; not called by the live winner engine."""
+    if package.get('kind')=='nba_neural_context_adjustment':
+        if __package__: from .nba_context_residual import predict
+        else: from nba_context_residual import predict
+        return predict(package,features,baseline_home_probability,baseline_model_id,captured_at,scheduled_start)
     import numpy as np
     captured,start=stamp(captured_at),stamp(scheduled_start)
     available=stamp(package.get('metadata',{}).get('available_after'))
@@ -246,8 +254,13 @@ def run(client=None):
     if not data or fingerprint(data)!=latest.get('dataset_hash'): raise ValueError('Dataset checksum mismatch')
     groups=validate_dataset(data);reasons=readiness(groups)
     if reasons:
-        status={'status':'waiting_for_completed_training_data','training_performed':False,
-            'partition_games':{name:len(rows) for name,rows in groups.items()},'reasons':reasons,
+        if __package__: from .nba_context_residual import run_early
+        else: from nba_context_residual import run_early
+        early=run_early(client)
+        status={'status':early['status'],'training_performed':early['training_performed'],
+            'learning_stage':'bounded_adjustment_to_existing_neural_model','early_learning':early,
+            'full_network_training':{'training_performed':False,
+                'partition_games':{name:len(rows) for name,rows in groups.items()},'reasons':reasons},
             'dataset_hash':latest['dataset_hash'],'live_model_changed':False,'sports_api_requests':0}
         client.write(MODEL_PREFIX+'training_status.json',status,replace=True)
         print(json.dumps(status),flush=True);return status
