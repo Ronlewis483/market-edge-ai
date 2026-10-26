@@ -40,7 +40,10 @@ def score_pairs(records):
     for (model_id,version),rows in sorted(groups.items()):
         summary={'candidate_model_id':model_id,'current_model_version':version,'paired_games':len(rows),
                  'evidence_status':'needs_more_completed_pairs' if len(rows)<100 else 'review_required_no_automatic_promotion'}
-        for label,field in (('current','current_home_probability'),('candidate','candidate_home_probability')):
+        models=[('current','current_home_probability'),('candidate','candidate_home_probability')]
+        if all(number(r['forecast'].get('neural_base_probability')) is not None for r in rows):
+            models.append(('neural_base','neural_base_probability'))
+        for label,field in models:
             probabilities=[r['forecast'][field] for r in rows];outcomes=[r['result']['home_win'] for r in rows]
             wins=sum((p>=.5)==y for p,y in zip(probabilities,outcomes));n=len(rows);rate=wins/n;z=1.96
             center=(rate+z*z/(2*n))/(1+z*z/n)
@@ -55,6 +58,9 @@ def score_pairs(records):
                 'brier':sum((p-y)**2 for p,y in zip(probabilities,outcomes))/n,
                 'log_loss':-sum(y*math.log(max(1e-7,p))+(1-y)*math.log(max(1e-7,1-p)) for p,y in zip(probabilities,outcomes))/n,
                 'confidence_buckets':reliability}
+        if 'neural_base' in summary:
+            summary['candidate_minus_neural_base_accuracy']=summary['candidate']['accuracy']-summary['neural_base']['accuracy']
+            summary['candidate_minus_neural_base_brier']=summary['candidate']['brier']-summary['neural_base']['brier']
         summary['candidate_minus_current_accuracy']=summary['candidate']['accuracy']-summary['current']['accuracy']
         summary['candidate_minus_current_brier']=summary['candidate']['brier']-summary['current']['brier']
         summaries.append(summary)
@@ -97,7 +103,7 @@ def run(client=None,now=None):
     if state.get('schema')!=1 or not isinstance(state.get('pairs'),dict): raise ValueError('Comparison checkpoint invalid; existing results not reset')
     graded=grade_existing(client,checkpoint,state,now)
     diagnostics={k:0 for k in ('baseline_forecasts_seen','invalid_baseline','no_unique_game','already_frozen',
-        'game_started','baseline_predates_candidate','no_prior_snapshot','invalid_snapshot','pairs_saved')}
+        'game_started','baseline_neural_mismatch','baseline_predates_candidate','no_prior_snapshot','invalid_snapshot','pairs_saved')}
     pointer=client.read(MODEL_PREFIX+'latest_candidate.json');model_id=None
     if pointer is not None:
         path=pointer.get('candidate_path','')
@@ -112,6 +118,11 @@ def run(client=None,now=None):
         baselines=sorted(checkpoint.get('frozen_forecasts',{}).items(),key=lambda x:(str(x[1].get('captured_at','')),x[0]))
         for name,baseline in baselines:
             diagnostics['baseline_forecasts_seen']+=1
+            adjustment=package.get('kind')=='nba_neural_context_adjustment'
+            base_neural_probability=number(baseline.get('learning_home_probability'))
+            if adjustment and (baseline.get('learning_model_id')!=package['metadata']['base_model_id']
+                or base_neural_probability is None or not 0<base_neural_probability<1):
+                diagnostics['baseline_neural_mismatch']+=1;continue
             frozen=stamp(baseline.get('captured_at'));start=stamp(baseline.get('start_time'))
             probability=number(baseline.get('current_home_probability'))
             if frozen is None or start is None or not frozen<=now or frozen>=start or probability is None or not 0<probability<1:
@@ -150,7 +161,11 @@ def run(client=None,now=None):
             try:features,gaps=extract_features(snapshot,game,checkpoint)
             except ValueError:diagnostics['invalid_snapshot']+=1;continue
             # Stamp the actual inference time; never pretend it ran at the old baseline time.
-            prediction=predict_candidate(package,features,now.isoformat(),min(start,scheduled).isoformat())
+            if adjustment:
+                prediction=predict_candidate(package,features,now.isoformat(),min(start,scheduled).isoformat(),
+                    baseline_home_probability=base_neural_probability,baseline_model_id=baseline['learning_model_id'])
+            else:
+                prediction=predict_candidate(package,features,now.isoformat(),min(start,scheduled).isoformat())
             candidate_probability=number(prediction.get('home_probability'))
             if candidate_probability is None or not 0<candidate_probability<1:raise ValueError('Invalid candidate probability')
             forecast={'schema':1,'game_id':game['id'],'candidate_model_id':model_id,'candidate_package_path':path,
@@ -161,6 +176,9 @@ def run(client=None,now=None):
                 'candidate_captured_at':now.isoformat(),'snapshot_path':snapshot_path,
                 'input_snapshot_captured_at':snapshot['captured_at'],'coverage_gaps':gaps,
                 'current_home_probability':probability,'candidate_home_probability':candidate_probability,
+                'candidate_kind':package.get('kind','nba_context_neural_candidate'),
+                'neural_base_probability':base_neural_probability if adjustment else None,
+                'neural_base_model_id':baseline.get('learning_model_id') if adjustment else None,
                 'comparison_policy':'Same game; candidate uses a snapshot already saved when baseline was frozen; both forecasts before earlier provider tipoff.',
                 'approved_for_live_use':False}
             client.write(forecast_path,forecast)
