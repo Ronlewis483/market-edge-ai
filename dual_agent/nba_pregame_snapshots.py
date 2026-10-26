@@ -130,6 +130,19 @@ class Client:
         if response.status_code not in (200,201):
             raise RuntimeError('Supabase write failed (HTTP '+str(response.status_code)+', '+storage_error(response)+')')
 
+    def forecast_files(self):
+        names=[];offset=0
+        while True:
+            response=self.http.post(self.env['SUPABASE_URL'].rstrip('/')+'/storage/v1/object/list/'+quote(self.bucket,safe=''),
+                headers=self.headers(),json={'prefix':PREFIX+'forecasts','limit':100,'offset':offset,
+                'sortBy':{'column':'name','order':'asc'}},timeout=(5,20))
+            if response.status_code!=200: raise RuntimeError('Saved forecast listing failed (HTTP '+str(response.status_code)+')')
+            batch=response.json()
+            if not isinstance(batch,list): raise RuntimeError('Invalid saved forecast listing')
+            names.extend(x['name'] for x in batch if str(x.get('name','')).endswith('.json'))
+            if len(batch)<100: return names
+            offset+=len(batch)
+
     def pages(self,endpoint,params=None):
         result=[];cursor=None;seen=set()
         while True:
@@ -170,6 +183,19 @@ def history_before(games,cutoff):
         and g['home_team_score']!=g['visitor_team_score']],key=lambda g:(g['date'],str(g['id'])))
 
 
+def recent_team_games(games,tid):
+    """Current continuous season segment; old seasons stay available for Elo only."""
+    rows=[g for g in games if tid in [g['home_team']['id'],g['visitor_team']['id']]
+          and str(g.get('season_type','')).lower() not in {'preseason','pre-season'}]
+    if not rows: return []
+    segment=[rows[-1]]
+    for g in reversed(rows[:-1]):
+        newer=segment[-1]
+        if g.get('season')!=newer.get('season') or (played_date(newer)-played_date(g)).days>45: break
+        segment.append(g)
+    return list(reversed(segment))
+
+
 def elo_ratings(games):
     ratings={}; counts={}
     for game in games:
@@ -184,7 +210,7 @@ def elo_ratings(games):
 
 def form(games,tid,target_date):
     rows=[]
-    for g in games:
+    for g in recent_team_games(games,tid):
         home=g['home_team']['id']==tid
         if not home and g['visitor_team']['id']!=tid: continue
         pf=g['home_team_score'] if home else g['visitor_team_score']
@@ -194,7 +220,7 @@ def form(games,tid,target_date):
     recent=rows[-8:]; support=rows[-30:]
     if not recent: return {'status':'unknown','games':0}
     last=stamp(recent[-1]['date']).date(); gap=(target_date-last).days
-    return {'status':'available','recent_window':8,'recent_games':len(recent),'support_games':len(support),
+    return {'status':'available','recent_window':8,'window_policy':'same season, no gap over 45 days; no old-season padding','recent_coverage_complete':len(recent)==8,'recent_games':len(recent),'support_games':len(support),
         'win_rate_8':mean(r['win'] for r in recent),'margin_8':mean(r['margin'] for r in recent),
         'points_for_8':mean(r['points_for'] for r in recent),'points_against_8':mean(r['points_against'] for r in recent),
         'win_rate_30':mean(r['win'] for r in support),'margin_sd_30':pstdev(r['margin'] for r in support),
@@ -220,7 +246,8 @@ def team_box(rows,tid):
 
 def matchup_stats(games,stats,tid):
     pairs=[]
-    for g in games:
+    target=recent_team_games(games,tid)[-8:]
+    for g in target:
         teams=[g['home_team']['id'],g['visitor_team']['id']]
         if tid not in teams: continue
         rows=stats.get(str(g['id']))
@@ -231,8 +258,10 @@ def matchup_stats(games,stats,tid):
             other=g['visitor_team_score'] if teams[0]==tid else g['home_team_score']
             if own['pts']==expected and opp['pts']==other: pairs.append((g,own,opp))
     pairs=pairs[-8:]
-    if not pairs: return {'status':'unknown','reason':'No complete prior player-stat box totals cached'}
-    return {'status':'derived_estimates','games':len(pairs),'source_game_ids':[g['id'] for g,_,_ in pairs],
+    if not pairs: return {'status':'unknown','games':0,'target_games':len(target),'missing_game_ids':[g['id'] for g in target],'reason':'No complete prior player-stat box totals cached'}
+    return {'status':'derived_estimates','games':len(pairs),'target_games':len(target),'eight_game_coverage_complete':len(pairs)==8,
+        'missing_game_ids':[g['id'] for g in target if g['id'] not in {x['id'] for x,_,_ in pairs}],
+        'source_game_ids':[g['id'] for g,_,_ in pairs],
         'estimated_pace_48':mean((a['estimated_pace_48']+b['estimated_pace_48'])/2 for _,a,b in pairs),
         'estimated_offensive_rating':mean(100*a['pts']/max((a['estimated_possessions']+b['estimated_possessions'])/2,1) for _,a,b in pairs),
         'estimated_defensive_rating':mean(100*b['pts']/max((a['estimated_possessions']+b['estimated_possessions'])/2,1) for _,a,b in pairs),
@@ -242,7 +271,7 @@ def matchup_stats(games,stats,tid):
 
 
 def rotation(games,stats,tid,active,injuries):
-    players={}; team_games=[g for g in games if tid in [g['home_team']['id'],g['visitor_team']['id']]][-8:]
+    players={}; team_games=recent_team_games(games,tid)[-8:]
     for g in team_games:
         for row in stats.get(str(g['id']),[]):
             player=row.get('player') or {};pid=player.get('id');m=minutes(row.get('min'))
@@ -259,7 +288,8 @@ def rotation(games,stats,tid,active,injuries):
         blocked=any(str(r.get('status','')).lower() in {'out','doubtful','inactive','suspended'} for r in reports)
         vals=[m for m,_ in sample]
         result.append({'player_id':pid,'name':(person.get('first_name','')+' '+person.get('last_name','')).strip(),
-            'prior_appearances':len(vals),'recent_minutes_if_playing':sum(m*(i+1) for i,m in enumerate(vals))/sum(range(1,len(vals)+1)) if vals else None,
+            'prior_appearances':len(vals),'team_games_in_window':len(team_games),
+            'games_with_cached_stats':sum(str(g['id']) in stats for g in team_games),'recent_minutes_if_playing':sum(m*(i+1) for i,m in enumerate(vals))/sum(range(1,len(vals)+1)) if vals else None,
             'minutes_sd':pstdev(vals) if vals else None,'availability_reports':reports,
             'unavailable_reported':blocked,'participation_probability':None,
             'minutes_restriction_reported':any(re.search(r'minutes? restriction|minutes? limit|limited to .*minutes',str(r.get('description','')),re.I) for r in reports),
@@ -267,7 +297,7 @@ def rotation(games,stats,tid,active,injuries):
             'replacement_quality':None,'replacement_status':'not trained; no redistribution of absent-player minutes'})
     result.sort(key=lambda p:-(p['recent_minutes_if_playing'] or 0))
     return {'status':'history_based_projections' if active is not None else 'unknown_roster',
-        'window':8,'players':result,'confirmed_starters':None,
+        'window':8,'window_policy':'same continuous season segment; no old-season padding','players':result,'confirmed_starters':None,
         'starter_status':'unknown; ALL-STAR does not include confirmed lineups'}
 
 
@@ -299,11 +329,12 @@ def make_snapshot(game,games,stats,active,injuries,events,source_times,captured)
     context={}
     for side in ('home','visitor'):
         team=game[side+'_team'];tid=team['id']
-        context[side]={'team':team,'form_and_schedule':form(prior,tid,played_date(game)),
+        team_prior=[g for g in prior if g.get('season')==game.get('season') and (played_date(game)-played_date(g)).days<=180]
+        context[side]={'team':team,'form_and_schedule':form(team_prior,tid,played_date(game)),
             'opponent_adjusted_strength':{'elo':ratings.get(tid),'prior_games':counts.get(tid,0),
                 'method':'Elo K=20, home advantage=60, seeded=1500; descriptive feature, not calibrated win probability'},
-            'matchup_performance':matchup_stats(prior,stats,tid),
-            'availability_and_rotation':rotation(prior,stats,tid,active,injuries)}
+            'matchup_performance':matchup_stats(team_prior,stats,tid),
+            'availability_and_rotation':rotation(team_prior,stats,tid,active,injuries)}
     market=market_snapshot(game,events,captured)
     return {'schema':1,'sport':'NBA','snapshot_id':uuid.uuid4().hex,'game_id':game['id'],
         'scheduled_start':start.isoformat(),'scheduled_date':str(played_date(game)),
@@ -328,6 +359,52 @@ def due(game,previous,now):
     return last is None or now-last>=interval or (previous or {}).get('scheduled_start')!=start.isoformat()
 
 
+def join_forecasts(client,state):
+    """Never generate past forecasts. Pair only data frozen before the same tipoff."""
+    joined=0;state.setdefault('joined_forecasts',{});state.setdefault('forecast_join_sources',{})
+    state.setdefault('frozen_forecasts',{})
+    for name in client.forecast_files():
+        forecast=state['frozen_forecasts'].get(name)
+        if forecast is None:
+            forecast=client.read(PREFIX+'forecasts/'+name)
+            if not isinstance(forecast,dict): continue
+            state['frozen_forecasts'][name]=forecast
+        start=stamp(forecast.get('start_time')); frozen=stamp(forecast.get('captured_at'))
+        if start is None or frozen is None or frozen>=start: continue
+        probabilities=[number(forecast.get(k)) for k in ('current_home_probability','learning_home_probability')]
+        if any(p is None or not 0<p<1 for p in probabilities): continue
+        matches=[g for g in state['games'].values() if start_time(g)==start
+            and team_name(g['home_team'].get('full_name'))==team_name(forecast.get('home_team'))
+            and team_name(g['visitor_team'].get('full_name'))==team_name(forecast.get('away_team'))]
+        if len(matches)!=1: continue
+        game=matches[0];gid=str(game['id']);capture=state['captures'].get(gid,{})
+        signature=state['settled'].get(gid,'pending')
+        if state['forecast_join_sources'].get(name)==signature: continue
+        # Use latest snapshot already available when the forecast was made.
+        candidates=[]
+        for path in capture.get('paths',[]):
+            snap=client.read(path)
+            at=stamp((snap or {}).get('captured_at'))
+            if at and at<=frozen and stamp(snap.get('scheduled_start'))==start: candidates.append((at,path))
+        if not candidates: continue
+        path=max(candidates)[1]
+        result={'schema':1,'game_id':game['id'],'forecast_path':PREFIX+'forecasts/'+name,
+            'snapshot_path':path,'forecast':forecast,'status':'Pending','full_package_training_ready':False}
+        if final(game):
+            hs,aws=number(game.get('home_team_score')),number(game.get('visitor_team_score'))
+            if hs and aws and hs!=aws:
+                y=int(hs>aws)
+                result.update(status='Final',home_win=y,home_score=hs,away_score=aws,
+                    outcome_path=PREFIX+'outcomes/'+gid+'/'+state['settled'][gid]+'.json' if gid in state['settled'] else None,
+                    scores={label:{'correct':bool((p>=.5)==y),'brier':(p-y)**2}
+                        for label,p in zip(('current','learning'),probabilities)})
+        digest=hashlib.sha256(json.dumps(result,sort_keys=True).encode()).hexdigest()
+        if state['joined_forecasts'].get(name)==digest: continue
+        client.write(PREFIX+'evaluations/'+name[:-5]+'/'+digest+'.json',result)
+        state['joined_forecasts'][name]=digest;state['forecast_join_sources'][name]=signature;joined+=1
+    return joined
+
+
 def run(client=None,now=None):
     client=client or Client();now=now or datetime.now(UTC)
     state=client.read(PREFIX+'checkpoint.json.gz',compressed=True)
@@ -344,6 +421,11 @@ def run(client=None,now=None):
     targets=[g for g in all_games if due(g,state['captures'].get(str(g['id'])),now)]
     # Prior completed basic stats bootstrap gradually and resume by game ID.
     needed=sorted([g for g in all_games if final(g) and played_date(g) and now.date()-timedelta(days=90)<=played_date(g)<now.date()],key=lambda g:g['date'],reverse=True)
+    priority={str(g['id']) for target in targets for side in ('home','visitor')
+        for g in recent_team_games([h for h in history_before(all_games,now) if h.get('season')==target.get('season')],target[side+'_team']['id'])[-8:]}
+    needed=sorted({str(g['id']):g for g in needed+
+        [g for g in all_games if str(g['id']) in priority]}.values(),
+        key=lambda g:(str(g['id']) in priority,g['date']),reverse=True)
     for g in needed:
         gid=str(g['id'])
         if gid in state['stats']: continue
@@ -392,8 +474,11 @@ def run(client=None,now=None):
             previous=state['captures'].get(gid,{})
             state['captures'][gid]={'captured_at':captured.isoformat(),'scheduled_start':payload['scheduled_start'],
                 'paths':previous.get('paths',[])+[path]};saved+=1
+    joined=0
+    try: joined=join_forecasts(client,state)
+    except Exception as exc: issues.append('Forecast join: '+safe_issue(exc))
     checkpoint()
-    status={'schema':1,'finished_at':datetime.now(UTC).isoformat(),'snapshots_saved':saved,'outcomes_saved':settled,
+    status={'schema':1,'finished_at':datetime.now(UTC).isoformat(),'snapshots_saved':saved,'outcomes_saved':settled,'forecast_evaluations_saved':joined,
         'games_with_snapshots':len(state['captures']),'completed_games_cached':len(state['stats']),
         'bdl_requests':client.calls,'odds_requests':client.odds_calls,'issues':issues,
         'scope':'All seven strengthening areas; unavailable fields remain explicitly unknown. Not yet a trained full-package winner model.'}
