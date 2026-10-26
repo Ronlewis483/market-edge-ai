@@ -8,10 +8,12 @@ import json
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from statistics import mean, median
-try:
-    from dual_agent.nba_pregame_snapshots import Client, PREFIX, stamp, number, final, start_time, played_date, safe_issue
-except ModuleNotFoundError as exc:
-    if exc.name != 'dual_agent': raise
+# GitHub runs this file directly, so Python places dual_agent/ on sys.path.
+# Package imports use a relative sibling; direct scripts use the local sibling.
+# Do not catch dependency ImportErrors and mistake them for launch-path issues.
+if __package__:
+    from .nba_pregame_snapshots import Client, PREFIX, stamp, number, final, start_time, played_date, safe_issue
+else:
     from nba_pregame_snapshots import Client, PREFIX, stamp, number, final, start_time, played_date, safe_issue
 
 DATA_PREFIX='nba/training_v1/'
