@@ -408,7 +408,15 @@ def run_nba_prediction_pipeline(
                 away_probability,
             )
 
+            learning_fields = {}
+            try:
+                from dual_agent.nba_winner_comparison import predict as learning_predict
+                learning_fields = learning_predict(matchup_features, game['commence_time'])
+            except Exception as exc:
+                learning_fields = {'learning_model_issue':type(exc).__name__+': '+str(exc)}
+
             prediction_rows.append({
+                **learning_fields,
                 "event_id":
                     game["event_id"],
 
@@ -634,10 +642,19 @@ def run_nba_prediction_pipeline(
     # 8. RETURN COMPLETE PIPELINE
     # ========================================================
 
+    comparison_issue = None
+    try:
+        from dual_agent.nba_winner_comparison import freeze_and_grade
+        comparison_ledger = freeze_and_grade(predictions, prepared_games)
+        if comparison_ledger.get('persistence_issue'):
+            comparison_issue = comparison_ledger['persistence_issue']
+    except Exception as exc:
+        comparison_issue = 'Winner comparison could not be saved/graded: '+type(exc).__name__
     report("NBA prediction pipeline complete")
 
     return {
         'pipeline_version': NBA_PIPELINE_VERSION,
+        'winner_comparison_issue': comparison_issue,
         'validation_summary': trained_model.get('validation_summary', {}),
         'calibration_status': trained_model.get('calibration_status'),
         "live_odds":
