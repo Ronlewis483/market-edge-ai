@@ -1,7 +1,7 @@
 """Pregame player-prop estimates using actual lines and prior appearances.
 
-These are historical hit-rate estimates shrunk toward bookmaker consensus,
-not calibrated win probabilities from the game-winner model.
+NBA uses saved neural weights for promoted categories, with the existing
+minutes model as fallback. MLB retains its existing historical calculations.
 """
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
@@ -734,6 +734,55 @@ def estimate_nba_matchup(rows, stat, line, side, matchup, context=None):
         'Opponent context':opponent_note,'NBA prop model version':2,
         'Estimate method':'Recency-weighted per-minute negative-binomial model + recent-minutes mixture; uncalibrated; sportsbook prices excluded',
         'Model calculated UTC':pd.Timestamp.now(tz='UTC').isoformat()})
+    # The trained model reuses these same completed-game rows. Never collect
+    # another history, train a network, or request another sportsbook here.
+    try:
+        from dual_agent.nba_prop_neural import STATS, estimate as neural_estimate, load_model
+        model_meta = load_model()['meta']
+        if cutoff.date() <= pd.Timestamp(model_meta['promotion_end']).date():
+            baseline['Neural fallback reason'] = 'Game predates the saved model promotion cutoff'
+            return baseline
+        complete = []
+        for row in prior:
+            date = pd.Timestamp(row['source_date'])
+            game = row.get('game') or {}
+            if date.date() >= cutoff.date() or date < cutoff-pd.Timedelta(days=365):
+                continue
+            if not str(game.get('status', '')).startswith('Final'):
+                continue
+            if str(game.get('season_type', '')).lower() in {'preseason', 'allstar', 'all-star'}:
+                continue
+            minute = nba_minutes(row.get('min'))
+            numbers = [nba_market_value(row, field) for field in STATS]
+            if minute is not None and all(v is not None and v >= 0 for v in numbers):
+                complete.append((row, minute, numbers))
+        # Exact game identity prevents duplicate provider rows inflating support.
+        unique = {}
+        for item in complete:
+            gid = (item[0].get('game') or {}).get('id')
+            if gid is not None:
+                unique[str(gid)] = item
+        complete = sorted(unique.values(), key=lambda item:pd.Timestamp(item[0]['source_date']))[-30:]
+        if len(complete) >= 10:
+            vector = np.array([item[2] for item in complete], dtype=float)
+            mins = np.array([item[1] for item in complete], dtype=float)
+            last_date = pd.Timestamp(complete[-1][0]['source_date'])
+            result = neural_estimate(vector, mins, stat, line, side, factor,
+                                     (cutoff.date()-last_date.date()).days)
+            # Historical support shown on the card must refer to the same sample
+            # supplied to the neural network, not an older or larger sample.
+            history = estimate_nba_history([nba_market_value(item[0],stat) for item in complete],line,side)
+            if result is not None and history is not None:
+                baseline.update(history)
+                baseline.update(result)
+                baseline['Minutes sample'] = 8
+                baseline['Recent form window'] = 8
+                baseline['Opponent context'] = opponent_note
+                baseline['Availability status'] = status
+                return baseline
+        baseline['Neural fallback reason'] = 'Category not promoted or complete neural history unavailable'
+    except (ImportError, OSError, ValueError, KeyError, TypeError) as exc:
+        baseline['Neural fallback reason'] = 'Saved NBA neural model unavailable: '+type(exc).__name__
     return baseline
 
 
@@ -1042,7 +1091,7 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
         result['loading_timings_seconds'] = {label: round(seconds, 2) for label, seconds in timings.items()}
         result['scan_complete'] = True
         result.update(probability_source='player_history', statistics_source='BALLDONTLIE',
-            note='Experimental per-minute count forecasts, not calibrated probabilities. Recent minutes are estimated; injury reports do not confirm participation. Opponent allowance adjusts only points components.')
+            note='Promoted NBA categories use trained neural weights with chronological residual calibration and an eight-game recent-form/minutes window. Other categories retain the existing minutes model. Probabilities are conditional on participation and no push; actual sportsbook accuracy is not established.')
         try:
             stored = json.loads((Path('nba_player_history_cache')/'player_histories_v3.json').read_text())
             result['history_storage_status'] = stored.get('storage_status', 'Player history saved locally.')
@@ -1160,6 +1209,6 @@ def _rank_prop_candidates(league, games, groups, history_by_name, errors,
             seen.add(key);chosen.append(pick)
         # Retain eligible picks for every matchup; the global list stays top ten.
     return {'picks':chosen[:10],'game_picks':chosen,'errors':errors,
-            **({'star_spotlights': build_star_spotlights(games, star_rosters, history_by_name, chosen), 'unavailable_players':(nba_context or {}).get('blocked_player_names',[]), 'nba_prop_model_version':2} if league == 'NBA' else {}),
+            **({'star_spotlights': build_star_spotlights(games, star_rosters, history_by_name, chosen), 'unavailable_players':(nba_context or {}).get('blocked_player_names',[]), 'nba_prop_model_version':3} if league == 'NBA' else {}),
             **({'exclusions': exclusions, 'quoted_candidates':len(groups), 'pitcher_forecasts':pitcher_forecasts} if league in ('MLB','NBA') else {}), 'message':f'{len(chosen)} player-prop estimates ranked from actual lines and prior appearances.',
             'note':'Estimated chance is conditional on no push and player participation. Estimates are not calibrated; no availability or injury clearance is implied.'}
