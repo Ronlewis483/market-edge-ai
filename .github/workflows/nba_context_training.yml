@@ -1,6 +1,9 @@
 name: NBA context model training
 
 on:
+  schedule:
+    # Run daily after the overnight NBA games and a scheduled collector run.
+    - cron: '7 15 * * *'
   workflow_dispatch:
 
 permissions:
