@@ -1099,6 +1099,8 @@ def ticket_prop_candidates(results, now=None, diagnostics=None):
                 }
                 candidate.update({k:row[k] for k in ('neural_model_version','neural_training_end',
                     'neural_calibration_end','estimate_method') if k in row})
+                if sport=='NBA':
+                    candidate['estimate_method']=row.get('Estimate method','')
                 if live:
                     observed=stamp(offer.get('observed_at'))
                     if pd.isna(observed) or not zero<=now-observed<=pd.Timedelta(seconds=90):
@@ -1167,7 +1169,7 @@ def ticket_cached_sources(sports=None):
         def has_rows(value):
             return len(value) > 0 if isinstance(value,(pd.DataFrame,list)) else False
         props=result.get('player_props',{})
-        complete=(sport=='NBA' and props.get('scan_complete') and props.get('nba_prop_model_version')==2)
+        complete=(sport=='NBA' and props.get('scan_complete') and props.get('nba_prop_model_version',0)>=2)
         has_props=has_rows(result.get('nfl_player_props')) if sport=='NFL' else (has_rows(props.get('game_picks')) or has_rows(props.get('picks')) or complete)
         has_games=has_rows(result.get('all_predictions')) or has_rows(result.get('predictions'))
         saved={}
@@ -1187,7 +1189,7 @@ def ticket_cached_sources(sports=None):
             result['nfl_player_props']=saved.get('nfl_player_props',[])
         elif sport!='NFL':
             props=result.get('player_props',{})
-            completed_nba_scan=(sport=='NBA' and props.get('scan_complete') and props.get('nba_prop_model_version')==2)
+            completed_nba_scan=(sport=='NBA' and props.get('scan_complete') and props.get('nba_prop_model_version',0)>=2)
             if not completed_nba_scan and not has_rows(props.get('game_picks')) and not has_rows(props.get('picks')):
                 restored=dict(saved.get('player_props',{}))
                 # Current availability and model version take precedence over disk.
@@ -1548,7 +1550,7 @@ def render_ai_ticket_results():
                         f'{leg["line"]:g} {leg["market"]}**')
             st.write(f'Estimated cover chance: **{leg["chance"]:.1%}**')
             if leg.get('neural_model_version'):
-                st.caption('Trained NFL neural model · '+str(leg['neural_model_version'])+' · chronological residual calibration. Accuracy at your sportsbook lines is not established.')
+                st.caption('Trained '+str(leg['sport'])+' neural model · '+str(leg['neural_model_version'])+' · chronological residual calibration. Accuracy at your sportsbook lines is not established.')
             elif leg.get('sport')=='NFL' and leg.get('estimate_method'):
                 st.caption('Estimator: '+str(leg['estimate_method'])+' · neural model is not approved for this market and game phase.')
             if leg.get('game_phase')=='live':
@@ -1916,8 +1918,8 @@ def merge_nba_display_props(previous, incoming):
     now = pd.Timestamp.now(tz='UTC')
     visible = [r for r in rows.values() if pd.to_datetime(r.get('start_time'),utc=True,errors='coerce')<=now
                or (nba_identity_key(r.get('Player')) not in blocked
-                   and not (merged.get('scan_complete') and merged.get('nba_prop_model_version')==2
-                            and r.get('NBA prop model version',1)!=2))]
+                   and not (merged.get('scan_complete') and merged.get('nba_prop_model_version',0)>=2
+                            and r.get('NBA prop model version',1)<2))]
     ordered = sorted(visible, key=lambda r: -float(r.get('Estimated chance', 0)))
     merged['game_picks'] = ordered; merged['picks'] = ordered[:10]
     return merged
@@ -1974,8 +1976,8 @@ def render_nba_live_prop_cards(game, fallback):
     blocked = set(payload.get('unavailable_players', []))
     rows = [r for r in rows if pd.to_datetime(r.get('start_time'),utc=True,errors='coerce')<=pd.Timestamp.now(tz='UTC')
             or (nba_identity_key(r.get('Player')) not in blocked
-                and not (payload.get('scan_complete') and payload.get('nba_prop_model_version')==2
-                         and r.get('NBA prop model version',1)!=2))]
+                and not (payload.get('scan_complete') and payload.get('nba_prop_model_version',0)>=2
+                         and r.get('NBA prop model version',1)<2))]
     normalized = [dict(r, market=r.get('Market'), player=r.get('Player')) for r in rows]
     import hashlib
     identity = '|'.join(str(game.get(k,'')) for k in ('home_team','away_team','commence_time'))
@@ -2517,7 +2519,7 @@ def prop_comparisons(props):
             raw_side=str(original.get('Pick','')).upper()
             opposite='Under' if raw_side=='OVER' else 'Over' if raw_side=='UNDER' else None
             chance=original.get((opposite+' chance') if opposite else '')
-            if opposite and chance is not None and original.get('Probability source')=='player_history':
+            if opposite and chance is not None and original.get('Probability source') in ('player_history','trained_neural'):
                 detail=dict(original,Pick=opposite,**{'Estimated chance':chance,
                     'Best sportsbook':None,'Best decimal odds':None,'_offered':False,'_comparison':True})
                 detail.pop('Historical wins',None)
@@ -2582,7 +2584,7 @@ def render_prop_comparisons(props, pending=False, limit=5, scope='main'):
         with st.container(border=True):
             title = f"{pair['player']} · {pair['market']}" if pair['binary'] else f"{pair['player']} · {pair['line']:g} {pair['market']}"
             st.markdown(f'**#{rank} · {title}**')
-            st.caption('Sportsbook-implied probabilities · not an independent player forecast' if pair['source']=='sportsbook_implied' else ('Minutes-adjusted count forecast · conditional on playing and no push; uncalibrated' if any(p.get('NBA prop model version')==2 for p in pair['sides'].values()) else 'Historical estimates · conditional on participation and no push; not calibrated'))
+            st.caption('Sportsbook-implied probabilities · not an independent player forecast' if pair['source']=='sportsbook_implied' else ('Trained NBA neural forecast · eight-game recent form · conditional on playing and no push; sportsbook accuracy not established' if any(p.get('neural_model_version')=='nba_neural_v1' for p in pair['sides'].values()) else ('Minutes-adjusted count forecast · conditional on playing and no push; uncalibrated' if any(p.get('NBA prop model version')==2 for p in pair['sides'].values()) else 'Historical estimates · conditional on participation and no push; not calibrated')))
             for column,side,label in zip(st.columns(2),('Over','Under'),('YES','NO')):
                 with column:
                     prop = pair['sides'].get(side)
@@ -2600,8 +2602,10 @@ def render_prop_comparisons(props, pending=False, limit=5, scope='main'):
                         st.caption('Forecast only · no matching sportsbook bet found')
                     if prop.get('Statistics source'): st.caption('Statistics: '+prop['Statistics source'])
                     if prop.get('Estimate method'): st.caption(prop['Estimate method'])
+                    if prop.get('Probability reliability'): st.caption(prop['Probability reliability'])
+                    if prop.get('Neural fallback reason'): st.caption(prop['Neural fallback reason'])
                     if prop.get('Availability status'): st.caption(prop['Availability status'])
-                    if prop.get('NBA prop model version') == 2:
+                    if prop.get('NBA prop model version',0) >= 2:
                         st.caption(f"Estimated minutes: {prop['Expected minutes']:.1f} · recent {prop['Minutes sample']} appearances · projected stat: {prop['Projected stat']:.2f}")
                         st.caption(prop.get('Opponent context','Opponent context unavailable'))
                     if prop.get('Historical wins') is not None:
