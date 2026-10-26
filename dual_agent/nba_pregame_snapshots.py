@@ -29,6 +29,24 @@ def safe_issue(exc):
     return str(exc) if type(exc) is RuntimeError else type(exc).__name__
 
 
+def storage_error(response):
+    """Classify provider errors without logging URLs, keys or arbitrary bodies."""
+    try: payload=response.json()
+    except (ValueError, TypeError): payload={}
+    if not isinstance(payload,dict): payload={}
+    code=str(payload.get('code','')).lower()
+    message=str(payload.get('message','')).strip().lower()
+    kind=str(payload.get('error','')).strip().lower()
+    status=str(payload.get('statusCode',''))
+    if code in {'accessdenied','invalidjwt','invalidsignature','jwtExpired'.lower()} or status in {'401','403'} or response.status_code in (401,403):
+        return 'access_denied'
+    if code=='nosuchbucket' or message=='bucket not found': return 'bucket_missing'
+    if code=='nosuchkey' or (status=='404' and message=='object not found' and kind in {'not_found','object not found'}):
+        return 'object_missing'
+    if code=='invalidkey': return 'invalid_object_path'
+    return 'unclassified'
+
+
 def stamp(value):
     try:
         dt = datetime.fromisoformat(str(value).replace('Z','+00:00'))
@@ -95,8 +113,12 @@ class Client:
 
     def read(self,path,compressed=False):
         response=self.http.get(self.base+'authenticated/'+quote(self.bucket,safe='')+'/'+quote(path,safe='/'),headers=self.headers(),timeout=(5,20))
-        if response.status_code==404: return None
-        if response.status_code!=200: raise RuntimeError('Supabase read failed (HTTP '+str(response.status_code)+'); existing history was not reset')
+        if response.status_code!=200:
+            category=storage_error(response)
+            # Some Supabase versions wrap NoSuchKey/statusCode=404 in HTTP 400.
+            # Only an explicit missing OBJECT is a valid first-run checkpoint.
+            if category=='object_missing' and response.status_code in (400,404): return None
+            raise RuntimeError('Supabase read failed (HTTP '+str(response.status_code)+', '+category+'); existing history was not reset')
         raw=gzip.decompress(response.content) if compressed else response.content
         return json.loads(raw)
 
@@ -106,7 +128,7 @@ class Client:
         headers=dict(self.headers(),**{'Content-Type':'application/gzip' if compressed else 'application/json','x-upsert':'true' if replace else 'false'})
         response=self.http.post(self.base+quote(self.bucket,safe='')+'/'+quote(path,safe='/'),headers=headers,data=raw,timeout=(5,25))
         if response.status_code not in (200,201):
-            raise RuntimeError('Supabase write failed (HTTP '+str(response.status_code)+')')
+            raise RuntimeError('Supabase write failed (HTTP '+str(response.status_code)+', '+storage_error(response)+')')
 
     def pages(self,endpoint,params=None):
         result=[];cursor=None;seen=set()
