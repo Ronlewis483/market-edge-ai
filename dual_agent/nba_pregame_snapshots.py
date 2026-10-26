@@ -360,36 +360,56 @@ def due(game,previous,now):
 
 
 def join_forecasts(client,state):
-    """Never generate past forecasts. Pair only data frozen before the same tipoff."""
+    """Join unique teams within 15 minutes; never use post-forecast inputs."""
     joined=0;state.setdefault('joined_forecasts',{});state.setdefault('forecast_join_sources',{})
     state.setdefault('frozen_forecasts',{})
+    diagnostics={k:0 for k in ('forecasts_seen','invalid_forecasts','no_unique_game',
+        'not_pregame_by_both_sources','no_eligible_snapshot','already_joined','saved')}
+    state['forecast_join_diagnostics']=diagnostics
     for name in client.forecast_files():
+        diagnostics['forecasts_seen']+=1
         forecast=state['frozen_forecasts'].get(name)
         if forecast is None:
             forecast=client.read(PREFIX+'forecasts/'+name)
-            if not isinstance(forecast,dict): continue
+            if not isinstance(forecast,dict):
+                diagnostics['invalid_forecasts']+=1; continue
             state['frozen_forecasts'][name]=forecast
         start=stamp(forecast.get('start_time')); frozen=stamp(forecast.get('captured_at'))
-        if start is None or frozen is None or frozen>=start: continue
+        if start is None or frozen is None or frozen>=start:
+            diagnostics['invalid_forecasts']+=1; continue
         probabilities=[number(forecast.get(k)) for k in ('current_home_probability','learning_home_probability')]
-        if any(p is None or not 0<p<1 for p in probabilities): continue
-        matches=[g for g in state['games'].values() if start_time(g)==start
+        if any(p is None or not 0<p<1 for p in probabilities):
+            diagnostics['invalid_forecasts']+=1; continue
+        matches=[g for g in state['games'].values() if start_time(g) is not None
+            and abs((start_time(g)-start).total_seconds())<=900
             and team_name(g['home_team'].get('full_name'))==team_name(forecast.get('home_team'))
             and team_name(g['visitor_team'].get('full_name'))==team_name(forecast.get('away_team'))]
-        if len(matches)!=1: continue
+        if len(matches)!=1:
+            diagnostics['no_unique_game']+=1; continue
         game=matches[0];gid=str(game['id']);capture=state['captures'].get(gid,{})
+        provider_start=start_time(game)
+        # A quote-provider delay must not turn an in-play forecast into a pregame one.
+        if frozen>=min(start,provider_start):
+            diagnostics['not_pregame_by_both_sources']+=1; continue
         signature=state['settled'].get(gid,'pending')
-        if state['forecast_join_sources'].get(name)==signature: continue
+        if state['forecast_join_sources'].get(name)==signature:
+            diagnostics['already_joined']+=1; continue
         # Use latest snapshot already available when the forecast was made.
         candidates=[]
         for path in capture.get('paths',[]):
             snap=client.read(path)
             at=stamp((snap or {}).get('captured_at'))
-            if at and at<=frozen and stamp(snap.get('scheduled_start'))==start: candidates.append((at,path))
-        if not candidates: continue
+            if (at and at<=frozen and at<min(start,provider_start)
+                and str(snap.get('game_id'))==gid
+                and stamp(snap.get('scheduled_start'))==provider_start): candidates.append((at,path))
+        if not candidates:
+            diagnostics['no_eligible_snapshot']+=1; continue
         path=max(candidates)[1]
         result={'schema':1,'game_id':game['id'],'forecast_path':PREFIX+'forecasts/'+name,
-            'snapshot_path':path,'forecast':forecast,'status':'Pending','full_package_training_ready':False}
+            'snapshot_path':path,'forecast':forecast,'status':'Pending','full_package_training_ready':False,
+            'game_match':{'method':'unique home/away teams and tipoff within 15 minutes',
+                'schedule_start':provider_start.isoformat(),'forecast_start':start.isoformat(),
+                'start_difference_seconds':(start-provider_start).total_seconds()}}
         if final(game):
             hs,aws=number(game.get('home_team_score')),number(game.get('visitor_team_score'))
             if hs and aws and hs!=aws:
@@ -401,7 +421,7 @@ def join_forecasts(client,state):
         digest=hashlib.sha256(json.dumps(result,sort_keys=True).encode()).hexdigest()
         if state['joined_forecasts'].get(name)==digest: continue
         client.write(PREFIX+'evaluations/'+name[:-5]+'/'+digest+'.json',result)
-        state['joined_forecasts'][name]=digest;state['forecast_join_sources'][name]=signature;joined+=1
+        state['joined_forecasts'][name]=digest;state['forecast_join_sources'][name]=signature;joined+=1;diagnostics['saved']+=1
     return joined
 
 
@@ -481,6 +501,7 @@ def run(client=None,now=None):
     status={'schema':1,'finished_at':datetime.now(UTC).isoformat(),'snapshots_saved':saved,'outcomes_saved':settled,'forecast_evaluations_saved':joined,
         'games_with_snapshots':len(state['captures']),'completed_games_cached':len(state['stats']),
         'bdl_requests':client.calls,'odds_requests':client.odds_calls,'issues':issues,
+        'forecast_join_diagnostics':state.get('forecast_join_diagnostics',{}),
         'scope':'All seven strengthening areas; unavailable fields remain explicitly unknown. Not yet a trained full-package winner model.'}
     client.write(PREFIX+'status.json',status,replace=True)
     print(json.dumps(status),flush=True)
