@@ -270,34 +270,121 @@ def matchup_stats(games,stats,tid):
         'note':'Derived from complete prior basic box scores; not official GOAT advanced statistics'}
 
 
-def rotation(games,stats,tid,active,injuries):
-    players={}; team_games=recent_team_games(games,tid)[-8:]
+def rotation(games,stats,tid,active,injuries,source_times=None,captured=None):
+    """Frozen descriptive role estimates and a bounded absence scenario, not a fitted impact model."""
+    source_times=source_times or {};captured=captured or datetime.now(UTC)
+    team_games=recent_team_games(history_before(games,captured),tid)[-8:]
+    complete=[]
     for g in team_games:
-        for row in stats.get(str(g['id']),[]):
-            player=row.get('player') or {};pid=player.get('id');m=minutes(row.get('min'))
-            if pid is None or m is None or (row.get('team') or {}).get('id')!=tid: continue
-            players.setdefault(pid,[]).append((m,row))
-    report={}
+        rows=stats.get(str(g['id']),[])
+        teams=[g['home_team']['id'],g['visitor_team']['id']]
+        own=team_box(rows,tid);opp=team_box(rows,teams[1] if teams[0]==tid else teams[0])
+        if own is None or opp is None: continue
+        expected=g['home_team_score'] if teams[0]==tid else g['visitor_team_score']
+        other=g['visitor_team_score'] if teams[0]==tid else g['home_team_score']
+        if own['pts']!=expected or opp['pts']!=other: continue
+        selected=[r for r in rows if (r.get('team') or {}).get('id')==tid and minutes(r.get('min')) is not None]
+        ids=[(r.get('player') or {}).get('id') for r in selected]
+        if None in ids or len(ids)!=len(set(ids)): continue
+        complete.append((g,selected,own['team_minutes']/5))
+    reports={}
     for item in injuries or []:
         pid=(item.get('player') or {}).get('id')
-        if pid is not None: report.setdefault(pid,[]).append(item)
-    result=[]
+        if pid is not None: reports.setdefault(pid,[]).append(item)
+    def fresh(name):
+        checked=stamp(source_times.get(name))
+        return checked is not None and timedelta(0)<=captured-checked<=timedelta(hours=6)
+    roster_fresh=active is not None and fresh('active_roster')
+    availability_fresh=roster_fresh and injuries is not None and fresh('injuries')
+    result=[];seen_players=set();weights=sum(range(1,len(complete)+1))
     for person in active or []:
         if (person.get('team') or {}).get('id')!=tid: continue
-        pid=person.get('id');sample=players.get(pid,[]);reports=report.get(pid,[])
-        blocked=any(str(r.get('status','')).lower() in {'out','doubtful','inactive','suspended'} for r in reports)
-        vals=[m for m,_ in sample]
+        pid=person.get('id')
+        if pid is None or pid in seen_players: continue
+        seen_players.add(pid);sample=[];weighted_role=0.;source_ids=[]
+        for i,(g,rows,duration) in enumerate(complete,1):
+            row=next((r for r in rows if r['player']['id']==pid),None)
+            if row is None: continue
+            actual=minutes(row['min']);regulation=actual*48/duration
+            sample.append((regulation,actual,row,i));weighted_role+=regulation*i;source_ids.append(g['id'])
+        vals=[v for v,_,_,_ in sample];report=reports.get(pid,[])
+        statuses={str(r.get('status','')).strip().lower() for r in report}
+        out=bool(statuses & {'out','inactive','suspended'})
+        doubtful='doubtful' in statuses
+        restricted=any(re.search(r'minutes? restriction|minutes? limit|limited to .*minutes',str(r.get('description','')),re.I) for r in report)
+        base=sum(v*i for v,_,_,i in sample)/sum(i for _,_,_,i in sample) if sample else None
+        total_minutes=sum(actual for _,actual,_,_ in sample)
+        rates={key:(36*sum(float(r[key]) for _,_,r,_ in sample)/total_minutes if total_minutes>=40 and len(sample)>=2 else None)
+               for key in ('pts','reb','ast','stl','blk','turnover')}
         result.append({'player_id':pid,'name':(person.get('first_name','')+' '+person.get('last_name','')).strip(),
-            'prior_appearances':len(vals),'team_games_in_window':len(team_games),
-            'games_with_cached_stats':sum(str(g['id']) in stats for g in team_games),'recent_minutes_if_playing':sum(m*(i+1) for i,m in enumerate(vals))/sum(range(1,len(vals)+1)) if vals else None,
-            'minutes_sd':pstdev(vals) if vals else None,'availability_reports':reports,
-            'unavailable_reported':blocked,'participation_probability':None,
-            'minutes_restriction_reported':any(re.search(r'minutes? restriction|minutes? limit|limited to .*minutes',str(r.get('description','')),re.I) for r in reports),
-            'status':'reported unavailable' if blocked else 'participation unconfirmed',
-            'replacement_quality':None,'replacement_status':'not trained; no redistribution of absent-player minutes'})
+            'position':person.get('position'),'prior_appearances':len(vals),'team_games_in_window':len(team_games),
+            'games_with_cached_stats':len(complete),'source_game_ids':source_ids,
+            'box_presence_fraction':len(vals)/len(complete) if complete else None,
+            'recent_minutes_if_playing':base,
+            'historical_role_minutes':weighted_role/weights if vals and weights else None,
+            'minutes_sd':pstdev(vals) if len(vals)>=2 else None,
+            'observed_minutes_low':min(vals) if vals else None,'observed_minutes_high':max(vals) if vals else None,
+            'expected_minutes_if_playing':0. if out and availability_fresh else None if restricted else base,
+            'expected_minutes_status':'reported out; report fresh' if out and availability_fresh else
+                'unknown numerical minutes restriction' if restricted else 'conditional on playing; historical estimate, not calibrated',
+            'availability_reports':report,'availability_feed_fresh':availability_fresh,
+            'unavailable_reported':out or doubtful,'firm_out_reported':out,
+            'availability_uncertain':doubtful or bool(statuses & {'questionable','day-to-day','day to day','gtd','game time decision'}),
+            'participation_probability':None,'minutes_restriction_reported':restricted,
+            'status':'reported unavailable' if out or doubtful else 'participation unconfirmed',
+            'basic_rates_per36':rates,'rate_support_minutes':total_minutes,
+            'rate_method':'current-team complete prior boxes; at least two appearances and 40 minutes; descriptive only',
+            'replacement_quality':None,'replacement_status':'causal impact not trained',
+            'scenario_minutes':None,'scenario_added_minutes':None})
     result.sort(key=lambda p:-(p['recent_minutes_if_playing'] or 0))
-    return {'status':'history_based_projections' if active is not None else 'unknown_roster',
-        'window':8,'window_policy':'same continuous season segment; no old-season padding','players':result,'confirmed_starters':None,
+    known=[p for p in result if p['historical_role_minutes'] is not None]
+    coverage=sum(p['historical_role_minutes'] for p in known)/240 if complete else None
+    donors=[p for p in result if p['firm_out_reported']]
+    lost=sum(p['historical_role_minutes'] for p in donors) if all(p['historical_role_minutes'] is not None for p in donors) else None
+    scenario={'status':'unavailable','reported_out_prior_minutes':lost,'allocated_minutes':None,
+        'unallocated_minutes':None,'replacement_points_volume_proxy':None,'out_points_volume_proxy':None,
+        'method':'Extra minutes proportional to prior role, restricted to overlapping listed positions and capped at observed regulation-minute maximum.',
+        'assumptions':'Conditional scenario: non-out roster members retain prior roles. Questionable/doubtful/restricted players receive no extra minutes. Box absence is not a verified DNP.',
+        'limitations':'No calibrated participation probability, lineup confirmation or learned causal replacement impact. Per-36 volume is not a win-probability adjustment.'}
+    can_project=(availability_fresh and len(complete)>=2 and coverage is not None and .9<=coverage<=1.000001 and lost is not None
+        and not any(p['minutes_restriction_reported'] and not p['firm_out_reported'] for p in known))
+    if can_project:
+        def positions(p): return set(re.findall('[GFC]',str(p.get('position') or '').upper()))
+        for p in known:
+            p['scenario_minutes']=0. if p['firm_out_reported'] else p['historical_role_minutes']
+            p['scenario_added_minutes']=0.
+        donor_positions=set().union(*(positions(p) for p in donors)) if donors else set()
+        candidates=[p for p in known if not p['unavailable_reported'] and not p['availability_uncertain']
+            and not p['minutes_restriction_reported'] and positions(p)&donor_positions]
+        remaining=lost
+        # Capacity is observed history, not an invented optimistic minutes cap.
+        for _ in range(len(candidates)+1):
+            pool=[p for p in candidates if min(48.,p['observed_minutes_high'])-p['scenario_minutes']>1e-9]
+            total=sum(p['historical_role_minutes'] for p in pool)
+            if remaining<=1e-9 or total<=0: break
+            allocated=0.
+            for p in pool:
+                extra=min(remaining*p['historical_role_minutes']/total,
+                    min(48.,p['observed_minutes_high'])-p['scenario_minutes'])
+                p['scenario_minutes']+=extra;p['scenario_added_minutes']+=extra;allocated+=extra
+            remaining=max(0.,remaining-allocated)
+        receiving=[p for p in known if p['scenario_added_minutes']>0]
+        def volume(players,minutes_field):
+            if any(p['basic_rates_per36']['pts'] is None for p in players): return None
+            return sum(p[minutes_field]*p['basic_rates_per36']['pts']/36 for p in players)
+        scenario.update(status='conditional_history_scenario',allocated_minutes=lost-remaining,
+            unallocated_minutes=remaining,replacement_points_volume_proxy=volume(receiving,'scenario_added_minutes'),
+            out_points_volume_proxy=volume(donors,'historical_role_minutes'))
+    else:
+        scenario['reason']='Needs fresh availability, two complete boxes, at least 90% current-roster historical minutes coverage, known history for each reported out player, and no unresolved numerical minutes restriction'
+    return {'schema':2,'status':'history_based_projections' if active is not None else 'unknown_roster',
+        'window':8,'window_policy':'same continuous season segment; no old-season padding',
+        'source_game_ids':[g['id'] for g,_,_ in complete],
+        'complete_history_games':len(complete),'target_history_games':len(team_games),
+        'missing_game_ids':[g['id'] for g in team_games if g['id'] not in {x['id'] for x,_,_ in complete}],
+        'current_roster_minutes_coverage':coverage,'availability_feed_fresh':availability_fresh,
+        'minutes_method':'Recency-weighted last eight team games; positive appearances for conditional minutes; complete-game denominator for historical role; overtime normalized to 48 minutes.',
+        'players':result,'replacement_scenario':scenario,'confirmed_starters':None,
         'starter_status':'unknown; ALL-STAR does not include confirmed lineups'}
 
 
@@ -334,7 +421,7 @@ def make_snapshot(game,games,stats,active,injuries,events,source_times,captured)
             'opponent_adjusted_strength':{'elo':ratings.get(tid),'prior_games':counts.get(tid,0),
                 'method':'Elo K=20, home advantage=60, seeded=1500; descriptive feature, not calibrated win probability'},
             'matchup_performance':matchup_stats(team_prior,stats,tid),
-            'availability_and_rotation':rotation(team_prior,stats,tid,active,injuries)}
+            'availability_and_rotation':rotation(team_prior,stats,tid,active,injuries,source_times,captured)}
     market=market_snapshot(game,events,captured)
     return {'schema':1,'sport':'NBA','snapshot_id':uuid.uuid4().hex,'game_id':game['id'],
         'scheduled_start':start.isoformat(),'scheduled_date':str(played_date(game)),
