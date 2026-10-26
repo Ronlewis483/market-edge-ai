@@ -18,6 +18,7 @@ else:
 
 DATA_PREFIX='nba/training_v1/'
 SCHEMA=1
+FEATURE_VERSION=2
 FORM_FIELDS=('recent_games','support_games','win_rate_8','margin_8','points_for_8',
              'points_against_8','win_rate_30','margin_sd_30','days_since_last_game',
              'back_to_back','games_last_4_days','home_games_8')
@@ -25,7 +26,11 @@ MATCH_FIELDS=('games','estimated_pace_48','estimated_offensive_rating',
               'estimated_defensive_rating','effective_fg','rebounds','turnovers')
 ROTATION_FIELDS=('players_with_minutes','top5_minutes_if_playing','top8_minutes_if_playing',
                  'mean_prior_appearances','reported_unavailable_count',
-                 'restricted_minutes_count','reported_unavailable_prior_minutes')
+                 'restricted_minutes_count','reported_unavailable_prior_minutes',
+                 'complete_history_games','history_coverage','current_roster_minutes_coverage',
+                 'firm_out_count','uncertain_count','players_with_unknown_history','mean_minutes_sd',
+                 'conditional_top5_minutes','out_prior_minutes','scenario_allocated_minutes',
+                 'scenario_unallocated_minutes','out_points_volume_proxy','replacement_points_volume_proxy')
 SIDE_FIELDS=tuple('form_'+x for x in FORM_FIELDS)+('elo','elo_prior_games',)+tuple('matchup_'+x for x in MATCH_FIELDS)+tuple('rotation_'+x for x in ROTATION_FIELDS)
 MARKET_FIELDS=('snapshot_lead_hours','market_home_probability','market_home_probability_spread','market_books')
 BASE_FEATURES=tuple(side+'_'+f for side in ('home','away') for f in SIDE_FIELDS)+tuple('difference_'+f for f in SIDE_FIELDS)+MARKET_FIELDS
@@ -108,6 +113,32 @@ def extract_features(snapshot,game,checkpoint):
             if rotation_valid and all(number(p.get('recent_minutes_if_playing')) is not None for p in unavailable):
                 features[side+'_rotation_reported_unavailable_prior_minutes']=sum(float(p['recent_minutes_if_playing']) for p in unavailable)
         else: gaps.append(side+': current availability feed not verified at capture')
+        if rotation.get('schema')==2 and rotation_valid:
+            valid_rotation=source_history_valid(rotation.get('source_game_ids'),game,checkpoint,captured,game[provider+'_team']['id'])
+            if valid_rotation:
+                count=number(rotation.get('complete_history_games'));target=number(rotation.get('target_history_games'))
+                features[side+'_rotation_complete_history_games']=count
+                features[side+'_rotation_history_coverage']=count/target if count is not None and target else None
+                features[side+'_rotation_current_roster_minutes_coverage']=number(rotation.get('current_roster_minutes_coverage'))
+                features[side+'_rotation_players_with_unknown_history']=sum((number(p.get('prior_appearances')) or 0)==0 for p in players)
+                deviations=[number(p.get('minutes_sd')) for p in players if number(p.get('minutes_sd')) is not None]
+                if deviations: features[side+'_rotation_mean_minutes_sd']=mean(deviations)
+                if injuries_fresh and rotation.get('availability_feed_fresh') is True:
+                    features[side+'_rotation_firm_out_count']=sum(p.get('firm_out_reported') is True for p in players)
+                    features[side+'_rotation_uncertain_count']=sum(p.get('availability_uncertain') is True for p in players)
+                    expected=sorted([number(p.get('expected_minutes_if_playing')) for p in players
+                        if number(p.get('expected_minutes_if_playing')) is not None],reverse=True)
+                    if len(expected)>=5: features[side+'_rotation_conditional_top5_minutes']=sum(expected[:5])
+                    scenario=rotation.get('replacement_scenario') or {}
+                    features[side+'_rotation_out_prior_minutes']=number(scenario.get('reported_out_prior_minutes'))
+                    if scenario.get('status')=='conditional_history_scenario':
+                        for key in ('out_points_volume_proxy','replacement_points_volume_proxy'):
+                            features[side+'_rotation_'+key]=number(scenario.get(key))
+                        features[side+'_rotation_scenario_allocated_minutes']=number(scenario.get('allocated_minutes'))
+                        features[side+'_rotation_scenario_unallocated_minutes']=number(scenario.get('unallocated_minutes'))
+                    else: gaps.append(side+': replacement minutes scenario lacks verified support')
+            else: gaps.append(side+': rotation source history not verified')
+        else: gaps.append(side+': enhanced rotation inputs not present in this saved snapshot')
         gaps.extend([side+': confirmed pregame starters unavailable',side+': replacement impact not trained'])
     for field in SIDE_FIELDS:
         h,a=features['home_'+field],features['away_'+field]
@@ -212,16 +243,19 @@ def build(client=None,now=None):
     rows.sort(key=lambda r:(r['scheduled_start'],r['game_id']))
     split=split_rows(rows)
     missing={name:sum(r['features'][name] is None for r in rows) for name in BASE_FEATURES}
-    report={'schema':SCHEMA,'prepared_games':len(rows),'labeled_games':sum(r['label'] is not None for r in rows),
+    report={'schema':SCHEMA,'feature_version':FEATURE_VERSION,'prepared_games':len(rows),
+        'games_with_enhanced_rotation':sum(all(r['features'][side+'_rotation_complete_history_games'] is not None for side in ('home','away')) for r in rows),
+        'games_with_supported_replacement_scenario':sum(any(r['features'][side+'_rotation_scenario_allocated_minutes'] is not None for side in ('home','away')) for r in rows),
+        'labeled_games':sum(r['label'] is not None for r in rows),
         'pending_games':sum(r['label'] is None for r in rows),'excluded_games':len(excluded),
         'missing_feature_counts':missing,'split':split,'training_performed':False,
         'live_model_changed':False,'odds_api_requests':0,'balldontlie_requests':0,
         'limitations':['Confirmed starters and trained replacement impact are not supplied.',
-            'Unlisted injury status does not mean healthy. Reported unavailable minutes are descriptive, not projected lost impact.',
+            'Unlisted injury status does not mean healthy. Conditional minutes and replacement volume scenarios are descriptive, not fitted causal impact or win-probability adjustments.',
             'Legacy cross-season form windows are masked; no historical injuries are invented.',
             'Model probabilities and actual game/player statistics are excluded from predictor columns.',
             'This is a winner dataset, not a player-prop training dataset.']}
-    dataset={'schema':SCHEMA,'feature_columns':list(FEATURE_COLUMNS),'label_column':'label',
+    dataset={'schema':SCHEMA,'feature_version':FEATURE_VERSION,'feature_columns':list(FEATURE_COLUMNS),'label_column':'label',
         'policy':{'snapshot_selection':'latest saved snapshot at least 60 minutes before tipoff; one row per game',
                   'missing_values':'null plus explicit missing indicators; fit imputation on train only',
                   'partitioning':'date groups in chronological order; purge labels observed after next partition inputs'},
@@ -238,7 +272,7 @@ def build(client=None,now=None):
         'pending_games':report['pending_games'],'split_status':split['status']},replace=True)
     cache['last_dataset_hash']=digest
     client.write(DATA_PREFIX+'feature_cache.json.gz',cache,replace=True,compressed=True)
-    print(json.dumps({'NBA training dataset':{k:report[k] for k in ('prepared_games','labeled_games','pending_games','excluded_games','training_performed')},
+    print(json.dumps({'NBA training dataset':{k:report[k] for k in ('feature_version','prepared_games','labeled_games','pending_games','excluded_games','games_with_enhanced_rotation','games_with_supported_replacement_scenario','training_performed')},
                       'new_snapshot_downloads':downloads,'split_status':split['status'],'dataset_path':path}),flush=True)
     return dataset
 
