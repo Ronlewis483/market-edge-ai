@@ -29,8 +29,10 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install collector dependency
-        run: python -m pip install requests==2.32.5
+        run: python -m pip install requests==2.32.5 numpy==2.3.5
       - name: Collect and persist pregame snapshots
         run: python dual_agent/nba_pregame_snapshots.py
       - name: Prepare saved NBA training dataset
         run: python dual_agent/nba_training_dataset.py
+      - name: Compare NBA candidate predictions and grade results
+        run: python dual_agent/nba_context_comparison.py
