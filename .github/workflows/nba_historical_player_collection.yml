@@ -23,7 +23,8 @@ jobs:
       NBA_SNAPSHOT_BUCKET: market-edge-data
       NBA_SNAPSHOT_BDL_BUDGET: '60'
       NBA_HISTORY_SAMPLE_GAMES: '100'
-      NBA_HISTORY_STOP_WHEN_TRAINED: ${{ github.event_name == 'schedule' && 'true' || 'false' }}
+      NBA_HISTORY_TARGET_GAMES: '800'
+      NBA_HISTORY_STOP_WHEN_TRAINED: 'false'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
