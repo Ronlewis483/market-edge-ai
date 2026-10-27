@@ -6,6 +6,7 @@ Requires the existing BALLDONTLIE and Supabase settings. No Odds API requests.
 import os
 from datetime import datetime, timedelta, timezone
 import json
+from urllib.parse import quote
 
 if __package__:
     from .nba_pregame_snapshots import Client, PREFIX, final, played_date, number, team_box
@@ -13,6 +14,27 @@ else:
     from nba_pregame_snapshots import Client, PREFIX, final, played_date, number, team_box
 
 ROOT = 'nba/historical_player_sample_v1/'
+
+
+def saved_game_ids(client):
+    """List saved objects once instead of downloading every earlier box again."""
+    result = set()
+    offset = 0
+    while True:
+        response = client.http.post(
+            client.env['SUPABASE_URL'].rstrip('/') + '/storage/v1/object/list/' + quote(client.bucket, safe=''),
+            headers=client.headers(), json={'prefix': ROOT + 'games', 'limit': 100,
+                'offset': offset, 'sortBy': {'column': 'name', 'order': 'asc'}}, timeout=(5, 20))
+        if response.status_code != 200:
+            raise RuntimeError('Historical sample listing failed; existing history was not reset')
+        batch = response.json()
+        if not isinstance(batch, list):
+            raise ValueError('Invalid historical sample listing')
+        result.update(str(x['name'])[:-8] for x in batch
+                      if str(x.get('name', '')).endswith('.json.gz'))
+        if len(batch) < 100:
+            return result
+        offset += len(batch)
 
 
 def valid_box(game, rows):
@@ -46,6 +68,9 @@ def run(client=None, now=None):
             print(json.dumps(result), flush=True)
             return result
     batch_limit = int(os.environ.get('NBA_HISTORY_SAMPLE_GAMES', '10'))
+    target = int(os.environ.get('NBA_HISTORY_TARGET_GAMES', '800'))
+    if not 1 <= target <= 5000:
+        raise ValueError('NBA_HISTORY_TARGET_GAMES must be between 1 and 5000')
     if not 1 <= batch_limit <= 100:
         raise ValueError('NBA_HISTORY_SAMPLE_GAMES must be between 1 and 100')
     checkpoint = client.read(PREFIX + 'checkpoint.json.gz', compressed=True)
@@ -55,17 +80,19 @@ def run(client=None, now=None):
     games = [g for g in checkpoint.get('games', {}).values()
              if final(g) and played_date(g) and played_date(g) < cutoff]
     games.sort(key=lambda g: (played_date(g), str(g['id'])), reverse=True)
-    counts = {'eligible_games_in_checkpoint': len(games), 'already_saved': 0,
+    saved = saved_game_ids(client)
+    eligible_saved = len(saved & {str(g['id']) for g in games})
+    effective_target = min(target, len(games))
+    counts = {'eligible_games_in_checkpoint': len(games), 'already_saved': eligible_saved,
               'new_saved': 0, 'reused_collector_boxes': 0, 'invalid_boxes': 0,
-              'attempted_new_games': 0, 'request_budget_reached': False}
+              'attempted_new_games': 0, 'request_budget_reached': False,
+              'target_saved_games': target, 'effective_target_games': effective_target}
     for game in games:
+        if eligible_saved + counts['new_saved'] >= effective_target:
+            break
         gid = str(game['id'])
         path = ROOT + 'games/' + gid + '.json.gz'
-        existing = client.read(path, compressed=True)
-        if existing is not None:
-            if not isinstance(existing, dict) or str(existing.get('game_id')) != gid:
-                raise ValueError('Existing historical sample is invalid; it was not replaced')
-            counts['already_saved'] += 1
+        if gid in saved:
             continue
         if counts['attempted_new_games'] >= batch_limit:
             break
@@ -93,7 +120,9 @@ def run(client=None, now=None):
         client.write(path, payload, compressed=True)
         counts['new_saved'] += 1
         counts['reused_collector_boxes'] += int(reused)
-    counts.update({'status': 'sample_collected' if counts['new_saved'] else 'no_new_boxes_saved',
+    total = eligible_saved + counts['new_saved']
+    counts.update({'status': 'history_target_reached' if total >= effective_target else 'sample_collected' if counts['new_saved'] else 'no_new_boxes_saved',
+                   'total_saved_games': total, 'target_reached': total >= effective_target,
                    'balldontlie_requests': client.calls, 'odds_api_requests': 0,
                    'training_performed': False, 'live_model_changed': False,
                    'note': 'Separate completed-game samples only; not historical injury reports, lineups, or pregame forecasts.'})
