@@ -1,0 +1,30 @@
+name: NBA historical pregame learning
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nba-historical-pregame-learning
+  cancel-in-progress: false
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      BALLDONTLIE_API_KEY: ${{ secrets.BALLDONTLIE_API_KEY }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+      NBA_SNAPSHOT_BUCKET: market-edge-data
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install training dependencies
+        run: python -m pip install requests==2.32.5 numpy==2.3.5 pandas scipy==1.17.0 scikit-learn==1.8.0 threadpoolctl==3.6.0
+      - name: Reconstruct and train from earlier games
+        run: python -m dual_agent.nba_historical_pregame_learning
