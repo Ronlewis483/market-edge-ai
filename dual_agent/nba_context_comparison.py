@@ -17,6 +17,8 @@ else:
     from train_nba_context_neural import MODEL_PREFIX, predict_candidate, load_candidate
 
 COMPARE_PREFIX=MODEL_PREFIX+'prospective/'
+HISTORICAL_PREFIX='nba/historical_pregame_learning_v1/'
+HISTORICAL_COMPARE_PREFIX=HISTORICAL_PREFIX+'prospective/'
 
 
 def digest(value):
@@ -67,7 +69,7 @@ def score_pairs(records):
     return summaries
 
 
-def grade_existing(client,checkpoint,state,now):
+def grade_existing(client,checkpoint,state,now,compare_prefix=COMPARE_PREFIX):
     count=0
     for record in state['pairs'].values():
         frozen=record['forecast'];gid=str(frozen['game_id']);game=checkpoint['games'].get(gid)
@@ -88,30 +90,42 @@ def grade_existing(client,checkpoint,state,now):
         result={'schema':1,'forecast_path':record['forecast_path'],'game_id':game['id'],
                 'home_win':int(hs>aws),'home_score':hs,'away_score':aws,'outcome_path':path,
                 'result_observed_at':observed.isoformat()}
-        result_path=COMPARE_PREFIX+'results/'+digest(result)+'.json'
+        result_path=compare_prefix+'results/'+digest(result)+'.json'
         write_immutable(client,result_path,result)
         record.update(result=result,outcome_hash=outcome_hash,result_path=result_path);count+=1
     return count
 
 
-def run(client=None,now=None):
+def run(client=None,now=None,historical=False):
     client=client or Client();now=now or datetime.now(timezone.utc)
+    compare_prefix=HISTORICAL_COMPARE_PREFIX if historical else COMPARE_PREFIX
     checkpoint=client.read(PREFIX+'checkpoint.json.gz',compressed=True)
     if not checkpoint or checkpoint.get('schema')!=1: raise ValueError('Collector checkpoint missing or incompatible')
-    state=client.read(COMPARE_PREFIX+'checkpoint.json.gz',compressed=True)
+    state=client.read(compare_prefix+'checkpoint.json.gz',compressed=True)
     if state is None: state={'schema':1,'pairs':{}}
     if state.get('schema')!=1 or not isinstance(state.get('pairs'),dict): raise ValueError('Comparison checkpoint invalid; existing results not reset')
-    graded=grade_existing(client,checkpoint,state,now)
+    graded=grade_existing(client,checkpoint,state,now,compare_prefix)
     diagnostics={k:0 for k in ('baseline_forecasts_seen','invalid_baseline','no_unique_game','already_frozen',
         'game_started','baseline_neural_mismatch','baseline_predates_candidate','no_prior_snapshot','invalid_snapshot','pairs_saved')}
-    pointer=client.read(MODEL_PREFIX+'latest_candidate.json');model_id=None
+    if historical:
+        training=client.read(HISTORICAL_PREFIX+'latest_report.json')
+        pointer=({'candidate_path':training.get('candidate_path'),
+                  'model_id':(training.get('candidate_path') or '').split('/')[-1].removesuffix('.json.gz')}
+                 if isinstance(training,dict) and training.get('status')=='candidate_saved'
+                 and training.get('training_performed') is True else None)
+    else:
+        pointer=client.read(MODEL_PREFIX+'latest_candidate.json')
+    model_id=None
     if pointer is not None:
         path=pointer.get('candidate_path','')
-        if not path.startswith(MODEL_PREFIX+'candidates/') or not path.endswith('.json.gz'):
+        candidate_root=(HISTORICAL_PREFIX if historical else MODEL_PREFIX)+'candidates/'
+        if not isinstance(path,str) or not path.startswith(candidate_root) or not path.endswith('.json.gz') or '/' in path[len(candidate_root):]:
             raise ValueError('Unexpected candidate package path')
         package=client.read(path,compressed=True)
         if not isinstance(package,dict): raise ValueError('Candidate package missing')
         load_candidate(package)
+        if historical and package.get('kind')!='nba_neural_context_adjustment':
+            raise ValueError('Unexpected historical candidate type')
         model_id=package['metadata']['model_id'];available=stamp(package['metadata'].get('available_after'))
         if model_id!=pointer.get('model_id') or available is None: raise ValueError('Candidate metadata differs from saved pointer')
         # Earliest eligible baseline wins; each game is counted once per candidate/version.
@@ -135,7 +149,7 @@ def run(client=None,now=None):
             game=matches[0];gid=str(game['id']);scheduled=start_time(game)
             version=baseline.get('current_model_version');identity=digest([gid,model_id,version])
             if identity in state['pairs']:diagnostics['already_frozen']+=1;continue
-            forecast_path=COMPARE_PREFIX+'forecasts/'+identity+'.json'
+            forecast_path=compare_prefix+'forecasts/'+identity+'.json'
             previous=client.read(forecast_path)
             if previous is not None:
                 at=stamp(previous.get('candidate_captured_at'));base_at=stamp(previous.get('baseline_captured_at'))
@@ -184,23 +198,26 @@ def run(client=None,now=None):
             client.write(forecast_path,forecast)
             state['pairs'][identity]={'forecast_path':forecast_path,'forecast':forecast}
             diagnostics['pairs_saved']+=1
-            client.write(COMPARE_PREFIX+'checkpoint.json.gz',state,replace=True,compressed=True)
+            client.write(compare_prefix+'checkpoint.json.gz',state,replace=True,compressed=True)
     # Includes any immutable forecasts recovered after an interrupted checkpoint write.
-    graded+=grade_existing(client,checkpoint,state,now)
-    client.write(COMPARE_PREFIX+'checkpoint.json.gz',state,replace=True,compressed=True)
+    graded+=grade_existing(client,checkpoint,state,now,compare_prefix)
+    client.write(compare_prefix+'checkpoint.json.gz',state,replace=True,compressed=True)
     report={'schema':1,'status':'waiting_for_trained_candidate' if pointer is None else 'prospective_comparison_active',
         'checked_at':now.isoformat(),'latest_candidate_model_id':model_id,'frozen_pairs':len(state['pairs']),
         'graded_pairs':sum(bool(r.get('result')) for r in state['pairs'].values()),'new_results':graded,
         'diagnostics':diagnostics,'model_comparisons':score_pairs(state['pairs'].values()),
         'live_model_changed':False,'sports_api_requests':0,'automatic_promotion':False,
-        'note':'Only genuinely prospective paired forecasts are scored. An accuracy target is not an established result. Historical backfill remains deferred.'}
-    client.write(COMPARE_PREFIX+'status.json',report,replace=True)
+        'comparison_source':'historical_adjustment' if historical else 'context_candidate',
+        'note':'Only genuinely prospective paired forecasts are scored. An accuracy target is not an established result.'}
+    client.write(compare_prefix+'status.json',report,replace=True)
     print(json.dumps(report),flush=True)
     return report
 
 
 if __name__=='__main__':
-    try:run()
+    try:
+        run()
+        run(historical=True)
     except Exception as exc:
         print('NBA prospective comparison stopped: '+safe_issue(exc),flush=True)
         raise SystemExit(1)
