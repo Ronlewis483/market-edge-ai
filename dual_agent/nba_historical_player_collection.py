@@ -36,6 +36,15 @@ def valid_box(game, rows):
 def run(client=None, now=None):
     client = client or Client()
     now = now or datetime.now(timezone.utc)
+    if os.environ.get('NBA_HISTORY_STOP_WHEN_TRAINED') == 'true':
+        learning = client.read('nba/historical_pregame_learning_v1/latest_report.json')
+        if (isinstance(learning, dict) and learning.get('training_performed') is True
+                and learning.get('status') in ('candidate_saved', 'candidate_did_not_pass_validation')):
+            result = {'status': 'stopped_training_attempt_completed', 'new_saved': 0,
+                      'balldontlie_requests': 0, 'odds_api_requests': 0,
+                      'training_status': learning['status'], 'live_model_changed': False}
+            print(json.dumps(result), flush=True)
+            return result
     batch_limit = int(os.environ.get('NBA_HISTORY_SAMPLE_GAMES', '10'))
     if not 1 <= batch_limit <= 100:
         raise ValueError('NBA_HISTORY_SAMPLE_GAMES must be between 1 and 100')
