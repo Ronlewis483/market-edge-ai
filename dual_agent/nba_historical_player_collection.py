@@ -37,8 +37,8 @@ def run(client=None, now=None):
     client = client or Client()
     now = now or datetime.now(timezone.utc)
     batch_limit = int(os.environ.get('NBA_HISTORY_SAMPLE_GAMES', '10'))
-    if not 1 <= batch_limit <= 25:
-        raise ValueError('NBA_HISTORY_SAMPLE_GAMES must be between 1 and 25')
+    if not 1 <= batch_limit <= 100:
+        raise ValueError('NBA_HISTORY_SAMPLE_GAMES must be between 1 and 100')
     checkpoint = client.read(PREFIX + 'checkpoint.json.gz', compressed=True)
     if not isinstance(checkpoint, dict) or checkpoint.get('schema') != 1:
         raise ValueError('NBA collector checkpoint missing; run the collector first')
@@ -48,7 +48,7 @@ def run(client=None, now=None):
     games.sort(key=lambda g: (played_date(g), str(g['id'])), reverse=True)
     counts = {'eligible_games_in_checkpoint': len(games), 'already_saved': 0,
               'new_saved': 0, 'reused_collector_boxes': 0, 'invalid_boxes': 0,
-              'attempted_new_games': 0}
+              'attempted_new_games': 0, 'request_budget_reached': False}
     for game in games:
         gid = str(game['id'])
         path = ROOT + 'games/' + gid + '.json.gz'
@@ -64,7 +64,16 @@ def run(client=None, now=None):
         rows = checkpoint.get('stats', {}).get(gid)
         reused = rows is not None
         if rows is None:
-            rows = client.pages('stats', {'game_ids[]': [game['id']]})
+            if client.calls >= client.max_calls:
+                counts['request_budget_reached'] = True
+                break
+            try:
+                rows = client.pages('stats', {'game_ids[]': [game['id']]})
+            except RuntimeError as exc:
+                if str(exc).startswith('BALLDONTLIE run budget reached'):
+                    counts['request_budget_reached'] = True
+                    break
+                raise
         if not valid_box(game, rows):
             counts['invalid_boxes'] += 1
             continue
