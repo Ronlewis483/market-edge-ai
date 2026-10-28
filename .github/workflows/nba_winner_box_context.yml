@@ -1,0 +1,38 @@
+name: NBA winner box context
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: ['NBA pregame snapshot collector']
+    types: [completed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nba-winner-box-context
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      BALLDONTLIE_API_KEY: ${{ secrets.BALLDONTLIE_API_KEY }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+      NBA_SNAPSHOT_BUCKET: market-edge-data
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python -m pip install requests==2.32.5 numpy==2.3.5 pandas scipy==1.17.0 scikit-learn==1.8.0
+      - name: Train from saved boxes and compare team-form inputs
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        run: python -m dual_agent.nba_winner_box_context
+      - name: Refresh saved context without retraining
+        if: ${{ github.event_name == 'workflow_run' }}
+        run: python -m dual_agent.nba_winner_box_context --refresh
