@@ -96,6 +96,33 @@ def grade_existing(client,checkpoint,state,now,compare_prefix=COMPARE_PREFIX):
     return count
 
 
+def tracked_game_status(checkpoint,state):
+    """Explain grading delays using saved data only; no additional API calls."""
+    rows=[]
+    for record in state['pairs'].values():
+        forecast=record['forecast'];gid=str(forecast['game_id'])
+        game=checkpoint.get('games',{}).get(gid)
+        if record.get('result'):
+            reason='graded'
+        elif not game:
+            reason='Game missing from saved collector data'
+        elif not final(game):
+            reason='Saved provider status is not Final yet'
+        elif not checkpoint.get('settled',{}).get(gid):
+            reason='Final game found; saved outcome is missing'
+        elif start_time(game)!=stamp(forecast.get('schedule_start')):
+            reason='Saved start time changed; result match withheld'
+        else:
+            reason='Final outcome available; needs grading review'
+        rows.append({'game_id':gid,'home_team':forecast.get('home_team'),
+                     'away_team':forecast.get('away_team'),'scheduled_start':forecast.get('schedule_start'),
+                     'provider_status':(game or {}).get('status'),
+                     'provider_status_state':(game or {}).get('status_state'),
+                     'home_score':(game or {}).get('home_team_score'),
+                     'away_score':(game or {}).get('visitor_team_score'),'grading_status':reason})
+    return sorted(rows,key=lambda r:(str(r['scheduled_start']),r['game_id']))
+
+
 def run(client=None,now=None,historical=False):
     client=client or Client();now=now or datetime.now(timezone.utc)
     compare_prefix=HISTORICAL_COMPARE_PREFIX if historical else COMPARE_PREFIX
@@ -206,6 +233,7 @@ def run(client=None,now=None,historical=False):
         'checked_at':now.isoformat(),'latest_candidate_model_id':model_id,'frozen_pairs':len(state['pairs']),
         'graded_pairs':sum(bool(r.get('result')) for r in state['pairs'].values()),'new_results':graded,
         'diagnostics':diagnostics,'model_comparisons':score_pairs(state['pairs'].values()),
+        'tracked_games':tracked_game_status(checkpoint,state),
         'live_model_changed':False,'sports_api_requests':0,'automatic_promotion':False,
         'comparison_source':'historical_adjustment' if historical else 'context_candidate',
         'note':'Only genuinely prospective paired forecasts are scored. An accuracy target is not an established result.'}
