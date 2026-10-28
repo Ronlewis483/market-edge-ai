@@ -152,6 +152,36 @@ def _train_cached_nba_model(feature_games, prediction_date):
     return trained
 
 
+def _nba_box_setting(name, default=None):
+    import os
+    value = os.environ.get(name)
+    if value is not None:
+        return value
+    try:
+        return st.secrets.get(name, default)
+    except Exception:
+        return default
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _load_nba_box_context():
+    """One compact saved artifact per cache interval; no sports API requests."""
+    if str(_nba_box_setting('NBA_WINNER_BOX_CONTEXT_ENABLED', 'false')).lower() != 'true':
+        return None, 'Box context awaiting review and activation'
+    try:
+        from dual_agent.nba_pregame_snapshots import Client
+        from dual_agent.nba_winner_box_context import ARTIFACT
+        settings = {name: _nba_box_setting(name) for name in
+                    ('SUPABASE_URL', 'SUPABASE_KEY', 'BALLDONTLIE_API_KEY')}
+        settings['NBA_SNAPSHOT_BUCKET'] = _nba_box_setting('NBA_SNAPSHOT_BUCKET', 'market-edge-data')
+        artifact = Client(env=settings).read(ARTIFACT, compressed=True)
+        if not artifact or not artifact.get('checks_passed'):
+            return None, 'Box context not ready or comparison checks did not pass'
+        return artifact, 'Saved box context loaded'
+    except Exception as exc:
+        return None, 'Box context unavailable (' + type(exc).__name__ + '); team-form model retained'
+
+
 def run_nba_prediction_pipeline(
     progress_callback=None,
 ):
@@ -334,6 +364,7 @@ def run_nba_prediction_pipeline(
         f"{len(unique_games)} games..."
     )
 
+    box_artifact, box_status = _load_nba_box_context()
     prediction_rows = []
     prediction_errors = []
 
@@ -381,6 +412,21 @@ def run_nba_prediction_pipeline(
                 )
             )
 
+            box_used = False
+            box_issue = box_status
+            if box_artifact is not None:
+                try:
+                    from dual_agent.nba_winner_box_context import predict as box_predict
+                    expanded = box_predict(box_artifact, matchup_features, home_team,
+                                           away_team, game['commence_time'])
+                    if expanded is not None:
+                        prediction = expanded
+                        box_used = True
+                    else:
+                        box_issue = 'Recent verified box coverage unavailable; team-form model retained'
+                except Exception as exc:
+                    box_issue = 'Box context unavailable (' + type(exc).__name__ + '); team-form model retained'
+
             home_probability = float(
                 prediction[
                     "home_win_probability"
@@ -417,6 +463,9 @@ def run_nba_prediction_pipeline(
 
             prediction_rows.append({
                 **learning_fields,
+                'winner_model_id': prediction.get('winner_model_id', 'nba_team_form_v3'),
+                'box_context_used': box_used,
+                'box_context_status': 'Saved box context applied' if box_used else box_issue,
                 "event_id":
                     game["event_id"],
 
