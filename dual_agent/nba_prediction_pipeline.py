@@ -182,6 +182,34 @@ def _load_nba_box_context():
         return None, 'Box context unavailable (' + type(exc).__name__ + '); team-form model retained'
 
 
+def _nba_unified_client():
+    from dual_agent.nba_pregame_snapshots import Client
+    settings = {name: _nba_box_setting(name) for name in
+                ('SUPABASE_URL', 'SUPABASE_KEY', 'BALLDONTLIE_API_KEY')}
+    settings['NBA_SNAPSHOT_BUCKET'] = _nba_box_setting('NBA_SNAPSHOT_BUCKET', 'market-edge-data')
+    return Client(env=settings)
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _cached_nba_unified_bundle():
+    """Cache successful loads; missing first-run artifacts must not be cached."""
+    from dual_agent.nba_unified_winner import ARTIFACT
+    artifact = _nba_unified_client().read(ARTIFACT, compressed=True)
+    if artifact is None:
+        raise FileNotFoundError('Train NBA unified winner first')
+    return artifact
+
+
+def _load_nba_unified_winner():
+    """Reuse one compact bundle, including while predictions are compared."""
+    try:
+        return _cached_nba_unified_bundle(), 'ready'
+    except FileNotFoundError:
+        return None, 'Train NBA unified winner first'
+    except Exception as exc:
+        return None, 'Unified winner unavailable (' + type(exc).__name__ + ')'
+
+
 def run_nba_prediction_pipeline(
     progress_callback=None,
 ):
@@ -364,6 +392,7 @@ def run_nba_prediction_pipeline(
         f"{len(unique_games)} games..."
     )
 
+    unified_artifact, unified_status = _load_nba_unified_winner()
     box_artifact, box_status = _load_nba_box_context()
     prediction_rows = []
     prediction_errors = []
@@ -412,6 +441,14 @@ def run_nba_prediction_pipeline(
                 )
             )
 
+            original_prediction = dict(prediction)
+            learning_fields = {}
+            try:
+                from dual_agent.nba_winner_comparison import predict as learning_predict
+                learning_fields = learning_predict(matchup_features, game['commence_time'])
+            except Exception as exc:
+                learning_fields = {'learning_model_issue':type(exc).__name__+': '+str(exc)}
+
             box_used = False
             box_issue = box_status
             if box_artifact is not None:
@@ -426,6 +463,35 @@ def run_nba_prediction_pipeline(
                         box_issue = 'Recent verified box coverage unavailable; team-form model retained'
                 except Exception as exc:
                     box_issue = 'Box context unavailable (' + type(exc).__name__ + '); team-form model retained'
+
+            unified_forecast = None
+            unified_used = False
+            unified_issue = unified_status
+            if unified_artifact is not None and learning_fields.get('learning_home_probability') is not None:
+                try:
+                    from dual_agent.nba_unified_winner import predict as unified_predict
+                    unified_forecast = unified_predict(
+                        unified_artifact, matchup_features,
+                        original_prediction['home_win_probability'],
+                        learning_fields['learning_home_probability'],
+                        home_team, away_team, game['commence_time'])
+                    if unified_forecast is not None:
+                        unified_forecast['original_model_version'] = original_prediction.get('probability_version', 3)
+                    activated = str(_nba_box_setting('NBA_UNIFIED_WINNER_ENABLED', 'false')).lower() == 'true'
+                    if unified_forecast is not None and activated and unified_forecast['checks_passed']:
+                        p = unified_forecast['combined_home_probability']
+                        prediction = dict(original_prediction,
+                            home_win_probability=p, away_win_probability=1-p,
+                            predicted_side='HOME' if p >= .5 else 'AWAY', confidence=max(p,1-p),
+                            raw_home_win_probability=p, calibration_games=0,
+                            probability_version=unified_forecast['model_id'],
+                            winner_model_id=unified_forecast['model_id'],
+                            calibration_status='Three-source NBA ensemble · live accuracy tracked separately')
+                        unified_used = True
+                        box_used = False
+                    unified_issue = 'Applied' if unified_used else 'Saved for comparison; current engine retained'
+                except Exception as exc:
+                    unified_issue = 'Unified winner unavailable (' + type(exc).__name__ + '); current engine retained'
 
             home_probability = float(
                 prediction[
@@ -454,15 +520,12 @@ def run_nba_prediction_pipeline(
                 away_probability,
             )
 
-            learning_fields = {}
-            try:
-                from dual_agent.nba_winner_comparison import predict as learning_predict
-                learning_fields = learning_predict(matchup_features, game['commence_time'])
-            except Exception as exc:
-                learning_fields = {'learning_model_issue':type(exc).__name__+': '+str(exc)}
 
             prediction_rows.append({
                 **learning_fields,
+                'unified_forecast': unified_forecast,
+                'unified_used': unified_used,
+                'unified_status': unified_issue,
                 'winner_model_id': prediction.get('winner_model_id', 'nba_team_form_v3'),
                 'box_context_used': box_used,
                 'box_context_status': 'Saved box context applied' if box_used else box_issue,
@@ -699,10 +762,18 @@ def run_nba_prediction_pipeline(
             comparison_issue = comparison_ledger['persistence_issue']
     except Exception as exc:
         comparison_issue = 'Winner comparison could not be saved/graded: '+type(exc).__name__
+    unified_save_issue = None
+    if 'unified_forecast' in predictions and predictions['unified_forecast'].map(lambda x: isinstance(x, dict)).any():
+        try:
+            from dual_agent.nba_unified_winner import save_forecasts
+            save_forecasts(_nba_unified_client(), predictions)
+        except Exception as exc:
+            unified_save_issue = 'Unified forecast persistence failed (' + type(exc).__name__ + ')'
     report("NBA prediction pipeline complete")
 
     return {
         'pipeline_version': NBA_PIPELINE_VERSION,
+        'unified_forecast_save_issue': unified_save_issue,
         'winner_comparison_issue': comparison_issue,
         'validation_summary': trained_model.get('validation_summary', {}),
         'calibration_status': trained_model.get('calibration_status'),
