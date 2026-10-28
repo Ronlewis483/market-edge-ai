@@ -121,6 +121,38 @@ def scores(y, p):
             'brier': float(brier_score_loss(y, p)), 'log_loss': float(log_loss(y, p, labels=[0, 1]))}
 
 
+def partition_by_game_count(frame):
+    """Choose chronological whole-date boundaries using counts, never outcomes.
+
+    Prefer 75/12.5/12.5 percent of games while retaining the existing
+    500/50/50 minimums whenever whole-date boundaries permit them.
+    """
+    if frame.empty:
+        return [frame.copy() for _ in range(3)]
+    ds = frame['game_date'].map(day)
+    counts = ds.value_counts().sort_index()
+    dates = list(counts.index)
+    if len(dates) < 3:
+        return [frame.copy(), frame.iloc[:0].copy(), frame.iloc[:0].copy()]
+    cumulative = counts.cumsum().to_numpy()
+    total = len(frame)
+    target = np.array([.75, .125, .125]) * total
+    best = None
+    for i in range(1, len(dates) - 1):
+        train_count = int(cumulative[i - 1])
+        for j in range(i + 1, len(dates)):
+            sizes = (train_count, int(cumulative[j - 1]) - train_count,
+                     total - int(cumulative[j - 1]))
+            feasible = all(size >= minimum for size, minimum in zip(sizes, (500, 50, 50)))
+            # Feasibility comes first; ties resolve deterministically by date.
+            rank = (not feasible, float(np.sum((np.array(sizes) - target) ** 2)), i, j)
+            if best is None or rank < best:
+                best = rank
+    _, _, i, j = best
+    a, b = dates[i], dates[j]
+    return [frame[ds < a].copy(), frame[(ds >= a) & (ds < b)].copy(), frame[ds >= b].copy()]
+
+
 def train(client=None):
     from sklearn.linear_model import LogisticRegression
     from sklearn.pipeline import Pipeline
@@ -160,11 +192,20 @@ def train(client=None):
     if len(dates) < 3:
         client.write(ROOT + 'latest_report.json', report, replace=True)
         print(json.dumps(report)); return report
-    a, b = dates[int(len(dates) * .75)], dates[int(len(dates) * .875)]
-    ds = frame['game_date'].map(day)
-    groups = [frame[ds < a], frame[(ds >= a) & (ds < b)], frame[ds >= b]]
+    groups = partition_by_game_count(frame)
+    report['partition_method'] = 'chronological_game_counts_whole_dates_v2'
     report['partition_games'] = dict(zip(('train', 'validation', 'test'), map(len, groups)))
-    if any(len(g) < n or g['home_win'].value_counts().min() < 10 or g['home_win'].nunique() != 2 for g, n in zip(groups, (500, 50, 50))):
+    report['partition_dates'] = {name: {'first': day(g['game_date'].min()),
+                                      'last': day(g['game_date'].max())} if len(g) else None
+                                 for name, g in zip(('train', 'validation', 'test'), groups)}
+    reasons = []
+    for name, g, minimum in zip(('train', 'validation', 'test'), groups, (500, 50, 50)):
+        if len(g) < minimum:
+            reasons.append(f'{name}: {len(g)}/{minimum} games')
+        if g['home_win'].nunique() != 2 or g['home_win'].value_counts().min() < 10:
+            reasons.append(f'{name}: needs at least 10 examples of each outcome')
+    report['reasons'] = reasons
+    if reasons:
         client.write(ROOT + 'latest_report.json', report, replace=True)
         print(json.dumps(report)); return report
     base_columns = research['NBA_LIVE_FEATURE_COLUMNS']
