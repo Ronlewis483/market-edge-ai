@@ -1723,6 +1723,8 @@ def restore_cross_result(league):
     state = cross_sport_state(league)
     existing = st.session_state.get(state)
     if existing: return existing
+    if league == 'NFL' and st.session_state.get('nfl_enrichment_future') is not None:
+        return None  # Do not block first generation on remote workspace restoration.
     checked = league.lower()+'_workspace_restore_checked'
     if st.session_state.get(checked): return None
     st.session_state[checked] = True
@@ -1833,6 +1835,8 @@ def drain_cross_updates(league):
             current = st.session_state.get(cross_sport_state(league)) or {}
             current.update(workspace_pending=False,enrichment_pending=False,
                 workspace_issue=league+' background refresh stopped ('+type(exc).__name__+').')
+            if league == 'NFL':
+                st.session_state['nfl_generation_issue'] = 'NFL prediction scan failed: '+str(exc)
         st.session_state.pop(key+'_enrichment_future',None)
         st.session_state.pop(key+'_enrichment_updates',None)
 
@@ -2402,13 +2406,17 @@ def enrich_nfl_result(result, feature_games, odds_key, progress_queue=None, cont
     except Exception as exc:
         result['connected_learning_issue'] = 'NFL connected finalization unavailable (' + type(exc).__name__ + ')'
     result.setdefault('nfl_stage_timings_seconds', {})['connected_finalization'] = round(perf_counter()-correction_clock, 3)
+    result['nfl_generation_stage'] = 'Winner predictions ready; player props are loading'
     if progress_queue is not None:
         progress_queue.put(copy.deepcopy(result))
+    props_clock = perf_counter()
     try:
         from dual_agent.game_prediction_addons import enhance_result
         result = enhance_result("NFL", result, odds_key, feature_games,on_props=publish_props)
     except Exception as exc:
         result['prop_issues'] = ['NFL add-ons unavailable ('+type(exc).__name__+'); winner predictions are preserved.']
+    result.setdefault('nfl_stage_timings_seconds', {})['player_props_and_spreads'] = round(perf_counter()-props_clock, 3)
+    result['nfl_generation_stage'] = 'NFL scan complete'
     result = merge_result('NFL',previous,result)
     result.update(enrichment_pending=False,workspace_pending=False,workspace_saved_at=pd.Timestamp.now(tz='UTC').isoformat())
     if progress_queue is not None: progress_queue.put(copy.deepcopy(result))
@@ -2452,6 +2460,124 @@ def run_nfl_prediction_with_addons(feature_games, historical_accuracy=None, hist
         result['enrichment_pending'] = False
         return result
     return start_cross_refresh('NFL',result,feature_games)
+
+
+@st.cache_resource(show_spinner=False)
+def nfl_generation_pool():
+    from concurrent.futures import ThreadPoolExecutor
+    return ThreadPoolExecutor(max_workers=2)
+
+
+def generate_nfl_in_background(previous, historical_accuracy, historical_sample, odds_key,
+                               updates, progress, revision, context=None):
+    """Run cold history, odds, connected winners and props off the UI thread."""
+    import copy
+    from time import perf_counter
+    from concurrent.futures import ThreadPoolExecutor
+    def bind_context():
+        if context is not None:
+            import threading
+            from streamlit.runtime.scriptrunner import add_script_run_ctx
+            add_script_run_ctx(threading.current_thread(), context)
+    bind_context()
+    def report(message):
+        progress.put(('stage', message))
+    def timed_load(name, function):
+        bind_context()
+        started = perf_counter()
+        value = function()
+        return value, round(perf_counter()-started, 3)
+    report('Loading current NFL results and sportsbook lines')
+    # Independent requests overlap; neither source is fetched a second time.
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        history_job = pool.submit(timed_load, 'history', load_nfl_history_bundle)
+        odds_job = pool.submit(timed_load, 'odds', get_live_nfl_moneylines)
+        bundle, history_seconds = history_job.result()
+        progress.put(('history', bundle))
+        report('NFL history ready; checking sportsbook lines')
+        live_odds, odds_seconds = odds_job.result()
+    report('Calculating NFL matchups')
+    result = run_nfl_prediction_pipeline(feature_games=bundle[1],
+        historical_accuracy=historical_accuracy, historical_sample=historical_sample,
+        live_odds=live_odds, on_progress=report)
+    result.setdefault('nfl_stage_timings_seconds', {}).update(
+        history=history_seconds, odds=odds_seconds)
+    from dual_agent.sports_prop_workspace import merge_result
+    result = merge_result('NFL', copy.deepcopy(previous or {}), result)
+    result.update(nfl_winner_revision=revision, workspace_pending=True, enrichment_pending=True)
+    report('Checking quarterbacks, injuries and weather for connected predictions')
+    return enrich_nfl_result(result, bundle[1], odds_key, updates, context)
+
+
+def start_nfl_prediction_request():
+    """One request per session; return immediately so saved cards stay usable."""
+    pending = st.session_state.get('nfl_enrichment_future')
+    if pending is not None and not pending.done():
+        return False
+    drain_cross_updates('NFL')
+    from queue import Queue
+    from uuid import uuid4
+    previous = st.session_state.get('nfl_prediction_pipeline_result') or {}
+    remember_game_addons('NFL', previous)
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        context = get_script_run_ctx()
+    except ImportError:
+        context = None
+    updates, progress = Queue(), Queue()
+    st.session_state['nfl_enrichment_updates'] = updates
+    st.session_state['nfl_generation_progress'] = progress
+    st.session_state['nfl_generation_stage'] = 'Starting NFL prediction scan'
+    st.session_state.pop('nfl_generation_issue', None)
+    revision = uuid4().hex
+    st.session_state['nfl_requested_winner_revision'] = revision
+    st.session_state['nfl_enrichment_future'] = nfl_generation_pool().submit(
+        generate_nfl_in_background, previous,
+        st.session_state.get('nfl_historical_accuracy'),
+        st.session_state.get('nfl_historical_sample'),
+        prediction_api_key('ODDS_API_KEY', 'THE_ODDS_API_KEY'), updates, progress,
+        revision, context)
+    return True
+
+
+@st.fragment(run_every='3s')
+def render_nfl_generation_progress():
+    """Mounted even before the first result; publish winner cards before props finish."""
+    from queue import Empty
+    progress = st.session_state.get('nfl_generation_progress')
+    if progress is not None:
+        for _ in range(50):
+            try:
+                kind, value = progress.get_nowait()
+            except Empty:
+                break
+            if kind == 'history':
+                install_nfl_history_bundle(value)
+            else:
+                st.session_state['nfl_generation_stage'] = value
+    pending = st.session_state.get('nfl_enrichment_future')
+    if pending is not None and pending.done():
+        try:
+            pending.result()  # Only inspect completed work; never wait on the UI.
+        except Exception as exc:
+            st.session_state['nfl_generation_issue'] = 'NFL prediction scan failed: '+str(exc)
+    drain_cross_updates('NFL')
+    current = st.session_state.get('nfl_prediction_pipeline_result') or {}
+    predictions = current.get('predictions')
+    revision = current.get('nfl_winner_revision')
+    if revision and predictions is not None and len(predictions) and revision != st.session_state.get('nfl_displayed_winner_revision'):
+        st.session_state['nfl_displayed_winner_revision'] = revision
+        for session_key, result_key in [('live_nfl_moneylines','live_odds'),
+                ('best_nfl_moneylines','best_lines'), ('live_nfl_predictions','predictions'),
+                ('live_nfl_opportunities','opportunities')]:
+            st.session_state[session_key] = current.get(result_key)
+        retain_nfl_picks(predictions, 'nfl_saved_team_cards')
+        st.rerun()  # One full redraw per new winner slate, not per props update.
+    if st.session_state.get('nfl_generation_issue'):
+        st.error(st.session_state['nfl_generation_issue'])
+    elif st.session_state.get('nfl_enrichment_future') is not None:
+        stage = current.get('nfl_generation_stage') if revision == st.session_state.get('nfl_requested_winner_revision') else None
+        st.info(stage or st.session_state.get('nfl_generation_stage', 'NFL scan running'))
 
 
 def remember_game_addons(league, result):
@@ -3266,74 +3392,10 @@ if page == "🏠 Home":
         type="primary",
         use_container_width=True,
     ):
-        try:
-    
-            feature_games = st.session_state.get(
-                "nfl_feature_games"
-            )
+        start_nfl_prediction_request()
 
-            # ============================================
-            # AUTO-PREPARE NFL HISTORICAL FEATURES
-            # ============================================
+    render_nfl_generation_progress()
 
-            feature_games = nfl_prediction_features()
-
-            with st.spinner(
-                "Generating NFL predictions and analyzing markets..."
-            ):
-    
-                nfl_pipeline_result = (
-                    run_nfl_prediction_with_addons(
-                        feature_games=feature_games,
-                        historical_accuracy=st.session_state.get(
-                            "nfl_historical_accuracy"
-                        ),
-                        historical_sample=st.session_state.get(
-                            "nfl_historical_sample"
-                        ),
-                    )
-                )
-    
-                retain_nfl_picks(st.session_state.get("nfl_prediction_pipeline_result", {}).get("predictions"), "nfl_saved_team_cards")
-                retain_nfl_picks(nfl_pipeline_result.get("predictions"), "nfl_saved_team_cards")
-                st.session_state[
-                    "nfl_prediction_pipeline_result"
-                ] = nfl_pipeline_result
-    
-                st.session_state[
-                    "live_nfl_moneylines"
-                ] = nfl_pipeline_result[
-                    "live_odds"
-                ]
-    
-                st.session_state[
-                    "best_nfl_moneylines"
-                ] = nfl_pipeline_result[
-                    "best_lines"
-                ]
-    
-                st.session_state[
-                    "live_nfl_predictions"
-                ] = nfl_pipeline_result[
-                    "predictions"
-                ]
-    
-                st.session_state[
-                    "live_nfl_opportunities"
-                ] = nfl_pipeline_result[
-                    "opportunities"
-                ]
-
-        
-    
-        except Exception as error:
-    
-            st.error(
-                f"NFL prediction pipeline failed: {error}"
-            )
-    
-            st.exception(error)
-    
     # ============================================
     # NFL PREDICTION RESULTS
     # ============================================
@@ -3518,22 +3580,9 @@ if page in ["🏈 NFL", "🏀 NBA", "⚾ MLB"]:
         )
 
         if st.button("🏈 Generate NFL Predictions · Next 7 Days", key="nfl_sidebar_generate", type="primary"):
-            try:
-                with st.spinner("Generating NFL predictions..."):
-                    result = run_nfl_prediction_with_addons(
-                        feature_games=nfl_prediction_features(),
-                        historical_accuracy=st.session_state.get("nfl_historical_accuracy"),
-                        historical_sample=st.session_state.get("nfl_historical_sample"),
-                    )
-                    retain_nfl_picks(st.session_state.get("nfl_prediction_pipeline_result", {}).get("predictions"), "nfl_saved_team_cards")
-                    retain_nfl_picks(result.get("predictions"), "nfl_saved_team_cards")
-                    st.session_state["nfl_prediction_pipeline_result"] = result
-                    for session_key, result_key in [("live_nfl_moneylines", "live_odds"),
-                        ("best_nfl_moneylines", "best_lines"), ("live_nfl_predictions", "predictions"),
-                        ("live_nfl_opportunities", "opportunities")]:
-                        st.session_state[session_key] = result.get(result_key)
-            except Exception as exc:
-                st.error("NFL prediction pipeline failed: " + str(exc))
+            start_nfl_prediction_request()
+
+        render_nfl_generation_progress()
 
         nfl_result = st.session_state.get(
             "nfl_prediction_pipeline_result"
