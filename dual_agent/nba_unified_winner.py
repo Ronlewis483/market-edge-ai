@@ -1,8 +1,8 @@
-"""Three-source NBA winner ensemble. Saved data only; no paid sports API calls.
+"""Connected NBA winner: original probability -> context -> learned correction.
 
-Original team-form engine + frozen neural forecast + player-aware boosted trees.
-Training and context refresh run offline. Live activation is explicit and gated.
-Player projections describe box production, not RAPM or verified participation.
+The original forecast is a fixed log-odds offset. Existing neural information
+and prior-player projections jointly enter a residual learning layer. There
+are no independent player votes or probability averages. Saved data only.
 """
 import hashlib
 import json
@@ -15,7 +15,7 @@ import pandas as pd
 
 from .nba_winner_box_context import compact_games, partition_by_game_count, scores, key, day
 
-ROOT = 'nba/unified_winner_v1/'
+ROOT = 'nba/connected_winner_v2/'
 ARTIFACT = ROOT + 'latest.json.gz'
 STATS = ('pts', 'reb', 'ast', 'stl', 'blk', 'turnover')
 HALF_LIVES = dict(zip(STATS, (21., 45., 30., 60., 60., 45.)))
@@ -142,18 +142,8 @@ def player_features(games, home, away, cutoff, availability=None):
             **{'difference_'+k:h[k]-a[k] for k in PLAYER_FIELDS}}
 
 
-def export_trees(model):
-    trees = []
-    for estimator in model.estimators_[:,0]:
-        t = estimator.tree_
-        trees.append({'left':t.children_left.tolist(),'right':t.children_right.tolist(),
-                      'feature':t.feature.tolist(),'threshold':t.threshold.tolist(),
-                      'value':t.value[:,0,0].tolist()})
-    prior = float(model.init_.class_prior_[1])
-    return {'initial_logit':math.log(prior/(1-prior)), 'learning_rate':float(model.learning_rate),'trees':trees}
-
-
-def tree_probability(model, values):
+def tree_probability(model, values, gain=1., raw=False):
+    offset_probability = float(np.asarray(values)[-1])
     x = np.asarray(values, dtype=np.float32)
     if x.ndim != 1 or not np.isfinite(x).all():
         raise ValueError('Invalid unified winner features')
@@ -170,19 +160,72 @@ def tree_probability(model, values):
             node = tree['left'][node] if x[f] <= tree['threshold'][node] else tree['right'][node]
         else:
             raise ValueError('Invalid serialized tree cycle')
+    if model.get('uses_original_offset'):
+        if raw:return float(logit)
+        return float(bounded_probability(offset_probability,logit,gain))
     return 1/(1+math.exp(-max(-35., min(35., logit))))
 
 
-def choose_weights(y, probabilities):
-    """Validation-only selection; include simple averaging and individual sources."""
-    candidates = [(1/3,1/3,1/3)]
-    candidates += [(i/4,j/4,(4-i-j)/4) for i in range(5) for j in range(5-i)]
-    trials = []
-    for w in candidates:
-        metric = scores(y, probabilities @ np.array(w))
-        trials.append(((-metric['accuracy'],metric['brier'],metric['log_loss']),w,metric))
-    _, weights, metric = min(trials, key=lambda t:t[0])
-    return list(weights), metric
+def original_functions():
+    """Reuse actual live fitting/calibration functions without API/UI imports."""
+    import ast
+    from pathlib import Path
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.pipeline import Pipeline
+    names = {'_nba_model_pipeline', '_nba_home_probabilities', '_nba_fit_calibrator',
+             '_nba_chronological_tail', '_nba_probability_metrics', '_nba_recent_holdout',
+             'train_balldontlie_live_model'}
+    constants = {'NBA_LIVE_FEATURE_COLUMNS','NBA_FEATURE_SCHEMA_VERSION','NBA_PROBABILITY_VERSION'}
+    path = Path(__file__).with_name('nba_research.py')
+    tree = ast.parse(path.read_text())
+    nodes = [n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name in names
+             or isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id in constants for t in n.targets)]
+    namespace = dict(np=np,pd=pd,LogisticRegression=LogisticRegression,
+                     StandardScaler=StandardScaler,Pipeline=Pipeline)
+    exec(compile(ast.Module(body=nodes,type_ignores=[]),str(path),'exec'),namespace)
+    if not names.issubset(namespace):raise ValueError('Live NBA fitting functions missing')
+    return namespace
+
+
+def original_probabilities(functions, model, frame, columns):
+    return functions['_nba_home_probabilities'](model['model'],frame[columns],model.get('calibrator'))
+
+
+def prior_original_forecasts(targets, history, columns, block_size=50):
+    """Expanding-date out-of-fold originals, never in-sample training predictions."""
+    functions = original_functions()
+    pending = targets.sort_values(['game_date','game_id']).copy()
+    output = []
+    while len(pending):
+        cutoff = pending.iloc[0]['game_date']
+        boundary = pending.iloc[min(block_size,len(pending))-1]['game_date']
+        batch = pending[pending.game_date<=boundary].copy()
+        pending = pending[pending.game_date>boundary]
+        prior = history[history.game_date<cutoff]
+        if len(prior)<500 or prior.home_win.nunique()!=2:
+            continue
+        model = functions['train_balldontlie_live_model'](prior,prediction_date=cutoff)
+        batch['original_probability'] = original_probabilities(functions,model,batch,columns)
+        batch['original_training_end'] = day(prior.game_date.max())
+        output.append(batch)
+    return pd.concat(output,ignore_index=True) if output else targets.iloc[:0].copy()
+
+
+def correction_inputs(frame, original_probabilities):
+    p = np.clip(np.asarray(original_probabilities,dtype=float),1e-7,1-1e-7)
+    neural = np.clip(frame.neural_probability.to_numpy(dtype=float),1e-7,1-1e-7)
+    x = frame[FEATURES].copy()
+    x['neural_logit_gap'] = np.log(neural/(1-neural))-np.log(p/(1-p))
+    # Last column is the unmodified original probability used by the offset.
+    x['original_probability'] = p
+    return x
+
+
+def bounded_probability(original, raw_correction, gain=1.):
+    p = np.clip(np.asarray(original,dtype=float),1e-7,1-1e-7)
+    logit = np.log(p/(1-p))+np.clip(gain*np.asarray(raw_correction),-.7,.7)
+    return 1/(1+np.exp(-np.clip(logit,-35,35)))
 
 
 def training_rows(games):
@@ -206,7 +249,7 @@ def training_rows(games):
             continue
         neural = predict(pd.DataFrame([r]),pd.Timestamp(g['date'],tz='UTC'))['learning_home_probability']
         rows.append(dict(r,neural_probability=neural,**extra))
-    return pd.DataFrame(rows), research['NBA_LIVE_FEATURE_COLUMNS']
+    return pd.DataFrame(rows), research['NBA_LIVE_FEATURE_COLUMNS'], base
 
 
 def train(client=None):
@@ -230,9 +273,9 @@ def train(client=None):
     games, aliases = compact_games(checkpoint,samples)
     samples.update({k:v for k,v in checkpoint.get('stats',{}).items() if k not in samples})
     games = add_players(games,samples)
-    frame, base_columns = training_rows(games)
+    frame, base_columns, original_history = training_rows(games)
     groups = partition_by_game_count(frame)
-    report = {'schema':1,'status':'waiting_for_history','training_performed':False,
+    report = {'schema':2,'architecture':'original_offset_neural_player_residual','status':'waiting_for_history','training_performed':False,
               'usable_games':len(frame),'partition_games':dict(zip(('train','validation','test'),map(len,groups))),
               'sports_api_requests':0,'live_model_changed':False,'reasons':[],
               'limitations':['Retrospective reconstruction, not an untouched benchmark.',
@@ -247,42 +290,72 @@ def train(client=None):
     if report['reasons']:
         client.write(ROOT+'latest_report.json',report,replace=True)
         print(json.dumps(report));return report
-    # The base is the existing live engine's model family, trained on the same
-    # earlier dates as the player model. It is not a new neural architecture.
-    original = Pipeline([('scaler',StandardScaler()),('model',LogisticRegression(C=.1,max_iter=2000,random_state=42))])
-    original.fit(groups[0][base_columns],groups[0].home_win)
-    columns = base_columns+FEATURES
-    player = GradientBoostingClassifier(n_estimators=100,learning_rate=.03,max_depth=2,
-                                        min_samples_leaf=30,random_state=42)
-    player.fit(groups[0][columns],groups[0].home_win)
-    def probabilities(g):
-        return np.column_stack([original.predict_proba(g[base_columns])[:,1],g.neural_probability.to_numpy(),
-                                player.predict_proba(g[columns])[:,1]])
-    weights,_ = choose_weights(groups[1].home_win, probabilities(groups[1]))
-    passed = True
+    # Learn only from original forecasts generated using strictly earlier dates.
+    correction_train = prior_original_forecasts(groups[0],original_history,base_columns)
+    report['correction_training_games'] = len(correction_train)
+    report['correction_training_method'] = 'expanding original engine; previous dates; 500-game minimum'
+    if len(correction_train)<200 or correction_train.home_win.nunique()!=2 or correction_train.home_win.value_counts().min()<20:
+        report['reasons'].append('Correction layer needs 200 out-of-fold forecasts and 20 of each outcome')
+        client.write(ROOT+'latest_report.json',report,replace=True)
+        print(json.dumps(report));return report
+    functions = original_functions()
+    cutoff = groups[1].game_date.min()
+    prior = original_history[original_history.game_date<cutoff]
+    original = functions['train_balldontlie_live_model'](prior,prediction_date=cutoff)
+    x = correction_inputs(correction_train,correction_train.original_probability)
+    columns = list(x.columns)
+    from sklearn.base import ClassifierMixin, BaseEstimator
+    class OriginalOffset(ClassifierMixin, BaseEstimator):
+        def fit(self,X,y,sample_weight=None):
+            self.classes_=np.array([0,1]);self.n_features_in_=np.asarray(X).shape[1]
+            return self
+        def predict_proba(self,X):
+            p=np.clip(np.asarray(X)[:,-1],1e-7,1-1e-7)
+            return np.column_stack([1-p,p])
+    residual = GradientBoostingClassifier(n_estimators=80,learning_rate=.025,max_depth=2,
+                min_samples_leaf=30,random_state=42,init=OriginalOffset())
+    residual.fit(x,correction_train.home_win)
+    trees=[]
+    for estimator in residual.estimators_[:,0]:
+        t=estimator.tree_
+        trees.append({'left':t.children_left.tolist(),'right':t.children_right.tolist(),
+                      'feature':t.feature.tolist(),'threshold':t.threshold.tolist(),'value':t.value[:,0,0].tolist()})
+    exported={'initial_logit':0.,'learning_rate':float(residual.learning_rate),'trees':trees,
+              'uses_original_offset':True}
+    report['learned_context_usage'] = {
+        'player_features':float(residual.feature_importances_[:-2].sum()),
+        'existing_neural_gap':float(residual.feature_importances_[-2]),
+        'original_probability':float(residual.feature_importances_[-1])}
+    # Validation selects how far to apply the same learned correction, never votes.
+    vp=original_probabilities(functions,original,groups[1],base_columns)
+    vx=correction_inputs(groups[1],vp)
+    raw=sum(residual.learning_rate * t.predict(vx.to_numpy()) for t in residual.estimators_[:,0])
+    gains=[0.,.25,.5,.75,1.]
+    gain=min(gains,key=lambda g:(-scores(groups[1].home_win,bounded_probability(vp,raw,g))['accuracy'],
+                               scores(groups[1].home_win,bounded_probability(vp,raw,g))['brier']))
+    passed=True
     for label,g in zip(('validation','test'),groups[1:]):
-        p = probabilities(g)
-        metric = {name:scores(g.home_win,p[:,i]) for i,name in enumerate(('original','neural','player'))}
-        metric['simple_average'] = scores(g.home_win,p.mean(axis=1))
-        metric['selected_combination'] = scores(g.home_win,p @ np.array(weights))
-        report[label] = metric
-        old,new = metric['original'],metric['selected_combination']
-        passed = passed and new['accuracy']>old['accuracy'] and new['brier']<=old['brier'] and new['log_loss']<=old['log_loss']
-    exported = export_trees(player)
-    reference = player.predict_proba(groups[2][columns])[:,1]
-    restored = np.array([tree_probability(exported,r) for r in groups[2][columns].to_numpy()])
-    if not np.allclose(reference,restored,atol=1e-10,rtol=0):
-        raise ValueError('Exported tree probabilities differ from trained model')
-    now = datetime.now(timezone.utc).isoformat()
-    artifact = {'schema':1,'trained_at':now,'context_refreshed_at':now,'columns':columns,
-                'base_columns':base_columns,'tree_model':exported,'weights':weights,'checks_passed':bool(passed),
-                'games':games,'aliases':aliases,'availability':{},'training_games':len(groups[0]),
-                'source_neural_model':'nba_winner_neural_v1'}
-    artifact['model_id'] = 'nba_unified_'+hashlib.sha256(json.dumps(artifact,sort_keys=True).encode()).hexdigest()[:16]
+        p=original_probabilities(functions,original,g,base_columns)
+        inputs=correction_inputs(g,p)
+        delta=sum(residual.learning_rate * t.predict(inputs.to_numpy()) for t in residual.estimators_[:,0])
+        connected=bounded_probability(p,delta,gain)
+        restored=np.array([tree_probability(exported,r,gain=gain) for r in inputs.to_numpy()])
+        if not np.allclose(connected,restored,atol=1e-10,rtol=0):
+            raise ValueError('Connected export differs from trained correction')
+        old,new=scores(g.home_win,p),scores(g.home_win,connected)
+        report[label]={'original_engine':old,'connected_engine':new,
+                       'changed_picks':int(np.sum((p>=.5)!=(connected>=.5)))}
+        passed=passed and new['accuracy']>old['accuracy'] and new['brier']<=old['brier'] and new['log_loss']<=old['log_loss']
+    now=datetime.now(timezone.utc).isoformat()
+    artifact={'schema':2,'architecture':'original_offset_neural_player_residual',
+              'trained_at':now,'context_refreshed_at':now,'columns':columns,'base_columns':base_columns,
+              'tree_model':exported,'correction_gain':gain,'checks_passed':bool(passed),
+              'games':games,'aliases':aliases,'availability':{},'training_games':len(correction_train),
+              'source_neural_model':'nba_winner_neural_v1'}
+    artifact['model_id']='nba_connected_'+hashlib.sha256(json.dumps(artifact,sort_keys=True).encode()).hexdigest()[:16]
     report.update(status='candidate_saved',training_performed=True,checks_passed=bool(passed),
-                  weights=dict(zip(('original','neural','player'),weights)),model_id=artifact['model_id'])
-    artifact['family_id'] = artifact['model_id']
-    artifact['report'] = report
+                  correction_gain=gain,model_id=artifact['model_id'],probability_averaging=False)
+    artifact['family_id']=artifact['model_id'];artifact['report']=report
     client.write(ROOT+'candidates/'+artifact['model_id']+'.json.gz',artifact,compressed=True)
     client.write(ARTIFACT,artifact,compressed=True,replace=True)
     client.write(ROOT+'latest_report.json',report,replace=True)
@@ -315,42 +388,38 @@ def fresh_availability(snapshot, now):
 
 
 def predict(artifact, base_features, original_probability, neural_probability, home, away, start):
-    """Return all three components and one combination; never train on UI thread."""
-    if not artifact or artifact.get('schema')!=1:return None
-    now,start = pd.Timestamp.now(tz='UTC'),pd.Timestamp(start)
+    """One original forecast, context inputs, then a jointly learned correction."""
+    if not artifact or artifact.get('schema')!=2:return None
+    now,start=pd.Timestamp.now(tz='UTC'),pd.Timestamp(start)
     if start.tzinfo is None:start=start.tz_localize('UTC')
     if (not now<start or pd.Timestamp(artifact['trained_at'])>=start or
-            not pd.Timedelta(0)<=now-pd.Timestamp(artifact['context_refreshed_at'])<=pd.Timedelta(hours=24)):
-        return None
-    probs = np.array([original_probability,neural_probability],dtype=float)
+            not pd.Timedelta(0)<=now-pd.Timestamp(artifact['context_refreshed_at'])<=pd.Timedelta(hours=24)):return None
+    probs=np.asarray([original_probability,neural_probability],dtype=float)
     if not np.isfinite(probs).all() or not ((probs>0)&(probs<1)).all():return None
-    h,a = artifact['aliases'].get(key(home)),artifact['aliases'].get(key(away))
+    h,a=artifact['aliases'].get(key(home)),artifact['aliases'].get(key(away))
     if not h or not a or h==a:return None
-    extra = player_features(artifact['games'],h,a,start)
+    extra=player_features(artifact['games'],h,a,start)
     if extra is None:return None
-    row = dict(base_features.iloc[0]);row.update(extra)
-    player = tree_probability(artifact['tree_model'],[row[c] for c in artifact['columns']])
-    components = [float(probs[0]),float(probs[1]),player]
-    w = np.asarray(artifact['weights'],dtype=float)
-    if w.shape!=(3,) or not np.isfinite(w).all() or (w<0).any() or not np.isclose(w.sum(),1):
-        raise ValueError('Invalid combination weights')
-    combined = float(np.dot(w,components))
-    status = 'Prior-rotation forecast; fresh availability unavailable'
-    conditional = None
-    availability = artifact.get('availability',{}).get(h+'|'+a)
+    row=dict(extra,neural_probability=float(probs[1]))
+    inputs=correction_inputs(pd.DataFrame([row]),[probs[0]])
+    values=inputs[artifact['columns']].iloc[0].to_numpy()
+    delta=tree_probability(artifact['tree_model'],values,raw=True)
+    connected=float(bounded_probability(probs[0],delta,artifact['correction_gain']))
+    conditional=None;status='Prior-player context; verified availability unavailable'
+    availability=artifact.get('availability',{}).get(h+'|'+a)
     if availability and pd.Timedelta(0)<=now-pd.Timestamp(availability['captured_at'])<=pd.Timedelta(hours=6) and abs((start-pd.Timestamp(availability['scheduled_start'])).total_seconds())<=900:
-        scenario = player_features(artifact['games'],h,a,start,availability['teams'])
+        scenario=player_features(artifact['games'],h,a,start,availability['teams'])
         if scenario is not None:
-            scenario_row = dict(base_features.iloc[0]);scenario_row.update(scenario)
-            scenario_player = tree_probability(artifact['tree_model'],[scenario_row[c] for c in artifact['columns']])
-            conditional = float(np.dot(w,[components[0],components[1],scenario_player]))
-            status = 'Fresh availability scenario shown separately; injury effects not historically validated'
+            sx=correction_inputs(pd.DataFrame([dict(scenario,neural_probability=float(probs[1]))]),[probs[0]])
+            conditional=tree_probability(artifact['tree_model'],sx[artifact['columns']].iloc[0].to_numpy(),gain=artifact['correction_gain'])
+            status='Fresh availability scenario separate; historical injury effect not validated'
     return {'model_id':artifact['model_id'],'source_player_model_id':artifact.get('family_id',artifact['model_id']),
-            'original_home_probability':components[0],
-            'neural_home_probability':components[1],'player_home_probability':player,
-            'combined_home_probability':combined,'simple_average_home_probability':float(np.mean(components)),
+            'architecture':'original_offset_neural_player_residual','original_home_probability':float(probs[0]),
+            'neural_home_probability':float(probs[1]),'raw_correction_logit':delta,
+            'connected_home_probability':connected,'combined_home_probability':connected,
+            'correction_gain':artifact['correction_gain'],'probability_averaging':False,
             'availability_scenario_home_probability':conditional,'availability_status':status,
-            'weights':w.tolist(),'checks_passed':bool(artifact['checks_passed'])}
+            'checks_passed':bool(artifact['checks_passed'])}
 
 
 def refresh(client=None):
@@ -392,7 +461,7 @@ def refresh(client=None):
     client.write(ARTIFACT,artifact,compressed=True,replace=True)
     comparison = grade(client,checkpoint)
     learn_from_results(client,artifact,comparison)
-    print(json.dumps({'status':'unified_context_refreshed','weights_changed':False,'sports_api_requests':0,
+    print(json.dumps({'status':'unified_context_refreshed','tree_weights_changed':False,'sports_api_requests':0,
                       'fresh_matchup_reports':len(availability)}))
 
 
@@ -463,8 +532,7 @@ def grade(client, checkpoint):
         rows=[r for r in state['results'].values() if r['model_id']==model]
         y=np.array([r['outcome'] for r in rows])
         summaries.append({'model_id':model,'graded_games':len(rows),**{name:scores(y,np.array([r[field] for r in rows])) for name,field in
-                         [('original','original_home_probability'),('neural','neural_home_probability'),('player','player_home_probability'),
-                          ('combined','combined_home_probability'),('simple_average','simple_average_home_probability')]}})
+                         [('original','original_home_probability'),('connected','connected_home_probability')]}})
     state['summaries']=summaries
     client.write(ROOT+'comparison.json.gz',state,compressed=True,replace=True)
     print(json.dumps({'status':'unified_comparison','graded_games':len(state['results']),'summaries':summaries,'sports_api_requests':0}))
@@ -472,70 +540,53 @@ def grade(client, checkpoint):
 
 
 def learn_from_results(client, artifact, state):
-    """Update only combination weights using genuine earlier paired forecasts.
-
-    Player/tree weights remain fixed. Whole-date splits and observed-label
-    purging ensure results were known before later forecasts were captured.
-    """
-    family = artifact.get('family_id',artifact['model_id'])
-    earliest = {}
+    """Prospective calibration of correction strength, never probability weights."""
+    family=artifact.get('family_id',artifact['model_id'])
+    earliest={}
     for r in state.get('results',{}).values():
-        if r.get('source_player_model_id')!=family or not r.get('label_observed_at'):
-            continue
-        if str(r.get('original_model_version','3'))!='3':continue
-        event = r['event_id']
-        if event not in earliest or pd.Timestamp(r['captured_at'])<pd.Timestamp(earliest[event]['captured_at']):
-            earliest[event]=r
-    rows = sorted(earliest.values(),key=lambda r:(r['start_time'],r['event_id']))
-    report = {'status':'waiting_for_prospective_pairs','graded_unique_games':len(rows),
-              'weights_changed':False,'sports_api_requests':0,'minimum_games':{'train':80,'validation':25,'test':25}}
+        if r.get('source_player_model_id')!=family or r.get('architecture')!='original_offset_neural_player_residual' or not r.get('label_observed_at'):continue
+        event=r['event_id']
+        if event not in earliest or pd.Timestamp(r['captured_at'])<pd.Timestamp(earliest[event]['captured_at']):earliest[event]=r
+    rows=sorted(earliest.values(),key=lambda r:(r['start_time'],r['event_id']))
+    report={'status':'waiting_for_connected_results','graded_unique_games':len(rows),
+            'correction_changed':False,'sports_api_requests':0,'minimum_games':{'train':80,'validation':25,'test':25}}
     if len(rows)<130 or len(rows)<artifact.get('last_learning_count',0)+30:
         client.write(ROOT+'learning_report.json',report,replace=True);return report
-    # Boundaries depend only on counts and dates, not win/loss outcomes.
-    dates = sorted({r['start_time'][:10] for r in rows})
-    candidates = []
-    for a in dates[1:-1]:
-        n1 = sum(r['start_time'][:10]<a for r in rows)
-        for b in dates[dates.index(a)+1:]:
-            n2 = sum(a<=r['start_time'][:10]<b for r in rows)
-            n3 = len(rows)-n1-n2
-            if n1>=80 and n2>=25 and n3>=25:
-                candidates.append(((n1-.6*len(rows))**2+(n2-.2*len(rows))**2+(n3-.2*len(rows))**2,a,b))
+    dates=sorted({r['start_time'][:10] for r in rows})
+    candidates=[]
+    for i,a in enumerate(dates[1:-1],1):
+        n1=sum(r['start_time'][:10]<a for r in rows)
+        for b in dates[i+1:]:
+            n2=sum(a<=r['start_time'][:10]<b for r in rows);n3=len(rows)-n1-n2
+            if n1>=80 and n2>=25 and n3>=25:candidates.append(((n1-.6*len(rows))**2+(n2-.2*len(rows))**2+(n3-.2*len(rows))**2,a,b))
     if not candidates:
         client.write(ROOT+'learning_report.json',report,replace=True);return report
-    _,a,b = min(candidates)
-    groups = [[r for r in rows if r['start_time'][:10]<a],
-              [r for r in rows if a<=r['start_time'][:10]<b],
-              [r for r in rows if r['start_time'][:10]>=b]]
+    _,a,b=min(candidates)
+    groups=[[r for r in rows if r['start_time'][:10]<a],[r for r in rows if a<=r['start_time'][:10]<b],[r for r in rows if r['start_time'][:10]>=b]]
     for i in (0,1):
-        boundary = min(pd.Timestamp(r['captured_at']) for g in groups[i+1:] for r in g)
-        groups[i] = [r for r in groups[i] if pd.Timestamp(r['label_observed_at'])<boundary]
+        boundary=min(pd.Timestamp(r['captured_at']) for g in groups[i+1:] for r in g)
+        groups[i]=[r for r in groups[i] if pd.Timestamp(r['label_observed_at'])<boundary]
     report['partition_games']=dict(zip(('train','validation','test'),map(len,groups)))
-    if any(len(g)<n or min(sum(r['outcome']==v for r in g) for v in (0,1))<5
-           for g,n in zip(groups,(80,25,25))):
+    if any(len(g)<n or min(sum(r['outcome']==v for r in g) for v in (0,1))<5 for g,n in zip(groups,(80,25,25))):
         client.write(ROOT+'learning_report.json',report,replace=True);return report
-    def matrix(g):
-        return np.array([[r[k] for k in ('original_home_probability','neural_home_probability','player_home_probability')] for r in g])
-    fitted,_=choose_weights(np.array([r['outcome'] for r in groups[0]]),matrix(groups[0]))
-    alternatives=[artifact['weights'],[1/3]*3,fitted,[1.,0.,0.]]
-    validation=groups[1];vp=matrix(validation);vy=np.array([r['outcome'] for r in validation])
-    weights=min(alternatives,key=lambda w:(-scores(vy,vp@np.array(w))['accuracy'],scores(vy,vp@np.array(w))['brier']))
+    def metric(g,gain):
+        return scores(np.array([r['outcome'] for r in g]),bounded_probability(
+            [r['original_home_probability'] for r in g],[r['raw_correction_logit'] for r in g],gain))
+    def rank(g,gain):
+        m=metric(g,gain);return -m['accuracy'],m['brier'],m['log_loss']
+    fitted=min([0.,.25,.5,.75,1.],key=lambda gain:rank(groups[0],gain))
+    gain=min([artifact['correction_gain'],0.,fitted],key=lambda v:rank(groups[1],v))
     passed=True
     for label,g in zip(('validation','test'),groups[1:]):
-        p=matrix(g);y=np.array([r['outcome'] for r in g])
-        before=scores(y,p@np.array(artifact['weights']))
-        original=scores(y,p[:,0]);after=scores(y,p@np.array(weights))
-        report[label]={'previous_combination':before,'original':original,'proposed_combination':after}
-        passed=passed and all(after['accuracy']>m['accuracy'] and after['brier']<=m['brier'] and after['log_loss']<=m['log_loss'] for m in (before,original))
-    report.update(status='prospective_weights_reviewed',proposed_weights=weights,checks_passed=bool(passed))
+        old,original,new=metric(g,artifact['correction_gain']),metric(g,0.),metric(g,gain)
+        report[label]={'previous_connected':old,'original':original,'proposed_connected':new}
+        passed=passed and all(new['accuracy']>m['accuracy'] and new['brier']<=m['brier'] and new['log_loss']<=m['log_loss'] for m in (old,original))
+    report.update(status='connected_correction_reviewed',proposed_gain=gain,checks_passed=bool(passed))
     artifact['last_learning_count']=len(rows)
     if passed:
-        artifact['weights']=list(weights)
-        artifact['weights_learned_at']=datetime.now(timezone.utc).isoformat()
-        artifact['model_id']='nba_unified_'+hashlib.sha256(json.dumps([family,weights,[r['event_id'] for r in rows]]).encode()).hexdigest()[:16]
-        artifact['checks_passed']=True
-        report['weights_changed']=True
-        report['model_id']=artifact['model_id']
+        artifact['correction_gain']=gain;artifact['checks_passed']=True
+        artifact['model_id']='nba_connected_'+hashlib.sha256(json.dumps([family,gain,[r['event_id'] for r in rows]]).encode()).hexdigest()[:16]
+        report.update(correction_changed=True,model_id=artifact['model_id'])
         client.write(ROOT+'candidates/'+artifact['model_id']+'.json.gz',artifact,compressed=True)
     client.write(ARTIFACT,artifact,compressed=True,replace=True)
     client.write(ROOT+'learning_report.json',report,replace=True)
