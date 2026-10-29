@@ -59,6 +59,9 @@ def run_nfl_prediction_pipeline(
     feature_games,
     historical_accuracy=None,
     historical_sample=None,
+    *,
+    live_odds=None,
+    on_progress=None,
 ):
     """
     Run the complete NFL live prediction pipeline.
@@ -105,7 +108,8 @@ def run_nfl_prediction_pipeline(
     # 2. LOAD LIVE NFL MONEYLINES
     # ==========================================
 
-    live_odds = get_live_nfl_moneylines()
+    if live_odds is None:
+        live_odds = get_live_nfl_moneylines()
 
     if live_odds is None:
         raise ValueError(
@@ -173,7 +177,9 @@ def run_nfl_prediction_pipeline(
 
     best_lines = nfl_week_rows(best_lines, now=current_time)
 
-    for _, game in best_lines.iterrows():
+    for matchup_number, (_, game) in enumerate(best_lines.iterrows(), 1):
+        if on_progress is not None:
+            on_progress(f"Calculating NFL matchup {matchup_number} of {len(best_lines)}")
 
         home_team = game["home_team"]
         away_team = game["away_team"]
