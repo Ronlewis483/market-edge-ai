@@ -197,6 +197,8 @@ def _cached_nba_unified_bundle():
     artifact = _nba_unified_client().read(ARTIFACT, compressed=True)
     if artifact is None:
         raise FileNotFoundError('Train NBA unified winner first')
+    if artifact.get('schema') != 2:
+        raise ValueError('Connected NBA model needs training')
     return artifact
 
 
@@ -486,7 +488,7 @@ def run_nba_prediction_pipeline(
                             raw_home_win_probability=p, calibration_games=0,
                             probability_version=unified_forecast['model_id'],
                             winner_model_id=unified_forecast['model_id'],
-                            calibration_status='Three-source NBA ensemble · live accuracy tracked separately')
+                            calibration_status='Connected NBA engine · original forecast with learned neural/player correction')
                         unified_used = True
                         box_used = False
                     unified_issue = 'Applied' if unified_used else 'Saved for comparison; current engine retained'
