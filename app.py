@@ -2441,7 +2441,8 @@ def run_nfl_prediction_with_addons(feature_games, historical_accuracy=None, hist
     pending = st.session_state.get('nfl_enrichment_future')
     if pending is not None and not pending.done():
         return st.session_state.get('nfl_prediction_pipeline_result') or {}
-    feature_games = nfl_prediction_features()
+    if feature_games is None:
+        feature_games = nfl_prediction_features()
     previous = st.session_state.get("nfl_prediction_pipeline_result") or {}
     remember_game_addons("NFL", previous)
     result = run_nfl_prediction_pipeline(feature_games=feature_games,
@@ -3070,36 +3071,65 @@ def render_game_addons(league, game, result):
             st.caption("Ranked by estimated cover chance. Estimates are not calibrated future probabilities." if league == "NFL" else "Ordered from strongest to weakest within this game. Prop estimates and ranking scores are not calibrated future probabilities.")
 
 
-def nfl_prediction_features():
-    """Rebuild from refreshed final results; session history is never the authority."""
+@st.cache_data(show_spinner=False, max_entries=4)
+def cached_nfl_history_features(history):
+    """Reuse identical completed results across sessions; score changes invalidate."""
+    features = build_nfl_pregame_features(history)
+    if features is None or features.empty:
+        raise ValueError('Fresh NFL completed results produced no usable features.')
+    return features
+
+
+def load_nfl_history_bundle():
+    """Read and build history without accessing session state (worker safe)."""
     from dual_agent.nfl_live_context import fresh_schedule, completed_history
     schedule, fetched = fresh_schedule()
     history = completed_history(schedule)
     if history.empty:
         raise ValueError('Current NFL completed-game history unavailable; stale features were not silently reused.')
-    signature = pd.util.hash_pandas_object(history[['game_id','home_score','away_score']],index=False).sum().item()
-    if st.session_state.get('nfl_history_signature') != signature or st.session_state.get('nfl_live_feature_games') is None:
-        features = build_nfl_pregame_features(history)
-        if features is None or features.empty:
-            raise ValueError('Fresh NFL completed results produced no usable features.')
-        st.session_state['nfl_live_feature_games'] = features
-        st.session_state['nfl_feature_games'] = features
-        st.session_state['multi_nfl_games'] = history
-        st.session_state['nfl_history_signature'] = signature
+    features = cached_nfl_history_features(history)
+    return history, features, fetched
+
+
+def install_nfl_history_bundle(bundle):
+    history, features, fetched = bundle
+    st.session_state['nfl_live_feature_games'] = features
+    st.session_state['nfl_feature_games'] = features
+    st.session_state['multi_nfl_games'] = history
     st.session_state['nfl_history_fetched_at'] = fetched
     st.session_state['nfl_latest_completed_game'] = history.start_time.max().isoformat()
-    return st.session_state['nfl_live_feature_games']
+    return features
+
+
+def nfl_prediction_features():
+    """Prediction requests verify current results; unchanged history reuses features."""
+    return install_nfl_history_bundle(load_nfl_history_bundle())
 
 
 @st.fragment(run_every='180s')
 def render_nfl_freshness_monitor():
-    try:
-        nfl_prediction_features()
-        stamp = pd.Timestamp(st.session_state['nfl_history_fetched_at']).tz_convert('America/Chicago')
-        latest = pd.Timestamp(st.session_state['nfl_latest_completed_game']).tz_convert('America/Chicago')
-        st.caption(f"History checked {stamp.strftime('%b %d · %I:%M %p CT')} · latest completed game {latest.strftime('%b %d, %Y')} · checks every 3 minutes while this page is open")
-    except Exception as exc:
-        st.warning('NFL history refresh unavailable: ' + str(exc))
+    # Rendering saved cards must never wait for the schedule network request.
+    pending = st.session_state.get('nfl_history_refresh_future')
+    if pending is not None and pending.done():
+        try:
+            install_nfl_history_bundle(pending.result())
+            st.session_state.pop('nfl_history_refresh_issue', None)
+        except Exception as exc:
+            st.session_state['nfl_history_refresh_issue'] = str(exc)
+        st.session_state.pop('nfl_history_refresh_future', None)
+        pending = None
+    checked = pd.to_datetime(st.session_state.get('nfl_history_fetched_at'), utc=True, errors='coerce')
+    if pending is None and (pd.isna(checked) or pd.Timestamp.now(tz='UTC')-checked >= pd.Timedelta(seconds=180)):
+        st.session_state['nfl_history_refresh_future'] = nfl_enrichment_pool().submit(load_nfl_history_bundle)
+    if pd.notna(checked):
+        stamp = checked.tz_convert('America/Chicago')
+        latest = pd.to_datetime(st.session_state.get('nfl_latest_completed_game'),utc=True,errors='coerce')
+        label = '' if pd.isna(latest) else ' · latest completed game '+latest.tz_convert('America/Chicago').strftime('%b %d, %Y')
+        st.caption(f"History checked {stamp.strftime('%b %d · %I:%M %p CT')}{label} · refresh checks run in the background")
+    else:
+        st.caption('NFL history is refreshing in the background; saved cards remain available.')
+    if st.session_state.get('nfl_history_refresh_issue'):
+        st.warning('NFL history refresh unavailable: '+st.session_state['nfl_history_refresh_issue'])
 
 
 @st.fragment(run_every='3s')
