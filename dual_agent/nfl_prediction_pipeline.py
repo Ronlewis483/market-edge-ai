@@ -16,6 +16,7 @@ Workflow:
 """
 
 import pandas as pd
+import time
 
 from dual_agent.nfl_odds import (
     get_live_nfl_moneylines,
@@ -79,6 +80,9 @@ def run_nfl_prediction_pipeline(
         Live odds, best lines, upcoming predictions,
         market opportunities, and any per-game errors.
     """
+
+    pipeline_clock = time.perf_counter()
+    model_fits = 0
 
     # ==========================================
     # 1. VALIDATE HISTORICAL FEATURES
@@ -203,14 +207,23 @@ def run_nfl_prediction_pipeline(
                 )
             )
 
-            prediction = predict_nfl_matchup(
+            from dual_agent.nfl_connected_engine import predict_original_cached
+            prediction = predict_original_cached(
                 feature_games=feature_games,
                 future_features=future_features,
             )
 
+            model_fits += int(not prediction.get('original_model_cache_hit'))
+
             prediction_rows.append(
                 {
                     "commence_time": game_time,
+                    "original_home_win_probability": prediction['home_win_probability'],
+                    "connected_features": {k: float(future_features.iloc[0][k]) for k in
+                        ('win_pct_diff','avg_point_diff_diff','recent_5_win_pct_diff','recent_5_point_diff_diff','rest_diff')},
+                    "connected_status": "Initial team forecast · current context loading in background",
+                    "input_status": "Initial team forecast · current context loading in background",
+                    "connected_applied": False,
                     "away_team": away_team,
                     "home_team": home_team,
                     "predicted_team":
@@ -262,6 +275,13 @@ def run_nfl_prediction_pipeline(
 
     predictions = nfl_week_rows(predictions, now=current_time)
 
+    # Context, correction model loads and forecast persistence run in the
+    # existing app worker, not on the first-card path.
+    import hashlib
+    import inspect
+    connected_base_id = 'nfl_live:' + hashlib.sha256(inspect.getsource(predict_nfl_matchup).encode()).hexdigest()[:20]
+    connected_issue = None
+
     # ==========================================
     # 5. BUILD LIVE NFL OPPORTUNITIES
     # ==========================================
@@ -286,4 +306,11 @@ def run_nfl_prediction_pipeline(
         "predictions": predictions,
         "opportunities": opportunities,
         "prediction_errors": prediction_errors,
+        "connected_learning_issue": connected_issue,
+        "connected_base_id": connected_base_id,
+        "connected_historical_accuracy": historical_accuracy,
+        "connected_historical_sample": historical_sample,
+        "connected_context_pending": True,
+        "nfl_original_model_fits": model_fits,
+        "nfl_stage_timings_seconds": {"initial_predictions": round(time.perf_counter()-pipeline_clock, 3)},
     }
