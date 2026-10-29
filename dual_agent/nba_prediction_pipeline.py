@@ -394,8 +394,12 @@ def run_nba_prediction_pipeline(
         f"{len(unique_games)} games..."
     )
 
+    connected_enabled = str(_nba_box_setting('NBA_UNIFIED_WINNER_ENABLED', 'true')).lower() == 'true'
     unified_artifact, unified_status = _load_nba_unified_winner()
-    box_artifact, box_status = _load_nba_box_context()
+    if connected_enabled:
+        box_artifact, box_status = None, 'Connected engine selected; original engine is the fallback'
+    else:
+        box_artifact, box_status = _load_nba_box_context()
     prediction_rows = []
     prediction_errors = []
 
@@ -479,8 +483,9 @@ def run_nba_prediction_pipeline(
                         home_team, away_team, game['commence_time'])
                     if unified_forecast is not None:
                         unified_forecast['original_model_version'] = original_prediction.get('probability_version', 3)
-                    activated = str(_nba_box_setting('NBA_UNIFIED_WINNER_ENABLED', 'false')).lower() == 'true'
-                    if unified_forecast is not None and activated and unified_forecast['checks_passed']:
+                    # User explicitly selected the connected engine. Historical
+                    # checks remain diagnostic; never rewrite them as passed.
+                    if unified_forecast is not None and connected_enabled:
                         p = unified_forecast['combined_home_probability']
                         prediction = dict(original_prediction,
                             home_win_probability=p, away_win_probability=1-p,
@@ -491,7 +496,13 @@ def run_nba_prediction_pipeline(
                             calibration_status='Connected NBA engine · original forecast with learned neural/player correction')
                         unified_used = True
                         box_used = False
-                    unified_issue = 'Applied' if unified_used else 'Saved for comparison; current engine retained'
+                    if unified_used:
+                        unified_issue = 'Connected engine active; forecasts saved for learning'
+                        unified_forecast['activation_basis'] = 'user_requested'
+                    elif unified_forecast is None:
+                        unified_issue = 'Connected inputs missing or stale; original engine retained'
+                    else:
+                        unified_issue = 'Connected engine disabled by setting; comparison saved'
                 except Exception as exc:
                     unified_issue = 'Unified winner unavailable (' + type(exc).__name__ + '); current engine retained'
 
