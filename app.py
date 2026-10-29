@@ -2387,11 +2387,21 @@ def enrich_nfl_result(result, feature_games, odds_key, progress_queue=None, cont
             checkpoint('NFL',partial); track('NFL',partial)
         except Exception:
             partial['workspace_issue'] = 'NFL predictions are ready; local saving is unavailable.'
+    from time import perf_counter
+    context_clock = perf_counter()
     try:
         from dual_agent.nfl_live_context import attach_context
         result['predictions'] = attach_context(result.get('predictions'), result.get('live_odds'))
     except Exception as exc:
         result['context_issue'] = 'NFL context retrieval unavailable (' + type(exc).__name__ + ')'
+    result.setdefault('nfl_stage_timings_seconds', {})['context'] = round(perf_counter()-context_clock, 3)
+    correction_clock = perf_counter()
+    try:
+        from dual_agent.nfl_connected_engine import finalize_connected_result
+        result = finalize_connected_result(result)
+    except Exception as exc:
+        result['connected_learning_issue'] = 'NFL connected finalization unavailable (' + type(exc).__name__ + ')'
+    result.setdefault('nfl_stage_timings_seconds', {})['connected_finalization'] = round(perf_counter()-correction_clock, 3)
     if progress_queue is not None:
         progress_queue.put(copy.deepcopy(result))
     try:
