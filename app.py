@@ -752,11 +752,8 @@ def render_league_prediction_results(
                 for label, seconds in load_times.items():
                     st.caption(f'{label}: {seconds:.1f} seconds')
 
-    if league_name == 'NFL':
-        saved = pd.to_datetime(pipeline_result.get('workspace_saved_at',pipeline_result.get('saved_at')),utc=True,errors='coerce')
-        if pd.notna(saved) and pd.Timestamp.now(tz='UTC')-saved>pd.Timedelta(minutes=30):
-            pending = st.session_state.get('nfl_enrichment_future')
-            if pending is None: pipeline_result = start_cross_refresh('NFL',pipeline_result)
+    # Viewing saved NFL cards never starts a paid prop scan. Explicit Generate
+    # and Refresh controls own scans; stale-price warnings remain visible.
     predictions = pipeline_result.get("all_predictions", pipeline_result.get("predictions"))
     opportunities = pipeline_result.get("opportunities")
     if league_name == "NFL":
@@ -1733,9 +1730,6 @@ def restore_cross_result(league):
     if saved:
         st.session_state[state] = saved
         remember_game_addons(league,saved)
-        stamp = pd.to_datetime(saved.get('workspace_saved_at'),utc=True,errors='coerce')
-        if league=='NFL' and pd.notna(stamp) and pd.Timestamp.now(tz='UTC')-stamp>pd.Timedelta(minutes=30):
-            return start_cross_refresh(league,saved)
     return saved
 
 
@@ -1768,6 +1762,7 @@ def start_cross_refresh(league, result, feature_games=None):
         pipeline = load_mlb_prediction_pipeline()
         future = nba_enrichment_pool().submit(enrich_mlb_workspace,result,pipeline,odds_key,queue,context)
     st.session_state[key+'_enrichment_future'] = future
+    if league == 'NFL': st.session_state['nfl_scan_was_running'] = True
     return result
 
 
@@ -1841,8 +1836,12 @@ def drain_cross_updates(league):
         st.session_state.pop(key+'_enrichment_updates',None)
 
 
-@st.fragment(run_every='3s')
 def render_cross_prop_cards(league, game, fallback):
+    interval = '3s' if league != 'NFL' or st.session_state.get('nfl_enrichment_future') is not None else None
+    return st.fragment(run_every=interval)(_render_cross_prop_cards)(league, game, fallback)
+
+
+def _render_cross_prop_cards(league, game, fallback):
     """Refresh game-local cards only; this fragment never fetches odds/stats."""
     from dual_agent.sports_prop_workspace import prop_rows,normalized
     from dual_agent.game_prediction_addons import matching_game_rows
@@ -2020,17 +2019,20 @@ def enrich_nba_props(result, odds_key, nba_key, updates, context=None):
     result = copy.deepcopy(result)
     try:
         from dual_agent.sports_player_prop_predictions import generate_player_prop_picks, save_nba_prop_results
+        from time import monotonic
+        last_progress_save = 0.0
         def publish_progress(props):
+            nonlocal last_progress_save
             partial = copy.deepcopy(result)
             partial['player_props'] = merge_nba_display_props(result.get('player_props', {}), props)
-            save_nba_prop_results(partial)
             partial['nba_props_pending'] = True
+            # Display first; do not rescan the tracking ledger on each status tick.
             updates.put(partial)
-            try:
-                from dual_agent.sports_player_prop_predictions import update_nba_prop_tracking
-                update_nba_prop_tracking(partial['player_props'])
-            except Exception:
-                pass
+            now = monotonic()
+            has_picks = bool(props.get('game_picks') or props.get('picks'))
+            if has_picks and now-last_progress_save >= 15:
+                last_progress_save = now
+                save_nba_prop_results(partial)
         result['player_props'] = generate_player_prop_picks('NBA',
             result['all_predictions'].sort_values('commence_time', kind='stable').to_dict('records'), odds_key, nba_key=nba_key,
             progress=publish_progress, nba_history_enabled=True)
@@ -2435,7 +2437,7 @@ def enrich_nfl_result(result, feature_games, odds_key, progress_queue=None, cont
     return result
 
 
-@st.fragment(run_every='3s')
+@st.fragment
 def render_nfl_enrichment_status():
     drain_cross_updates('NFL')
     current = st.session_state.get('nfl_prediction_pipeline_result') or {}
@@ -2531,6 +2533,7 @@ def start_nfl_prediction_request():
     st.session_state.pop('nfl_generation_issue', None)
     revision = uuid4().hex
     st.session_state['nfl_requested_winner_revision'] = revision
+    st.session_state['nfl_scan_was_running'] = True
     st.session_state['nfl_enrichment_future'] = nfl_generation_pool().submit(
         generate_nfl_in_background, previous,
         st.session_state.get('nfl_historical_accuracy'),
@@ -2540,8 +2543,12 @@ def start_nfl_prediction_request():
     return True
 
 
-@st.fragment(run_every='3s')
 def render_nfl_generation_progress():
+    interval = '3s' if st.session_state.get('nfl_enrichment_future') is not None else None
+    return st.fragment(run_every=interval)(_render_nfl_generation_progress)()
+
+
+def _render_nfl_generation_progress():
     """Mounted even before the first result; publish winner cards before props finish."""
     from queue import Empty
     progress = st.session_state.get('nfl_generation_progress')
@@ -2573,6 +2580,8 @@ def render_nfl_generation_progress():
             st.session_state[session_key] = current.get(result_key)
         retain_nfl_picks(predictions, 'nfl_saved_team_cards')
         st.rerun()  # One full redraw per new winner slate, not per props update.
+    if st.session_state.get('nfl_enrichment_future') is None and st.session_state.pop('nfl_scan_was_running', False):
+        st.rerun()  # One completion redraw removes all NFL polling timers.
     if st.session_state.get('nfl_generation_issue'):
         st.error(st.session_state['nfl_generation_issue'])
     elif st.session_state.get('nfl_enrichment_future') is not None:
@@ -3258,7 +3267,7 @@ def render_nfl_freshness_monitor():
         st.warning('NFL history refresh unavailable: '+st.session_state['nfl_history_refresh_issue'])
 
 
-@st.fragment(run_every='3s')
+@st.fragment
 def render_nfl_game_context(game):
     from dual_agent.game_prediction_addons import matching_game_rows
     latest = (st.session_state.get('nfl_prediction_pipeline_result') or {}).get('predictions')
