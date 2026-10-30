@@ -46,12 +46,20 @@ def _player_keys(name):
     return keys
 
 
+def build_player_history_index(history):
+    """Positions into this exact history frame, grouped once per scan."""
+    if history is None or history.empty:
+        return {}
+    return history.groupby(['player_key', 'market'], sort=False).indices
+
+
 def _historical_player_games(
     history,
     player,
     market,
     kickoff,
     window=12,
+    history_index=None,
 ):
     """Return leakage-safe historical games before kickoff."""
 
@@ -60,10 +68,14 @@ def _historical_player_games(
 
     player_keys = _player_keys(player)
 
-    games = history.loc[
-        history["player_key"].isin(player_keys)
-        & (history["market"] == market)
-    ].copy()
+    if history_index is None:
+        games = history.loc[
+            history['player_key'].isin(player_keys) & (history['market'] == market)
+        ].copy()
+    else:
+        positions = sorted({int(i) for key in player_keys
+            for i in history_index.get((key, market), ())})
+        games = history.iloc[positions].copy()
 
     if games.empty:
         return games
@@ -394,6 +406,7 @@ def run_nfl_player_prop_prediction_pipeline(
     horizon_days=1,
     retain_all_qualified=False,
     include_value_candidates=False,
+    history_index=None,
 ):
     """
     Generate and rank future player-prop forecasts within the requested horizon.
@@ -426,6 +439,9 @@ def run_nfl_player_prop_prediction_pipeline(
 
     if player_history.empty:
         return pd.DataFrame()
+
+    if history_index is None:
+        history_index = build_player_history_index(player_history)
 
     market_lookup = {
         value: name
@@ -501,6 +517,7 @@ def run_nfl_player_prop_prediction_pipeline(
                 market=market,
                 kickoff=kickoff,
                 window=window,
+                history_index=history_index,
             )
         )
 
