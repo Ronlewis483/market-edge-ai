@@ -346,7 +346,7 @@ def attach_qb_forecasts(predictions, history, lines=None):
     return frame
 
 
-def nfl_prop_market_diagnostics(event, lines, history, forecasts, source_issue=None):
+def nfl_prop_market_diagnostics(event, lines, history, forecasts, source_issue=None, history_index=None):
     """Trace every configured category using collected data; never fetch odds."""
     from dual_agent.nfl_player_props import MARKETS
     from dual_agent.nfl_player_prop_prediction_pipeline import (
@@ -365,7 +365,7 @@ def nfl_prop_market_diagnostics(event, lines, history, forecasts, source_issue=N
             if history is None or history.empty:
                 unmatched.add(candidate.player); continue
             games = _historical_player_games(history, candidate.player, label,
-                pd.Timestamp(candidate.game_time), window=12)
+                pd.Timestamp(candidate.game_time), window=12, history_index=history_index)
             if games.empty:
                 unmatched.add(candidate.player); continue
             values = games.value.to_numpy(dtype=float)
@@ -459,54 +459,14 @@ def automatic_nfl_props(predictions, key, on_props=None):
             data, _ = job.result()
             frames.append(normalize_props(data))
         return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(), notes
-    # Quote batches share one bounded pool across the entire slate.
-    with ThreadPoolExecutor(max_workers=6) as quote_pool, ThreadPoolExecutor(max_workers=4) as pool:
-        history_job = pool.submit(cached_player_history, (2025,2026))
-        pending = {pool.submit(load, event): event for event in selected}
-        for future in as_completed(pending):
-            event = pending[future]
-            try:
-                frame, notes = future.result()
-                frames_by_event[event['id']] = frame
-                issues.extend(f"{event.get('away_team')} @ {event.get('home_team')}: {note}" for note in notes)
-                if not frame.empty:
-                    frames.append(frame)
-                else:
-                    issues.append(f"{event.get('away_team')} @ {event.get('home_team')}: no offered prop lines.")
-            except Exception as exc:
-                fetch_errors[event['id']] = f'Prop listings could not be loaded ({type(exc).__name__}).'
-                issues.append(f"{event.get('away_team')} @ {event.get('home_team')}: {fetch_errors[event['id']]}")
-    if not frames:
-        empty = pd.DataFrame()
-        empty.attrs['prop_diagnostics'] = [row for event in selected
-            for row in nfl_prop_market_diagnostics(event, frames_by_event.get(event['id']), None, None,
-                fetch_errors.get(event['id']))]
-        return empty, issues
-    try:
-        history = history_job.result()
-    except Exception as exc:
-        history = pd.DataFrame()
-        issues.append(f'NFL player history could not be loaded ({type(exc).__name__}).')
-    if history is None or len(history) == 0:
-        empty = pd.DataFrame()
-        empty.attrs['prop_diagnostics'] = [row for event in selected
-            for row in nfl_prop_market_diagnostics(event, frames_by_event.get(event['id']), history, None)]
-        return empty, issues + [f"{e.get('away_team')} @ {e.get('home_team')}: sportsbook props were found, but NFL player history is empty. Check the player-history data source." for e in selected]
-
-    # The existing pipeline selects its top players internally. Run that same
-    # equation per event so the slate-wide player limit cannot starve a game.
     forecasts = []
-    lines = pd.concat(frames, ignore_index=True)
-    if 'game_time' in lines: lines = lines.sort_values('game_time',kind='stable')
-    try:
-        from dual_agent.sports_prop_workspace import settle_nfl
-        settle_nfl(history)
-    except Exception:
-        pass
-    for event_id, group in lines.groupby('event_id', sort=False):
+    history = None
+    history_index = None
+    processed = set()
+    def score_ready(event_id, group):
         try:
             props = run_nfl_player_prop_prediction_pipeline(group, history,
-                window=12, max_results=200, horizon_days=7, retain_all_qualified=True, include_value_candidates=True)
+                window=12, max_results=200, horizon_days=7, retain_all_qualified=True, include_value_candidates=True, history_index=history_index)
             if not props.empty:
                 forecasts.append(props)
             else:
@@ -529,11 +489,61 @@ def automatic_nfl_props(predictions, key, on_props=None):
             issues.append(f"{event.get('away_team')} @ {event.get('home_team')}: prop model unavailable ({type(exc).__name__}).")
         if on_props and forecasts:
             on_props(pd.concat(forecasts, ignore_index=True))
+
+    # History and quotes run together. Each completed game is scored as soon as
+    # history is ready, without waiting for the slowest remaining game.
+    with ThreadPoolExecutor(max_workers=6) as quote_pool, ThreadPoolExecutor(max_workers=4) as pool:
+        season = now.year if now.month >= 8 else now.year-1
+        history_job = pool.submit(cached_player_history, (season-1, season))
+        pending = {pool.submit(load, event): event for event in selected}
+        for future in as_completed([history_job, *pending]):
+            if future is history_job:
+                try:
+                    history = future.result()
+                    if history is None:
+                        history = pd.DataFrame()
+                    if not history.empty:
+                        history_index = pipeline_module.build_player_history_index(history)
+                except Exception as exc:
+                    history = pd.DataFrame()
+                    issues.append(f'NFL player history could not be loaded ({type(exc).__name__}).')
+            else:
+                event = pending[future]
+                try:
+                    frame, notes = future.result()
+                    frames_by_event[event['id']] = frame
+                    issues.extend(f"{event.get('away_team')} @ {event.get('home_team')}: {note}" for note in notes)
+                    if not frame.empty:
+                        frames.append(frame)
+                    else:
+                        issues.append(f"{event.get('away_team')} @ {event.get('home_team')}: no offered prop lines.")
+                except Exception as exc:
+                    fetch_errors[event['id']] = f'Prop listings could not be loaded ({type(exc).__name__}).'
+                    issues.append(f"{event.get('away_team')} @ {event.get('home_team')}: {fetch_errors[event['id']]}")
+            if history is not None and not history.empty:
+                for event_id, group in frames_by_event.items():
+                    if event_id not in processed and not group.empty:
+                        processed.add(event_id)
+                        score_ready(event_id, group)
+    lines = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    if not lines.empty and 'game_time' in lines:
+        lines = lines.sort_values('game_time', kind='stable')
+    if history is None:
+        history = pd.DataFrame()
+    if history.empty:
+        issues.append('NFL player history is unavailable; no prop probabilities were fabricated.')
     combined = pd.concat(forecasts, ignore_index=True) if forecasts else pd.DataFrame()
+    # Preserve settlement, after progressive props have already been published.
+    if not history.empty:
+        try:
+            from dual_agent.sports_prop_workspace import settle_nfl
+            settle_nfl(history)
+        except Exception:
+            pass
     combined.attrs['prop_diagnostics'] = [row for event in selected
         for row in nfl_prop_market_diagnostics(event, frames_by_event.get(event['id']), history,
             combined.loc[combined.event_id.eq(event['id'])] if not combined.empty else combined,
-            fetch_errors.get(event['id']))]
+            fetch_errors.get(event['id']), history_index=history_index)]
     combined.attrs['prop_diagnostics'].extend(row for game in predicted
         if not matching_game_rows(game, selected)
         for row in nfl_prop_market_diagnostics(game, None, None, None,
@@ -570,7 +580,9 @@ def enhance_result(league, result, key, history=None, on_props=None):
             from dual_agent.nfl_player_props_ui import cached_player_history
             props = result.get('nfl_player_props',pd.DataFrame())
             lines = props.attrs.pop('qb_forecast_lines',None)
-            enriched = attach_qb_forecasts(predictions,cached_player_history((2025,2026)),lines)
+            now = pd.Timestamp.now(tz='UTC')
+            season = now.year if now.month >= 8 else now.year-1
+            enriched = attach_qb_forecasts(predictions,cached_player_history((season-1,season)),lines)
             result['predictions'] = enriched
             if 'all_predictions' in result:result['all_predictions'] = enriched
         except Exception as exc:
