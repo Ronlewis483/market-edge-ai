@@ -959,13 +959,37 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
         return {'picks':[], 'message':'Player props need the configured Odds API key.', 'errors':[]}
     if league == 'NBA' and progress:
         progress({'picks': [], 'game_picks': [], 'errors': [], 'loading_progress': {'stage': 'Finding sportsbook lines', 'completed': 0, 'total': 0}})
-    try:
-        quotes, errors = fetch_prop_quotes(league, games, odds_key) if odds_key else ([], ['Sportsbook API key unavailable.'])
-    except Exception as exc:
-        if league != 'NBA':
-            raise
-        quotes, errors = [], [f'NBA sportsbook lines unavailable: {type(exc).__name__}: {exc}.']
-    timings['Sportsbook collection'] = time.perf_counter()-scan_started
+    prepared_nba_context = None
+    prepared_star_rosters = None
+    if league == 'NBA' and nba_history_enabled:
+        from concurrent.futures import ThreadPoolExecutor
+        from dual_agent.nba_star_spotlight import collect_star_rosters
+        def timed_input(function, *args):
+            started = time.perf_counter()
+            return function(*args), time.perf_counter()-started
+        # Same calls and freshness guards, with independent sources overlapped.
+        with ThreadPoolExecutor(max_workers=3) as input_pool:
+            context_job = input_pool.submit(timed_input, load_nba_matchup_context, nba_key)
+            roster_job = input_pool.submit(timed_input, collect_star_rosters, games)
+            quote_job = input_pool.submit(timed_input, fetch_prop_quotes, league, games, odds_key) if odds_key else None
+            try:
+                if quote_job is not None:
+                    (quotes, errors), seconds = quote_job.result()
+                    timings['Sportsbook collection'] = seconds
+                else:
+                    quotes, errors = [], ['Sportsbook API key unavailable.']
+            except Exception as exc:
+                quotes, errors = [], [f'NBA sportsbook lines unavailable: {type(exc).__name__}: {exc}.']
+            prepared_nba_context, timings['Injury and opponent context'] = context_job.result()
+            prepared_star_rosters, timings['Team rosters'] = roster_job.result()
+    else:
+        try:
+            quotes, errors = fetch_prop_quotes(league, games, odds_key) if odds_key else ([], ['Sportsbook API key unavailable.'])
+        except Exception as exc:
+            if league != 'NBA':
+                raise
+            quotes, errors = [], [f'NBA sportsbook lines unavailable: {type(exc).__name__}: {exc}.']
+        timings['Sportsbook collection'] = time.perf_counter()-scan_started
     if not quotes and league != 'NBA':
         return {'picks':[], 'message':'No fresh eligible sportsbook player-prop lines are available for upcoming games.', 'errors':errors}
     if league == 'NBA' and not nba_history_enabled:
@@ -977,14 +1001,13 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
     if league=='NBA':
         from dual_agent.nba_star_spotlight import collect_star_rosters, build_star_spotlights, key as star_key
         context_started = time.perf_counter()
-        nba_context = load_nba_matchup_context(nba_key)
-        timings['Injury and opponent context'] = time.perf_counter()-context_started
+        nba_context = prepared_nba_context
+        # Source timings were measured in their concurrent tasks.
         if nba_context.get('issue'): errors.append(nba_context['issue'])
         if progress:
             progress({'picks': [], 'game_picks': [], 'errors': list(errors), 'loading_progress': {'stage': 'Finding team star rosters', 'completed': 0, 'total': 0}})
         roster_started = time.perf_counter()
-        star_rosters = collect_star_rosters(games)
-        timings['Team rosters'] = time.perf_counter()-roster_started
+        star_rosters = prepared_star_rosters
         if not nba_key:
             errors.append('NBA projections need BALLDONTLIE_API_KEY and access to player game stats.')
         # Fetch each unique player once, reusing the existing daily history cache.
