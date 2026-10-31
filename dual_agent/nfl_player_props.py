@@ -72,7 +72,7 @@ def normalize_props(event):
                   'bookmaker':book.get('title'), 'bookmaker_key':book.get('key'),
                   'market_key':market_key, 'player':player, 'side':side,
                   'line':float(point) if point is not None else 0.5,
-                  'american_odds':outcome.get('price'), 'last_update':market.get('last_update')})
+                  'american_odds':outcome.get('price'), 'last_update':market.get('last_update') or book.get('last_update')})
     return pd.DataFrame(rows)
 
 def implied_probability(american):
@@ -81,7 +81,8 @@ def implied_probability(american):
     return (-a)/((-a)+100) if a < 0 else 100/(a+100)
 
 def canonical_name(value):
-    return re.sub(r'[^a-z0-9]', '', str(value).lower())
+    from dual_agent.player_aliases import name_key
+    return name_key(value, 'NFL')
 
 def validate_history(df):
     missing=REQUIRED-set(df.columns)
