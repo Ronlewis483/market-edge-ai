@@ -20,9 +20,10 @@ def cached_props(key, event_id, market_keys):
 
 @st.cache_data(ttl=21600, show_spinner=False)
 def cached_player_history(seasons):
-    return validate_history(
-        load_player_history(seasons)
-    )
+    # Changed cache schema retains provider IDs and provider-supplied aliases.
+    history = validate_history(load_player_history(seasons))
+    history.attrs['player_alias_schema'] = 1
+    return history
 
 
 
