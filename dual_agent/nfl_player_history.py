@@ -365,6 +365,22 @@ def load_player_history(seasons):
         .ne('')
     ]
 
+    identity_column = _column(stats, 'player_id', 'gsis_id')
+    if identity_column:
+        identity_rows = stats[['player','team','game_time',identity_column]].drop_duplicates()
+        identity_rows = identity_rows.drop_duplicates(['player','team','game_time'],keep=False)
+        identity_rows = identity_rows.rename(columns={identity_column:'provider_player_id'})
+        result = result.merge(identity_rows,on=['player','team','game_time'],how='left',validate='many_to_one')
+        alias_names = {}
+        name_columns = [c for c in ('player','player_name','player_display_name','display_name','full_name') if c in stats]
+        for record in stats[[identity_column]+name_columns].drop_duplicates().to_dict('records'):
+            identity = record[identity_column]
+            if pd.isna(identity): continue
+            aliases = alias_names.setdefault(str(identity),set())
+            aliases.update(record[c] for c in name_columns if isinstance(record.get(c),str) and record[c].strip())
+        alias_names = {key:sorted(values) for key,values in alias_names.items()}
+        result['provider_player_aliases'] = result['provider_player_id'].astype(str).map(alias_names)
+
     result = result.merge(participation,on=['player','team','game_time'],how='left',validate='many_to_one')
 
     return (
