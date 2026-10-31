@@ -1119,13 +1119,14 @@ def build_suggested_ticket(candidates, book, legs, same_game=False,
         raise ValueError('Choose 3 to 10 legs.')
     pool = [c for c in candidates if c['book'] == book and
             (include_specialty or ticket_is_standard(c['sport'], c['market']))]
-    pool.sort(key=lambda r: (-r['chance'], r['start'], str(r['player'])))
+    from dual_agent.ticket_value import rank_offers
+    pool = rank_offers(pool, book)
     chosen, players, games = [], set(), set()
     family_counts = {}
 
     def try_take(candidate, family_cap=None):
         game = (candidate['sport'], candidate['game'], candidate['start'])
-        player = game + (str(candidate['player']).casefold(),)
+        player = (candidate['sport'], str(candidate['player']).strip().casefold())
         family = (candidate['sport'], ticket_market_family(candidate['market']))
         if player in players or (not same_game and game in games):
             return False
@@ -1341,6 +1342,10 @@ def render_ai_ticket_builder():
     st.checkbox('Allow different players from the same game',value=False,key='ai_ticket_same_game')
     st.checkbox('Include specialty / defensive markets (e.g. assisted tackles)',value=False,key='ai_ticket_specialty')
     st.checkbox('Spread picks across stat categories',value=True,key='ai_ticket_diversify')
+    if book in ('underdog', 'prizepicks'):
+        st.number_input('Actual all-win payout: total returned per $1 entry, including stake', min_value=0.0, value=0.0, step=0.1, key='ai_ticket_entry_return')
+        st.caption('Enter the payout shown for this exact entry. Zero means unknown. Partial-win/flex payouts, promos, ties and voids require separate evaluation; do not enter their top prize as an all-or-nothing payout.')
+    st.caption('Sportsbook legs require positive estimated value at the exact offered price. This is model-based screening, not proven profitability.')
     st.caption('One pick per game by default. Same-game picks can be correlated; the platform must confirm whether the combination is allowed. One leg per player per game prevents conflicting or overlapping player picks.')
     render_ai_ticket_results()
 
@@ -1373,9 +1378,22 @@ def render_ai_ticket_results():
     ticket_future=st.session_state.get('ai_ticket_nfl_future')
     if 'NFL' in selected_sports and ticket_future is not None and not ticket_future.done() and 'NFL' not in active:
         active.append('NFL')
+    for league in selected_sports:
+        payload = sources.get(league, {}).get('player_props', {})
+        if league == 'NBA':
+            stage = payload.get('loading_progress', {}).get('stage')
+            if stage: st.caption('NBA: '+str(stage))
+            issues = list(dict.fromkeys(str(e) for e in payload.get('errors', [])))
+            if issues:
+                with st.expander('NBA prop input issues', expanded=not payload.get('game_picks')):
+                    for issue in issues[-8:]: st.warning(issue)
     nfl_source=sources.get('NFL',{})
     if nfl_source.get('ticket_collection_stage'): st.caption(nfl_source['ticket_collection_stage'])
     fingerprint = ticket_offer_fingerprint(eligible)
+    entry_return = st.session_state.get('ai_ticket_entry_return', 0.0) if book in ('underdog','prizepicks') else None
+    from dual_agent.ticket_value import rank_offers, review_ticket
+    value_pool = rank_offers(eligible, book)
+    st.caption(f'{len(value_pool)} offers remain after price-value screening.' if book not in ('underdog','prizepicks') else 'Pick’em value requires the actual entry payout; individual feed prices are not treated as entry payouts.')
 
     st.caption(f'**Ready to build:** {len(eligible)} fresh, listed {PLATFORMS[book]} offers '
                f'({len(standard)} standard / {len(offered)-len(standard)} specialty) '
@@ -1408,12 +1426,24 @@ def render_ai_ticket_results():
                 'legs': picks, 'offer_fingerprint': fingerprint,
                 'include_specialty': include_specialty,
                 'diversify_markets': diversify_markets,
+                'entry_return': entry_return,
+                'value_review': review_ticket(picks, book, legs, entry_return),
             }
+            # Save exact offered inputs and the review, independently of placed bets.
+            try:
+                from pathlib import Path
+                import json
+                root = Path('sports_prop_workspace/ticket_reviews'); root.mkdir(parents=True, exist_ok=True)
+                snapshot = st.session_state['ai_suggested_ticket']
+                name = pd.Timestamp.now(tz='UTC').strftime('%Y%m%dT%H%M%S%fZ')+'.json'
+                (root/name).write_text(json.dumps(snapshot, default=str, allow_nan=False))
+            except Exception:
+                st.caption('Ticket review is displayed, but its local snapshot could not be saved.')
             st.session_state.pop('ai_ticket_build_issue', None)
         else:
             st.session_state.pop('ai_suggested_ticket', None)
             st.session_state['ai_ticket_build_issue'] = (
-                f'No fresh, verified {PLATFORMS[book]} picks are available. '
+                f'No fresh, compatible {PLATFORMS[book]} picks passed the current checks. For priced sportsbooks, the model must also beat the break-even price. '
                 'Wait for the scan to complete and check its results, or '
                 'collect new sportsbook offers. No ticket was generated.')
     if st.session_state.get('ai_ticket_build_issue'):
@@ -1523,7 +1553,8 @@ def render_ai_ticket_results():
     if (ticket.get('book') != book or ticket.get('sport') != sport or
             ticket.get('requested') != legs or ticket.get('same_game') != same_game or
             ticket.get('include_specialty') != include_specialty or
-            ticket.get('diversify_markets') != diversify_markets):
+            ticket.get('diversify_markets') != diversify_markets or
+            ticket.get('entry_return') != entry_return):
         st.info('Ticket settings changed. Press Build my ticket to apply the new selections.')
         return
     if ticket.get('offer_fingerprint') != fingerprint:
@@ -1537,15 +1568,50 @@ def render_ai_ticket_results():
     if ticket['book'] in ('prizepicks', 'underdog'):
         st.caption('Suggested pick’em entry. Recheck exact offered lines and combination '
                    'rules in the platform; the odds feed is not direct platform confirmation.')
-    st.caption('Individual leg percentages are model estimates, not guaranteed win rates. '
-               'No combined win probability or payout is calculated without a verified '
-               'correlation model and platform rules.')
+    review = review_ticket(ticket['legs'], book, ticket['requested'], entry_return)
+    st.markdown('#### Ticket value review')
+    if not review['complete']:
+        st.warning('Incomplete shortlist: this is not a ready-to-use ticket.')
+    elif review['status'] == 'actual_payout_required':
+        st.info('Enter the actual all-win payout above, then rebuild to assess this entry. No payout has been assumed.')
+    elif review['status'] in ('correlation_not_assessed', 'live_joint_not_assessed'):
+        st.info('Combined value is unassessed for same-game, repeated-player or live combinations. Individual percentages must not be multiplied into a verified ticket chance.')
+    elif review.get('combined_probability') is not None:
+        st.caption('Illustrative scenario assuming independent legs and no pushes or voids. These are not verified combined win rates.')
+        st.write(f"Model scenario: {review['combined_probability']:.1%} all-win chance · {review['break_even']:.1%} break-even · total return {review['total_return']:.2f}× stake")
+        st.write(f"Estimated net return per $1: {review['return_per_unit']:+.2f}")
+        if review['status'] == 'no_estimated_edge':
+            st.warning('This entry does not show positive estimated value at the entered payout. Do not treat it as a value ticket.')
+        else:
+            st.caption('Positive estimated edge under the stated assumptions; model error and dependence can erase it.')
+    if book not in ('underdog','prizepicks'):
+        if review.get('combined_probability') is not None:
+            comparisons = []
+            for size in range(1, len(ticket['legs'])+1):
+                smaller = review_ticket(ticket['legs'][:size], book, size)
+                comparisons.append({'Legs':size, 'All-win model scenario':smaller.get('combined_probability'),
+                    'Estimated net per $1':smaller.get('return_per_unit')})
+            with st.expander('What adding legs changes'):
+                st.dataframe(pd.DataFrame(comparisons), hide_index=True)
+                st.caption('Adding legs reduces the all-win chance. Any estimated return improvement depends on the model and independence assumptions.')
+        singles = rank_offers(eligible, book)[:5]
+        with st.expander('Compare with the strongest single-pick options', expanded=True):
+            st.dataframe(pd.DataFrame([{'Player':r['player'], 'Pick':f"{r['side']} {r['line']:g} {r['market']}",
+                'Model chance':r['chance'], 'Break-even chance':r['value_review']['break_even'],
+                'Estimated net per $1 (no push)':r['value_review']['return_per_unit']} for r in singles]), hide_index=True)
+            st.caption('Singles avoid the requirement that every ticket leg wins. Expected returns are conditional on a decided result and depend on accurate model probabilities.')
+    else:
+        st.caption('A single-pick cash value cannot be inferred from a pick’em listing. The platform’s actual entry rules determine returns.')
     now = pd.Timestamp.now(tz='UTC')
     for i, leg in enumerate(ticket['legs'], 1):
         with st.container(border=True):
             st.markdown(f'**Leg {i} · {leg["player"]} · {leg["side"]} '
                         f'{leg["line"]:g} {leg["market"]}**')
             st.write(f'Estimated cover chance: **{leg["chance"]:.1%}**')
+            from dual_agent.ticket_value import single_value
+            leg_value = single_value(leg) if book not in ('underdog','prizepicks') else None
+            if leg_value:
+                st.caption(f"Why included: model {leg['chance']:.1%} versus price break-even {leg_value['break_even']:.1%}; estimated edge {leg_value['edge']:+.1%}.")
             if leg.get('neural_model_version'):
                 st.caption('Trained '+str(leg['sport'])+' neural model · '+str(leg['neural_model_version'])+' · chronological residual calibration. Accuracy at your sportsbook lines is not established.')
             elif leg.get('sport')=='NFL' and leg.get('estimate_method'):
@@ -1987,7 +2053,22 @@ def render_nba_live_prop_cards(game, fallback):
     scope = 'nba_live_'+hashlib.sha256(identity.encode()).hexdigest()[:16]
     with st.expander('🎯 NBA player props · ranked by cover chance', expanded=True):
         if current.get('nba_props_pending'):
-            st.caption('Refreshing in the background · existing cards remain visible.')
+            loading = payload.get('loading_progress', {})
+            st.caption(loading.get('stage') or 'Preparing NBA player-prop inputs…')
+            if 'sportsbook_lines' in loading:
+                st.caption(f"{loading['sportsbook_lines']} sportsbook lines · {loading.get('players_with_history', 0)} players with history · {loading.get('calculated_props', 0)} calculated props")
+        problems = list(dict.fromkeys(str(e) for e in payload.get('errors', [])))
+        if not rows and problems:
+            with st.expander('Why NBA props are not appearing', expanded=True):
+                for problem in problems[-8:]:
+                    st.warning(problem)
+        exclusions = [e for e in payload.get('exclusions', [])
+            if e.get('Game') == game.get('away_team', '')+' @ '+game.get('home_team', '')]
+        if not rows and exclusions:
+            with st.expander('Prop eligibility checks for this game', expanded=True):
+                for item in exclusions[:10]:
+                    st.caption(str(item.get('Player', 'Player'))+' · '+str(item.get('Market', ''))+': '+str(item.get('Reason', 'Unavailable')))
+
         captured = [pd.to_datetime(r.get('Captured UTC'), utc=True, errors='coerce') for r in rows]
         valid = [t for t in captured if pd.notna(t)]
         if valid:
@@ -1999,7 +2080,12 @@ def render_nba_live_prop_cards(game, fallback):
         render_prop_category_buttons(markets[1:], scope+'_market', 'All supported markets')
         selected = st.selectbox('NBA prop market', markets, key=scope+'_market')
         shown = normalized if selected == markets[0] else [r for r in normalized if r['market'] == selected]
-        render_prop_comparisons(shown, pending=current.get('nba_props_pending', False), scope=scope)
+        if shown:
+            render_prop_comparisons(shown, pending=current.get('nba_props_pending', False), scope=scope)
+        elif current.get('nba_props_pending'):
+            st.caption('No calculated props for this game yet; see the current stage and input issues above.')
+        else:
+            st.info('No eligible priced props were produced for this selection. See the input issues and eligibility checks above.')
         render_prop_category_rankings(normalized, 'NBA')
 
 
@@ -2104,7 +2190,7 @@ def render_nba_enrichment_status():
         if total:
             st.progress(min(completed / total, 1.0),
                         text=f'Player history checked: {completed} of {total}')
-        for issue in [e for e in props.get('errors', []) if not any(t in str(e) for t in ('No unique NBA player identity', 'No completed played-game statistics', 'Player identity for', 'NBA stats for'))][-3:]:
+        for issue in list(dict.fromkeys(str(e) for e in props.get('errors', [])))[-3:]:
             st.warning(str(issue))
         if props.get('game_picks') or props.get('picks'):
             if st.button('Show latest completed NBA props', key='nba_show_partial_props'):
