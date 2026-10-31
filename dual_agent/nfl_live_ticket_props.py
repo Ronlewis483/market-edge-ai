@@ -263,7 +263,10 @@ def collect_ticket_props(key,book,include_specialty=False,publish=None):
     Completed games are excluded using explicit status. Active games are
     scored with current box-score data rather than discarded on kickoff time.
     """
-    if not key or not allowed(book): raise ValueError('Choose a configured sportsbook and API key')
+    if not key or (book != 'all' and not allowed(book)): raise ValueError('Choose configured sportsbooks and API key')
+    from dual_agent.preferred_sportsbooks import PLATFORMS, BOOKMAKERS
+    requested_books = set(PLATFORMS) if book == 'all' else {book}
+    request_book = BOOKMAKERS if book == 'all' else book
     started=time.monotonic();now=pd.Timestamp.now(tz='UTC');all_rows=[];issues=[];diagnostics=[]
     def send(stage):
         payload={'nfl_player_props':pd.DataFrame(all_rows),'ticket_book':book,
@@ -273,7 +276,7 @@ def collect_ticket_props(key,book,include_specialty=False,publish=None):
         return payload
     with ThreadPoolExecutor(max_workers=3) as setup:
         history_job=setup.submit(load_ticket_history)
-        events_job=setup.submit(_odds,'/events',key,book)
+        events_job=setup.submit(_odds,'/events',key,request_book)
         board_job=setup.submit(_json,ESPN+'scoreboard',
             {'dates':(now-pd.Timedelta(days=1)).strftime('%Y%m%d')+'-'+now.strftime('%Y%m%d'),'limit':1000},30)
         send('Loading saved player history and game status')
@@ -303,18 +306,18 @@ def collect_ticket_props(key,book,include_specialty=False,publish=None):
         if game:
             summary,checked=_json(ESPN+'summary',{'event':game['id']},30)
             snapshot=parse_summary(summary,checked,game)
-        payload,checked=_odds('/events/'+event['id']+'/odds',key,book,batch,live=bool(game))
+        payload,checked=_odds('/events/'+event['id']+'/odds',key,request_book,batch,live=bool(game))
         if not checked: raise ValueError('Original quote retrieval time unavailable; update odds_request_cache.py')
         # A response must match the requested event and its exact participants.
         if payload.get('id')!=event['id'] or payload.get('home_team')!=event['home_team'] or payload.get('away_team')!=event['away_team']:
             raise ValueError('Sportsbook event identity mismatch')
         frame=normalize_props(payload)
-        if not frame.empty: frame=frame.loc[frame.bookmaker_key.eq(book)]
+        if not frame.empty: frame=frame.loc[frame.bookmaker_key.isin(requested_books)]
         return _score(frame,event,index,snapshot,checked,pd.Timestamp.now(tz='UTC')) if not frame.empty else ([],{'no sportsbook lines in this batch':1})
     # Active games first, then nearest upcoming game. Each batch publishes
     # immediately; no wait for all games or for a full historical model refit.
     selected.sort(key=lambda item:(item[1] is None,item[0]['commence_time']))
-    send('Collecting selected-book offensive props, including active games')
+    send('Collecting configured-book offensive props, including active games')
     with ThreadPoolExecutor(max_workers=4) as pool:
         for batch in batches:
             jobs={pool.submit(fetch,event,game,batch):event for event,game in selected}
@@ -327,7 +330,7 @@ def collect_ticket_props(key,book,include_specialty=False,publish=None):
                 except Exception as exc:
                     issues.append(event['away_team']+' @ '+event['home_team']+': '+str(exc) if isinstance(exc,ValueError)
                                   else event['away_team']+' @ '+event['home_team']+': '+type(exc).__name__)
-                send('Ready estimates: '+str(len(all_rows))+'; collecting remaining selected-book markets')
+                send('Ready estimates: '+str(len(all_rows))+'; collecting remaining configured-book markets')
     result=send('Finished in '+str(round(time.monotonic()-started,1))+' seconds')
     result['ticket_scan_complete']=True
     return result
