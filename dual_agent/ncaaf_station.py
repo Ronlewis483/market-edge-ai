@@ -79,7 +79,7 @@ def parse_markets(events, now=None):
     return sorted(games.values(),key=lambda g:(g['commence_time'],g['game_id']))
 
 
-def load_station(api_key):
+def load_markets(api_key):
     if not api_key:raise ValueError('The existing ODDS_API_KEY is not configured.')
     from dual_agent.odds_request_cache import get
     now = datetime.now(timezone.utc)
@@ -98,6 +98,11 @@ def load_station(api_key):
             'reported_request_cost':response.headers.get('x-requests-last')}
 
 
+def load_station(api_key, cfbd_key=None):
+    from dual_agent.ncaaf_prediction import generate_predictions
+    return generate_predictions(cfbd_key,api_key)
+
+
 def render_station():
     import os
     import pandas as pd
@@ -106,17 +111,21 @@ def render_station():
     @st.cache_resource(show_spinner=False)
     def worker_pool():
         return ThreadPoolExecutor(max_workers=2)
-    st.title('🏈 NCAA Football')
-    st.caption('FBS college football · upcoming seven days · sportsbook information from your existing Odds API.')
-    st.info('This station currently shows market-based win probabilities and offered lines. An independent NCAA prediction model and player-prop history are not connected yet; NFL model weights are not used.')
-    if st.button('Load / refresh NCAA games and lines',type='primary',key='ncaaf_load'):
+    st.title('🏈 NCAA Football · Connected Engine')
+    st.caption('FBS college football · upcoming seven days · CollegeFootballData + your existing Odds API.')
+    st.caption('One final forecast: college base engine → NCAA-trained neural signal → bounded context correction. No probability averaging or NBA/NFL weights. Current context covers team history, rest and neutral venues; player/injury adjustments are not yet connected.')
+    if st.button('Generate NCAA connected predictions',type='primary',key='ncaaf_load'):
         pending = st.session_state.get('ncaaf_station_future')
         if pending is None or pending.done():
             key = os.environ.get('ODDS_API_KEY') or os.environ.get('THE_ODDS_API_KEY')
             if not key:
                 try:key = st.secrets.get('ODDS_API_KEY') or st.secrets.get('THE_ODDS_API_KEY')
                 except Exception:key = None
-            st.session_state['ncaaf_station_future'] = worker_pool().submit(load_station,key)
+            cfbd_key = os.environ.get('CFBD_API_KEY')
+            if not cfbd_key:
+                try:cfbd_key = st.secrets.get('CFBD_API_KEY')
+                except Exception:cfbd_key = None
+            st.session_state['ncaaf_station_future'] = worker_pool().submit(load_station,key,cfbd_key)
             st.session_state.pop('ncaaf_station_error',None)
     st.button('Show latest NCAA results',key='ncaaf_show')
     pending = st.session_state.get('ncaaf_station_future')
@@ -129,12 +138,26 @@ def render_station():
         st.session_state.pop('ncaaf_station_future',None)
         pending = None
     if pending is not None:
-        st.caption('NCAA lines are loading in the background. Use Show latest NCAA results when ready; this page does not refresh automatically.')
+        st.caption('NCAA history and connected predictions are processing in the background. The first training run takes longer; saved data and fitted weights are reused. Use Show latest NCAA results when ready.')
     if st.session_state.get('ncaaf_station_error'):
         st.error(st.session_state['ncaaf_station_error'])
     result = st.session_state.get('ncaaf_station_result')
-    st.caption('Refreshing sportsbook lines may use API credits. Viewing saved results does not make requests.')
+    st.caption('Generation may use CFBD and Odds API requests. Viewing saved results makes no requests. CFBD_API_KEY is required; odds comparisons are optional.')
     if not result:return
+    if result.get('architecture') != 'original_offset_neural_context_residual_v1':
+        st.info('Generate NCAA connected predictions to replace the earlier market-only results.')
+        return
+    for issue in result.get('issues', []):st.warning(str(issue))
+    if not result.get('checks_passed'):
+        st.warning('Experimental NCAA candidate: it has not demonstrated improvement over the base model on both historical partitions. Forecasts are not validated for betting performance.')
+    with st.expander('Connected NCAA model and historical comparison'):
+        st.write('Model: '+result['model_id'])
+        st.write('Usable historical games: '+str(result['training_games']))
+        st.json(result.get('comparison', {}))
+        st.caption(result.get('limitations',''))
+        st.write('Frozen pregame results by model version')
+        st.json(result.get('prospective_results', {}))
+        st.caption('Local forecast records are graded on later Generate requests using CFBD finals. No scheduled training job or remote forecast backup is configured by these files.')
     checked = pd.Timestamp(result['checked_at']).tz_convert('America/Chicago')
     st.caption('Last check: '+checked.strftime('%b %d, %I:%M %p CT'))
     # Reapply time and freshness rules while viewing saved results.
@@ -145,23 +168,24 @@ def render_station():
         game = dict(original)
         for field in ('moneylines','spreads','totals'):
             game[field] = [q for q in original[field] if pd.Timedelta(0)<=now-pd.Timestamp(q['Quote UTC'])<=pd.Timedelta(minutes=30)]
-        if not any(game[k] for k in ('moneylines','spreads','totals')):continue
+        # Connected predictions remain visible when market quotes are unavailable.
         p = median(q['home_probability'] for q in game['moneylines']) if game['moneylines'] else None
         game.update(home_probability=p,away_probability=1-p if p is not None else None,
                     market_favorite=game['home_team'] if p is not None and p>=.5 else game['away_team'] if p is not None else None,
                     favorite_probability=max(p,1-p) if p is not None else None)
         games.append(game)
     if not games:
-        st.info('No upcoming games with fresh supported sportsbook lines were returned. No picks were invented.')
+        st.info('No supported upcoming FBS predictions were produced. Games with unconfirmed kickoff times or insufficient prior history are excluded.')
         return
     def summary(g):
         return {'Game':g['away_team']+' @ '+g['home_team'],
                 'Kickoff CT':pd.Timestamp(g['commence_time']).tz_convert('America/Chicago').strftime('%b %d, %I:%M %p'),
+                'Connected pick':g['predicted_team'], 'Model probability':g['model_confidence'],
                 'Market favorite':g['market_favorite'], 'Market-implied chance':g['favorite_probability'],
                 'Moneyline books':len(g['moneylines'])}
-    favorites = sorted([g for g in games if g['favorite_probability'] is not None],key=lambda g:-g['favorite_probability'])[:10]
+    favorites = sorted(games,key=lambda g:-g['model_confidence'])[:10]
     if favorites:
-        st.subheader('Top 10 market favorites')
+        st.subheader('Top 10 connected predictions')
         st.dataframe(pd.DataFrame([summary(g) for g in favorites]),hide_index=True,use_container_width=True)
     st.subheader('All upcoming games')
     st.dataframe(pd.DataFrame([summary(g) for g in games]),hide_index=True,use_container_width=True)
@@ -172,4 +196,4 @@ def render_station():
         fresh = [q for q in chosen[field] if pd.Timedelta(0)<=now-pd.Timestamp(q['Quote UTC'])<=pd.Timedelta(minutes=30)]
         if fresh:st.dataframe(pd.DataFrame(fresh).drop(columns=['book']),hide_index=True,use_container_width=True)
         else:st.caption('No current quotes in this category. Refresh to check for new listings.')
-    st.caption('Player props and NCAA ticket recommendations are not generated without verified college player statistics and participation checks.')
+    st.caption('These are winner predictions. Player props, player-strength corrections and NCAA ticket recommendations require a separate college player-data pipeline.')
