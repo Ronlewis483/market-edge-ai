@@ -79,7 +79,10 @@ def load_ticket_history():
     with _history_lock:
         path=Path('nfl_ticket_history/history_v1.parquet')
         if path.exists() and time.time()-path.stat().st_mtime<21600:
-            try: return pd.read_parquet(path)
+            try:
+                saved = pd.read_parquet(path)
+                if saved.attrs.get('player_alias_schema') == 1:
+                    return saved
             except Exception: pass
         from dual_agent.nfl_player_props_ui import cached_player_history
         now=pd.Timestamp.now(tz='UTC');year=now.year if now.month>=8 else now.year-1
@@ -98,8 +101,12 @@ def history_index(history,now):
     h['value']=pd.to_numeric(h['value'],errors='coerce')
     h=h.loc[(h.game_time<now)&np.isfinite(h.value)].sort_values('game_time')
     h['ticket_key']=h['player'].map(name_key)
-    return {key:group.drop_duplicates('game_time',keep='last').tail(12)
-            for key,group in h.groupby(['ticket_key','market'],sort=False)}
+    result = {key:group.drop_duplicates('game_time',keep='last').tail(12)
+              for key,group in h.groupby(['ticket_key','market'],sort=False)}
+    if 'provider_player_id' in h:
+        from dual_agent.player_aliases import resolver_from_history
+        result['__resolver__'] = resolver_from_history(h)
+    return result
 
 
 def board_games(payload):
@@ -210,7 +217,13 @@ def _score(frame,event,index,snapshot,checked,now):
         if not market: reasons['unsupported market']+=1;continue
         if side not in ('OVER','UNDER','YES','NO'): continue
         kickoff=pd.Timestamp(quote['game_time']);line=float(quote['line'])
-        sample=index.get((name_key(player),market))
+        history_name = player
+        if '__resolver__' in index:
+            matched = index['__resolver__'].resolve(player)
+            if matched is None:
+                reasons[market+': player identity missing or ambiguous']+=1;continue
+            history_name = matched['name']
+        sample=index.get((name_key(history_name),market))
         if sample is None: reasons[market+': no exact player history']+=1;continue
         vals=sample.loc[sample.game_time<min(kickoff,now),'value'].to_numpy(float)
         if len(vals)<8: reasons[market+': fewer than 8 prior games']+=1;continue
