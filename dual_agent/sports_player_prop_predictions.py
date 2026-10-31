@@ -170,7 +170,8 @@ def fetch_prop_quotes(league, games, odds_key):
                 errors.append('No unique prop event match for '+game['away_team']+' at '+game['home_team']); return quotes, errors
             event = matched[0]
         try:
-            payload = _get(base+'/events/'+event['id']+'/odds', odds_key, {'apiKey': odds_key, 'regions': 'us', 'markets': ','.join(MARKETS[league]), 'oddsFormat': 'decimal'})
+            from dual_agent.preferred_sportsbooks import BOOKMAKERS
+            payload = _get(base+'/events/'+event['id']+'/odds', odds_key, {'apiKey': odds_key, 'bookmakers': BOOKMAKERS, 'markets': ','.join(MARKETS[league]), 'oddsFormat': 'decimal'})
         except RuntimeError as exc:
             errors.append(str(exc)); return quotes, errors
         stamp = pd.Timestamp.now(tz='UTC')
@@ -439,8 +440,12 @@ def _nba_history_batches_locked(names, api_key, status=None):
                             active_ids.remove(pid)
         except Exception as exc:
             # Discard all partial batch rows: incomplete samples must not drive picks.
+            issue = _nba_request_issue(exc)
             for name, pid in batch:
-                yield name, [], 'NBA stats for '+name+': '+_nba_request_issue(exc)
+                yield name, [], 'NBA stats for '+name+': '+issue
+            if issue.startswith(('HTTP 401:', 'HTTP 403:')):
+                notify('Player-history scan stopped: '+issue)
+                return  # Retrying other players cannot repair denied API access.
             continue
         for name, pid in batch:
             previous = known[name].get('rows', [])
@@ -1055,7 +1060,9 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
                 ready, list(errors), star_rosters, {}, {}, nba_context=nba_context)
             calculation_seconds += time.perf_counter()-scoring_started
             partial.update(probability_source='player_history', statistics_source='BALLDONTLIE')
-            partial['loading_progress'] = {'completed': completed, 'total': len(names), 'stage': stage}
+            partial['loading_progress'] = {'completed': completed, 'total': len(names), 'stage': stage,
+                'sportsbook_lines': len(quotes), 'players_with_history': sum(bool(rows) for rows in history_by_name.values()),
+                'calculated_props': len(partial.get('game_picks', []))}
             progress(partial)
         history_started = time.perf_counter()
         history_scoring_before = calculation_seconds
@@ -1065,6 +1072,8 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
             completed += 1
             if error: errors.append(error)
             publish('Processed '+player)
+        last_scored = -1
+        publish('Player history checks finished; completing prop calculations')
         timings['Player history and storage'] = max(0.0, time.perf_counter()-history_started-(calculation_seconds-history_scoring_before))
         # Provider spellings may differ only in accents or punctuation.
         by_key = {star_key(name): rows for name, rows in history_by_name.items()}
