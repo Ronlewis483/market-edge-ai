@@ -1746,7 +1746,7 @@ with st.sidebar:
     st.caption('Scans continue in the background. Use Show latest results to update the display; the page does not refresh automatically.')
     navigation_groups = [
         ("START", ["🏠 Home"]),
-        ("SPORTS", ["🏈 NFL", "🏀 NBA", "⚾ MLB"]),
+        ("SPORTS", ["🏈 NFL", "🏀 NBA", "⚾ MLB", "🏈 NCAA Football"]),
         ("MARKETS", ["📈 Stocks"]),
         ("WORKSPACE", ["🎫 AI Ticket Builder", "🎟️ My Bets", "📊 Performance", "🧪 Research Lab"]),
     ]
@@ -11280,3 +11280,9 @@ if page == "🧪 Research Lab":
                 st.download_button("Download collected historical odds", data=__import__("json").dumps(collected_odds), file_name="mlb_historical_odds.json", mime="application/json", key="mlb_historical_odds_download")
         except Exception as exc:
             st.error("Unable to open model data: " + str(exc))
+
+
+# NCAA football uses a separate market station until college model data is connected.
+if page == "🏈 NCAA Football":
+    from dual_agent.ncaaf_station import render_station
+    render_station()
