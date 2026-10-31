@@ -25,32 +25,19 @@ from dual_agent.nfl_player_props import (
 
 
 def _player_keys(name):
-    """Return possible historical identifiers for a player."""
-
-    full_key = canonical_name(name)
-
-    parts = re.findall(
-        r"[A-Za-z]+",
-        str(name),
-    )
-
-    keys = {full_key}
-
-    if len(parts) >= 2:
-        keys.add(
-            canonical_name(
-                parts[0][0] + parts[-1]
-            )
-        )
-
-    return keys
+    return {canonical_name(name)}
 
 
 def build_player_history_index(history):
     """Positions into this exact history frame, grouped once per scan."""
     if history is None or history.empty:
         return {}
-    return history.groupby(['player_key', 'market'], sort=False).indices
+    normalized_keys = history['player'].map(canonical_name) if 'player' in history else history['player_key']
+    index = history.groupby([normalized_keys, history['market']], sort=False).indices
+    if 'provider_player_id' in history:
+        from dual_agent.player_aliases import resolver_from_history
+        index['__resolver__'] = resolver_from_history(history)
+    return index
 
 
 def _historical_player_games(
@@ -67,6 +54,10 @@ def _historical_player_games(
         return pd.DataFrame()
 
     player_keys = _player_keys(player)
+    if history_index is not None and '__resolver__' in history_index:
+        match = history_index['__resolver__'].resolve(player)
+        if match is None: return pd.DataFrame()
+        player_keys = {canonical_name(match['name'])}
 
     if history_index is None:
         games = history.loc[
