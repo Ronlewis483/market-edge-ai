@@ -1112,7 +1112,7 @@ def ticket_prop_candidates(results, now=None, diagnostics=None):
     return sorted(candidates.values(), key=lambda r: (-r['chance'], r['start'], r['player']))
 
 
-def build_suggested_ticket(candidates, book, legs, same_game=False,
+def build_suggested_ticket(candidates, book, legs, same_game=True,
                            include_specialty=False, diversify_markets=True):
     """Rank listed offers, preferring common markets and avoiding prop clustering."""
     if legs not in range(3, 11):
@@ -1123,33 +1123,31 @@ def build_suggested_ticket(candidates, book, legs, same_game=False,
     pool = rank_offers(pool, book)
     chosen, players, games = [], set(), set()
     family_counts = {}
+    game_counts = {}
 
-    def try_take(candidate, family_cap=None):
+    def try_take(candidate, family_cap=None, game_cap=1):
         game = (candidate['sport'], candidate['game'], candidate['start'])
         player = (candidate['sport'], str(candidate['player']).strip().casefold())
         family = (candidate['sport'], ticket_market_family(candidate['market']))
-        if player in players or (not same_game and game in games):
+        if player in players or game_counts.get(game, 0) >= game_cap:
             return False
         if family_cap is not None and family_counts.get(family, 0) >= family_cap:
             return False
         chosen.append(candidate)
         players.add(player)
         games.add(game)
+        game_counts[game] = game_counts.get(game, 0) + 1
         family_counts[family] = family_counts.get(family, 0) + 1
         return True
 
-    # First take a maximum of two legs per stat market, then fill any remaining
-    # spaces from the same verified standard-market pool. This is preference,
-    # not a reason to pretend fewer valid listed props exist.
-    if diversify_markets:
-        for c in pool:
-            try_take(c, family_cap=2)
-            if len(chosen) == legs:
-                return sorted(chosen, key=lambda r: (-r['chance'], r['start'], str(r['player'])))
-    for c in pool:
-        try_take(c)
-        if len(chosen) == legs:
-            break
+    # Prefer distinct games first. Only fill from a second player in a game
+    # after the available distinct-game choices have been considered.
+    for game_cap in ((1, 2) if same_game else (1,)):
+        for family_cap in ((2, None) if diversify_markets else (None,)):
+            for candidate in pool:
+                try_take(candidate, family_cap=family_cap, game_cap=game_cap)
+                if len(chosen) == legs:
+                    return sorted(chosen, key=lambda r: (-r['chance'], r['start'], str(r['player'])))
     return sorted(chosen, key=lambda r: (-r['chance'], r['start'], str(r['player'])))
 
 
@@ -1342,7 +1340,7 @@ def render_ai_ticket_builder():
     with columns[0]: legs=st.selectbox('Ticket size',list(range(3,11)),format_func=lambda n:f'{n} legs',key='ai_ticket_legs')
     with columns[1]: sport=st.selectbox('Sports',['All sports','NFL','NBA','MLB'],key='ai_ticket_sport')
     st.caption('Checking all configured platforms: '+', '.join(PLATFORMS.values())+'. Each ticket stays within one platform; feed coverage can vary.')
-    st.checkbox('Allow different players from the same game',value=False,key='ai_ticket_same_game')
+    st.checkbox('Allow up to two different players per game',value=True,key='ai_ticket_two_per_game_v1')
     st.checkbox('Include specialty / defensive markets (e.g. assisted tackles)',value=False,key='ai_ticket_specialty')
     st.checkbox('Spread picks across stat categories',value=True,key='ai_ticket_diversify')
     with st.expander('Optional actual pick’em payouts'):
@@ -1350,7 +1348,7 @@ def render_ai_ticket_builder():
             st.number_input(PLATFORMS[platform]+': all-win total return per $1, including stake', min_value=0.0, value=0.0, step=0.1, key='ai_ticket_return_'+platform)
         st.caption('Enter payouts shown for the exact entry. Zero means unknown. Flex/partial-win payouts, promos, ties and voids are not assessed by this all-or-nothing calculation.')
     st.caption('Sportsbook legs require positive estimated value at the exact offered price. This is model-based screening, not proven profitability.')
-    st.caption('One pick per game by default. Same-game picks can be correlated; the platform must confirm whether the combination is allowed. One leg per player per game prevents conflicting or overlapping player picks.')
+    st.caption('Different games are preferred. Up to two players per game are allowed by default, with one pick per player across the ticket. Uncheck the option for one pick per game. Same-game combined value is unassessed; confirm the platform accepts the combination.')
     render_ai_ticket_results()
 
 
@@ -1442,7 +1440,7 @@ def _render_ai_ticket_results():
         return
     sources, diagnostics, candidates, prepare_seconds = prepared
     legs = st.session_state['ai_ticket_legs']
-    same_game = st.session_state.get('ai_ticket_same_game', False)
+    same_game = st.session_state.get('ai_ticket_two_per_game_v1', True)
     include_specialty = st.session_state.get('ai_ticket_specialty', False)
     diversify_markets = st.session_state.get('ai_ticket_diversify', True)
     from dual_agent.ticket_value import choose_book_ticket
@@ -1545,9 +1543,11 @@ def _render_ai_ticket_results():
         if not include_specialty and offered and not standard:
             st.info('Only specialty markets are currently listed for this sportsbook. '
                     'Standard-market mode excludes those markets; you may opt in explicitly.')
-        elif eligible and not same_game:
-            st.info('Insufficient independent legs under your one-pick-per-game setting. '
-                    'Allowing multiple players from one game can increase correlation.')
+        elif eligible and book not in ('underdog','prizepicks') and len(value_pool) < legs:
+            st.info(f'Only {len(value_pool)} offers passed price-value screening; {legs} legs were requested. More listings alone do not establish value.')
+        elif eligible:
+            limit = 2 if same_game else 1
+            st.info(f'Only {possible} compatible legs remain after the {limit}-player-per-game limit, one-pick-per-player rule and current eligibility checks; {legs} were requested.')
         elif quote_status['saved'] == 0:
             st.info('No saved model props were found. NFL can collect active and upcoming games directly below. For NBA/MLB, generate game predictions first.')
         elif not offered and not active and not quote_status['listings']:
