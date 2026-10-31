@@ -74,3 +74,28 @@ def review_ticket(legs, book, requested, total_return=None):
                 'without_leg_return_per_unit': (p*payout/factor)-1,
                 'with_leg_return_per_unit': p*payout-1})
     return report
+
+
+def choose_book_ticket(choices, requested, payouts=None):
+    """Compare separate-platform entries; never combine incompatible book offers."""
+    payouts = payouts or {}
+    assessed = []
+    for choice in choices:
+        review = review_ticket(choice['legs'],choice['book'],requested,payouts.get(choice['book']))
+        assessed.append(dict(choice, review=review))
+    if not assessed:
+        raise ValueError('No configured platforms')
+    def priority(choice):
+        r = choice['review']
+        # Complete positive-value scenarios lead; unassessed entries are never
+        # advertised as established value. Incomplete lists remain shortlists.
+        status = r['status']
+        tier = 3 if status == 'positive_estimated_edge' else 2 if status in (
+            'actual_payout_required','correlation_not_assessed','live_joint_not_assessed') else 1
+        value = r['return_per_unit'] if r['return_per_unit'] is not None else -1
+        weakest = min((float(x['chance']) for x in choice['legs']),default=0)
+        return (r['complete'],tier,value,len(choice['legs']),weakest)
+    assessed.sort(key=priority,reverse=True)
+    comparisons = [{'book':c['book'],'count':len(c['legs']),
+        'status':c['review']['status'],'return_per_unit':c['review']['return_per_unit']} for c in assessed]
+    return assessed[0], comparisons
