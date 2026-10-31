@@ -1392,12 +1392,12 @@ def ticket_offer_inputs(sports):
         st.session_state['ai_ticket_prepare_signature'] = signature
         st.session_state['ai_ticket_prepare_future'] = ticket_prepare_pool().submit(prepare_ticket_offers, sports, snapshot)
         st.session_state['ai_ticket_prepare_started'] = monotonic()
-        st.rerun(scope='app')  # Register polling once, while actual preparation runs.
+        # The next user refresh reads the completed preparation; no automatic redraw.
     return None
 
 
 def render_ai_ticket_results():
-    interval = '3s' if st.session_state.get('ai_ticket_prepare_future') is not None else None
+    interval = None  # Background preparation never redraws the ticket controls.
     return st.fragment(run_every=interval)(_render_ai_ticket_results)()
 
 
@@ -1409,8 +1409,8 @@ def _render_ai_ticket_results():
     sport = st.session_state['ai_ticket_sport']
     selected_sports = ['NFL', 'NBA', 'MLB'] if sport == 'All sports' else [sport]
     prepared = ticket_offer_inputs(selected_sports)
-    if st.session_state.pop('ai_ticket_prepare_finished', False):
-        st.rerun(scope='app')  # One redraw disarms idle polling after preparation.
+    st.session_state.pop('ai_ticket_prepare_finished', False)
+
     if prepared is None:
         from time import monotonic
         seconds = max(0, int(monotonic()-st.session_state.get('ai_ticket_prepare_started',monotonic())))
@@ -1717,6 +1717,9 @@ def select_main_page(destination):
 with st.sidebar:
     st.markdown("## ⚡ MARKET EDGE AI")
     st.caption("Your sports & market dashboard")
+    if st.button('Show latest results', key='show_latest_background_results', use_container_width=True):
+        drain_ticket_prop_updates()
+    st.caption('Scans continue in the background. Use Show latest results to update the display; the page does not refresh automatically.')
     navigation_groups = [
         ("START", ["🏠 Home"]),
         ("SPORTS", ["🏈 NFL", "🏀 NBA", "⚾ MLB"]),
@@ -1975,7 +1978,7 @@ def drain_cross_updates(league):
 
 
 def render_cross_prop_cards(league, game, fallback):
-    interval = '3s' if league != 'NFL' or st.session_state.get('nfl_enrichment_future') is not None else None
+    interval = None  # Display updates only on user interaction.
     return st.fragment(run_every=interval)(_render_cross_prop_cards)(league, game, fallback)
 
 
@@ -2022,7 +2025,7 @@ def _render_cross_prop_cards(league, game, fallback):
                     for reason in reasons[:8]: st.caption(str(reason.get('reason',reason)))
 
 
-@st.fragment(run_every='3s')
+@st.fragment
 def render_mlb_live_workspace(location):
     drain_cross_updates('MLB')
     result = st.session_state.get('mlb_live_pipeline_result') or {}
@@ -2102,7 +2105,7 @@ def render_nba_prop_tracking():
         st.dataframe(frame.sort_values('start_time', ascending=False)[cols], hide_index=True, use_container_width=True)
 
 
-@st.fragment(run_every='3s')
+@st.fragment
 def render_nba_live_prop_cards(game, fallback):
     """Only this game's cards refresh; no network requests or full-page reruns."""
     from dual_agent.game_prediction_addons import matching_game_rows
@@ -2232,7 +2235,7 @@ def enrich_nba_props(result, odds_key, nba_key, updates, context=None):
     return result
 
 
-@st.fragment(run_every='3s')
+@st.fragment
 def render_nba_enrichment_status():
     future = st.session_state.get('nba_enrichment_future')
     render_nba_prop_tracking()
@@ -2702,7 +2705,7 @@ def start_nfl_prediction_request():
 
 
 def render_nfl_generation_progress():
-    interval = '3s' if st.session_state.get('nfl_enrichment_future') is not None else None
+    interval = None  # Background generation never triggers page refreshes.
     return st.fragment(run_every=interval)(_render_nfl_generation_progress)()
 
 
@@ -2737,9 +2740,10 @@ def _render_nfl_generation_progress():
                 ('live_nfl_opportunities','opportunities')]:
             st.session_state[session_key] = current.get(result_key)
         retain_nfl_picks(predictions, 'nfl_saved_team_cards')
-        st.rerun()  # One full redraw per new winner slate, not per props update.
-    if st.session_state.get('nfl_enrichment_future') is None and st.session_state.pop('nfl_scan_was_running', False):
-        st.rerun()  # One completion redraw removes all NFL polling timers.
+        # Results are already in session state and render on this user-requested run.
+    if st.session_state.get('nfl_enrichment_future') is None:
+        st.session_state.pop('nfl_scan_was_running', False)
+
     if st.session_state.get('nfl_generation_issue'):
         st.error(st.session_state['nfl_generation_issue'])
     elif st.session_state.get('nfl_enrichment_future') is not None:
@@ -3399,7 +3403,7 @@ def nfl_prediction_features():
     return install_nfl_history_bundle(load_nfl_history_bundle())
 
 
-@st.fragment(run_every='180s')
+@st.fragment
 def render_nfl_freshness_monitor():
     # Rendering saved cards must never wait for the schedule network request.
     pending = st.session_state.get('nfl_history_refresh_future')
