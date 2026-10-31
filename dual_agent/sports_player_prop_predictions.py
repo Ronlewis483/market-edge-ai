@@ -243,11 +243,9 @@ def _nba_request_issue(exc):
 
 
 def nba_identity_key(name):
-    """Normalize suffixes and explicit aliases; require one unique provider ID."""
-    import re
-    clean = re.sub(r'\s+(?:jr\.?|sr\.?|ii|iii|iv)$', '', str(name).strip(), flags=re.I)
-    value = name_key(clean)
-    return {'alexsarr': 'alexandresarr', 'nicclaxton': 'nicolasclaxton'}.get(value, value)
+    """Use the shared sport-scoped alias normalization."""
+    from dual_agent.player_aliases import name_key as player_name_key
+    return player_name_key(name, 'NBA')
 
 
 def _nba_load_history_archive(path):
@@ -320,6 +318,14 @@ def _nba_history_batches_locked(names, api_key, status=None):
     for name in dict.fromkeys(names):
         key = nba_identity_key(name)
         entry = entries.get(key, {})
+        if not entry:
+            # Reuse histories saved under an older nickname spelling. Never
+            # merge different provider IDs simply because names normalize alike.
+            old_entries = [v for k,v in entries.items()
+                           if nba_identity_key(k) == key and isinstance(v,dict) and v.get('player_id')]
+            if old_entries and len({str(v['player_id']) for v in old_entries}) == 1:
+                entry = max(old_entries, key=lambda v:str(v.get('checked_at','')))
+                entries[key] = entry
         # Migrate the previous complete daily caches instead of downloading again.
         if not entry:
             for legacy in sorted(root.glob(name_key(name)+'_bdl_v2_*.json'), reverse=True):
@@ -369,22 +375,25 @@ def _nba_history_batches_locked(names, api_key, status=None):
             except Exception as exc:
                 for name in missing: yield name, [], 'NBA player directory: '+_nba_request_issue(exc)
                 return
-    index = {}
-    for player in catalog:
-        index.setdefault(nba_identity_key(player.get('first_name','')+' '+player.get('last_name','')), {})[player['id']] = player
+    from dual_agent.player_aliases import PlayerResolver
+    resolver = PlayerResolver(catalog, 'NBA', 'balldontlie')
     resolved = []
     for name in missing:
         if known[name].get('player_id'):
             resolved.append((name, known[name]['player_id']))
             continue
-        matches = list(index.get(nba_identity_key(name), {}).values())
+        matched = resolver.resolve(name)
+        matches = [matched] if matched is not None else []
         if len(matches) != 1:
             # Search is first OR last name, not an assumed full-name match.
             notify('Resolving player identity · '+name)
             try:
                 payload = _get(base+'/players', api_key,
                                {'search': re.sub(r'\s+(?:jr\.?|sr\.?|ii|iii|iv)$', '', name, flags=re.I).split()[-1], 'per_page': 100}, True)
-                matches = [r for r in payload.get('data', []) if nba_identity_key(r.get('first_name','')+' '+r.get('last_name','')) == nba_identity_key(name)]
+                # Keep the current roster in scope: fallback search must not hide a known ambiguous identity.
+                search = {str(r['id']):r for r in catalog+payload.get('data',[]) if r.get('id') is not None}
+                matched = PlayerResolver(list(search.values()), 'NBA', 'balldontlie').resolve(name)
+                matches = [matched] if matched is not None else []
             except Exception as exc:
                 yield name, [], 'Player identity for '+name+': '+_nba_request_issue(exc)
                 continue
@@ -460,9 +469,10 @@ def _nba_history_batches_locked(names, api_key, status=None):
     save(archive_path, archive)
 
 
-def mlb_prop_identities(snapshots):
+def mlb_prop_identities(snapshots, quotes=None):
     """Resolve names within each game's teams; posted lineups override guesses."""
     candidates = {}
+    roster_records = {}
     for gid, snapshot in (snapshots or {}).items():
         feed = snapshot.get('raw_feed', {})
         box = feed.get('liveData', {}).get('boxscore', {}).get('teams', {})
@@ -498,6 +508,20 @@ def mlb_prop_identities(snapshots):
                 value = (pid, hitter, pitching, hitting_status, pitching_status)
                 key = (int(gid), name_key(person['fullName']))
                 candidates.setdefault(key, {})[pid] = value
+                roster_records.setdefault(int(gid), {})[pid] = dict(people.get('ID'+str(pid), {}), **person)
+    from dual_agent.player_aliases import PlayerResolver
+    resolvers = {gid:PlayerResolver(list(players.values()), 'MLB', 'mlb_statsapi') for gid,players in roster_records.items()}
+    for quote in quotes or []:
+        gid = quote.get('game_id')
+        if gid is None: continue
+        gid = int(gid)
+        resolver = resolvers.get(gid)
+        matched = resolver.resolve(quote['player']) if resolver is not None else None
+        if matched is not None:
+            pid = int(matched['id'])
+            original = candidates.get((gid,name_key(matched['fullName'])), {})
+            if pid in original:
+                candidates.setdefault((gid,name_key(quote['player'])), {})[pid] = original[pid]
     return {key: next(iter(values.values())) for key, values in candidates.items() if len(values) == 1}
 
 
@@ -1082,7 +1106,7 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
     else:
         if player_logs is None or player_logs.empty:
             return {'picks':[], 'message':'MLB player warehouse is unavailable; no prop estimates generated.', 'errors':errors}
-        identities = mlb_prop_identities(snapshots)
+        identities = mlb_prop_identities(snapshots, quotes=quotes)
         wanted = {identity[0] for identity in identities.values()}
         player_ids = pd.to_numeric(player_logs.player_id, errors='coerce')
         subset = player_logs.loc[player_ids.isin(wanted)].copy()
