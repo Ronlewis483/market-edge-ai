@@ -261,6 +261,30 @@ st.markdown(
         border: none;
     }
 
+    /* Explicit secondary-button contrast across Streamlit/Snowflake themes. */
+    div[data-testid="stButton"] button[kind="secondary"],
+    div.stButton button[kind="secondary"] {
+        background-color: #172338 !important;
+        color: #F8FAFC !important;
+        border: 1px solid #52647E !important;
+    }
+    div[data-testid="stButton"] button[kind="secondary"] p,
+    div.stButton button[kind="secondary"] p {
+        color: inherit !important;
+    }
+    div[data-testid="stButton"] button[kind="secondary"]:hover:not(:disabled),
+    div.stButton button[kind="secondary"]:hover:not(:disabled) {
+        background-color: #22344E !important;
+        border-color: #38BDF8 !important;
+    }
+    div[data-testid="stButton"] button:disabled,
+    div.stButton button:disabled {
+        background-color: #202B3C !important;
+        color: #A6B2C4 !important;
+        border-color: #475569 !important;
+        opacity: 0.75;
+    }
+
     /* Input fields */
     div[data-baseweb="select"] > div,
     div[data-baseweb="input"] > div {
