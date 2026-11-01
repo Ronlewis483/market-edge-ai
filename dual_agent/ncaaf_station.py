@@ -1,7 +1,7 @@
 """NCAA football market station using the existing Odds API credentials.
 
 Market probabilities are explicitly separate from trained model predictions.
-No extra stats subscription, model training, automatic polls or wager placement.
+Connected forecasts are generated explicitly; viewing cards never starts API requests.
 """
 from datetime import datetime, timedelta, timezone
 from statistics import median
@@ -111,9 +111,9 @@ def render_station():
     @st.cache_resource(show_spinner=False)
     def worker_pool():
         return ThreadPoolExecutor(max_workers=2)
-    st.title('🏈 NCAA Football · Connected Engine')
-    st.caption('FBS college football · upcoming seven days · CollegeFootballData + your existing Odds API.')
-    st.caption('One final forecast: college base engine → NCAA-trained neural signal → bounded context correction. No probability averaging or NBA/NFL weights. Current context covers team history, rest and neutral venues; player/injury adjustments are not yet connected.')
+    st.title('ðŸˆ NCAA Football Â· Connected Engine')
+    st.caption('FBS college football Â· upcoming seven days Â· CollegeFootballData + your existing Odds API.')
+    st.caption('One final forecast: college base engine â†’ NCAA-trained neural signal â†’ bounded context correction. No probability averaging or NBA/NFL weights. Current context covers team history, rest and neutral venues; player/injury adjustments are not yet connected.')
     if st.button('Generate NCAA connected predictions',type='primary',key='ncaaf_load'):
         pending = st.session_state.get('ncaaf_station_future')
         if pending is None or pending.done():
@@ -177,23 +177,100 @@ def render_station():
     if not games:
         st.info('No supported upcoming FBS predictions were produced. Games with unconfirmed kickoff times or insufficient prior history are excluded.')
         return
-    def summary(g):
-        return {'Game':g['away_team']+' @ '+g['home_team'],
-                'Kickoff CT':pd.Timestamp(g['commence_time']).tz_convert('America/Chicago').strftime('%b %d, %I:%M %p'),
-                'Connected pick':g['predicted_team'], 'Model probability':g['model_confidence'],
-                'Market favorite':g['market_favorite'], 'Market-implied chance':g['favorite_probability'],
-                'Moneyline books':len(g['moneylines'])}
-    favorites = sorted(games,key=lambda g:-g['model_confidence'])[:10]
-    if favorites:
-        st.subheader('Top 10 connected predictions')
-        st.dataframe(pd.DataFrame([summary(g) for g in favorites]),hide_index=True,use_container_width=True)
-    st.subheader('All upcoming games')
-    st.dataframe(pd.DataFrame([summary(g) for g in games]),hide_index=True,use_container_width=True)
-    chosen = st.selectbox('Game details',games,format_func=lambda g:g['away_team']+' @ '+g['home_team']+' · '+pd.Timestamp(g['commence_time']).tz_convert('America/Chicago').strftime('%b %d, %I:%M %p CT'),key='ncaaf_game')
-    st.caption('Win probabilities remove each book’s margin, then take the median across returned books. They are not independent model confidence or proof of a betting edge.')
+    chosen = render_prediction_cards(games, result)
+    if chosen is None:
+        return
+    st.caption('Win probabilities remove each bookâ€™s margin, then take the median across returned books. They are not independent model confidence or proof of a betting edge.')
     for field,label in [('moneylines','Moneylines'),('spreads','Spreads'),('totals','Game totals')]:
         st.markdown('**'+label+'**')
         fresh = [q for q in chosen[field] if pd.Timedelta(0)<=now-pd.Timestamp(q['Quote UTC'])<=pd.Timedelta(minutes=30)]
         if fresh:st.dataframe(pd.DataFrame(fresh).drop(columns=['book']),hide_index=True,use_container_width=True)
         else:st.caption('No current quotes in this category. Refresh to check for new listings.')
     st.caption('These are winner predictions. Player props, player-strength corrections and NCAA ticket recommendations require a separate college player-data pipeline.')
+
+
+def card_groups(games, now=None):
+    """Today first, then strongest ten remaining, then the rest; no duplicates."""
+    from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
+    now = now or datetime.now(timezone.utc)
+    today = now.astimezone(ZoneInfo('America/Chicago')).date()
+    unique = {str(g['game_id']): g for g in games}
+    ranked = sorted(unique.values(), key=lambda g: (-float(g['model_confidence']), g['commence_time'], str(g['game_id'])))
+    current = [g for g in ranked if datetime.fromisoformat(g['commence_time'].replace('Z','+00:00')).astimezone(ZoneInfo('America/Chicago')).date() == today]
+    seen = {str(g['game_id']) for g in current}
+    remaining = [g for g in ranked if str(g['game_id']) not in seen]
+    return [("Today's picks", current), ('Strongest upcoming picks Â· up to 10', remaining[:10]), ('Remaining games', remaining[10:])]
+
+
+def render_prediction_cards(games, result):
+    """Match the other sport workspaces: selectable cards and game spotlight."""
+    import pandas as pd
+    import streamlit as st
+    from html import escape
+    st.markdown('<div class="me-workspace-header"><div class="me-eyebrow">PREDICTION WORKSPACE Â· NCAA FOOTBALL</div><h2>Find your next pick</h2><p>Select a game to compare its connected forecast and listed sportsbook lines.</p></div>', unsafe_allow_html=True)
+    controls = st.columns([2,2,3])
+    with controls[0]:
+        window = st.selectbox('Game window', ['Next 7 days', 'Today'], key='ncaaf_card_window')
+    with controls[1]:
+        threshold = st.selectbox('Winner confidence', ['All predictions','70% or higher','80% or higher'], key='ncaaf_card_confidence')
+    with controls[2]:
+        search = st.text_input('Find a team', key='ncaaf_card_search', placeholder='Search either teamâ€¦').strip().casefold()
+    minimum = .8 if threshold.startswith('80') else .7 if threshold.startswith('70') else 0
+    filtered = [g for g in games if float(g['model_confidence']) >= minimum and
+                (not search or search in g['home_team'].casefold() or search in g['away_team'].casefold())]
+    groups = card_groups(filtered)
+    if window == 'Today': groups = groups[:1]
+    visible = [g for _, rows in groups for g in rows]
+    if not visible:
+        st.info('No games match these filters. Try another team, window or confidence level.')
+        return None
+    by_id = {str(g['game_id']):g for g in visible}
+    selection = 'ncaaf_selected_card'
+    if st.session_state.get(selection) not in by_id:
+        st.session_state[selection] = str(visible[0]['game_id'])
+    def select_game(identity):
+        st.session_state[selection] = identity
+    def badge(label, probability):
+        # Same badge class used by the other prediction workspaces.
+        tone = 'strong' if probability >= .70 else 'moderate' if probability >= .58 else 'close'
+        st.markdown('<div class="me-confidence me-'+tone+'">'+escape(str(label))+' <span>'+f'{float(probability):.1%}'+'</span></div>', unsafe_allow_html=True)
+    left, right = st.columns([1,1.25], gap='large')
+    with left:
+        st.subheader('NCAA game picks')
+        st.caption(f'{len(visible)} games Â· today first, then the strongest upcoming forecasts')
+        with st.container(height=650, border=True):
+            for title, rows in groups:
+                if not rows: continue
+                st.markdown('**'+title+'**')
+                for game in rows:
+                    gid = str(game['game_id'])
+                    with st.container(border=True):
+                        kickoff = pd.Timestamp(game['commence_time']).tz_convert('America/Chicago')
+                        st.caption(kickoff.strftime('%b %d, %Y Â· %I:%M %p CT')+' Â· Upcoming')
+                        st.markdown('**'+game['away_team']+' @ '+game['home_team']+'**')
+                        badge(game['predicted_team'], game['model_confidence'])
+                        st.button('Selected game' if st.session_state[selection]==gid else 'View game & sportsbook lines',
+                            key='ncaaf_pick_'+gid, type='primary' if st.session_state[selection]==gid else 'secondary',
+                            use_container_width=True, on_click=select_game, args=(gid,))
+    chosen = by_id[st.session_state[selection]]
+    with right:
+        st.subheader('Game spotlight')
+        with st.container(border=True):
+            st.markdown('### '+chosen['away_team']+' @ '+chosen['home_team'])
+            st.caption(pd.Timestamp(chosen['commence_time']).tz_convert('America/Chicago').strftime('%b %d, %Y Â· %I:%M %p CT'))
+            st.markdown('**ðŸ† Predicted winner: '+chosen['predicted_team']+'**')
+            badge('Estimated win chance', chosen['model_confidence'])
+            st.progress(min(1., max(0., float(chosen['model_confidence']))))
+            market = chosen.get('market_favorite')
+            if market and chosen.get('favorite_probability') is not None:
+                st.caption(f"Sportsbook consensus: {market} Â· {chosen['favorite_probability']:.1%} implied chance")
+            else:
+                st.caption('No fresh moneyline comparison. The connected forecast remains available.')
+            with st.expander('View model details'):
+                st.write('Home win chance:', f"{chosen['model_home_probability']:.1%}")
+                st.write('Away win chance:', f"{chosen['model_away_probability']:.1%}")
+                st.caption('Connected NCAA engine Â· '+str(result['model_id']))
+                st.caption('Team history, rest and neutral venues; college player and injury inputs are not connected.')
+            st.caption('College player props are not connected yet. Listed spreads and totals below are sportsbook offers, not model spread or total predictions.')
+    return chosen
