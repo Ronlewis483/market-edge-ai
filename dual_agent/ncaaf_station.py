@@ -103,6 +103,21 @@ def load_station(api_key, cfbd_key=None):
     return generate_predictions(cfbd_key,api_key)
 
 
+def _player_ui(function_name):
+    """Keep the winner page usable when a deployed prop module is incomplete."""
+    import importlib
+    import streamlit as st
+    try:
+        module = importlib.import_module('dual_agent.ncaaf_player_props')
+        function = getattr(module, function_name, None)
+        if not callable(function):
+            raise ImportError('Missing public NCAAF player UI function')
+        return function
+    except ImportError:
+        st.warning('NCAAF player tools could not load. Replace dual_agent/ncaaf_player_props.py with the complete matching file, then reboot the app. NCAA winner predictions remain available.')
+        return None
+
+
 def render_station():
     import os
     import pandas as pd
@@ -111,11 +126,12 @@ def render_station():
     @st.cache_resource(show_spinner=False)
     def worker_pool():
         return ThreadPoolExecutor(max_workers=2)
-    st.title('ðŸˆ NCAA Football Â· Connected Engine')
-    from dual_agent.ncaaf_player_props import render_training_controls
-    render_training_controls()
-    st.caption('FBS college football Â· upcoming seven days Â· CollegeFootballData + your existing Odds API.')
-    st.caption('One final forecast: college base engine â†’ NCAA-trained neural signal â†’ bounded context correction. No probability averaging or NBA/NFL weights. Winner inputs cover team history, rest and neutral venues. College-only player-prop regression is configured separately below; injury and starter status remain unverified.')
+    st.title('NCAA Football | Connected Engine')
+    training_controls = _player_ui('render_training_controls')
+    if training_controls is not None:
+        training_controls()
+    st.caption('FBS college football \xb7 upcoming seven days \xb7 CollegeFootballData + your existing Odds API.')
+    st.caption('One final forecast: college base engine \u2192 NCAA-trained neural signal \u2192 bounded context correction. No probability averaging or NBA/NFL weights. Winner inputs cover team history, rest and neutral venues. College-only player-prop regression is configured separately below; injury and starter status remain unverified.')
     if st.button('Generate NCAA connected predictions',type='primary',key='ncaaf_load'):
         pending = st.session_state.get('ncaaf_station_future')
         if pending is None or pending.done():
@@ -182,7 +198,7 @@ def render_station():
     chosen = render_prediction_cards(games, result)
     if chosen is None:
         return
-    st.caption('Win probabilities remove each bookâ€™s margin, then take the median across returned books. They are not independent model confidence or proof of a betting edge.')
+    st.caption('Win probabilities remove each book\u2019s margin, then take the median across returned books. They are not independent model confidence or proof of a betting edge.')
     for field,label in [('moneylines','Moneylines'),('spreads','Spreads'),('totals','Game totals')]:
         st.markdown('**'+label+'**')
         fresh = [q for q in chosen[field] if pd.Timedelta(0)<=now-pd.Timestamp(q['Quote UTC'])<=pd.Timedelta(minutes=30)]
@@ -202,7 +218,7 @@ def card_groups(games, now=None):
     current = [g for g in ranked if datetime.fromisoformat(g['commence_time'].replace('Z','+00:00')).astimezone(ZoneInfo('America/Chicago')).date() == today]
     seen = {str(g['game_id']) for g in current}
     remaining = [g for g in ranked if str(g['game_id']) not in seen]
-    return [("Today's picks", current), ('Strongest upcoming picks Â· up to 10', remaining[:10]), ('Remaining games', remaining[10:])]
+    return [("Today's picks", current), ('Strongest upcoming picks \xb7 up to 10', remaining[:10]), ('Remaining games', remaining[10:])]
 
 
 def render_prediction_cards(games, result):
@@ -210,14 +226,14 @@ def render_prediction_cards(games, result):
     import pandas as pd
     import streamlit as st
     from html import escape
-    st.markdown('<div class="me-workspace-header"><div class="me-eyebrow">PREDICTION WORKSPACE Â· NCAA FOOTBALL</div><h2>Find your next pick</h2><p>Select a game to compare its connected forecast and listed sportsbook lines.</p></div>', unsafe_allow_html=True)
+    st.markdown('<div class="me-workspace-header"><div class="me-eyebrow">PREDICTION WORKSPACE \xb7 NCAA FOOTBALL</div><h2>Find your next pick</h2><p>Select a game to compare its connected forecast and listed sportsbook lines.</p></div>', unsafe_allow_html=True)
     controls = st.columns([2,2,3])
     with controls[0]:
         window = st.selectbox('Game window', ['Next 7 days', 'Today'], key='ncaaf_card_window')
     with controls[1]:
         threshold = st.selectbox('Winner confidence', ['All predictions','70% or higher','80% or higher'], key='ncaaf_card_confidence')
     with controls[2]:
-        search = st.text_input('Find a team', key='ncaaf_card_search', placeholder='Search either teamâ€¦').strip().casefold()
+        search = st.text_input('Find a team', key='ncaaf_card_search', placeholder='Search either team\u2026').strip().casefold()
     minimum = .8 if threshold.startswith('80') else .7 if threshold.startswith('70') else 0
     filtered = [g for g in games if float(g['model_confidence']) >= minimum and
                 (not search or search in g['home_team'].casefold() or search in g['away_team'].casefold())]
@@ -240,7 +256,7 @@ def render_prediction_cards(games, result):
     left, right = st.columns([1,1.25], gap='large')
     with left:
         st.subheader('NCAA game picks')
-        st.caption(f'{len(visible)} games Â· today first, then the strongest upcoming forecasts')
+        st.caption(f'{len(visible)} games \xb7 today first, then the strongest upcoming forecasts')
         with st.container(height=650, border=True):
             for title, rows in groups:
                 if not rows: continue
@@ -249,7 +265,7 @@ def render_prediction_cards(games, result):
                     gid = str(game['game_id'])
                     with st.container(border=True):
                         kickoff = pd.Timestamp(game['commence_time']).tz_convert('America/Chicago')
-                        st.caption(kickoff.strftime('%b %d, %Y Â· %I:%M %p CT')+' Â· Upcoming')
+                        st.caption(kickoff.strftime('%b %d, %Y \xb7 %I:%M %p CT')+' \xb7 Upcoming')
                         st.markdown('**'+game['away_team']+' @ '+game['home_team']+'**')
                         badge(game['predicted_team'], game['model_confidence'])
                         st.button('Selected game' if st.session_state[selection]==gid else 'View game & sportsbook lines',
@@ -260,21 +276,22 @@ def render_prediction_cards(games, result):
         st.subheader('Game spotlight')
         with st.container(border=True):
             st.markdown('### '+chosen['away_team']+' @ '+chosen['home_team'])
-            st.caption(pd.Timestamp(chosen['commence_time']).tz_convert('America/Chicago').strftime('%b %d, %Y Â· %I:%M %p CT'))
-            st.markdown('**ðŸ† Predicted winner: '+chosen['predicted_team']+'**')
+            st.caption(pd.Timestamp(chosen['commence_time']).tz_convert('America/Chicago').strftime('%b %d, %Y \xb7 %I:%M %p CT'))
+            st.markdown('**\U0001f3c6 Predicted winner: '+chosen['predicted_team']+'**')
             badge('Estimated win chance', chosen['model_confidence'])
             st.progress(min(1., max(0., float(chosen['model_confidence']))))
             market = chosen.get('market_favorite')
             if market and chosen.get('favorite_probability') is not None:
-                st.caption(f"Sportsbook consensus: {market} Â· {chosen['favorite_probability']:.1%} implied chance")
+                st.caption(f"Sportsbook consensus: {market} \xb7 {chosen['favorite_probability']:.1%} implied chance")
             else:
                 st.caption('No fresh moneyline comparison. The connected forecast remains available.')
             with st.expander('View model details'):
                 st.write('Home win chance:', f"{chosen['model_home_probability']:.1%}")
                 st.write('Away win chance:', f"{chosen['model_away_probability']:.1%}")
-                st.caption('Connected NCAA engine Â· '+str(result['model_id']))
+                st.caption('Connected NCAA engine \xb7 '+str(result['model_id']))
                 st.caption('Winner inputs: team history, rest and neutral venues. Individual player-strength and injury corrections are not inputs to this winner model.')
             st.caption('Listed spreads and totals below are sportsbook offers, not model spread or total predictions.')
-            from dual_agent.ncaaf_player_props import render_props_panel
-            render_props_panel(chosen)
+            props_panel = _player_ui('render_props_panel')
+            if props_panel is not None:
+                props_panel(chosen)
     return chosen
