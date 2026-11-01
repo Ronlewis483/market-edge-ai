@@ -112,8 +112,10 @@ def render_station():
     def worker_pool():
         return ThreadPoolExecutor(max_workers=2)
     st.title('ðŸˆ NCAA Football Â· Connected Engine')
+    from dual_agent.ncaaf_player_props import render_training_controls
+    render_training_controls()
     st.caption('FBS college football Â· upcoming seven days Â· CollegeFootballData + your existing Odds API.')
-    st.caption('One final forecast: college base engine â†’ NCAA-trained neural signal â†’ bounded context correction. No probability averaging or NBA/NFL weights. Current context covers team history, rest and neutral venues; player/injury adjustments are not yet connected.')
+    st.caption('One final forecast: college base engine â†’ NCAA-trained neural signal â†’ bounded context correction. No probability averaging or NBA/NFL weights. Winner inputs cover team history, rest and neutral venues. College-only player-prop regression is configured separately below; injury and starter status remain unverified.')
     if st.button('Generate NCAA connected predictions',type='primary',key='ncaaf_load'):
         pending = st.session_state.get('ncaaf_station_future')
         if pending is None or pending.done():
@@ -186,7 +188,7 @@ def render_station():
         fresh = [q for q in chosen[field] if pd.Timedelta(0)<=now-pd.Timestamp(q['Quote UTC'])<=pd.Timedelta(minutes=30)]
         if fresh:st.dataframe(pd.DataFrame(fresh).drop(columns=['book']),hide_index=True,use_container_width=True)
         else:st.caption('No current quotes in this category. Refresh to check for new listings.')
-    st.caption('These are winner predictions. Player props, player-strength corrections and NCAA ticket recommendations require a separate college player-data pipeline.')
+    st.caption('Winner predictions and player-prop regression are separate models. College props are provisional; no NCAA ticket placement or verified combined-ticket probability is provided.')
 
 
 def card_groups(games, now=None):
@@ -271,6 +273,8 @@ def render_prediction_cards(games, result):
                 st.write('Home win chance:', f"{chosen['model_home_probability']:.1%}")
                 st.write('Away win chance:', f"{chosen['model_away_probability']:.1%}")
                 st.caption('Connected NCAA engine Â· '+str(result['model_id']))
-                st.caption('Team history, rest and neutral venues; college player and injury inputs are not connected.')
-            st.caption('College player props are not connected yet. Listed spreads and totals below are sportsbook offers, not model spread or total predictions.')
+                st.caption('Winner inputs: team history, rest and neutral venues. Individual player-strength and injury corrections are not inputs to this winner model.')
+            st.caption('Listed spreads and totals below are sportsbook offers, not model spread or total predictions.')
+            from dual_agent.ncaaf_player_props import render_props_panel
+            render_props_panel(chosen)
     return chosen
