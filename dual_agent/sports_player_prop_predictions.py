@@ -1,7 +1,8 @@
 """Pregame player-prop estimates using actual lines and prior appearances.
 
 NBA uses saved neural weights for promoted categories, with the existing
-minutes model as fallback. MLB retains its existing historical calculations.
+minutes model as fallback. Approved saved regression estimates can replace
+non-neural projections; existing history calculations remain the fallback.
 """
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
@@ -812,6 +813,14 @@ def estimate_nba_matchup(rows, stat, line, side, matchup, context=None):
         baseline['Neural fallback reason'] = 'Category not promoted or complete neural history unavailable'
     except (ImportError, OSError, ValueError, KeyError, TypeError) as exc:
         baseline['Neural fallback reason'] = 'Saved NBA neural model unavailable: '+type(exc).__name__
+    try:
+        from dual_agent.player_prop_regression import card_estimate
+        category = next((key for key, (_, fields) in MARKETS['NBA'].items() if fields == stat), None)
+        trained = card_estimate(actual, line, side, 'NBA', category, cutoff)
+        if trained:
+            baseline.update(trained)
+    except ImportError:
+        pass
     return baseline
 
 
@@ -1223,6 +1232,13 @@ def _rank_prop_candidates(league, games, groups, history_by_name, errors,
                 minimum_decisions=8 if league == 'MLB' and not pitching_market else None)
             if league == 'NBA':
                 estimate = estimate_nba_matchup(nba_rows,stat,line,side,first,nba_context)
+            if estimate and league == 'MLB':
+                try:
+                    from dual_agent.player_prop_regression import card_estimate
+                    trained = card_estimate(values, line, side, 'MLB', market, min(start,pd.Timestamp(first['capture_time'])))
+                    if trained: estimate.update(trained)
+                except ImportError:
+                    pass
             if estimate and league == 'MLB' and pitching_market:
                 best_forecast = max(available, key=lambda q:q[price_key])
                 pitcher_forecasts.append({'game_id': int(first['game_id']), 'player_id': identity[0],
@@ -1238,7 +1254,7 @@ def _rank_prop_candidates(league, games, groups, history_by_name, errors,
             enough_history = estimate and estimate['Prior games'] >= 10 and estimate['Prior games']-estimate['Historical pushes'] >= required_decisions
             if enough_history:
 
-                if league != 'NBA' and not paired_probabilities:
+                if league != 'NBA' and not paired_probabilities and not estimate.get('Regression model ID'):
                     estimate['Estimate method'] = 'Prior 30 appearances + neutral shrinkage; one-sided sportsbook quote'
                 best = max(available, key=lambda q:q[price_key])
                 if league == 'NBA':
