@@ -208,7 +208,9 @@ def train_connected(sport,base_id,rows,store):
         old,new=metrics(y,p),metrics(y,probability(p,delta));report[label]={'original':old,'connected':new}
         passed=passed and new['accuracy']>old['accuracy'] and new['brier']<=old['brier'] and new['log_loss']<=old['log_loss']
     model['checks_passed']=bool(passed);model['model_id']='nfl_connected_'+digest(model)[:16]
-    report.update(trained=True,status='candidate_saved',activated=bool(passed),checks_passed=bool(passed),correction_gain=gain,model_id=model['model_id'],probability_averaging=False)
+    from .sports_connected_winner import approve_candidate
+    activate=approve_candidate(sport,base_id,model,groups,report,store)
+    report.update(trained=True,status='candidate_saved',activated=bool(activate),checks_passed=bool(passed),correction_gain=gain,model_id=model['model_id'],probability_averaging=False)
     store.write(ROOT+'nfl/candidates/'+model['model_id']+'.json.gz',model)
-    if passed:store.write(ROOT+'nfl/active.json.gz',model,replace=True)
+    if activate:store.write(ROOT+'nfl/active.json.gz',model,replace=True)
     return report
