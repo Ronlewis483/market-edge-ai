@@ -153,12 +153,12 @@ def render_station():
         st.session_state.pop('ncaaf_station_future',None)
         pending = None
     if pending is not None:
-        st.caption('NCAA history and connected predictions are processing in the background. The first training run takes longer; saved data and fitted weights are reused. Use Show latest NCAA results when ready.')
+        st.caption('Loading saved NCAA weights and calculating predictions in the background. Training runs in GitHub Actions. Use Show latest NCAA results when ready.')
     if st.session_state.get('ncaaf_station_error'):
         st.error(st.session_state['ncaaf_station_error'])
     result = st.session_state.get('ncaaf_station_result')
     st.caption('Generation may use CFBD and Odds API requests. Viewing saved results makes no requests. CFBD_API_KEY is required; odds comparisons are optional.')
-    st.caption('Player-prop training below is optional for winner predictions. Use Generate NCAA connected predictions above for game winners.')
+    st.caption('Use Generate NCAA connected predictions for game winners. Data collection and training run separately in GitHub Actions.')
     training_controls = _player_ui('render_training_controls')
     if training_controls is not None:
         training_controls()
@@ -176,7 +176,12 @@ def render_station():
         st.caption(result.get('limitations',''))
         st.write('Frozen pregame results by model version')
         st.json(result.get('prospective_results', {}))
-        st.caption('Local forecast records are graded on later Generate requests using CFBD finals. No scheduled training job or remote forecast backup is configured by these files.')
+        st.caption('Pregame winner forecasts are backed up to Supabase and graded by the daily Actions job after CFBD marks games final. Weekly training evaluates challengers separately.')
+    if result.get('history_checked_at'):
+        history_time=pd.Timestamp(result['history_checked_at'])
+        st.caption('Saved schedule/results snapshot: '+history_time.tz_convert('America/Chicago').strftime('%b %d, %I:%M %p CT'))
+        if pd.Timestamp.now(tz='UTC')-history_time>pd.Timedelta(days=2):
+            st.warning('The saved NCAA history is more than two days old. Check the daily Actions job before relying on this slate.')
     checked = pd.Timestamp(result['checked_at']).tz_convert('America/Chicago')
     st.caption('Last check: '+checked.strftime('%b %d, %I:%M %p CT'))
     # Reapply time and freshness rules while viewing saved results.
