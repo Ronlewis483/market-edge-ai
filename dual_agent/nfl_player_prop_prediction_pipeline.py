@@ -109,6 +109,7 @@ def _estimate_prop(
     line,
     market,
     side=None,
+    cutoff=None,
 ):
     """
     Produce a ranked prop forecast.
@@ -201,6 +202,18 @@ def _estimate_prop(
         (under_hits + 1)
         / (eligible + 2)
     )
+
+    regression = None
+    if market != 'Anytime touchdown' and cutoff is not None:
+        try:
+            from dual_agent.player_prop_regression import estimate as regression_estimate
+            regression = regression_estimate(values, line, side or 'OVER', 'NFL', market, cutoff)
+            if regression:
+                projection = regression['projection']
+                over_support = regression['over_support']
+                under_support = regression['under_support']
+        except ImportError:
+            pass
 
     if market == "Anytime touchdown":
 
@@ -319,17 +332,18 @@ def _estimate_prop(
             consistency,
         "prediction_score":
             prediction_score,
+        **({k: regression[k] for k in ('estimated_push_chance', 'estimate_method', 'regression_model_id', 'regression_evaluation_end')} if regression else {}),
     }
 
 
-def _compare_prop_outcomes(values, line, market, offered_sides):
+def _compare_prop_outcomes(values, line, market, offered_sides, cutoff=None):
     """Score both outcomes; only exact offered sides can qualify."""
     outcomes = []
     sides = ('YES', 'NO') if market == 'Anytime touchdown' else ('OVER', 'UNDER')
     aliases = ('OVER', 'UNDER') if market == 'Anytime touchdown' else ('YES', 'NO')
     sides += tuple(side for side in aliases if side in offered_sides)
     for side in sides:
-        estimate = _estimate_prop(values, line, market, side=side)
+        estimate = _estimate_prop(values, line, market, side=side, cutoff=cutoff)
         if estimate is None:
             continue
         offers = offered_sides.get(side, [])
@@ -523,7 +537,7 @@ def run_nfl_player_prop_prediction_pipeline(
             )
         )
 
-        outcome_comparison = _compare_prop_outcomes(values, float(line), market, prop['offered_sides'])
+        outcome_comparison = _compare_prop_outcomes(values, float(line), market, prop['offered_sides'], cutoff=kickoff)
         valid_sides = {'YES','NO','OVER','UNDER'}
         for offered_side in prop['offered_sides']:
             if offered_side not in valid_sides:
@@ -533,6 +547,7 @@ def run_nfl_player_prop_prediction_pipeline(
                 line=float(line),
                 market=market,
                 side=offered_side,
+                cutoff=kickoff,
             )
 
             if estimate is None:
@@ -631,6 +646,7 @@ def run_nfl_player_prop_prediction_pipeline(
                         estimate[
                             "consistency"
                         ],
+                    **{k:estimate[k] for k in ("estimate_method", "regression_model_id", "regression_evaluation_end", "estimated_push_chance") if k in estimate},
                     "prediction_score":
                         score,
                     "outcome_comparison": outcome_comparison,
