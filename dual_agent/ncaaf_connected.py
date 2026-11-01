@@ -98,6 +98,13 @@ def _predict(artifact,x):
 def fit_connected(records,now=None):
     now=now or datetime.now(timezone.utc)
     rows,future,unsupported=build_dataset(records,now)
+    import os
+    if os.environ.get('NCAAF_ACTIONS_RUN') != 'true':
+        from dual_agent.ncaaf_storage import runtime_bundle
+        bundle=runtime_bundle();artifact=bundle.get('winner')
+        if not artifact:raise ValueError('No saved connected NCAA model yet. Run the NCAAF Actions workflow in bootstrap mode.')
+        if artifact.get('architecture')!=ARCHITECTURE:raise ValueError('Saved NCAA winner architecture mismatch')
+        return _forecast(artifact,rows,future,unsupported)
     if len(rows)<400:raise ValueError('Connected NCAA training needs at least 400 supported completed FBS games.')
     identity=hashlib.sha256(json.dumps([[r['id'],r['x'],r['y']] for r in rows],separators=(',',':')).encode()).hexdigest()[:20]
     path=Path('ncaaf_history_cache/connected_models')/(identity+'.json')
@@ -110,6 +117,10 @@ def fit_connected(records,now=None):
             path.parent.mkdir(parents=True,exist_ok=True);temp=path.with_suffix('.tmp')
             temp.write_text(json.dumps(artifact,allow_nan=False));temp.replace(path)
         except OSError:pass
+    return _forecast(artifact,rows,future,unsupported)
+
+
+def _forecast(artifact,rows,future,unsupported):
     games=[]
     if future:
         base,connected=_predict(artifact,[r['x'] for r in future])
@@ -189,6 +200,7 @@ def _train(rows,identity):
     for name,part in [('validation',validation),('test',test)]:
         p,c=probabilities(part,gain);y=[r['y'] for r in part]
         comparisons[name]={'original':_metrics(y,p),'connected':_metrics(y,c)}
+        if name=='test':heldout=[{'id':r['id'],'date':r['start'].isoformat(),'y':int(r['y']),'probability':float(v)} for r,v in zip(part,c)]
     passed=all(c['connected']['accuracy']>=c['original']['accuracy'] and c['connected']['log_loss']<c['original']['log_loss']
                and c['connected']['brier']<=c['original']['brier'] for c in comparisons.values())
     # Refit the base on all observed history for current inference. Correction
@@ -196,6 +208,7 @@ def _train(rows,identity):
     live_base=_base(rows);scaler=live_base.named_steps['standardscaler'];lr=live_base.named_steps['logisticregression']
     return {'architecture':ARCHITECTURE,'model_id':'ncaaf_connected_'+identity,
         'base':{'mean':scaler.mean_.tolist(),'scale':scaler.scale_.tolist(),'coef':lr.coef_[0].tolist(),'intercept':float(lr.intercept_[0])},
-        'brain':brain,'trees':exported,'learning_rate':.025,'gain':gain,
+        'trained_through':max(r['start'] for r in rows).isoformat(),'training_ids':[r['id'] for r in rows],
+        'heldout':heldout,'brain':brain,'trees':exported,'learning_rate':.025,'gain':gain,
         'checks_passed':passed,**comparisons,'residual_training_games':len(residual),
         'partition_games':{'train':len(train),'validation':len(validation),'test':len(test)}}
