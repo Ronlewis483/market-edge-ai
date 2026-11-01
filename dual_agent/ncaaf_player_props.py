@@ -39,11 +39,26 @@ def _write(name, data):
 
 
 def _weights_path():
+    import os
+    if os.environ.get('NCAAF_ACTIONS_RUN') != 'true':
+        from dual_agent.ncaaf_storage import runtime_bundle, digest
+        weights=runtime_bundle().get('props')
+        if weights:
+            path=Path('ncaaf_history_cache/runtime')/('props_'+digest(weights)+'.json')
+            with _LOCK:
+                if not path.exists():
+                    path.parent.mkdir(parents=True,exist_ok=True);tmp=path.with_suffix('.tmp')
+                    tmp.write_text(json.dumps(weights,allow_nan=False));tmp.replace(path)
+            return path
     local=ROOT/'weights.json'
     return local if local.exists() else Path(__file__).with_name('ncaaf_player_prop_regression_weights.json')
 
 
 def _weights():
+    import os
+    if os.environ.get('NCAAF_ACTIONS_RUN') != 'true':
+        from dual_agent.ncaaf_storage import runtime_bundle
+        return runtime_bundle().get('props') or {}
     try:return json.loads(_weights_path().read_text())
     except (OSError,ValueError):return {}
 
@@ -274,7 +289,12 @@ def generate_props(game, cfbd_key, odds_key, now=None):
     from dual_agent.ncaaf_prediction import _cfbd
     now=now or datetime.now(timezone.utc)
     if not odds_key or not cfbd_key: raise ValueError('CFBD_API_KEY and ODDS_API_KEY are required for NCAAF props')
-    with _LOCK: history=_read('history.json',[])
+    import os
+    if os.environ.get('NCAAF_ACTIONS_RUN') == 'true':
+        with _LOCK: history=_read('history.json',[])
+    else:
+        from dual_agent.ncaaf_storage import runtime_bundle
+        history=runtime_bundle().get('player_history',[])
     if not history: return {'picks':[],'issues':['Prepare NCAAF player history and train the model first.'],'checked_at':now.isoformat()}
     with _LOCK: weights=_weights()
     eligible=[market for market in MARKETS if weights.get('markets',{}).get('NCAAF|'+market,{}).get('promoted')]
@@ -290,6 +310,11 @@ def generate_props(game, cfbd_key, odds_key, now=None):
     picks,issues=score_quotes(game,quotes,roster,history,now)
     result={'picks':picks,'issues':issues,'listed_offers':len(quotes),'checked_at':now.isoformat(),
         'limitations':'Only explicitly recorded category results are used; missing appearances are not zero. College injury/lineup availability is unverified. Probabilities are experimental, not established betting accuracy.'}
+    try:
+        from dual_agent.ncaaf_storage import freeze_props
+        result['new_frozen_forecasts']=freeze_props(picks,now=now)
+    except Exception:
+        result['issues'].append('Remote pregame prop backup unavailable; new offers are not confirmed in the prospective audit.')
     with _LOCK:_write('game_'+str(game['game_id'])+'.json',result)
     return result
 
@@ -320,34 +345,21 @@ def _ui_pool():
 
 def render_training_controls():
     import streamlit as st
-    with st.expander('NCAAF player history and regression training'):
-        st.caption('Collect completed-game player stats with CFBD_API_KEY and train college-only regression weights. This is separate from winner prediction generation and does not request sportsbook odds.')
-        limit=st.number_input('Maximum player-history weeks per preparation run',min_value=1,max_value=100,value=8,step=1,key='ncaaf_prop_weeks')
-        future=st.session_state.get('ncaaf_prop_training_future')
-        if st.button('Prepare / train NCAAF player model',key='ncaaf_prepare_player_model',disabled=future is not None and not future.done()):
-            key,_=_credentials()
-            if not key:st.error('Add CFBD_API_KEY to app secrets first.')
-            else:
-                st.session_state['ncaaf_prop_training_future']=_ui_pool().submit(prepare_history,key,int(limit))
-                future=st.session_state['ncaaf_prop_training_future']
-        st.button('Show latest training status',key='ncaaf_prop_training_status')
-        if future is not None and future.done():
-            try:st.session_state['ncaaf_prop_training_report']=future.result()
-            except Exception as exc:st.error('NCAAF player preparation failed: '+str(exc))
-            st.session_state.pop('ncaaf_prop_training_future',None);future=None
-        if future is not None:st.caption('Preparing saved history and training in the background. Use Show latest training status; the page does not refresh automatically.')
-        report=st.session_state.get('ncaaf_prop_training_report') or _read('latest_training_report.json',{})
-        if report:
-            st.write('Status: '+report.get('status','Unknown'))
-            st.caption(f"{report.get('saved_stat_rows',0):,} saved stat rows \xb7 {report.get('weeks_ready',0)} saved week batches \xb7 {len(report.get('promoted_markets',[]))} eligible markets")
-            for issue in report.get('issues',[]):st.warning(str(issue))
+    with st.expander('NCAAF automated learning status'):
+        st.caption('History collection runs daily in GitHub Actions; model training runs weekly. No training is performed while loading this page.')
+        try:
+            from dual_agent.ncaaf_storage import runtime_bundle
+            bundle=runtime_bundle();report=bundle.get('training_report',{})
+            st.write('Latest workflow status: '+str(report.get('status','Awaiting first workflow run')))
+            st.caption('History snapshot: '+str(bundle.get('checked_at','Not available')))
             st.json(report)
-        saved_weights=_weights()
-        if saved_weights.get('markets'):
-            st.download_button('Download NCAAF regression weights',data=json.dumps(saved_weights,allow_nan=False),
-                file_name='ncaaf_player_prop_regression_weights.json',mime='application/json',key='ncaaf_prop_weights_download')
-            st.caption('To preserve trained weights across app restarts, save the downloaded file in dual_agent/ncaaf_player_prop_regression_weights.json. Player histories still need persistent local storage or recollection.')
-        st.caption('Collection resumes from saved week batches. More than one bounded run may be needed. A market needs at least 700 training examples and sufficient chronological validation/test coverage. Missing stat appearances are not filled with zeros. Weights and history are stored locally; this does not configure Supabase backup or scheduled retraining.')
+            st.write('Prospective frozen-forecast results')
+            st.json(bundle.get('prospective_results',{}))
+            st.write('Frozen prop offer results (correlated offers, not independent games)')
+            st.json(bundle.get('prop_results',{}))
+        except (RuntimeError,ValueError):
+            st.info('Run the NCAAF automated learning workflow in bootstrap mode, then generate predictions. Check SUPABASE_URL and SUPABASE_KEY in app secrets.')
+        st.caption('The first saved connected winner is experimental if it has not passed historical checks. Later challengers must pass comparisons before replacing it. Prop markets require their own validation. Missing injuries and uncertain stat coverage remain limitations.')
 
 
 def render_props_panel(game):
