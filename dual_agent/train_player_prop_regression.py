@@ -94,3 +94,70 @@ def metric(rows, samples):
     scale = np.array([r[4] for r in rows]); preds = np.mean(np.rint(samples), axis=1)
     # Constructed half-point thresholds are not archived sportsbook lines.
     thresholds = np.maximum(.5, np.floor(base[:,None]+scale[:,None]*np.array([-.5,0,.5]))+.5)
+    p = np.array([[probabilities(s, line)[0] for line in lines] for s,lines in zip(samples, thresholds)])
+    y = actual[:,None] > thresholds
+    p = np.clip(p, 1e-6, 1-1e-6)
+    return {'mae':float(np.mean(abs(preds-actual))), 'brier':float(np.mean((p-y)**2)),
+            'log_loss':float(-np.mean(y*np.log(p)+(1-y)*np.log(1-p))), 'games':len(rows)}
+
+
+def train(rows, league):
+    result = {}
+    for market in sorted({r[0] for r in rows}):
+        if 'touchdown' in market.lower() or market.lower().endswith('_yes_no'): continue
+        group = sorted([r for r in rows if r[0]==market], key=lambda r:r[1])
+        dates = sorted({r[1] for r in group})
+        if len(dates)<40 or len(group)<700: continue
+        boundaries = [dates[int(len(dates)*f)] for f in (.6,.75,.875)]
+        # Two-day buffer at each boundary; whole dates stay together.
+        a,b,c = boundaries; gap=pd.Timedelta(days=2)
+        parts = [[r for r in group if r[1]<a-gap],
+                 [r for r in group if a<=r[1]<b-gap],
+                 [r for r in group if b<=r[1]<c-gap], [r for r in group if r[1]>=c]]
+        if min(map(len,parts))<80: continue
+        fit, cal, val, test = parts
+        x=np.array([r[2] for r in fit]); y=np.array([(r[5]-r[3])/r[4] for r in fit])
+        center=x.mean(axis=0); spread=np.maximum(x.std(axis=0), .05)
+        model=Ridge(alpha=10.).fit((x-center)/spread,y)
+        def point(rs):
+            return np.array([r[3] for r in rs])+np.array([r[4] for r in rs])*model.predict((np.array([r[2] for r in rs])-center)/spread)
+        residual=(np.array([r[5] for r in cal])-point(cal))/np.array([r[4] for r in cal])
+        baseline_residual=np.array([(r[5]-r[3])/r[4] for r in cal])
+        if league=='NCAAF' and len(residual)>512:
+            quantiles=(np.arange(512)+.5)/512
+            residual=np.quantile(residual,quantiles)
+            baseline_residual=np.quantile(baseline_residual,quantiles)
+        nonnegative=not (league in ('NFL','NCAAF') and ('yards' in market.lower() or 'yds' in market.lower()))
+        def score(rs, trained):
+            base=point(rs) if trained else np.array([r[3] for r in rs])
+            samples=base[:,None]+np.array([r[4] for r in rs])[:,None]*(residual if trained else baseline_residual)
+            if nonnegative: samples=np.maximum(samples,0)
+            return metric(rs,samples)
+        checks={name:{'regression':score(rs,True),'baseline':score(rs,False)} for name,rs in [('validation',val),('test',test)]}
+        promoted=all(m['regression']['mae']<=m['baseline']['mae'] and m['regression']['brier']<=m['baseline']['brier'] and m['regression']['log_loss']<m['baseline']['log_loss'] for m in checks.values())
+        fingerprint=hashlib.sha256(repr([(r[1].isoformat(),r[2].tolist(),r[5]) for r in group]).encode()).hexdigest()[:16]
+        result[league+'|'+market]={'promoted':bool(promoted),'model_id':league+'_'+fingerprint,
+            'evaluation_end':str(group[-1][1].date()),'center':center.tolist(),'spread':spread.tolist(),
+            'coef':model.coef_.tolist(),'intercept':float(model.intercept_), 'residuals':residual.tolist(),
+            'nonnegative':nonnegative,'checks':checks,'partition_games':list(map(len,parts))}
+    return result
+
+
+def main():
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--league',choices=['NBA','NFL','MLB','NCAAF'],required=True)
+    parser.add_argument('--history',required=True)
+    parser.add_argument('--output',default='dual_agent/player_prop_regression_weights.json')
+    args=parser.parse_args(); markets=train(dataset(read_history(args.history,args.league)),args.league)
+    if not markets: raise SystemExit('Insufficient history: need >=700 examples per market and >=80 in each chronological partition. Existing weights unchanged.')
+    path=Path(args.output); path.parent.mkdir(parents=True,exist_ok=True)
+    data={'schema':1,'features':FEATURES,'markets':{}}
+    if path.exists():
+        data=json.loads(path.read_text())
+        if data.get('schema')!=1 or data.get('features')!=FEATURES: raise ValueError('Incompatible output artifact')
+    data['markets'].update(markets)
+    data['limitations']='Saved completed-game history; approximate publication times; constructed thresholds, not verified sportsbook accuracy. Baseline comparison is recent weighted mean, not the neural model.'
+    temp=path.with_suffix('.tmp'); temp.write_text(json.dumps(data,allow_nan=False)); temp.replace(path)
+    print(json.dumps({key:{'promoted':v['promoted'],'checks':v['checks']} for key,v in markets.items()},indent=2))
+
+if __name__=='__main__': main()
