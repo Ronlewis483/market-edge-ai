@@ -222,6 +222,46 @@ def partitions(rows):
     return groups
 
 
+def calibration(rows,probability_key):
+    groups={}
+    for row in rows:
+        model=row.get('model_id','original:'+row['base_id']) if probability_key=='connected_probability' else 'original:'+row['base_id']
+        groups.setdefault(model,[]).append(row)
+    result={}
+    for model,group in groups.items():
+        y=np.array([r['outcome'] for r in group]);p=np.array([r.get(probability_key,r['original_probability']) for r in group])
+        report=metrics(y,p);confidence=np.maximum(p,1-p);correct=(p>=.5)==y
+        bands=[]
+        for low,high in ((.5,.6),(.6,.7),(.7,.8),(.8,.9),(.9,1.0000001)):
+            mask=(confidence>=low)&(confidence<high)
+            if mask.any():bands.append({'low':low,'high':min(1.,high),'games':int(mask.sum()),
+                'average_confidence':float(confidence[mask].mean()),'actual_accuracy':float(correct[mask].mean())})
+        result[model]=dict(report,confidence_bands=bands)
+    return result
+
+
+def approve_candidate(sport,base_id,model,groups,report,store):
+    if not model.get('checks_passed'):return False
+    active=store.read(ROOT+sport.lower()+'/active.json.gz')
+    if not active or active.get('base_id')!=base_id:return True
+    cutoff=stamp(active['trained_at'])
+    later=[r for r in groups[2] if stamp(r['captured_at'])>cutoff]
+    if len(later)<25:
+        report['activation_reason']='Need 25 later held-out forecasts to compare against the incumbent'
+        return False
+    def predict(artifact):
+        if sport=='NFL' and artifact.get('kind')=='nfl_offset_tree_v2':
+            from .nfl_connected_engine import connected_delta
+            delta=np.array([connected_delta(artifact,r['original_probability'],r['context']) for r in later])
+        else:
+            x=np.array([encode(r['context'],artifact['columns'],np.array(artifact['median']),np.array(artifact['mean']),np.array(artifact['scale']),r['original_probability']) for r in later])
+            delta=forward(x,{k:np.array(artifact[k]) for k in ('w1','b1','w2','b2')})
+        return metrics([r['outcome'] for r in later],probability(np.array([r['original_probability'] for r in later]),delta))
+    new,old=predict(model),predict(active)
+    report['incumbent_comparison']={'candidate':new,'incumbent':old}
+    return new['accuracy']>=old['accuracy'] and new['brier']<=old['brier'] and new['log_loss']<old['log_loss']
+
+
 def train(sport,base_id,rows,store):
     """Fit a small offset neural correction on frozen forecasts of this base only."""
     if sport == 'NFL':
@@ -272,9 +312,10 @@ def train(sport,base_id,rows,store):
            'columns':columns,'median':median.tolist(),'mean':mean.tolist(),'scale':scale.tolist(),
            **{k:v.tolist() for k,v in params.items()},'checks_passed':bool(passed)}
     model['model_id']=sport.lower()+'_connected_'+digest(model)[:16]
-    report.update(trained=True,status='candidate_saved',activated=bool(passed),penalty=penalty,model_id=model['model_id'],checks_passed=bool(passed))
+    activate=approve_candidate(sport,base_id,model,groups,report,store)
+    report.update(trained=True,status='candidate_saved',activated=bool(activate),penalty=penalty,model_id=model['model_id'],checks_passed=bool(passed))
     store.write(ROOT+sport.lower()+'/candidates/'+model['model_id']+'.json.gz',model)
-    if passed:store.write(ROOT+sport.lower()+'/active.json.gz',model,replace=True)
+    if activate:store.write(ROOT+sport.lower()+'/active.json.gz',model,replace=True)
     return report
 
 
@@ -315,7 +356,7 @@ def fetch_finals(sport,rows,budget):
     return finals
 
 
-def run(sport,store=None,budget=None):
+def run(sport,store=None,budget=None,train_models=True):
     if sport not in ('NFL','MLB'):raise ValueError('Sport must be NFL or MLB')
     store=store or Store();budget=budget or {'remaining':12};prefix=ROOT+sport.lower()+'/'
     state=store.read(prefix+'checkpoint.json.gz') or {'schema':1,'slates':{},'graded':{}}
@@ -347,23 +388,28 @@ def run(sport,store=None,budget=None):
     valid=[r for r in state['graded'].values() if r.get('outcome') in (0,1)]
     reports=[]
     active_base=max(earliest.values(),key=lambda r:stamp(r['captured_at']))['base_id'] if earliest else None
-    for base_id in ([active_base] if active_base else []):
+    for base_id in ([active_base] if active_base and train_models else []):
         report=train(sport,base_id,valid,store);reports.append(report)
         # Independent base cohorts never silently activate a correction for another model.
         store.write(prefix+'training_report.json.gz',report,replace=True)
-    summary={'sport':sport,'frozen_unique_games':len(earliest),'graded_games':len(valid),'pending':len(earliest)-len(state['graded']),
+    summary={'sport':sport,'mode':'train' if train_models else 'grade','status':'awaiting_saved_forecasts' if not earliest else 'up_to_date_no_pending_games' if not pending else 'completed',
+             'calibration':{'original':calibration(valid,'original_probability'),'connected':calibration(valid,'connected_probability')},
+             'frozen_unique_games':len(earliest),'graded_games':len(valid),'pending':len(earliest)-len(state['graded']),
              'paid_sports_api_requests':0,'training':reports,'score_lookup_budget_remaining':budget['remaining']}
     store.write(prefix+'latest_report.json.gz',summary,replace=True)
     print(json.dumps(summary));return summary
 
 
 if __name__=='__main__':
-    import sys
-    league=sys.argv[1].upper() if len(sys.argv)>1 else 'ALL'
-    budget={'remaining':12}
-    failures=[]
-    for sport in (('NFL','MLB') if league=='ALL' else (league,)):
-        try:run(sport,budget=budget)
+    import argparse
+    from pathlib import Path
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('sport',choices=['ALL','NFL','MLB'],nargs='?',default='ALL')
+    parser.add_argument('--mode',choices=['grade','train'],default='train')
+    args=parser.parse_args();reports=[];failures=[]
+    for sport in (('NFL','MLB') if args.sport=='ALL' else (args.sport,)):
+        try:reports.append(run(sport,budget={'remaining':12},train_models=args.mode=='train'))
         except Exception as exc:
-            failures.append(sport);print(json.dumps({'sport':sport,'status':'learning_job_failed','error_type':type(exc).__name__}))
+            failures.append(sport);reports.append({'sport':sport,'status':'learning_job_failed','error_type':type(exc).__name__})
+    Path('sports_learning_report.json').write_text(json.dumps({'mode':args.mode,'reports':reports},indent=2))
     if failures:raise SystemExit(1)
