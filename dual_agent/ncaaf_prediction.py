@@ -174,9 +174,10 @@ def attach_markets(predictions, market_games, teams):
     for g in predictions:
         matches=[m for m in market_games if resolve(m['home_team'])==g['home_id'] and resolve(m['away_team'])==g['away_id']
                  and abs((stamp(m['commence_time'])-stamp(g['commence_time'])).total_seconds())<=900]
-        fields=dict(moneylines=[],spreads=[],totals=[],market_favorite=None,favorite_probability=None,home_probability=None,away_probability=None)
+        fields=dict(moneylines=[],spreads=[],totals=[],market_favorite=None,favorite_probability=None,home_probability=None,away_probability=None,odds_event_id=None)
         if len(matches)==1:
-            fields.update({k:matches[0][k] for k in fields})
+            fields.update({k:matches[0][k] for k in fields if k!='odds_event_id'})
+            fields['odds_event_id'] = str(matches[0]['game_id'])
         output.append(dict(g,**fields))
     return output
 
