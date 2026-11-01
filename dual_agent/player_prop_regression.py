@@ -41,9 +41,9 @@ def _load(path, stamp):
     return data
 
 
-def estimate(values, line, side, league, market, cutoff=None):
+def estimate(values, line, side, league, market, cutoff=None, artifact_path=None):
     """Conditional non-push probability, using a later residual calibration set."""
-    path = Path(os.environ.get('PLAYER_PROP_REGRESSION_PATH',
+    path = Path(artifact_path) if artifact_path is not None else Path(os.environ.get('PLAYER_PROP_REGRESSION_PATH',
                                str(Path(__file__).with_name('player_prop_regression_weights.json'))))
     try:
         model = _load(str(path), path.stat().st_mtime_ns)
