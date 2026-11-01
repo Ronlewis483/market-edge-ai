@@ -249,7 +249,7 @@ def _score(frame,event,index,snapshot,checked,now):
         elif estimate_key not in memo:
             try: trained=neural_estimate(vals,0.,line,market,side,0)
             except (ValueError,OSError,KeyError): trained=None
-            memo[estimate_key]=trained or _estimate_prop(vals,line,market,side=side)
+            memo[estimate_key]=trained or _estimate_prop(vals,line,market,side=side,cutoff=min(kickoff,now))
         estimate=memo.get(estimate_key)
         if estimate is None: reasons[market+': insufficient usable history or resolved live line']+=1;continue
         offer={'bookmaker_key':quote['bookmaker_key'],'american_odds':quote.get('american_odds'),
