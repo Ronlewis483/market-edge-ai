@@ -59,6 +59,11 @@ def _cfbd(path, params, key, ttl):
 
 def load_history(key, now=None):
     now = now or datetime.now(timezone.utc)
+    import os
+    if os.environ.get('NCAAF_ACTIONS_RUN') != 'true':
+        from dual_agent.ncaaf_storage import runtime_bundle
+        bundle=runtime_bundle(force=True)
+        return bundle['records'],bundle.get('teams',[]),list(bundle.get('issues',[]))
     season = now.year if now.month>=7 else now.year-1
     # Completed seasons are reusable; the current season is checked every 15 min.
     rows, issues = [], []
@@ -236,6 +241,13 @@ def generate_predictions(cfbd_key, odds_key=None, now=None):
     result['games']=attach_markets(result['games'],market_games,teams)
     result.update(checked_at=now.isoformat(),issues=issues)
     result['prospective_results'] = update_forecast_ledger(result['games'], records, now)
+    try:
+        from dual_agent.ncaaf_storage import freeze_games, runtime_bundle
+        result['forecasts_backed_up']=freeze_games(result['games'],now=now)
+        result['history_checked_at']=runtime_bundle().get('checked_at')
+        result['prospective_results']=runtime_bundle().get('prospective_results',{})
+    except Exception:
+        result['issues'].append('Remote pregame forecast saving unavailable; these new forecasts are not confirmed in the prospective audit.')
     # Freeze generated predictions without retraining, settling or placing bets.
     try:
         root=Path('ncaaf_history_cache/forecasts');root.mkdir(parents=True,exist_ok=True)
