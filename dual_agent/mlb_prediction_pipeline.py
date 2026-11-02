@@ -560,6 +560,7 @@ def _generate_mlb_predictions(game_date=None, api_key=None, progress=None, on_te
                 features[side+'_starter_known'] = int(context['starter_id'] is not None)
             baseline = row['Home win probability']
             result = correct('MLB', base_id, baseline, features, start_time=row['start_time'])
+            row['evidence_confidence'] = result.get('evidence_confidence')
             p = result['connected_probability']
             row['Original home win probability'] = baseline
             row['Home win probability'] = p
