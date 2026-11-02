@@ -167,14 +167,21 @@ def run(start_season=2018,store=None,now=None,input_csv=None,activate=False):
             frame=pd.read_csv(input_csv,dtype={'game_id':str});sha=hashlib.sha256(Path(input_csv).read_bytes()).hexdigest();downloaded=False
         else:frame,sha,downloaded=load_source(store,now)
         games=completed_games(frame,start_season,now);base_id=base_identity()
-        fingerprint=digest([METHOD,base_id,start_season,json.loads(games.to_json(orient='records',date_format='iso'))])
+        from dual_agent.experiment_controller import VERSION
+        fingerprint=digest([VERSION,METHOD,base_id,start_season,json.loads(games.to_json(orient='records',date_format='iso'))])
         prior=store.read(PREFIX+'training_report.json.gz')
         if prior and prior.get('input_fingerprint')==fingerprint and prior.get('trained'):
             report.update(prior,status='unchanged_historical_data_skipped',checked_at=now.isoformat(),activated=False,live_model_changed=False)
             if activate:
                 report.update(activate_bootstrap(store,base_id))
             return report
-        rows,fits=reconstruct(games,start_season,base_id)
+        saved_rows=store.read(PREFIX+'reconstructed_rows.json.gz') or {}
+        reusable=(prior and prior.get('raw_source_sha256')==sha and prior.get('completed_games')==len(games)
+            and prior.get('base_id')==base_id and prior.get('start_season')==start_season and prior.get('method')==METHOD
+            and saved_rows.get('rows') and all(r.get('base_id')==base_id for r in saved_rows['rows']))
+        if reusable:rows,fits=saved_rows['rows'],0
+        else:rows,fits=reconstruct(games,start_season,base_id)
+        report['reused_reconstructed_rows']=bool(reusable)
         report.update(base_id=base_id,raw_source_sha256=sha,input_fingerprint=fingerprint,
             public_source_downloaded=downloaded,completed_games=len(games),reconstructed_games=len(rows),base_fits=fits)
         store.write(PREFIX+'reconstructed_rows.json.gz',{'schema':1,'source':'historical_reconstruction','rows':rows,'limitations':LIMITATIONS},replace=True)
