@@ -1,0 +1,28 @@
+# Scheduled MLB scanning is now owned by NFL and MLB connected learning.
+# Keep a manual diagnostic entry without a second scheduled writer.
+name: MLB Information Scanner
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: connected-lifecycle-MLB
+  cancel-in-progress: false
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+      CONNECTED_WINNER_BUCKET: market-edge-data
+      OPENBLAS_NUM_THREADS: '1'
+      OMP_NUM_THREADS: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r automation-requirements.txt
+      - name: Collect and learn through the shared lifecycle
+        run: python -m dual_agent.sports_automation MLB --mode cycle
