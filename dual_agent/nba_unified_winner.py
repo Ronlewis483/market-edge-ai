@@ -475,13 +475,18 @@ def predict(artifact, base_features, original_probability, neural_probability, h
             sx=correction_inputs(pd.DataFrame([dict(scenario,neural_probability=float(probs[1]))]),[probs[0]])
             conditional=tree_probability(artifact['tree_model'],sx[artifact['columns']].iloc[0].to_numpy(),gain=artifact['correction_gain'])
             status='Fresh availability scenario separate; historical injury effect not validated'
-    return {'model_id':artifact['model_id'],'source_player_model_id':artifact.get('family_id',artifact['model_id']),
+    result={'model_id':artifact['model_id'],'source_player_model_id':artifact.get('family_id',artifact['model_id']),
             'architecture':'original_offset_neural_player_residual','original_home_probability':float(probs[0]),
             'neural_home_probability':float(probs[1]),'raw_correction_logit':delta,
             'connected_home_probability':connected,'combined_home_probability':connected,
             'correction_gain':artifact['correction_gain'],'probability_averaging':False,
             'availability_scenario_home_probability':conditional,'availability_status':status,
             'checks_passed':bool(artifact['checks_passed'])}
+
+    result['experience_context']={**extra,'availability_scenario_known':int(conditional is not None)}
+    from .shared_experience import attach
+    result['evidence_confidence']=attach('NBA',result)
+    return result
 
 
 def refresh(client=None):
@@ -595,6 +600,10 @@ def grade(client, checkpoint):
         y=np.array([r['outcome'] for r in rows])
         summaries.append({'model_id':model,'graded_games':len(rows),**{name:scores(y,np.array([r[field] for r in rows])) for name,field in
                          [('original','original_home_probability'),('connected','connected_home_probability')]}})
+    try:
+        from .shared_experience import publish
+        state['shared_experience']=publish('NBA',state['results'].values(),NBAExperimentStore(client))
+    except Exception as exc:state['shared_experience']={'status':'experience_unavailable','error_type':type(exc).__name__}
     state['summaries']=summaries
     client.write(ROOT+'comparison.json.gz',state,compressed=True,replace=True)
     print(json.dumps({'status':'unified_comparison','graded_games':len(state['results']),'summaries':summaries,'sports_api_requests':0}))
