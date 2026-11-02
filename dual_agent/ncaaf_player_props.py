@@ -79,7 +79,7 @@ def parse_boxes(boxes, games, now=None):
         game = games.get(str(box.get('id')))
         if not game or game.get('completed') is not True: continue
         start = stamp(game.get('startDate'))
-        if not start or start >= now-timedelta(days=2): continue
+        if not start or start >= now: continue
         team_ids = {name_key(game.get(side+'Team')):str(game.get(side+'Id')) for side in ('home','away')}
         for team in box.get('teams', []):
             tid = team_ids.get(name_key(team.get('team')))
@@ -102,7 +102,7 @@ def parse_boxes(boxes, games, now=None):
                             if 'yds' not in market and value<0: continue
                             row = {'player_id':str(athlete['id']), 'player':athlete['name'],
                                 'team_id':tid,'team':team['team'], 'game_id':str(game['id']),
-                                'date':start.isoformat(),'market':market,'value':float(value)}
+                                'date':start.isoformat(),'market':market,'value':float(value),'label_observed_at':now.isoformat()}
                             key = (row['player_id'],row['game_id'],market)
                             # Conflicts are retained as invalid, never last-write-wins.
                             if key in records and records[key] and records[key]['value']!=row['value']: records[key]=None
@@ -124,7 +124,7 @@ def prepare_history(cfbd_key, max_weeks=8, now=None, fit=True):
     with _LOCK:
         schedules, _, issues = load_history(cfbd_key, now)
         games = {str(g['id']):g for g in schedules if g.get('id') is not None and g.get('completed') is True
-                 and stamp(g.get('startDate')) and stamp(g['startDate'])<now-timedelta(days=2)}
+                 and stamp(g.get('startDate')) and stamp(g['startDate'])<now}
         buckets=defaultdict(list)
         for g in games.values():
             if g.get('season') is None or g.get('week') is None: continue
@@ -142,7 +142,7 @@ def prepare_history(cfbd_key, max_weeks=8, now=None, fit=True):
             previous=manifest.get(key,{})
             if isinstance(previous,dict) and previous.get('signature')==signature:
                 checked=stamp(previous.get('checked_at'))
-                if previous.get('complete') or (checked and now-checked<timedelta(hours=6)): continue
+                if previous.get('complete') or (checked and now-checked<timedelta(minutes=15)): continue
             if queried>=max_weeks: break
             try:
                 boxes = _cfbd('/games/players',{'year':year,'week':week,'seasonType':season_type,'classification':'fbs'},cfbd_key,900 if year==now.year else 30*86400)
