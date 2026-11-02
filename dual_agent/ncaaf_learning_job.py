@@ -88,7 +88,9 @@ def grade_props(store,history,now):
         result=actual.get((str(row['game_id']),str(row['player_id']),row['market']))
         if not result or str(result['team_id'])!=str(row['team_id']):continue
         started=stamp(row['commence_time']);observed=stamp(result['date'])
-        if not observed or abs((started-observed).total_seconds())>900 or now<observed+timedelta(days=2):continue
+        if not observed or abs((started-observed).total_seconds())>900:continue
+        # The canonical collector accepts only explicit final games and actual stats.
+        if result.get('label_observed_at') and stamp(result['label_observed_at'])>now:continue
         value=float(result['value']);line=float(row['line'])
         won=(value>line) if row['side']=='Over' else (value<line)
         row.update(status='Push' if value==line else 'Won' if won else 'Lost',actual=value,graded_at=now.isoformat())
@@ -133,7 +135,7 @@ def train_winner(records,active,now,min_new):
     report['status']='incumbent_retained';return active,report
 
 
-def train_props(history,active,min_new):
+def train_props(history,active,min_new,league='NCAAF'):
     import numpy as np
     import pandas as pd
     from dual_agent.train_player_prop_regression import dataset,train,metric
@@ -142,14 +144,14 @@ def train_props(history,active,min_new):
     result=dict(active or {'schema':1,'features':FEATURES,'markets':{}});result['markets']=dict(result['markets'])
     reports={};ready=[]
     for market in sorted({r[0] for r in rows}):
-        key='NCAAF|'+market;previous=result['markets'].get(key)
+        key=league+'|'+market;previous=result['markets'].get(key)
         group=[r for r in rows if r[0]==market]
         if previous and previous.get('promoted'):
             count=sum((r[1]-pd.Timestamp(previous['evaluation_end'],tz='UTC')).days>2 for r in group)
             if count<min_new:
                 reports[key]={'status':'waiting_for_new_examples','examples':count};continue
         ready.extend(group)
-    candidates=train(ready,'NCAAF') if ready else {}
+    candidates=train(ready,league) if ready else {}
     for key,candidate in candidates.items():
         previous=result['markets'].get(key)
         if not candidate['promoted']:reports[key]={'status':'failed_baseline_checks','checks':candidate['checks']};continue
@@ -182,7 +184,7 @@ def runtime_history(history,now):
 
 
 def run(mode='collect',max_weeks=8,store=None,now=None):
-    if mode not in ('collect','train','bootstrap') or not 1<=int(max_weeks)<=100:raise ValueError('Invalid NCAA mode or week limit')
+    if mode not in ('collect','train','bootstrap','cycle') or not 1<=int(max_weeks)<=100:raise ValueError('Invalid NCAA mode or week limit')
     os.environ['NCAAF_ACTIONS_RUN']='true'
     now=now or datetime.now(timezone.utc);store=store or storage.Store()
     previous=storage.restore_state(store)
@@ -200,7 +202,7 @@ def run(mode='collect',max_weeks=8,store=None,now=None):
         report['collection']=collection;report['issues'].extend(collection.get('issues',[]))
         history=read('player_props/history.json',[])
         winner=active_bundle.get('winner');props=active_bundle.get('props')
-        if mode in ('train','bootstrap'):
+        if mode in ('train','bootstrap','cycle'):
             rows,_,_=build_dataset(records,now)
             winner_input=storage.digest([[r['id'],r['x'],r['y']] for r in rows])
             prop_input=storage.digest(history)
@@ -243,6 +245,6 @@ def run(mode='collect',max_weeks=8,store=None,now=None):
 
 if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--mode',choices=['collect','train','bootstrap'],default='collect')
+    parser.add_argument('--mode',choices=['collect','train','bootstrap','cycle'],default='collect')
     parser.add_argument('--max-weeks',type=int,default=8)
     args=parser.parse_args();run(args.mode,args.max_weeks)
