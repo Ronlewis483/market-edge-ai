@@ -286,6 +286,8 @@ def render_prediction_cards(games, result):
             st.markdown('**\U0001f3c6 Predicted winner: '+chosen['predicted_team']+'**')
             badge('Estimated win chance', chosen['model_confidence'])
             st.progress(min(1., max(0., float(chosen['model_confidence']))))
+            from dual_agent.shared_experience import render as render_experience
+            render_experience('NCAAF',chosen)
             market = chosen.get('market_favorite')
             if market and chosen.get('favorite_probability') is not None:
                 st.caption(f"Sportsbook consensus: {market} \xb7 {chosen['favorite_probability']:.1%} implied chance")
