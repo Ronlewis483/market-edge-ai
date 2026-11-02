@@ -129,7 +129,10 @@ def _forecast(artifact,rows,future,unsupported):
                 'home_team':r['home_name'],'away_team':r['away_name'],'commence_time':r['start'].isoformat(),
                 'neutral_site':r['neutral'],'model_home_probability':float(p),'model_away_probability':float(1-p),
                 'original_home_probability':float(original),'predicted_team':r['home_name'] if p>=.5 else r['away_name'],
-                'model_confidence':float(max(p,1-p)),'model_id':artifact['model_id']})
+                'model_confidence':float(max(p,1-p)),'model_id':artifact['model_id'],
+                'experience_context':dict(zip(('elo_gap','win_rate_gap','margin_gap','scoring_gap','allowed_gap','rest_gap','home_advantage'),r['x']))})
+        from .shared_experience import attach
+        for game in games:game['evidence_confidence']=attach('NCAAF',game)
     return {'games':games,'model_id':artifact['model_id'],'architecture':ARCHITECTURE,
         'training_games':len(rows),'evaluation':artifact['test']['connected'],
         'comparison':{'validation':artifact['validation'],'test':artifact['test']},
