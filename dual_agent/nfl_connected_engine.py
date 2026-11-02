@@ -56,6 +56,7 @@ def finalize_connected_result(result):
     base_id=result.get('connected_base_id')
     if not base_id:raise ValueError('NFL original model identity missing')
     frozen=[]
+    if 'evidence_confidence' not in frame:frame['evidence_confidence']=[None]*len(frame)
     for i,row in frame.iterrows():
         start=pd.Timestamp(row['commence_time'])
         if start.tzinfo is None:start=start.tz_localize('UTC')
@@ -66,6 +67,7 @@ def finalize_connected_result(result):
         features=row.get('connected_features');features=features if isinstance(features,dict) else {}
         context=row.get('game_context');context=dict(context) if isinstance(context,dict) else {}
         forecast=correct('NFL',base_id,original,nfl_context(features,context),start_time=start)
+        frame.at[i,'evidence_confidence']=forecast.get('evidence_confidence')
         p=forecast['connected_probability']
         frame.at[i,'home_win_probability']=p;frame.at[i,'away_win_probability']=1-p
         frame.at[i,'confidence']=max(p,1-p);frame.at[i,'predicted_team']=row['home_team'] if p>=.5 else row['away_team']
