@@ -1,4 +1,4 @@
-"""Saved ridge-regression prop inference. No training, network or sklearn at runtime.
+"""Saved ridge-regression prop inference. No training or sklearn at runtime; registry checks are cached.
 
 Artifacts are built by train_player_prop_regression.py. Unsupported markets or
 failed held-out checks return None so existing models retain control.
@@ -46,7 +46,11 @@ def estimate(values, line, side, league, market, cutoff=None, artifact_path=None
     path = Path(artifact_path) if artifact_path is not None else Path(os.environ.get('PLAYER_PROP_REGRESSION_PATH',
                                str(Path(__file__).with_name('player_prop_regression_weights.json'))))
     try:
-        model = _load(str(path), path.stat().st_mtime_ns)
+        model = None
+        if artifact_path is None and league.upper() in ('NFL','MLB'):
+            from dual_agent.sports_prop_registry import weights
+            model = weights(league.upper())
+        if model is None: model = _load(str(path), path.stat().st_mtime_ns)
         group = model['markets'].get(league.upper()+'|'+str(market))
         if not group or not group.get('promoted'): return None
         # ISO UTC dates; live callers must supply the actual forecast cutoff.
