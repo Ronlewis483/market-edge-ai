@@ -9,6 +9,9 @@ from pathlib import Path
 import argparse
 import json
 import os
+import subprocess
+import sys
+import time
 
 import numpy as np
 import pandas as pd
@@ -167,7 +170,8 @@ def mlb_historical(store,now):
                 archive=candidate;break
     games=sorted(archive.get('retained_feature_rows',[]),key=lambda g:(g['start_time'],str(g['game_id'])))
     prefix=ROOT+'mlb/historical_v1/'
-    fingerprint=digest([base_id,games])
+    from dual_agent.experiment_controller import VERSION
+    fingerprint=digest([VERSION,base_id,games])
     prior=store.read(prefix+'training_report.json.gz') or {}
     if prior.get('fingerprint')==fingerprint and prior.get('trained'):return dict(prior,status='unchanged_history_skipped',activated=False)
     if len(games)<330:return {'status':'waiting_for_archived_pregame_features','archived_games':len(games),
@@ -242,7 +246,7 @@ def mlb_historical(store,now):
     return report
 
 
-def player_history(sport,store,now,train_models=False):
+def player_history(sport,store,now,train_models=False,backfill=False):
     """Separate bounded history collection and numeric prop regression training."""
     prefix=ROOT+sport.lower()+'/props/'
     from dual_agent.train_player_prop_regression import read_history,dataset,train
@@ -263,10 +267,16 @@ def player_history(sport,store,now,train_models=False):
         frame=pd.concat(pieces,ignore_index=True)
     else:
         from dual_agent import mlb_research as research,supabase_db as storage
+        print('MLB player history: loading saved warehouse',flush=True)
         old=storage.load_mlb_player_history()
         # Recent finals first; missing historical boxes remain resumable.
-        start=f'{now.year-2}-01-01' if train_models else str((now-timedelta(days=3)).date())
-        games=research.fetch_mlb_games(start,str(now.date())).sort_values('start_time',ascending=False)
+        start=f'{now.year-2}-01-01' if backfill else str((now-timedelta(days=3)).date())
+        print('MLB player history: checking completed games since '+start,flush=True)
+        games=research.fetch_mlb_games(start,str(now.date()))
+        if games.empty:
+            return {'status':'no_completed_games_in_collection_window','saved_stat_rows':len(old),'training_performed':False}
+        games=games.sort_values('start_time',ascending=False)
+        print('MLB player history: collecting at most 25 missing boxes',flush=True)
         batch=research.collect_mlb_player_logs_batch(games,old,batch_size=25,max_workers=4)
         frame=batch['combined_logs']
         if not frame.empty:
@@ -278,10 +288,13 @@ def player_history(sport,store,now,train_models=False):
     payload=json.loads(canonical.to_json(orient='records',date_format='iso'))
     store.write(prefix+'history.json.gz',{'schema':1,'rows':payload,'collected_at':now.isoformat()},replace=True)
     report={'saved_stat_rows':len(canonical),'training_performed':False}
-    if not train_models or canonical.empty:return report
+    if not train_models or canonical.empty:
+        report['status']='recent_history_saved_training_runs_on_daily_backfill' if sport=='MLB' else 'history_saved'
+        return report
     fingerprint=digest(payload);last=store.read(prefix+'training_report.json.gz') or {}
     if last.get('fingerprint')==fingerprint:return dict(report,status='unchanged_history_skipped')
     active=store.read(prefix+'active.json.gz') or {'schema':1,'features':FEATURES,'markets':{}}
+    print(sport+' player history: training changed numeric prop history',flush=True)
     from dual_agent.ncaaf_learning_job import train_props
     updated,checks=train_props(payload,active,80,league=sport)
     changed=digest(updated)!=digest(active)
@@ -295,15 +308,54 @@ def player_history(sport,store,now,train_models=False):
     return report
 
 
+def bounded_mlb_player_history(mode,now):
+    """Run blocking warehouse/provider calls in a killable worker, never a thread.
+
+    Frequent cycles collect recent boxes only. Full-history numeric prop fitting
+    remains automatic on the daily backfill. Worker logs stream into Actions.
+    """
+    destination=Path('mlb_player_history_stage.json')
+    destination.unlink(missing_ok=True)
+    limit=int(os.environ.get('MLB_PLAYER_STAGE_SECONDS','1200' if mode=='backfill' else '240'))
+    if not 1<=limit<=3600:raise ValueError('Invalid MLB player-stage timeout')
+    command=[sys.executable,'-u','-m','dual_agent.sports_automation','MLB','--mode',mode,
+             '--player-history-only','--observed-at',now.isoformat()]
+    started=time.monotonic()
+    print('MLB player history: starting '+mode+' worker (maximum '+str(limit)+' seconds)',flush=True)
+    try:
+        result=subprocess.run(command,timeout=limit,check=False)
+    except subprocess.TimeoutExpired:
+        report={'status':'deferred_timeout','training_performed':False,'retry_on_next_backfill':mode=='backfill',
+                'duration_seconds':round(time.monotonic()-started,2),'timeout_seconds':limit}
+        destination.write_text(json.dumps(report,indent=2))
+        return report
+    if not destination.exists():raise RuntimeError('MLB player worker exited without a diagnostic report')
+    report=json.loads(destination.read_text())
+    if result.returncode:
+        if report.get('error_type') in ('ReadTimeout','ConnectTimeout','Timeout'):
+            report['status']='deferred_source_timeout'
+            return report
+        raise RuntimeError('MLB player worker failed: '+str(report.get('error_type','unknown')))
+    return report
+
+
 def run(sport,mode='cycle',store=None,now=None):
     if sport not in ('NFL','MLB') or mode not in ('cycle','backfill'):raise ValueError('Invalid lifecycle request')
     store=store or Store();now=now or datetime.now(timezone.utc)
     report={'sport':sport,'mode':mode,'checked_at':now.isoformat(),'stages':{},'paid_sports_api_requests':0}
     failures=[]
+    def checkpoint():
+        Path('sports_automation_report.json').write_text(json.dumps(report,indent=2,allow_nan=False))
     def stage(name,action):
+        started=time.monotonic()
+        print(sport+' stage starting: '+name,flush=True)
+        report['stages'][name]={'status':'running'};checkpoint()
         try:report['stages'][name]=action()
         except Exception as exc:
             failures.append(name);report['stages'][name]={'status':'failed','error_type':type(exc).__name__}
+        report['stages'][name]['duration_seconds']=round(time.monotonic()-started,2)
+        checkpoint()
+        print(sport+' stage finished: '+name+' ('+str(report['stages'][name]['duration_seconds'])+' seconds)',flush=True)
     # Independent work continues after a feed failure; workflow still reports failure.
     stage('final_results',lambda:collect_finals(sport,store,now))
     finals=report['stages']['final_results'].get('games',[])
@@ -315,13 +367,21 @@ def run(sport,mode='cycle',store=None,now=None):
     from dual_agent.sports_connected_winner import run as learn
     stage('grade_and_train',lambda:learn(sport,store=store,budget={'remaining':12},train_models=True))
     stage('pregame_forecasts',lambda:nfl_forecasts(store,now,finals) if sport=='NFL' else mlb_forecasts(now))
-    # Large player histories are not re-downloaded every 15 minutes.
+    # Routine MLB cycles never replay or train full player history.
     pointer=store.read(ROOT+sport.lower()+'/props/collection_clock.json.gz') or {}
     due=not pointer.get('at') or stamp(now)-stamp(pointer['at'])>=pd.Timedelta(minutes=15)
     if due or mode=='backfill':
-        stage('player_history',lambda:player_history(sport,store,now,train_models=True))
-        if 'player_history' not in failures:store.write(ROOT+sport.lower()+'/props/collection_clock.json.gz',{'at':now.isoformat()},replace=True)
-    report['status']='failed' if failures else 'completed';report['failed_stages']=failures
+        if sport=='MLB':
+            upcoming=report['stages'].get('pregame_forecasts',{})
+            if mode=='cycle' and not report['stages']['final_results'].get('new_finals') and upcoming.get('status')=='offseason_or_no_upcoming_games':
+                report['stages']['player_history']={'status':'skipped_no_new_finals_or_upcoming_games','training_performed':False,
+                    'historical_training':'automatic_daily_backfill'}
+            else:stage('player_history',lambda:bounded_mlb_player_history(mode,now))
+        else:stage('player_history',lambda:player_history(sport,store,now,train_models=True))
+        if 'player_history' not in failures and not report['stages']['player_history'].get('status','').startswith('deferred'):store.write(ROOT+sport.lower()+'/props/collection_clock.json.gz',{'at':now.isoformat()},replace=True)
+    deferred=[name for name,value in report['stages'].items() if str(value.get('status','')).startswith('deferred')]
+    report['status']='failed' if failures else 'completed_with_deferred_work' if deferred else 'completed'
+    report['failed_stages']=failures;report['deferred_stages']=deferred
     # Raw current finals already persisted, so keep the workflow report compact.
     report['stages']['final_results'].pop('games',None)
     store.write(ROOT+sport.lower()+'/automation_latest.json.gz',report,replace=True)
@@ -335,4 +395,17 @@ if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('sport',choices=['NFL','MLB'])
     parser.add_argument('--mode',choices=['cycle','backfill'],default='cycle')
-    args=parser.parse_args();run(args.sport,args.mode)
+    parser.add_argument('--player-history-only',action='store_true',help=argparse.SUPPRESS)
+    parser.add_argument('--observed-at',default=None,help=argparse.SUPPRESS)
+    args=parser.parse_args()
+    if args.player_history_only:
+        if args.sport!='MLB':parser.error('Player worker is MLB-only')
+        try:
+            result=player_history('MLB',Store(),datetime.fromisoformat(args.observed_at) if args.observed_at else datetime.now(timezone.utc),
+                train_models=args.mode=='backfill',backfill=args.mode=='backfill')
+        except Exception as exc:
+            Path('mlb_player_history_stage.json').write_text(json.dumps({'status':'failed','error_type':type(exc).__name__}))
+            print('MLB player history failed: '+type(exc).__name__,flush=True)
+            raise SystemExit(1)
+        Path('mlb_player_history_stage.json').write_text(json.dumps(result,indent=2,allow_nan=False))
+    else:run(args.sport,args.mode)
