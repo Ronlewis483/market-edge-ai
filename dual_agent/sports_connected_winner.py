@@ -123,7 +123,7 @@ def forward(x,params):
     return .7*np.tanh(h@params['w2']+params['b2'])
 
 
-def correct(sport,base_id,original,context,at=None,start_time=None):
+def _correct(sport,base_id,original,context,at=None,start_time=None):
     """No fitting or paid API requests; missing artifacts retain original pick."""
     original=float(original)
     if not 0<original<1:raise ValueError('Original probability invalid')
@@ -153,6 +153,13 @@ def correct(sport,base_id,original,context,at=None,start_time=None):
     except Exception as exc:
         details['status']='Original retained; correction unavailable ('+type(exc).__name__+')'
     return details
+
+
+def correct(sport,base_id,original,context,at=None,start_time=None):
+    result=_correct(sport,base_id,original,context,at,start_time)
+    from .shared_experience import attach
+    result['evidence_confidence']=attach(sport,result,at)
+    return result
 
 
 def freeze(sport,rows):
@@ -410,6 +417,10 @@ def run(sport,store=None,budget=None,train_models=True):
               label_observed_at=datetime.now(timezone.utc).isoformat(),grading_status='tie_excluded' if h==a else 'Final')
     store.write(prefix+'checkpoint.json.gz',state,replace=True)
     valid=[r for r in state['graded'].values() if r.get('outcome') in (0,1)]
+    try:
+        from .shared_experience import publish
+        experience_report=publish(sport,valid,store)
+    except Exception as exc:experience_report={'status':'experience_unavailable','error_type':type(exc).__name__}
     reports=[]
     active_base=max(earliest.values(),key=lambda r:stamp(r['captured_at']))['base_id'] if earliest else None
     for base_id in ([active_base] if active_base and train_models else []):
@@ -428,7 +439,7 @@ def run(sport,store=None,budget=None,train_models=True):
     summary={'sport':sport,'mode':'train' if train_models else 'grade','status':'awaiting_saved_forecasts' if not earliest else 'up_to_date_no_pending_games' if not pending else 'completed',
              'calibration':{'original':calibration(valid,'original_probability'),'connected':calibration(valid,'connected_probability')},
              'frozen_unique_games':len(earliest),'graded_games':len(valid),'pending':len(earliest)-len(state['graded']),
-             'paid_sports_api_requests':0,'training':reports,'score_lookup_budget_remaining':budget['remaining']}
+             'paid_sports_api_requests':0,'training':reports,'shared_experience':experience_report,'score_lookup_budget_remaining':budget['remaining']}
     store.write(prefix+'latest_report.json.gz',summary,replace=True)
     print(json.dumps(summary));return summary
 
