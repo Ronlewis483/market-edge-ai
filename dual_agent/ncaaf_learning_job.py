@@ -106,20 +106,21 @@ def better(candidate,incumbent):
             and candidate['log_loss']<incumbent['log_loss'])
 
 
-def train_winner(records,active,now,min_new):
+def train_winner(records,active,now,min_new,store=None):
     from dual_agent.ncaaf_connected import _train,_predict,_metrics
     rows,_,_=build_dataset(records,now)
     current_ids={str(r['id']) for r in rows};previous=set((active or {}).get('training_ids',[]))
     if active and len(current_ids-previous)<min_new:return active,{'status':'waiting_for_new_games','new_games':len(current_ids-previous)}
     if len(rows)<400:return active,{'status':'waiting_for_history','usable_games':len(rows)}
     identity=hashlib.sha256(json.dumps([[r['id'],r['x'],r['y']] for r in rows],separators=(',',':')).encode()).hexdigest()[:20]
-    candidate=_train(rows,identity)
+    candidate=_train(rows,identity,experiment_store=store)
+    if candidate.get('controller_wait'):return active,candidate['controller_wait']
     write('candidates/winner_'+identity+'.json',candidate)
-    report={'candidate_id':candidate['model_id'],'comparison':{'validation':candidate['validation'],'test':candidate['test']}}
+    report={'candidate_id':candidate['model_id'],'comparison':{'validation':candidate['validation'],'test':candidate['test']},'controller':candidate.get('controller')}
     if active is None:
-        # Preserve the existing NCAA behavior: the first connected candidate is
-        # explicitly experimental, not labeled as an improvement or approval.
-        candidate['deployment_status']='bootstrap_experimental' if not candidate['checks_passed'] else 'bootstrap_passed_base_checks'
+        if not candidate['checks_passed']:
+            report['status']='candidate_rejected_baseline_checks';return active,report
+        candidate['deployment_status']='bootstrap_passed_base_checks'
         report['status']=candidate['deployment_status'];return candidate,report
     cutoff=stamp(active.get('trained_through'))
     eligible={r['id']:r for r in rows if cutoff and r['start']>cutoff+timedelta(days=2)}
@@ -204,11 +205,12 @@ def run(mode='collect',max_weeks=8,store=None,now=None):
         winner=active_bundle.get('winner');props=active_bundle.get('props')
         if mode in ('train','bootstrap','cycle'):
             rows,_,_=build_dataset(records,now)
-            winner_input=storage.digest([[r['id'],r['x'],r['y']] for r in rows])
+            from dual_agent.experiment_controller import VERSION
+            winner_input=storage.digest([VERSION,[[r['id'],r['x'],r['y']] for r in rows]])
             prop_input=storage.digest(history)
             attempted=read('last_training_inputs.json',{})
             if attempted.get('winner')!=winner_input:
-                winner,report['winner_training']=train_winner(records,winner,now,25)
+                winner,report['winner_training']=train_winner(records,winner,now,25,store=store)
                 report['training_performed']=True
             else:report['winner_training']={'status':'unchanged_history_skipped'}
             if history and attempted.get('props')!=prop_input:
