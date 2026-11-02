@@ -45,13 +45,20 @@ def prepare(sport,base_id,rows,groups,store):
         return None,dict(report,status='interrupted_experiment_requires_fresh_results')
     ctx={'sport':sport,'base_id':base_id,'prefix':prefix,'state':state,'groups':groups,'run_id':run_id,
          'dataset':identity,'rows':len(rows),'store':store,'report':report}
+    # Other-sport evidence must already have existed before this test window.
+    try:
+        from .shared_experience import lessons
+        shared=lessons(sport,store,min(r['captured_at'] for r in groups[2]))
+    except Exception:shared={'status':'experience_unavailable','hypotheses':[]}
+    ctx['shared_experience']=shared;report['shared_experience']=shared
     return ctx,report
 
 
 def plan(context,kind):
     """Only development summaries/configuration are allowed into the planner."""
     state=context['state'];diagnosis=state.get('development_diagnosis',{})
-    conservative=bool(diagnosis.get('probability_regression') or diagnosis.get('overconfidence'))
+    conservative=bool(diagnosis.get('probability_regression') or diagnosis.get('overconfidence') or
+        context.get('shared_experience',{}).get('hypotheses'))
     if kind in ('NFL','NBA','NCAAF'):
         baseline={'depth':2,'trees':80,'leaf':{'NFL':10,'NBA':30,'NCAAF':20}[kind],'half_life_days':None,'gain_cap':1.}
         candidates=[baseline,
@@ -70,6 +77,9 @@ def plan(context,kind):
     unique=[]
     for value in candidates:
         if value not in unique:unique.append(value)
+    # Keep the conservative hypothesis in the trial budget even when an older
+    # development winner is prepended as an additional anchor.
+    if conservative and len(unique)>MAX_TRIALS:return unique[:MAX_TRIALS-1]+[unique[-1]]
     return unique[:MAX_TRIALS]
 
 
