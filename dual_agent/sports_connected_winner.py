@@ -146,7 +146,7 @@ def correct(sport,base_id,original,context,at=None,start_time=None):
             x=encode(context,artifact['columns'],np.array(artifact['median']),np.array(artifact['mean']),np.array(artifact['scale']),original)
             params={k:np.asarray(artifact[k]) for k in ('w1','b1','w2','b2')}
             if not all(np.isfinite(v).all() for v in params.values()):raise ValueError('Connected parameters invalid')
-            delta=float(forward(x,params))
+            delta=float(artifact.get('correction_scale',1.)*forward(x,params))
         p=float(probability(original,delta))
         if not 0<p<1:raise ValueError('Connected result invalid')
         details.update(connected_probability=p,raw_correction_logit=delta,applied=True,model_id=artifact['model_id'],status='Sport-specific connected correction applied')
@@ -207,10 +207,14 @@ def metrics(y,p):
 def partitions(rows):
     rows=sorted(rows,key=lambda r:(r['start_time'],r['event_id']))
     dates=sorted({r['start_time'][:10] for r in rows});best=None
+    counts={day:0 for day in dates}
+    for r in rows:counts[r['start_time'][:10]]+=1
+    cumulative=[0]
+    for day in dates:cumulative.append(cumulative[-1]+counts[day])
     for i,a in enumerate(dates[1:-1],1):
-        n1=sum(r['start_time'][:10]<a for r in rows)
-        for b in dates[i+1:]:
-            n2=sum(a<=r['start_time'][:10]<b for r in rows);n3=len(rows)-n1-n2
+        n1=cumulative[i]
+        for j in range(i+1,len(dates)):
+            b=dates[j];n2=cumulative[j]-n1;n3=len(rows)-cumulative[j]
             if min(n1-80,n2-25,n3-25)<0:continue
             rank=((n1-.6*len(rows))**2+(n2-.2*len(rows))**2+(n3-.2*len(rows))**2,a,b)
             if best is None or rank<best:best=rank
@@ -255,7 +259,7 @@ def approve_candidate(sport,base_id,model,groups,report,store):
             delta=np.array([connected_delta(artifact,r['original_probability'],r['context']) for r in later])
         else:
             x=np.array([encode(r['context'],artifact['columns'],np.array(artifact['median']),np.array(artifact['mean']),np.array(artifact['scale']),r['original_probability']) for r in later])
-            delta=forward(x,{k:np.array(artifact[k]) for k in ('w1','b1','w2','b2')})
+            delta=artifact.get('correction_scale',1.)*forward(x,{k:np.array(artifact[k]) for k in ('w1','b1','w2','b2')})
         return metrics([r['outcome'] for r in later],probability(np.array([r['original_probability'] for r in later]),delta))
     new,old=predict(model),predict(active)
     report['incumbent_comparison']={'candidate':new,'incumbent':old}
@@ -274,9 +278,10 @@ def train(sport,base_id,rows,store):
             'partition_games':dict(zip(('train','validation','test'),map(len,groups))),
             'minimum_games':{'train':80,'validation':25,'test':25},'trained':False,'activated':False,'paid_sports_api_requests':0}
     if any(len(g)<n or min(sum(r['outcome']==v for r in g) for v in (0,1))<5 for g,n in zip(groups,(80,25,25))):return report
-    prior=store.read(ROOT+sport.lower()+'/training_report.json.gz')
-    if prior and prior.get('base_id')==base_id and prior.get('trained') and len(rows)<prior.get('graded_games',0)+25:
-        return dict(prior,status='waiting_for_25_new_results',available_graded_games=len(rows))
+    from . import experiment_controller as controller
+    experiment,control_report=controller.prepare(sport,base_id,rows,groups,store)
+    if experiment is None:return dict(report,controller=control_report,status=control_report['status'])
+    groups=experiment['groups']
     # Never activate a context field that has no observed training support.
     names=sorted({k for r in groups[0] for k in r['context']})
     columns=[k for k in names if sum(number(r['context'].get(k)) is not None for r in groups[0])>=20]
@@ -290,32 +295,45 @@ def train(sport,base_id,rows,store):
     shapes=[(d,h),(h,),(h,),()];sizes=[d*h,h,h,1];edges=np.cumsum([0]+sizes)
     def unpack(theta):return {k:theta[edges[i]:edges[i+1]].reshape(shapes[i]) for i,k in enumerate(('w1','b1','w2','b2'))}
     initial=np.r_[np.random.default_rng(42).normal(0,.05,d*h),np.zeros(2*h+1)]
-    fitted=[]
-    for penalty in (1.,10.,100.):
+    fitted=[];trials=[]
+    for config in controller.plan(experiment,'MLB'):
+        penalty=config['penalty'];weight=controller.weights(groups[0],config['half_life_days']);weight=weight/weight.sum()
         def objective(theta):
             v=unpack(theta);hidden=np.tanh(x@v['w1']+v['b1']);t=np.tanh(hidden@v['w2']+v['b2'])
-            q=probability(p,.7*t);loss=-np.mean(y*np.log(q)+(1-y)*np.log1p(-q))+penalty*np.dot(theta,theta)/(2*len(y))
-            dz=(q-y)*.7*(1-t*t)/len(y);dh=dz[:,None]*v['w2']*(1-hidden*hidden)
+            q=probability(p,.7*config['scale']*t)
+            loss=-np.sum(weight*(y*np.log(q)+(1-y)*np.log1p(-q)))+penalty*np.dot(theta,theta)/(2*len(y))
+            dz=(q-y)*.7*config['scale']*(1-t*t)*weight;dh=dz[:,None]*v['w2']*(1-hidden*hidden)
             grad=np.r_[(x.T@dh).ravel(),dh.sum(axis=0),(hidden.T@dz).ravel(),dz.sum()]+penalty*theta/len(y)
             return loss,grad
         result=minimize(objective,initial,jac=True,method='L-BFGS-B',options={'maxiter':300})
-        if not result.success or not np.isfinite(result.x).all():continue
-        params=unpack(result.x);vx,vy,vp=arrays(groups[1]);q=probability(vp,forward(vx,params));m=metrics(vy,q)
-        fitted.append(((-m['accuracy'],m['brier'],m['log_loss']),penalty,params))
-    if not fitted:return dict(report,status='numerical_fit_failed')
-    _,penalty,params=min(fitted,key=lambda v:v[0]);passed=True
+        if not result.success or not np.isfinite(result.x).all():
+            trials.append({'config':config,'status':'numerical_fit_failed'});continue
+        params=unpack(result.x);vx,vy,vp=arrays(groups[1]);q=probability(vp,config['scale']*forward(vx,params));score=metrics(vy,q)
+        trial={'config':config,'validation':score};trials.append(trial)
+        fitted.append((controller.rank(score),params,trial,q))
+    if not fitted:
+        store.write(experiment['prefix']+'failed/'+experiment['run_id']+'.json.gz',{'trials':trials})
+        return dict(report,status='numerical_fit_failed')
+    _,params,selected,vq=min(fitted,key=lambda value:value[0]);config=selected['config']
+    _,vy,vp=arrays(groups[1]);diagnosis=controller.diagnose(vy,vq,vp,selected['validation'],metrics(vy,vp))
+    controller.claim_test(experiment)
+    passed=True
     for label,g in zip(('validation','test'),groups[1:]):
-        tx,ty,tp=arrays(g);q=probability(tp,forward(tx,params));old,new=metrics(ty,tp),metrics(ty,q)
+        tx,ty,tp=arrays(g);q=probability(tp,config['scale']*forward(tx,params));old,new=metrics(ty,tp),metrics(ty,q)
         report[label]={'original':old,'connected':new}
         passed=passed and new['accuracy']>old['accuracy'] and new['brier']<=old['brier'] and new['log_loss']<=old['log_loss']
     model={'schema':1,'sport':sport,'base_id':base_id,'trained_at':datetime.now(timezone.utc).isoformat(),
-           'columns':columns,'median':median.tolist(),'mean':mean.tolist(),'scale':scale.tolist(),
-           **{k:v.tolist() for k,v in params.items()},'checks_passed':bool(passed)}
+        'columns':columns,'median':median.tolist(),'mean':mean.tolist(),'scale':scale.tolist(),
+        **{k:v.tolist() for k,v in params.items()},'checks_passed':bool(passed),
+        'correction_scale':config['scale'],'experiment_config':config}
     model['model_id']=sport.lower()+'_connected_'+digest(model)[:16]
     activate=approve_candidate(sport,base_id,model,groups,report,store)
-    report.update(trained=True,status='candidate_saved',activated=bool(activate),penalty=penalty,model_id=model['model_id'],checks_passed=bool(passed))
+    report.update(trained=True,status='candidate_saved',activated=bool(activate),penalty=config['penalty'],
+        model_id=model['model_id'],checks_passed=bool(passed),partition_games=dict(zip(('train','validation','test'),map(len,groups))))
     store.write(ROOT+sport.lower()+'/candidates/'+model['model_id']+'.json.gz',model)
     if activate:store.write(ROOT+sport.lower()+'/active.json.gz',model,replace=True)
+    report['controller']=controller.finish(experiment,trials,selected,diagnosis,report.copy())
+    store.write(ROOT+sport.lower()+'/training_report.json.gz',report,replace=True)
     return report
 
 
@@ -369,8 +387,14 @@ def run(sport,store=None,budget=None,train_models=True):
     for rows in state['slates'].values():
         for r in rows:
             if r.get('sport')!=sport or not stamp(r['captured_at'])<stamp(r['start_time']):continue
-            identity=r['base_id']+'|'+str(r['event_id'])+'|'+r['start_time']
+            identity=r['base_id']+'|'+(digest([clean_team(r['home_team'],sport),clean_team(r['away_team'],sport)]) if sport=='NFL' else str(r['event_id']))+'|'+stamp(r['start_time']).isoformat()
             if identity not in earliest or stamp(r['captured_at'])<stamp(earliest[identity]['captured_at']):earliest[identity]=r
+    # Migrate old app-generated event hashes to canonical matchup identities.
+    canonical={}
+    for r in state['graded'].values():
+        identity=r['base_id']+'|'+(digest([clean_team(r['home_team'],sport),clean_team(r['away_team'],sport)]) if sport=='NFL' else str(r['event_id']))+'|'+stamp(r['start_time']).isoformat()
+        if identity not in canonical or stamp(r['captured_at'])<stamp(canonical[identity]['captured_at']):canonical[identity]=r
+    state['graded']=canonical
     pending=[r for k,r in earliest.items() if k not in state['graded']]
     finals=fetch_finals(sport,pending,budget)
     for identity,r in earliest.items():
@@ -389,7 +413,16 @@ def run(sport,store=None,budget=None,train_models=True):
     reports=[]
     active_base=max(earliest.values(),key=lambda r:stamp(r['captured_at']))['base_id'] if earliest else None
     for base_id in ([active_base] if active_base and train_models else []):
-        report=train(sport,base_id,valid,store);reports.append(report)
+        # Historical rows help fitting, but never enter prospective score counts.
+        history=store.read(prefix+'historical_v1/reconstructed_rows.json.gz') or {}
+        merged={}
+        for row in history.get('rows',[])+valid:
+            if row.get('base_id')!=base_id or row.get('outcome') not in (0,1):continue
+            key=(clean_team(row['home_team'],sport),clean_team(row['away_team'],sport),row['start_time'])
+            merged[key]=row
+        report=train(sport,base_id,list(merged.values()),store)
+        report['prospective_graded_games']=sum(r.get('source')!='historical_reconstruction' for r in merged.values())
+        reports.append(report)
         # Independent base cohorts never silently activate a correction for another model.
         store.write(prefix+'training_report.json.gz',report,replace=True)
     summary={'sport':sport,'mode':'train' if train_models else 'grade','status':'awaiting_saved_forecasts' if not earliest else 'up_to_date_no_pending_games' if not pending else 'completed',
