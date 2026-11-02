@@ -66,7 +66,13 @@ def grade(store,records,now):
     write('forecast_results_v1.json',{'schema':1,'records':ledger})
     counts=update_forecast_ledger([],records,now)
     write('remote_forecasts_seen.json',sorted(known))
-    measured=calibration(read('forecast_results_v1.json',{'records':{}})['records'].values())
+    saved_results=list(read('forecast_results_v1.json',{'records':{}})['records'].values())
+    try:
+        from .shared_experience import publish
+        experience=publish('NCAAF',saved_results,store,now)
+    except Exception as exc:experience={'status':'experience_unavailable','error_type':type(exc).__name__}
+    write('shared_experience_report.json',experience)
+    measured=calibration(saved_results)
     for model,metrics in measured.items():counts.setdefault(model,{}).update(calibration=metrics)
     return counts
 
@@ -219,6 +225,7 @@ def run(mode='collect',max_weeks=8,store=None,now=None):
             write('last_training_inputs.json',{'winner':winner_input,'props':prop_input})
         counts=grade(store,records,now)
         report['prospective_results']=counts
+        report['shared_experience']=read('shared_experience_report.json',{'status':'not_published'})
         report['prop_results']=grade_props(store,history,now)
         # Generate daily pregame forecasts using saved weights only, no odds calls.
         if winner:
