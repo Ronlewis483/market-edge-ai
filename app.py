@@ -471,7 +471,7 @@ def render_prediction_workspace(league, predictions, result):
     with controls[0]:
         period = st.selectbox("Game window", ["Next 7 days + active", "Today"], key=f"workspace_window_{league}")
     with controls[1]:
-        threshold = st.selectbox("Winner confidence", ["All predictions", "70% or higher", "80% or higher"], key=f"workspace_confidence_{league}")
+        threshold = st.selectbox("Estimated win chance", ["All predictions", "70% or higher", "80% or higher"], key=f"workspace_confidence_{league}")
     with controls[2]:
         search = st.text_input("Find a team", key=f"workspace_search_{league}", placeholder="Search either team…")
     frame = predictions.copy()
@@ -525,6 +525,8 @@ def render_prediction_workspace(league, predictions, result):
             confidence = float(game.get('confidence',0))
             render_confidence_badge('Estimated win chance', confidence)
             st.progress(min(1.,max(0.,confidence)))
+            from dual_agent.shared_experience import render as render_experience
+            render_experience(league,game)
             if league == 'NBA':
                 render_nba_star_spotlight(game, result)
             if game.get('input_status'):
