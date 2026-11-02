@@ -389,7 +389,7 @@ def attach_pitcher_forecasts(predictions, logs, offered_forecasts=None):
                 if team['pitcher_projections'] else 'No usable saved prior starts. Projection and cover percentage are unavailable.')
 
 
-def _generate_mlb_predictions(game_date=None, api_key=None, progress=None, on_team_predictions=None, on_prop_predictions=None):
+def _generate_mlb_predictions(game_date=None, api_key=None, progress=None, on_team_predictions=None, on_prop_predictions=None, include_props=True):
     from dual_agent import mlb_research as research, supabase_db as storage
     from dual_agent.mlb_matchup_elo import attach_elo
     from dual_agent.mlb_matchup_context import attach_matchup_context
@@ -536,17 +536,72 @@ def _generate_mlb_predictions(game_date=None, api_key=None, progress=None, on_te
                 'lineup_confirmed': len(order)==9 and len(set(order))==9,
                 'lineup': [player_name(pid) for pid in order]}
         row['game_context'] = context
+    # Connect the existing matchup probability to an independently learned MLB correction.
+    # This does not alter pitcher props, run-rate equations or sportsbook requests.
+    connected_issue = None
+    try:
+        from dual_agent.sports_connected_winner import correct, freeze, digest
+        base_id = 'mlb_matchup:' + digest(model)[:20]
+        inputs = {str(g['game_id']): g for g in games}
+        frozen = []
+        for row in predictions:
+            g = inputs[str(row['game_id'])]
+            features = {}
+            for source in ('team_sides','player_sides','bullpen_sides','hand_sides','form_sides'):
+                for side, values in (g.get(source) or {}).items():
+                    if isinstance(values, (list, tuple, np.ndarray)):
+                        for j, value in enumerate(values):
+                            features[source+'_'+side+'_'+str(j)] = _number(value)
+            for j, value in enumerate(g.get('environment') or []):
+                features['environment_'+str(j)] = _number(value)
+            features['elo_difference'] = _number(g.get('elo_difference'))
+            for side, context in row['game_context']['teams'].items():
+                features[side+'_lineup_confirmed'] = int(context['lineup_confirmed'])
+                features[side+'_starter_known'] = int(context['starter_id'] is not None)
+            baseline = row['Home win probability']
+            result = correct('MLB', base_id, baseline, features, start_time=row['start_time'])
+            p = result['connected_probability']
+            row['Original home win probability'] = baseline
+            row['Home win probability'] = p
+            row['Winner probability'] = max(p, 1-p)
+            row['Predicted winner'] = row['Home'] if p >= .5 else row['Away']
+            row['Connected model ID'] = result['model_id']
+            row['Connected status'] = result['status']
+            row['Connected applied'] = result['applied']
+            if result['applied']:
+                row['Original equation'] = row['Equation']
+                row['Equation'] += ' + connected correction'
+                threshold = row['Recommendation threshold']
+                row['Should we make the pick'] = bool(not row['Input notes'] and not row['Missing model inputs']
+                                                       and threshold is not None and max(p,1-p) >= threshold)
+            frozen.append(dict(event_id=str(row['game_id']),start_time=row['start_time'],
+                         home_team=row['Home'],away_team=row['Away'],connected=result))
+        connected_issue = freeze('MLB', frozen)
+    except Exception as exc:
+        connected_issue = 'MLB connected learning unavailable (' + type(exc).__name__ + ')'
+    if connected_issue:
+        for row in predictions: row['Connected learning issue'] = connected_issue
     attach_pitcher_forecasts(predictions, logs)
     now = pd.Timestamp.now(tz='UTC')
     predictions = [r for r in predictions if pd.Timestamp(r['start_time'])>now and now-pd.Timestamp(r['Captured UTC'])<=pd.Timedelta(minutes=15)]
     predictions.sort(key=lambda r: (-r['Winner probability'], r['start_time'], r['game_id']))
     all_eligible_predictions = list(predictions)
     predictions = predictions[:10]
+    if not include_props:
+        previous = storage.load_mlb_capture_learning_dataset()
+        incoming = research.build_mlb_capture_learning_rows(package)
+        existing = {r['capture_key']:r for r in previous['rows']}
+        refreshed = research.refresh_mlb_capture_learning_results(list(existing.values()))
+        for r in refreshed['rows']+incoming['rows']: existing[r['capture_key']]=r
+        saved = storage.update_mlb_capture_learning_dataset({'rows':list(existing.values())})
+        if not saved.get('success'):raise RuntimeError('MLB learning capture dataset save failed')
     mark('Collect player props')
     if on_team_predictions:
         on_team_predictions(all_eligible_predictions)
     update('Team forecasts ready. Collecting player props in parallel...')
     try:
+        if not include_props:
+            raise StopIteration('Scheduled winner collection does not scan prop odds')
         import importlib
         prop_module = importlib.import_module('dual_agent.sports_player_prop_predictions')
         if getattr(prop_module, 'MLB_PROP_MATCH_VERSION', None) != 6:
@@ -556,6 +611,8 @@ def _generate_mlb_predictions(game_date=None, api_key=None, progress=None, on_te
         generate_player_prop_picks = prop_module.generate_player_prop_picks
         prop_games = [{'game_id': r['game_id'], 'start_time': r['start_time'], 'home_team': r['Home'], 'away_team': r['Away']} for r in all_eligible_predictions]
         props = generate_player_prop_picks('MLB', prop_games, api_key, player_logs=logs, snapshots=snapshots, progress=on_prop_predictions)
+    except StopIteration:
+        props = {'picks': [], 'errors': [], 'message': 'Winner-only scheduled collection; no prop odds requested.'}
     except Exception as exc:
         props = {'picks': [], 'errors': [{'stage': 'MLB prop generation', 'error_type': type(exc).__name__}],
                  'message': 'MLB player-prop generation failed ('+type(exc).__name__+'). See player-prop data coverage.'}
@@ -603,12 +660,12 @@ def fetch_live_consensus(games, api_key):
     return probabilities
 
 
-def run_mlb_prediction_pipeline(game_date=None, api_key=None, progress=None, on_team_predictions=None, force_refresh=False, on_prop_predictions=None):
+def run_mlb_prediction_pipeline(game_date=None, api_key=None, progress=None, on_team_predictions=None, force_refresh=False, on_prop_predictions=None, include_props=True):
     """Reuse completed pregame results for three minutes, retaining source times."""
     import copy
     now = pd.Timestamp.now(tz='UTC')
     date_key = str(game_date or now.tz_convert('America/Chicago').date())
-    key = ('completed_predictions', date_key, hashlib.sha256((api_key or '').encode()).hexdigest())
+    key = ('completed_predictions', date_key, hashlib.sha256((api_key or '').encode()).hexdigest(), bool(include_props))
     with _CACHE_LOCK:
         if force_refresh:
             _HISTORY_CACHE.pop(key, None)
@@ -616,7 +673,7 @@ def run_mlb_prediction_pipeline(game_date=None, api_key=None, progress=None, on_
         reused = bool(cached and time.monotonic()-cached[0]<180)
     if reused and progress:
         progress('Using predictions collected within the last three minutes...')
-    result = copy.deepcopy(_cached_history(key, 180, lambda: _generate_mlb_predictions(game_date, api_key, progress, on_team_predictions, on_prop_predictions)))
+    result = copy.deepcopy(_cached_history(key, 180, lambda: _generate_mlb_predictions(game_date, api_key, progress, on_team_predictions, on_prop_predictions, include_props)))
     now = pd.Timestamp.now(tz='UTC')
     def eligible(row):
         return pd.Timestamp(row['start_time'])>now and now-pd.Timestamp(row['Captured UTC'])<=pd.Timedelta(minutes=15)
