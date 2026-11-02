@@ -252,6 +252,23 @@ def training_rows(games):
     return pd.DataFrame(rows), research['NBA_LIVE_FEATURE_COLUMNS'], base
 
 
+class NBAExperimentStore:
+    def __init__(self,client):self.client=client
+    def read(self,path):return self.client.read(path,compressed=True)
+    def write(self,path,value,replace=False):return self.client.write(path,value,compressed=True,replace=replace)
+
+
+def _experiment_rows(frame,cohort):
+    values=[]
+    for r in frame.to_dict('records'):
+        at=pd.Timestamp(r['game_date']);at=at.tz_localize('UTC') if at.tzinfo is None else at.tz_convert('UTC')
+        values.append(dict(base_id=cohort,event_id=str(r['game_id']),start_time=at.isoformat(),
+            captured_at=(at-pd.Timedelta(hours=1)).isoformat(),label_observed_at=(at+pd.Timedelta(days=1)).isoformat(),
+            original_probability=None,context={k:float(v) for k,v in r.items() if pd.api.types.is_number(v) and pd.notna(v) and np.isfinite(v)},
+            outcome=int(r['home_win'])))
+    return values
+
+
 def train(client=None):
     from sklearn.ensemble import GradientBoostingClassifier
     from sklearn.linear_model import LogisticRegression
@@ -264,6 +281,24 @@ def train(client=None):
     checkpoint = client.read(PREFIX+'checkpoint.json.gz',compressed=True)
     if not isinstance(checkpoint,dict) or checkpoint.get('schema') != 1:
         raise ValueError('Saved NBA checkpoint missing')
+    from . import experiment_controller as controller
+    from .sports_connected_winner import digest
+    sample_report=client.read('nba/historical_player_sample_v1/latest_report.json') or {}
+    source_signature=digest([controller.VERSION,checkpoint.get('games',{}),sorted(checkpoint.get('stats',{})),sample_report.get('total_saved_games')])
+    readiness=client.read(ROOT+'controller_readiness.json.gz',compressed=True) or {}
+    if readiness.get('controller_version')==controller.VERSION and readiness.get('status')=='complete' and readiness.get('signature')==source_signature:
+        result={'status':'unchanged_controller_source_skipped','training_performed':False,'sports_api_requests':0}
+        print(json.dumps(result));return result
+    # Context refresh is frequent; full saved-box reconstruction waits for new finals.
+    from .nba_pregame_snapshots import final
+    completed=sum(final(g) for g in checkpoint.get('games',{}).values())
+    if readiness.get('controller_version')==controller.VERSION and readiness.get('status')=='complete' and completed<int(readiness.get('completed_games',0))+25 and sample_report.get('total_saved_games')==readiness.get('saved_boxes'):
+        result={'status':'waiting_for_25_new_completed_games','training_performed':False,'sports_api_requests':0}
+        print(json.dumps(result));return result
+    marker={'controller_version':controller.VERSION,'signature':source_signature,'completed_games':completed,'saved_boxes':sample_report.get('total_saved_games'),'status':'running'}
+    client.write(ROOT+'controller_readiness.json.gz',marker,compressed=True,replace=True)
+    def complete_readiness():
+        client.write(ROOT+'controller_readiness.json.gz',dict(marker,status='complete'),compressed=True,replace=True)
     samples = {}
     for name in list_samples(client):
         saved = client.read(HISTORY_ROOT+'games/'+name,compressed=True)
@@ -288,15 +323,27 @@ def train(client=None):
         if len(g)==0 or g.home_win.nunique()!=2 or g.home_win.value_counts().min()<10:
             report['reasons'].append(label+': needs 10 examples of each outcome')
     if report['reasons']:
-        client.write(ROOT+'latest_report.json',report,replace=True)
+        complete_readiness();client.write(ROOT+'latest_report.json',report,replace=True)
         print(json.dumps(report));return report
+    cohort='original_offset_neural_player_residual|nba_winner_neural_v1'
+    experiment,control=controller.prepare('NBA',cohort,_experiment_rows(frame,cohort),
+        [_experiment_rows(g,cohort) for g in groups],NBAExperimentStore(client))
+    if experiment is None:
+        report.update(status=control['status'],controller=control)
+        complete_readiness();client.write(ROOT+'latest_report.json',report,replace=True);print(json.dumps(report));return report
+    fresh_ids={r['event_id'] for r in experiment['groups'][2]}
+    groups[2]=groups[2][groups[2].game_id.astype(str).isin(fresh_ids)].copy()
+    report['partition_games']=dict(zip(('train','validation','test'),map(len,groups)))
+    if len(groups[2])<50 or groups[2].home_win.nunique()!=2 or groups[2].home_win.value_counts().min()<10:
+        report.update(status='waiting_for_50_fresh_test_results',fresh_test_games=len(groups[2]),controller=control)
+        complete_readiness();client.write(ROOT+'latest_report.json',report,replace=True);print(json.dumps(report));return report
     # Learn only from original forecasts generated using strictly earlier dates.
     correction_train = prior_original_forecasts(groups[0],original_history,base_columns)
     report['correction_training_games'] = len(correction_train)
     report['correction_training_method'] = 'expanding original engine; previous dates; 500-game minimum'
     if len(correction_train)<200 or correction_train.home_win.nunique()!=2 or correction_train.home_win.value_counts().min()<20:
         report['reasons'].append('Correction layer needs 200 out-of-fold forecasts and 20 of each outcome')
-        client.write(ROOT+'latest_report.json',report,replace=True)
+        complete_readiness();client.write(ROOT+'latest_report.json',report,replace=True)
         print(json.dumps(report));return report
     functions = original_functions()
     cutoff = groups[1].game_date.min()
@@ -312,53 +359,68 @@ def train(client=None):
         def predict_proba(self,X):
             p=np.clip(np.asarray(X)[:,-1],1e-7,1-1e-7)
             return np.column_stack([1-p,p])
-    residual = GradientBoostingClassifier(n_estimators=80,learning_rate=.025,max_depth=2,
-                min_samples_leaf=30,random_state=42,init=OriginalOffset())
-    residual.fit(x,correction_train.home_win)
-    trees=[]
-    for estimator in residual.estimators_[:,0]:
-        t=estimator.tree_
-        trees.append({'left':t.children_left.tolist(),'right':t.children_right.tolist(),
-                      'feature':t.feature.tolist(),'threshold':t.threshold.tolist(),'value':t.value[:,0,0].tolist()})
-    exported={'initial_logit':0.,'learning_rate':float(residual.learning_rate),'trees':trees,
-              'uses_original_offset':True}
-    report['learned_context_usage'] = {
-        'player_features':float(residual.feature_importances_[:-2].sum()),
-        'existing_neural_gap':float(residual.feature_importances_[-2]),
-        'original_probability':float(residual.feature_importances_[-1])}
-    # Validation selects how far to apply the same learned correction, never votes.
     vp=original_probabilities(functions,original,groups[1],base_columns)
     vx=correction_inputs(groups[1],vp)
-    raw=sum(residual.learning_rate * t.predict(vx.to_numpy()) for t in residual.estimators_[:,0])
-    gains=[0.,.25,.5,.75,1.]
-    gain=min(gains,key=lambda g:(-scores(groups[1].home_win,bounded_probability(vp,raw,g))['accuracy'],
-                               scores(groups[1].home_win,bounded_probability(vp,raw,g))['brier']))
-    passed=True
+    trials=[];fitted=[]
+    for config in controller.plan(experiment,'NBA'):
+        residual=GradientBoostingClassifier(n_estimators=config['trees'],learning_rate=.025,max_depth=config['depth'],
+            min_samples_leaf=config['leaf'],random_state=42,init=OriginalOffset())
+        weight=controller.weights(_experiment_rows(correction_train,cohort),config['half_life_days'])
+        residual.fit(x,correction_train.home_win,sample_weight=weight)
+        trees=[]
+        for estimator in residual.estimators_[:,0]:
+            t=estimator.tree_;trees.append({'left':t.children_left.tolist(),'right':t.children_right.tolist(),
+                'feature':t.feature.tolist(),'threshold':t.threshold.tolist(),'value':t.value[:,0,0].tolist()})
+        exported={'initial_logit':0.,'learning_rate':float(residual.learning_rate),'trees':trees,'uses_original_offset':True}
+        raw=sum(residual.learning_rate*t.predict(vx.to_numpy()) for t in residual.estimators_[:,0])
+        gains=[v for v in (0.,.125,.25,.5,.75,1.) if v<=config['gain_cap']]
+        gain=min(gains,key=lambda v:controller.rank(scores(groups[1].home_win,bounded_probability(vp,raw,v))))
+        q=bounded_probability(vp,raw,gain);score=scores(groups[1].home_win,q)
+        trial={'config':config,'gain':gain,'validation':score};trials.append(trial)
+        fitted.append((controller.rank(score),exported,gain,trial,q,residual.feature_importances_.tolist()))
+    _,exported,gain,selected,vq,importance=min(fitted,key=lambda r:r[0])
+    diagnosis=controller.diagnose(groups[1].home_win.to_numpy(),vq,vp,selected['validation'],scores(groups[1].home_win,vp))
+    controller.claim_test(experiment)
+    report['learned_context_usage']={'player_features':float(sum(importance[:-2])),
+        'existing_neural_gap':float(importance[-2]),'original_probability':float(importance[-1])}
+    passed=True;incumbent=client.read(ARTIFACT,compressed=True)
     for label,g in zip(('validation','test'),groups[1:]):
-        p=original_probabilities(functions,original,g,base_columns)
-        inputs=correction_inputs(g,p)
-        delta=sum(residual.learning_rate * t.predict(inputs.to_numpy()) for t in residual.estimators_[:,0])
-        connected=bounded_probability(p,delta,gain)
-        restored=np.array([tree_probability(exported,r,gain=gain) for r in inputs.to_numpy()])
-        if not np.allclose(connected,restored,atol=1e-10,rtol=0):
-            raise ValueError('Connected export differs from trained correction')
+        p=original_probabilities(functions,original,g,base_columns);inputs=correction_inputs(g,p)
+        connected=np.array([tree_probability(exported,r,gain=gain) for r in inputs.to_numpy()])
         old,new=scores(g.home_win,p),scores(g.home_win,connected)
-        report[label]={'original_engine':old,'connected_engine':new,
-                       'changed_picks':int(np.sum((p>=.5)!=(connected>=.5)))}
+        report[label]={'original_engine':old,'connected_engine':new,'changed_picks':int(np.sum((p>=.5)!=(connected>=.5)))}
         passed=passed and new['accuracy']>old['accuracy'] and new['brier']<=old['brier'] and new['log_loss']<=old['log_loss']
+    activate=bool(passed)
+    if incumbent:
+        held=groups[2]
+        after=pd.Timestamp(incumbent['trained_at'])+pd.Timedelta(days=1)
+        dates=pd.to_datetime(held.game_date,utc=True)
+        held=held[dates>after]
+        if len(held)<50:
+            activate=False;report['activation_reason']='Need 50 fresh later games for incumbent comparison'
+        elif incumbent.get('columns')!=columns:
+            activate=False;report['activation_reason']='Incumbent input columns differ; retained pending a compatible comparison'
+        else:
+            p=original_probabilities(functions,original,held,base_columns);inputs=correction_inputs(held,p).to_numpy()
+            oldp=[tree_probability(incumbent['tree_model'],r,gain=incumbent['correction_gain']) for r in inputs]
+            newp=[tree_probability(exported,r,gain=gain) for r in inputs]
+            oldm,newm=scores(held.home_win,oldp),scores(held.home_win,newp)
+            report['incumbent_comparison']={'incumbent':oldm,'candidate':newm}
+            activate=activate and newm['accuracy']>=oldm['accuracy'] and newm['brier']<=oldm['brier'] and newm['log_loss']<oldm['log_loss']
     now=datetime.now(timezone.utc).isoformat()
     artifact={'schema':2,'architecture':'original_offset_neural_player_residual',
               'trained_at':now,'context_refreshed_at':now,'columns':columns,'base_columns':base_columns,
               'tree_model':exported,'correction_gain':gain,'checks_passed':bool(passed),
               'games':games,'aliases':aliases,'availability':{},'training_games':len(correction_train),
-              'source_neural_model':'nba_winner_neural_v1'}
+              'source_neural_model':'nba_winner_neural_v1','experiment_config':selected['config']}
     artifact['model_id']='nba_connected_'+hashlib.sha256(json.dumps(artifact,sort_keys=True).encode()).hexdigest()[:16]
     report.update(status='candidate_saved',training_performed=True,checks_passed=bool(passed),
-                  correction_gain=gain,model_id=artifact['model_id'],probability_averaging=False)
+                  correction_gain=gain,model_id=artifact['model_id'],probability_averaging=False,activated=bool(activate),live_model_changed=bool(activate))
+    report['controller']=controller.finish(experiment,trials,selected,diagnosis,report.copy())
     artifact['family_id']=artifact['model_id'];artifact['report']=report
     client.write(ROOT+'candidates/'+artifact['model_id']+'.json.gz',artifact,compressed=True)
-    client.write(ARTIFACT,artifact,compressed=True,replace=True)
-    client.write(ROOT+'latest_report.json',report,replace=True)
+    if activate:client.write(ARTIFACT,artifact,compressed=True,replace=True)
+    complete_readiness();client.write(ROOT+'latest_report.json',report,replace=True)
     print(json.dumps(report));return report
 
 
@@ -460,7 +522,7 @@ def refresh(client=None):
     artifact['context_refreshed_at']=now.isoformat()
     client.write(ARTIFACT,artifact,compressed=True,replace=True)
     comparison = grade(client,checkpoint)
-    learn_from_results(client,artifact,comparison)
+    # Retain the existing graded ledger; parameter search is handled by train().
     print(json.dumps({'status':'unified_context_refreshed','tree_weights_changed':False,'sports_api_requests':0,
                       'fresh_matchup_reports':len(availability)}))
 
@@ -595,4 +657,7 @@ def learn_from_results(client, artifact, state):
 
 if __name__=='__main__':
     import sys
-    refresh() if '--refresh' in sys.argv else train()
+    if '--refresh' in sys.argv:
+        refresh()
+        train()
+    else:train()
