@@ -1,34 +1,28 @@
 name: NCAAF automated learning
-
 on:
   schedule:
-    - cron: '17 3 * * *'
-      timezone: America/Chicago
-    - cron: '47 4 * * 2'
-      timezone: America/Chicago
+    - cron: '11,26,41,56 * * * *'
+    - cron: '47 9 * * *'
   workflow_dispatch:
     inputs:
       mode:
-        description: 'bootstrap for first setup; collect daily; train weekly'
+        description: 'All modes collect; cycle/train/bootstrap also readiness-train automatically'
         type: choice
-        options: [bootstrap, collect, train]
+        options: [bootstrap, cycle, train, collect]
         default: bootstrap
       max_weeks:
-        description: 'Maximum player-stat week batches to collect (1-100)'
+        description: 'Bounded player-stat week requests, 1-100'
         type: number
         default: 8
-
 permissions:
   contents: read
-
 concurrency:
   group: ncaaf-automated-learning
   cancel-in-progress: false
-
 jobs:
   learn:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     env:
       CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -38,30 +32,23 @@ jobs:
       OMP_NUM_THREADS: '1'
       OPENBLAS_NUM_THREADS: '1'
       MKL_NUM_THREADS: '1'
-      REQUESTED_MODE: ${{ inputs.mode || (github.event.schedule == '47 4 * * 2' && 'train' || 'collect') }}
-      MAX_WEEKS: ${{ inputs.max_weeks || 8 }}
+      REQUESTED_MODE: ${{ inputs.mode || 'cycle' }}
+      MAX_WEEKS: ${{ inputs.max_weeks || (github.event.schedule == '47 9 * * *' && 8 || 2) }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+          cache: pip
+          cache-dependency-path: automation-requirements.txt
       - name: Install collection and training dependencies
-        run: python -m pip install requests==2.32.5 numpy==2.3.5 pandas==2.3.3 scipy==1.17.0 scikit-learn==1.8.0
-      - name: Check required secrets
-        run: |
-          python - <<'PY'
-          import os
-          required = ['CFBD_API_KEY', 'SUPABASE_URL', 'SUPABASE_KEY']
-          missing = [name for name in required if not os.environ.get(name)]
-          if missing:
-              raise SystemExit('Missing repository secrets: ' + ', '.join(missing))
-          PY
-      - name: Collect, grade and optionally train NCAAF models
+        run: python -m pip install -r automation-requirements.txt
+      - name: Collect, grade, readiness-train and publish NCAA weights
         run: python -m dual_agent.ncaaf_learning_job --mode "$REQUESTED_MODE" --max-weeks "$MAX_WEEKS"
       - name: Save workflow report
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
-          name: ncaaf-learning-report
+          name: ncaaf-learning-${{ github.run_id }}
           path: ncaaf_automation_report.json
           if-no-files-found: ignore
