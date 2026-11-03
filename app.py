@@ -446,6 +446,10 @@ def prediction_date_groups(predictions, now=None):
 def visible_prediction_rows(predictions):
     if predictions is None or predictions.empty:
         return predictions
+    from dual_agent.game_lifecycle import display_rows
+    predictions = display_rows(predictions)
+    if predictions.empty:
+        return predictions
     groups = prediction_date_groups(predictions)
     return pd.concat([rows for _, _, rows in groups], ignore_index=True)
 
@@ -464,6 +468,7 @@ def render_prediction_workspace(league, predictions, result):
     if league == 'NFL':
         render_nfl_enrichment_status()
         render_nfl_freshness_monitor()
+        if result.get('market_issue'):st.info(result['market_issue'])
         if result.get('context_issue'):st.warning(result['context_issue'])
         if result.get('qb_forecast_issue'):st.warning(result['qb_forecast_issue'])
     st.markdown(f'<div class="me-workspace-header"><div class="me-eyebrow">PREDICTION WORKSPACE · {escape(league)}</div><h2>Find your next pick</h2><p>Select a game. Compare its winner, spread and strongest player props.</p></div>', unsafe_allow_html=True)
@@ -2407,12 +2412,19 @@ def cached_nfl_pick_statuses(api_key):
         return []
 
 
+@st.cache_data(ttl=180, show_spinner=False)
+def cached_public_pick_statuses(league):
+    from dual_agent.game_lifecycle import public_statuses
+    return public_statuses(league)
+
+
 def nfl_pick_identity(row, time_column):
+    from dual_agent.game_lifecycle import team_identity
     kickoff = pd.to_datetime(row.get(time_column), utc=True, errors="coerce")
     if pd.isna(kickoff):
         return None
-    return (str(row.get("home_team", "")).strip(),
-            str(row.get("away_team", "")).strip(), kickoff.isoformat())
+    return (team_identity(row.get("home_team", "")),
+            team_identity(row.get("away_team", "")), kickoff.isoformat())
 
 
 def merge_nfl_saved_picks(previous, fresh, time_column, identity_columns, statuses, now, completed=()):
@@ -2424,7 +2436,7 @@ def merge_nfl_saved_picks(previous, fresh, time_column, identity_columns, status
     for status in statuses:
         game = nfl_pick_identity(status, "commence_time")
         if game is not None:
-            status_by_game[game] = status
+            status_by_game[game] = {**status_by_game.get(game, {}), **status}
             if status.get("completed") is True:
                 final_games.add(game)
     def records(value):
@@ -2443,11 +2455,15 @@ def merge_nfl_saved_picks(previous, fresh, time_column, identity_columns, status
             continue
         row = dict(row)
         status = status_by_game.get(game, {})
+        active = status.get("in_progress") is True or bool(status.get("scores"))
+        old_unknown = kickoff.tz_convert("America/Chicago").date() < now.tz_convert("America/Chicago").date() and not active
+        row["pick_display_state"] = ("unavailable" if status.get("unavailable") else
+            "archived_unverified" if kickoff <= now and old_unknown else "visible")
         row["pick_game_status"] = (
+            "Unavailable · saved pregame pick" if status.get("unavailable") else
             "Upcoming" if kickoff > now else
-            "In progress · saved pregame pick" if status.get("scores") else
-            "Started · awaiting game status · saved pregame pick"
-        )
+            "In progress · saved pregame pick" if active else
+            "Started · awaiting game status · saved pregame pick")
         saved[identity] = row
     return pd.DataFrame(saved.values()), final_games
 
@@ -2461,12 +2477,15 @@ def retain_nfl_picks(rows, archive_key, time_column="commence_time", identity_co
             times = pd.to_datetime(frame[time_column], utc=True, errors="coerce")
             needs_status = needs_status or bool((times <= current).any())
     statuses = cached_nfl_pick_statuses(st.secrets.get("ODDS_API_KEY", st.secrets.get("THE_ODDS_API_KEY", ""))) if needs_status else []
+    if needs_status:
+        statuses = statuses + cached_public_pick_statuses("NFL")
     final_key = archive_key + "_completed"
     visible, completed = merge_nfl_saved_picks(previous, rows, time_column, identity_columns,
         statuses, current, st.session_state.get(final_key, set()))
     st.session_state[archive_key] = visible
     st.session_state[final_key] = completed
-    return visible
+    from dual_agent.game_lifecycle import display_rows
+    return display_rows(visible)
 
 
 @st.cache_data(ttl=180, show_spinner=False)
@@ -2516,12 +2535,16 @@ def retain_sport_picks(league, rows, kind="teams", now=None, limit=10):
         for f in (previous, frame))
     sport = {"MLB": "baseball_mlb", "NBA": "basketball_nba"}[league]
     statuses = cached_sport_pick_statuses(sport, prediction_api_key("ODDS_API_KEY", "THE_ODDS_API_KEY")) if started else []
+    if started:
+        statuses = statuses + cached_public_pick_statuses(league)
     columns = ("Player", "Market", "Pick", "Line") if kind == "props" else ()
     done_key = archive_key + "_completed"
     visible, completed = merge_nfl_saved_picks(previous, frame, "commence_time", columns,
         statuses, current, st.session_state.get(done_key, set()))
     st.session_state[archive_key] = visible
     st.session_state[done_key] = completed
+    from dual_agent.game_lifecycle import display_rows
+    visible = display_rows(visible)
     if visible.empty:
         return visible
     kickoff = pd.to_datetime(visible["commence_time"], utc=True, errors="coerce")
@@ -2684,7 +2707,11 @@ def generate_nfl_in_background(previous, historical_accuracy, historical_sample,
         bundle, history_seconds = history_job.result()
         progress.put(('history', bundle))
         report('NFL history ready; checking sportsbook lines')
-        live_odds, odds_seconds = odds_job.result()
+        try:
+            live_odds, odds_seconds = odds_job.result()
+        except Exception:
+            live_odds, odds_seconds = pd.DataFrame(), 0
+            report("Sportsbook lines unavailable; checking the NFL schedule for winner forecasts")
     report('Calculating NFL matchups')
     result = run_nfl_prediction_pipeline(feature_games=bundle[1],
         historical_accuracy=historical_accuracy, historical_sample=historical_sample,
