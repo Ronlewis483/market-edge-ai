@@ -82,7 +82,9 @@ def finalize_connected_result(result):
         frozen.append(dict(event_id=digest([row['home_team'],row['away_team'],start.isoformat()]),start_time=start.isoformat(),
                            home_team=row['home_team'],away_team=row['away_team'],connected=forecast))
     result['predictions']=frame;result['all_predictions']=frame
-    result['opportunities']=build_live_nfl_opportunities(model_predictions=frame,best_lines=result.get('best_lines'),
+    priced=frame.loc[frame['moneyline_available'].eq(True)] if 'moneyline_available' in frame else frame
+    lines=result.get('best_lines')
+    result['opportunities']=pd.DataFrame() if priced.empty or lines is None or len(lines)==0 else build_live_nfl_opportunities(model_predictions=priced,best_lines=lines,
             historical_accuracy=result.get('connected_historical_accuracy'),historical_sample=result.get('connected_historical_sample'))
     issue=freeze('NFL',frozen)
     if issue:result['connected_learning_issue']=issue
