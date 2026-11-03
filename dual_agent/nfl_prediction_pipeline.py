@@ -55,6 +55,34 @@ def nfl_week_rows(rows, now=None):
     return frame.reset_index(drop=True)
 
 
+def scheduled_slate(best_lines, now):
+    """Official schedule supplies matchups; quotes only supply real prices."""
+    from dual_agent.nfl_live_context import fresh_schedule, team_code, TEAMS
+    schedule, _ = fresh_schedule()
+    schedule = schedule.copy()
+    start = pd.to_datetime(schedule["start_time"], utc=True, errors="coerce")
+    eligible = (start > now) & (start <= now + pd.Timedelta(days=7))
+    eligible &= schedule["gametime"].notna() & schedule["gametime"].astype(str).str.strip().ne("")
+    if "game_type" in schedule:
+        eligible &= schedule["game_type"].isin(["REG", "WC", "DIV", "CON", "SB", "POST"])
+    if "home_score" in schedule and "away_score" in schedule:
+        eligible &= ~(schedule["home_score"].notna() & schedule["away_score"].notna())
+    rows = []
+    for index, game in schedule.loc[eligible].iterrows():
+        home, away = team_code(game["home_team"]), team_code(game["away_team"])
+        row = {"home_team": TEAMS.get(home, game["home_team"]), "away_team": TEAMS.get(away, game["away_team"]),
+               "commence_time": start.loc[index], "schedule_game_id": game.get("game_id"), "moneyline_available": False}
+        for quote in best_lines.to_dict("records"):
+            when = pd.to_datetime(quote.get("commence_time"), utc=True, errors="coerce")
+            if team_code(quote.get("home_team")) == home and team_code(quote.get("away_team")) == away and pd.notna(when) and abs(when-start.loc[index]) <= pd.Timedelta(minutes=15):
+                row.update(quote)
+                row["commence_time"] = start.loc[index]
+                row["moneyline_available"] = True
+                break
+        rows.append(row)
+    return nfl_week_rows(pd.DataFrame(rows), now)
+
+
 def run_nfl_prediction_pipeline(
     feature_games,
     historical_accuracy=None,
@@ -108,65 +136,24 @@ def run_nfl_prediction_pipeline(
     # 2. LOAD LIVE NFL MONEYLINES
     # ==========================================
 
+    market_issue = None
     if live_odds is None:
-        live_odds = get_live_nfl_moneylines()
-
-    if live_odds is None:
-        raise ValueError(
-            "NFL live odds retrieval returned no data."
-        )
-
-    if not isinstance(live_odds, pd.DataFrame):
-        live_odds = pd.DataFrame(live_odds)
-
-    if live_odds.empty:
-        raise ValueError(
-            "No live NFL moneylines are available."
-        )
-
-    # ==========================================
-    # 3. FIND BEST AVAILABLE MONEYLINES
-    # ==========================================
-
-    best_lines = get_best_nfl_moneylines(
-    live_odds.to_dict("records")
-)
-
-    if best_lines is None:
-        raise ValueError(
-            "NFL best-line calculation returned no data."
-        )
-
-    if not isinstance(best_lines, pd.DataFrame):
-        best_lines = pd.DataFrame(best_lines)
-
+        try:
+            live_odds = get_live_nfl_moneylines()
+        except Exception:
+            live_odds = pd.DataFrame()
+    live_odds = pd.DataFrame() if live_odds is None else pd.DataFrame(live_odds)
+    best_lines = pd.DataFrame(get_best_nfl_moneylines(live_odds.to_dict("records"))) if not live_odds.empty else pd.DataFrame()
+    current_time = pd.Timestamp.now(tz="UTC")
+    best_lines = nfl_week_rows(best_lines, now=current_time)
+    try:
+        slate = scheduled_slate(best_lines, current_time)
+    except Exception:
+        slate = best_lines.copy()
+        slate["moneyline_available"] = True
+        market_issue = "Schedule unavailable; showing only upcoming games with sportsbook coverage."
     if best_lines.empty:
-        raise ValueError(
-            "No usable NFL best lines were found."
-        )
-
-    required_line_columns = {
-        "home_team",
-        "away_team",
-        "commence_time",
-    }
-
-    missing_line_columns = (
-        required_line_columns
-        - set(best_lines.columns)
-    )
-
-    if missing_line_columns:
-        raise ValueError(
-            "NFL best lines are missing required columns: "
-            + ", ".join(
-                sorted(missing_line_columns)
-            )
-        )
-
-    # ==========================================
-    # 4. GENERATE UPCOMING NFL PREDICTIONS
-    # ==========================================
+        market_issue = "No sportsbook moneylines available; schedule-based winner forecasts have no quoted price."
 
     prediction_rows = []
     prediction_errors = []
@@ -177,9 +164,9 @@ def run_nfl_prediction_pipeline(
 
     best_lines = nfl_week_rows(best_lines, now=current_time)
 
-    for matchup_number, (_, game) in enumerate(best_lines.iterrows(), 1):
+    for matchup_number, (_, game) in enumerate(slate.iterrows(), 1):
         if on_progress is not None:
-            on_progress(f"Calculating NFL matchup {matchup_number} of {len(best_lines)}")
+            on_progress(f"Calculating NFL matchup {matchup_number} of {len(slate)}")
 
         home_team = game["home_team"]
         away_team = game["away_team"]
@@ -224,6 +211,8 @@ def run_nfl_prediction_pipeline(
             prediction_rows.append(
                 {
                     "commence_time": game_time,
+                    "moneyline_available": bool(game.get("moneyline_available", False)),
+                    "schedule_game_id": game.get("schedule_game_id"),
                     "original_home_win_probability": prediction['home_win_probability'],
                     "connected_features": {k: float(future_features.iloc[0][k]) for k in
                         ('win_pct_diff','avg_point_diff_diff','recent_5_win_pct_diff','recent_5_point_diff_diff','rest_diff')},
@@ -292,8 +281,9 @@ def run_nfl_prediction_pipeline(
     # 5. BUILD LIVE NFL OPPORTUNITIES
     # ==========================================
 
-    opportunities = build_live_nfl_opportunities(
-        model_predictions=predictions,
+    priced = predictions.loc[predictions["moneyline_available"].eq(True)]
+    opportunities = pd.DataFrame() if priced.empty or best_lines.empty else build_live_nfl_opportunities(
+        model_predictions=priced,
         best_lines=best_lines,
         historical_accuracy=historical_accuracy,
         historical_sample=historical_sample,
@@ -307,6 +297,7 @@ def run_nfl_prediction_pipeline(
     # ==========================================
 
     return {
+        "market_issue": market_issue,
         "live_odds": live_odds,
         "best_lines": best_lines,
         "predictions": predictions,
