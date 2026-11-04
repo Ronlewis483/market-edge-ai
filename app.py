@@ -2297,7 +2297,8 @@ def enrich_nba_props(result, odds_key, nba_key, updates, context=None):
                     result['player_props'].setdefault('errors', []).append('Partial props could not be saved; completed estimates remain available in this session.')
         result['player_props'] = generate_player_prop_picks('NBA',
             result['all_predictions'].sort_values('commence_time', kind='stable').to_dict('records'), odds_key, nba_key=nba_key,
-            progress=publish_progress, nba_history_enabled=True)
+            progress=publish_progress, nba_history_enabled=True,
+            priority_game=result.pop('_nba_prop_priority_game', None))
     except Exception as exc:
         props = dict(result.get('player_props') or {})
         props['message'] = 'NBA scan stopped; completed prop estimates and team predictions are preserved.'
@@ -2389,13 +2390,15 @@ def render_nba_enrichment_status():
     st.caption('NBA player props are up to date for the completed scan.')
 
 
-def start_nba_prop_loading(result):
+def start_nba_prop_loading(result, priority_game=None):
     """Start props without rerunning the winner model; preserve all team picks."""
     import copy
     pending = st.session_state.get('nba_enrichment_future')
     if pending is not None and not pending.done():
         return False
     result = copy.deepcopy(result)
+    if priority_game is not None:
+        result['_nba_prop_priority_game'] = dict(priority_game)
     from queue import Queue
     try:
         from streamlit.runtime.scriptrunner import get_script_run_ctx
@@ -3225,7 +3228,7 @@ def render_game_addons(league, game, result):
             from dual_agent.odds_request_cache import refresh_game_props
             matched = refresh_game_props(game.get('home_team'), game.get('away_team'))
             if league == 'NBA':
-                started = start_nba_prop_loading(st.session_state.get('nba_prediction_pipeline_result') or result)
+                started = start_nba_prop_loading(st.session_state.get('nba_prediction_pipeline_result') or result, priority_game=game)
                 if started:
                     st.rerun()
                 else:
