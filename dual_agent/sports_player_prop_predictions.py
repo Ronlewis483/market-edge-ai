@@ -989,7 +989,7 @@ def load_nba_prop_results():
             'nba_props_pending': False, 'restored_saved_results': True}
 
 
-def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapshots=None, nba_key=None, progress=None, nba_history_enabled=True):
+def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapshots=None, nba_key=None, progress=None, nba_history_enabled=True, priority_game=None):
     scan_started = time.perf_counter()
     calculation_seconds = 0.0
     timings = {}
@@ -1018,8 +1018,15 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
                     quotes, errors = [], ['Sportsbook API key unavailable.']
             except Exception as exc:
                 quotes, errors = [], [f'NBA sportsbook lines unavailable: {type(exc).__name__}: {exc}.']
-            prepared_nba_context, timings['Injury and opponent context'] = context_job.result()
-            prepared_star_rosters, timings['Team rosters'] = roster_job.result()
+            try:
+                prepared_nba_context, timings['Injury and opponent context'] = context_job.result()
+            except Exception as exc:
+                prepared_nba_context = {'issue': 'NBA availability/opponent context unavailable: '+type(exc).__name__}
+            try:
+                prepared_star_rosters, timings['Team rosters'] = roster_job.result()
+            except Exception as exc:
+                prepared_star_rosters = {}
+                errors.append('NBA star rosters unavailable: '+type(exc).__name__+'. Quoted players remain in the scan.')
     else:
         try:
             quotes, errors = fetch_prop_quotes(league, games, odds_key) if odds_key else ([], ['Sportsbook API key unavailable.'])
@@ -1051,12 +1058,8 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
         # Fetch each unique player once, reusing the existing daily history cache.
         # Stars remain visible even without any available sportsbook market.
         names_by_key = {star_key(q['player']): q['player'] for q in quotes}
-        pending_ledger = load_nba_prop_tracking(restore=True)
-        for record in pending_ledger['records'].values():
-            kickoff = pd.to_datetime(record.get('start_time'), utc=True, errors='coerce')
-            if (record.get('Tracking status') == 'Pending' and pd.notna(kickoff)
-                    and kickoff < pd.Timestamp.now(tz='UTC')-pd.Timedelta(hours=2)):
-                names_by_key.setdefault(star_key(record['Player']), record['Player'])
+        # Pending settlement records stay in their ledger. Do not add every
+        # historical player to the user-facing scan for current offered lines.
         for roster in star_rosters.values():
             for player in roster['players']:
                 names_by_key.setdefault(star_key(player['player']), player['player'])
@@ -1072,7 +1075,15 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
                         for player in roster['players']:
                             k = star_key(player['player']); stamp = pd.Timestamp(game['commence_time'])
                             priority[k] = min(priority.get(k, stamp), stamp)
-        names = sorted(names_by_key.values(), key=lambda name:(priority.get(star_key(name), pd.Timestamp.max.tz_localize('UTC')), name)) if nba_key else []
+        preferred = set()
+        if isinstance(priority_game, dict):
+            from dual_agent.game_prediction_addons import matching_game_rows
+            preferred = {star_key(q['player']) for q in matching_game_rows(priority_game, quotes)}
+        # Process quoted players before optional spotlight-only history.
+        quoted_names = {star_key(q['player']) for q in quotes}
+        names = sorted(names_by_key.values(), key=lambda name:(
+            star_key(name) not in preferred, star_key(name) not in quoted_names,
+            priority.get(star_key(name), pd.Timestamp.max.tz_localize('UTC')), name)) if nba_key else []
         completed = 0
         last_scored = -1
         last_publish = 0.0
@@ -1100,11 +1111,14 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
         history_started = time.perf_counter()
         history_scoring_before = calculation_seconds
         publish('Checking saved player histories')
-        for player, history, error in _nba_history_batches(names, nba_key, status=publish):
-            history_by_name[player] = history
-            completed += 1
-            if error: errors.append(error)
-            publish('Processed '+player)
+        # Resolve and fetch one bounded group before touching later identities.
+        # The loader still reuses the same shared catalog and history archive.
+        for offset in range(0, len(names), 8):
+            for player, history, error in _nba_history_batches(names[offset:offset+8], nba_key, status=publish):
+                history_by_name[player] = history
+                completed += 1
+                if error: errors.append(error)
+                publish('Processed '+player)
         last_scored = -1
         publish('Player history checks finished; completing prop calculations')
         timings['Player history and storage'] = max(0.0, time.perf_counter()-history_started-(calculation_seconds-history_scoring_before))
