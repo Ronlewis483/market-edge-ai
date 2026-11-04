@@ -2136,15 +2136,76 @@ def render_nba_prop_tracking():
         st.dataframe(frame.sort_values('start_time', ascending=False)[cols], hide_index=True, use_container_width=True)
 
 
-@st.fragment
+def collect_nba_prop_updates():
+    """Drain published results on the UI thread without restarting any scan."""
+    from queue import Empty
+    updates = st.session_state.get('nba_enrichment_updates')
+    latest = None
+    if updates is not None:
+        for _ in range(100):
+            try:
+                latest = updates.get_nowait()
+            except Empty:
+                break
+    if latest is not None:
+        st.session_state['nba_prediction_pipeline_result'] = latest
+    future = st.session_state.get('nba_enrichment_future')
+    if future is not None and future.done():
+        try:
+            complete = future.result()
+            if complete is not None:
+                st.session_state['nba_prediction_pipeline_result'] = complete
+        except Exception as exc:
+            current = dict(st.session_state.get('nba_prediction_pipeline_result') or {})
+            current.update(nba_props_pending=False, nba_snapshot_pending=False)
+            props = dict(current.get('player_props') or {})
+            props['errors'] = list(props.get('errors', [])) + [
+                'NBA scan stopped ('+type(exc).__name__+'); completed prop estimates are preserved.']
+            current['player_props'] = props
+            st.session_state['nba_prediction_pipeline_result'] = current
+        finally:
+            st.session_state.pop('nba_enrichment_future', None)
+            st.session_state.pop('nba_enrichment_updates', None)
+    return st.session_state.get('nba_prediction_pipeline_result')
+
+
+def nba_game_prop_rows(game, candidates):
+    """Match spelling variants, requiring both teams and the same kickoff."""
+    from dual_agent.game_prediction_addons import game_fields, records
+    import re
+    import unicodedata
+    def key(value):
+        value = unicodedata.normalize('NFKD', str(value)).encode('ascii', 'ignore').decode().casefold()
+        return re.sub(r'[^a-z0-9]', '', value).replace('losangeles', 'la')
+    home, away, stamp = game_fields(game)
+    if not home or not away or pd.isna(stamp):
+        return []
+    matched = []
+    for row in records(candidates):
+        rh, ra, rt = game_fields(row)
+        if (rh and ra and pd.notna(rt) and key(rh)==key(home) and key(ra)==key(away)
+                and abs(rt-stamp)<=pd.Timedelta(minutes=15)):
+            matched.append(row)
+    return matched
+
+
+
 def render_nba_live_prop_cards(game, fallback):
+    # Poll only the prop panel while a scan is active. No page rerun, API calls,
+    # winner recalculation, or automatic scan restart occurs here.
+    future = st.session_state.get('nba_enrichment_future')
+    interval = '5s' if future is not None else None
+    return st.fragment(run_every=interval)(_render_nba_live_prop_cards)(game, fallback)
+
+
+def _render_nba_live_prop_cards(game, fallback):
     """Only this game's cards refresh; no network requests or full-page reruns."""
-    from dual_agent.game_prediction_addons import matching_game_rows
-    current = st.session_state.get('nba_prediction_pipeline_result') or fallback or {}
+    current = collect_nba_prop_updates() or fallback or {}
     payload = current.get('player_props', {})
-    rows = matching_game_rows(game, payload.get('game_picks', payload.get('picks', [])))
+    scan_rows = payload.get('game_picks') or payload.get('picks', [])
+    rows = nba_game_prop_rows(game, scan_rows)
     if not rows:
-        rows = matching_game_rows(game, st.session_state.get('nba_saved_props_cards'))
+        rows = nba_game_prop_rows(game, st.session_state.get('nba_saved_props_cards'))
     from dual_agent.preferred_sportsbooks import allowed
     rows = [r for r in rows if allowed(r.get('Best sportsbook'))]
     from dual_agent.sports_player_prop_predictions import nba_identity_key
@@ -2162,7 +2223,7 @@ def render_nba_live_prop_cards(game, fallback):
             loading = payload.get('loading_progress', {})
             st.caption(loading.get('stage') or 'Preparing NBA player-prop inputs…')
             if 'sportsbook_lines' in loading:
-                st.caption(f"{loading['sportsbook_lines']} sportsbook lines · {loading.get('players_with_history', 0)} players with history · {loading.get('calculated_props', 0)} calculated props")
+                st.caption(f"{loading['sportsbook_lines']} sportsbook lines · {loading.get('players_with_history', 0)} players with history · {loading.get('calculated_props', 0)} calculated props across all scanned games")
         problems = list(dict.fromkeys(str(e) for e in payload.get('errors', [])))
         if not rows and problems:
             with st.expander('Why NBA props are not appearing', expanded=True):
@@ -2186,10 +2247,15 @@ def render_nba_live_prop_cards(game, fallback):
         render_prop_category_buttons(markets[1:], scope+'_market', 'All supported markets')
         selected = st.selectbox('NBA prop market', markets, key=scope+'_market')
         shown = normalized if selected == markets[0] else [r for r in normalized if r['market'] == selected]
+        st.caption(f'{len(rows)} estimates available for this game · {len(shown)} in the selected category')
         if shown:
             render_prop_comparisons(shown, pending=current.get('nba_props_pending', False), scope=scope)
         elif current.get('nba_props_pending'):
-            st.caption('No calculated props for this game yet; see the current stage and input issues above.')
+            if rows:
+                available = ', '.join(sorted({str(r.get('Market')) for r in rows}))
+                st.info('No '+selected+' estimates for this game yet. Available categories: '+available+'. Choose All supported markets to view them while the scan continues.')
+            else:
+                st.caption('No completed estimates match this game yet. The scan-wide total above may belong to other games; completed results appear here as they arrive.')
         else:
             st.info('No eligible priced props were produced for this selection. See the input issues and eligibility checks above.')
         render_prop_category_rankings(normalized, 'NBA')
@@ -2217,6 +2283,7 @@ def enrich_nba_props(result, odds_key, nba_key, updates, context=None):
             nonlocal last_progress_save
             partial = copy.deepcopy(result)
             partial['player_props'] = merge_nba_display_props(result.get('player_props', {}), props)
+            result['player_props'] = partial['player_props']
             partial['nba_props_pending'] = True
             # Display first; do not rescan the tracking ledger on each status tick.
             updates.put(partial)
@@ -2224,13 +2291,18 @@ def enrich_nba_props(result, odds_key, nba_key, updates, context=None):
             has_picks = bool(props.get('game_picks') or props.get('picks'))
             if has_picks and now-last_progress_save >= 15:
                 last_progress_save = now
-                save_nba_prop_results(partial)
+                try:
+                    save_nba_prop_results(partial)
+                except Exception:
+                    result['player_props'].setdefault('errors', []).append('Partial props could not be saved; completed estimates remain available in this session.')
         result['player_props'] = generate_player_prop_picks('NBA',
             result['all_predictions'].sort_values('commence_time', kind='stable').to_dict('records'), odds_key, nba_key=nba_key,
             progress=publish_progress, nba_history_enabled=True)
     except Exception as exc:
-        result['player_props'] = {'picks': [], 'message': 'Player-prop data unavailable. Team predictions are preserved.',
-            'errors': ['NBA prop processing failed: '+type(exc).__name__+': '+str(exc)]}
+        props = dict(result.get('player_props') or {})
+        props['message'] = 'NBA scan stopped; completed prop estimates and team predictions are preserved.'
+        props['errors'] = list(props.get('errors', [])) + ['NBA prop processing failed: '+type(exc).__name__+': '+str(exc)]
+        result['player_props'] = props
     result['player_props'] = merge_nba_display_props(result.get('_previous_player_props', {}), result['player_props'])
     result.pop('_previous_player_props', None)
     result['saved_props_at'] = pd.Timestamp.now(tz='UTC').isoformat()
@@ -2239,12 +2311,18 @@ def enrich_nba_props(result, odds_key, nba_key, updates, context=None):
         update_nba_prop_tracking(result['player_props'])
     except Exception:
         result['player_props'].setdefault('errors', []).append('NBA prop tracking could not be updated; predictions are preserved.')
-    save_nba_prop_results(result)
+    try:
+        save_nba_prop_results(result)
+    except Exception:
+        result['player_props'].setdefault('errors', []).append('NBA prop saving unavailable; completed estimates remain available in this session.')
     result['nba_props_pending'] = False
     result['nba_snapshot_pending'] = True
     # Publish the props before any optional storage request can delay them.
     updates.put(copy.deepcopy(result))
-    save_nba_prop_results(result, remote=True)
+    try:
+        save_nba_prop_results(result, remote=True)
+    except Exception:
+        result['player_props'].setdefault('errors', []).append('Remote prop backup unavailable; completed estimates are preserved.')
     try:
         import dual_agent.supabase_db as storage
         ready = storage.ensure_market_edge_storage_bucket()
@@ -2272,18 +2350,11 @@ def render_nba_enrichment_status():
     render_nba_prop_tracking()
     if future is None:
         return
-    updates = st.session_state.get('nba_enrichment_updates')
-    changed = False
-    if updates is not None:
-        from queue import Empty
-        while True:
-            try:
-                partial = updates.get_nowait()
-            except Empty:
-                break
-            st.session_state['nba_prediction_pipeline_result'] = partial
-            remember_game_addons('NBA', partial)
-            changed = True
+    collect_nba_prop_updates()
+    future = st.session_state.get('nba_enrichment_future')
+    if future is None:
+        st.caption('NBA scan finished; completed estimates are available in the game panels.')
+        return
     if not future.done():
         # Poll this small fragment only. Background progress must not repeatedly
         # redraw the prediction workspace or interrupt the selected game.
