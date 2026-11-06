@@ -2224,6 +2224,20 @@ def _render_nba_live_prop_cards(game, fallback):
             st.caption(loading.get('stage') or 'Preparing NBA player-prop inputs…')
             if 'sportsbook_lines' in loading:
                 st.caption(f"{loading['sportsbook_lines']} sportsbook lines · {loading.get('players_with_history', 0)} players with history · {loading.get('calculated_props', 0)} calculated props across all scanned games")
+        stamp = pd.to_datetime(current.get('nba_prop_progress_at'), utc=True, errors='coerce')
+        if current.get('nba_props_pending') and pd.notna(stamp):
+            age = max(0, int((pd.Timestamp.now(tz='UTC')-stamp).total_seconds()))
+            st.caption(f'Last scan update: {age} seconds ago')
+            if age >= 90:
+                st.warning('No new scan update for at least 90 seconds. The task is still pending; this does not confirm progress. Open Scan details below for the last reported stage and provider errors.')
+        with st.expander('NBA scan details', expanded=False):
+            st.json({'scan_pending': bool(current.get('nba_props_pending')),
+                'last_update_utc': current.get('nba_prop_progress_at'),
+                'progress': payload.get('loading_progress', {}),
+                'selected_game': str(game.get('away_team'))+' @ '+str(game.get('home_team')),
+                'selected_game_time': str(game.get('commence_time')),
+                'matched_estimates': len(rows),
+                'input_errors': payload.get('errors', [])[-10:]})
         problems = list(dict.fromkeys(str(e) for e in payload.get('errors', [])))
         if not rows and problems:
             with st.expander('Why NBA props are not appearing', expanded=True):
@@ -2285,6 +2299,7 @@ def enrich_nba_props(result, odds_key, nba_key, updates, context=None):
             partial['player_props'] = merge_nba_display_props(result.get('player_props', {}), props)
             result['player_props'] = partial['player_props']
             partial['nba_props_pending'] = True
+            partial['nba_prop_progress_at'] = pd.Timestamp.now(tz='UTC').isoformat()
             # Display first; do not rescan the tracking ledger on each status tick.
             updates.put(partial)
             now = monotonic()
@@ -2411,6 +2426,7 @@ def start_nba_prop_loading(result, priority_game=None):
     result['_previous_player_props'] = copy.deepcopy(result['player_props'])
     result['player_props']['message'] = 'Refreshing in the background; saved estimates remain visible.'
     result['nba_props_pending'] = True
+    result['nba_prop_progress_at'] = pd.Timestamp.now(tz='UTC').isoformat()
     st.session_state['nba_prediction_pipeline_result'] = result
     st.session_state['nba_enrichment_updates'] = updates
     st.session_state['nba_enrichment_future'] = nba_enrichment_pool().submit(enrich_nba_props,
