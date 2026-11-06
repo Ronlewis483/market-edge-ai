@@ -1087,24 +1087,32 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
         completed = 0
         last_scored = -1
         last_publish = 0.0
+        last_partial = {}
         def publish(stage):
-            nonlocal last_scored, last_publish, calculation_seconds
+            nonlocal last_scored, last_publish, calculation_seconds, last_partial
             if not progress: return
-            # Network-page updates should not rescore the whole slate.
-            if completed == last_scored or (completed < len(names) and completed % 8 and time.monotonic()-last_publish < 3):
-                return
-            last_scored = completed
-            last_publish = time.monotonic()
-            by_key = {star_key(name): rows for name, rows in history_by_name.items()}
-            ready = {q['player']: by_key[star_key(q['player'])] for q in quotes if star_key(q['player']) in by_key}
-            ready.update(history_by_name)
-            ready_groups = {key: group for key, group in groups.items() if star_key(key[1]) in by_key}
-            scoring_started = time.perf_counter()
-            partial = _rank_prop_candidates('NBA', games, ready_groups,
-                ready, list(errors), star_rosters, {}, {}, nba_context=nba_context)
-            calculation_seconds += time.perf_counter()-scoring_started
-            partial.update(probability_source='player_history', statistics_source='BALLDONTLIE')
-            partial['loading_progress'] = {'completed': completed, 'total': len(names), 'stage': stage,
+            tick = time.monotonic()
+            # A network-page update is progress even before a player completes.
+            # Reuse scored rows rather than silently dropping these updates.
+            if completed == last_scored:
+                if tick-last_publish < 1:
+                    return
+                partial = dict(last_partial)
+            else:
+                by_key = {star_key(name): rows for name, rows in history_by_name.items()}
+                ready = {q['player']: by_key[star_key(q['player'])] for q in quotes if star_key(q['player']) in by_key}
+                ready.update(history_by_name)
+                ready_groups = {key: group for key, group in groups.items() if star_key(key[1]) in by_key}
+                scoring_started = time.perf_counter()
+                partial = _rank_prop_candidates('NBA', games, ready_groups,
+                    ready, list(errors), star_rosters, {}, {}, nba_context=nba_context)
+                calculation_seconds += time.perf_counter()-scoring_started
+                partial.update(probability_source='player_history', statistics_source='BALLDONTLIE')
+                last_partial = partial
+                last_scored = completed
+            last_publish = tick
+            partial['errors'] = list(errors)
+            partial['loading_progress'] = {'completed': completed, 'total': len(names), 'stage': stage, 'updated_at': pd.Timestamp.now(tz='UTC').isoformat(),
                 'sportsbook_lines': len(quotes), 'players_with_history': sum(bool(rows) for rows in history_by_name.values()),
                 'calculated_props': len(partial.get('game_picks', []))}
             progress(partial)
