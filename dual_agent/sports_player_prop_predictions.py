@@ -292,11 +292,57 @@ def _nba_save_remote_history_archive(archive):
 
 
 _NBA_PROP_HISTORY_LOCK = threading.RLock()
+_NBA_PROP_PRIORITY = threading.Condition()
+_NBA_PROP_FOREGROUND = 0
 
 
-def _nba_history_batches(names, api_key, status=None):
-    with _NBA_PROP_HISTORY_LOCK:
+from contextlib import contextmanager
+
+
+@contextmanager
+def nba_foreground_scan():
+    """Let explicit game scans take the next history-cache turn safely."""
+    global _NBA_PROP_FOREGROUND
+    with _NBA_PROP_PRIORITY:
+        _NBA_PROP_FOREGROUND += 1
+    try:
+        yield
+    finally:
+        with _NBA_PROP_PRIORITY:
+            _NBA_PROP_FOREGROUND -= 1
+            _NBA_PROP_PRIORITY.notify_all()
+
+
+
+def _nba_history_batches(names, api_key, status=None, foreground=False):
+    # An in-flight batch completes before another writer enters the shared
+    # cache. The full slate then yields to an explicit selected-game scan.
+    waiting_reported = False
+    while True:
+        with _NBA_PROP_PRIORITY:
+            held = _NBA_PROP_FOREGROUND > 0 and not foreground
+        if held:
+            if status and not waiting_reported:
+                status('Full-slate history paused for selected-game refresh')
+                waiting_reported = True
+            with _NBA_PROP_PRIORITY:
+                _NBA_PROP_PRIORITY.wait(timeout=1)
+            continue
+        if not _NBA_PROP_HISTORY_LOCK.acquire(timeout=1):
+            if status and not waiting_reported:
+                status('Waiting for the current shared history batch to finish')
+                waiting_reported = True
+            continue
+        with _NBA_PROP_PRIORITY:
+            held = _NBA_PROP_FOREGROUND > 0 and not foreground
+        if held:
+            _NBA_PROP_HISTORY_LOCK.release()
+            continue
+        break
+    try:
         yield from _nba_history_batches_locked(names, api_key, status)
+    finally:
+        _NBA_PROP_HISTORY_LOCK.release()
 
 
 def _nba_history_batches_locked(names, api_key, status=None):
@@ -989,7 +1035,7 @@ def load_nba_prop_results():
             'nba_props_pending': False, 'restored_saved_results': True}
 
 
-def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapshots=None, nba_key=None, progress=None, nba_history_enabled=True, priority_game=None):
+def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapshots=None, nba_key=None, progress=None, nba_history_enabled=True, priority_game=None, foreground=False):
     scan_started = time.perf_counter()
     calculation_seconds = 0.0
     timings = {}
@@ -1122,7 +1168,7 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
         # Resolve and fetch one bounded group before touching later identities.
         # The loader still reuses the same shared catalog and history archive.
         for offset in range(0, len(names), 8):
-            for player, history, error in _nba_history_batches(names[offset:offset+8], nba_key, status=publish):
+            for player, history, error in _nba_history_batches(names[offset:offset+8], nba_key, status=publish, foreground=foreground):
                 history_by_name[player] = history
                 completed += 1
                 if error: errors.append(error)
