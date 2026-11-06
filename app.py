@@ -2190,17 +2190,127 @@ def nba_game_prop_rows(game, candidates):
 
 
 
+def nba_prop_game_key(game):
+    import hashlib
+    from dual_agent.game_prediction_addons import game_fields
+    home, away, stamp = game_fields(game)
+    if not home or not away or pd.isna(stamp):
+        raise ValueError('A game with both teams and a valid start time is required.')
+    return hashlib.sha256(str((home, away, stamp.isoformat())).encode()).hexdigest()[:24]
+
+
+@st.cache_resource(show_spinner=False)
+def nba_game_prop_pool():
+    from concurrent.futures import ThreadPoolExecutor
+    return ThreadPoolExecutor(max_workers=2)
+
+
+def generate_nba_game_props(game, odds_key, nba_key, updates, context=None):
+    """Only the requested game's quotes, players and model inputs are loaded."""
+    import copy
+    if context is not None:
+        import threading
+        from streamlit.runtime.scriptrunner import add_script_run_ctx
+        add_script_run_ctx(threading.current_thread(), context)
+    from dual_agent.sports_player_prop_predictions import generate_player_prop_picks, nba_foreground_scan
+    latest = {'player_props': {}, 'nba_props_pending': True}
+    def publish(props):
+        nonlocal latest
+        latest = {'player_props': copy.deepcopy(props), 'nba_props_pending': True,
+                  'nba_prop_progress_at': pd.Timestamp.now(tz='UTC').isoformat()}
+        updates.put(copy.deepcopy(latest))
+    try:
+        with nba_foreground_scan():
+            props = generate_player_prop_picks('NBA', [dict(game)], odds_key, nba_key=nba_key,
+                progress=publish, nba_history_enabled=True, priority_game=dict(game), foreground=True)
+        latest = {'player_props': props, 'nba_props_pending': False,
+                  'nba_prop_progress_at': pd.Timestamp.now(tz='UTC').isoformat()}
+    except Exception as exc:
+        latest['nba_props_pending'] = False
+        latest['player_props'].setdefault('errors', []).append(
+            'Selected-game prop scan stopped: '+type(exc).__name__+': '+str(exc))
+    updates.put(copy.deepcopy(latest))
+    return latest
+
+
+def start_nba_game_prop_loading(game):
+    """Deduplicate only this game's job; the full-slate future is independent."""
+    import copy
+    from queue import Queue
+    key = nba_prop_game_key(game)
+    jobs = st.session_state.setdefault('nba_game_prop_jobs', {})
+    previous = jobs.get(key, {})
+    future = previous.get('future')
+    if future is not None and not future.done():
+        return False
+    from dual_agent.odds_request_cache import refresh_game_props
+    refresh_game_props(game.get('home_team'), game.get('away_team'))
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        context = get_script_run_ctx()
+    except ImportError:
+        context = None
+    updates = Queue()
+    initial = copy.deepcopy(previous.get('result') or {'player_props': {}})
+    initial.update(nba_props_pending=True, nba_prop_progress_at=pd.Timestamp.now(tz='UTC').isoformat())
+    initial['player_props']['loading_progress'] = {'stage': 'Loading props for this game only', 'completed': 0, 'total': 0}
+    jobs[key] = {'game': dict(game), 'updates': updates, 'result': initial,
+        'future': nba_game_prop_pool().submit(generate_nba_game_props, dict(game),
+            prediction_api_key('ODDS_API_KEY', 'THE_ODDS_API_KEY'),
+            prediction_api_key('BALLDONTLIE_API_KEY'), updates, context)}
+    return True
+
+
+def collect_nba_game_prop_updates(game):
+    from queue import Empty
+    job = st.session_state.get('nba_game_prop_jobs', {}).get(nba_prop_game_key(game))
+    if not job:
+        return None
+    queue = job.get('updates')
+    changed = False
+    if queue is not None:
+        for _ in range(100):
+            try:
+                job['result'] = queue.get_nowait()
+                changed = True
+            except Empty:
+                break
+    future = job.get('future')
+    if future is not None and future.done():
+        try:
+            job['result'] = future.result()
+        except Exception as exc:
+            job['result']['nba_props_pending'] = False
+            job['result'].setdefault('player_props', {}).setdefault('errors', []).append(
+                'Selected-game worker failed: '+type(exc).__name__)
+        job.pop('future', None)
+        job.pop('updates', None)
+        changed = True
+    if changed:
+        current = st.session_state.get('nba_prediction_pipeline_result')
+        if current is not None:
+            current['player_props'] = merge_nba_display_props(current.get('player_props', {}),
+                {'game_picks': job['result'].get('player_props', {}).get('game_picks', [])})
+    return job.get('result')
+
+
 def render_nba_live_prop_cards(game, fallback):
     # Poll only the prop panel while a scan is active. No page rerun, API calls,
     # winner recalculation, or automatic scan restart occurs here.
     future = st.session_state.get('nba_enrichment_future')
-    interval = '5s' if future is not None else None
+    game_job = st.session_state.get('nba_game_prop_jobs', {}).get(nba_prop_game_key(game), {})
+    interval = '5s' if future is not None or game_job.get('future') is not None else None
     return st.fragment(run_every=interval)(_render_nba_live_prop_cards)(game, fallback)
 
 
 def _render_nba_live_prop_cards(game, fallback):
     """Only this game's cards refresh; no network requests or full-page reruns."""
     current = collect_nba_prop_updates() or fallback or {}
+    scoped = collect_nba_game_prop_updates(game)
+    if scoped is not None:
+        base_props = current.get('player_props', {})
+        current = dict(current, **scoped)
+        current['player_props'] = merge_nba_display_props(base_props, scoped.get('player_props', {}))
     payload = current.get('player_props', {})
     scan_rows = payload.get('game_picks') or payload.get('picks', [])
     rows = nba_game_prop_rows(game, scan_rows)
@@ -2219,6 +2329,8 @@ def _render_nba_live_prop_cards(game, fallback):
     identity = '|'.join(str(game.get(k,'')) for k in ('home_team','away_team','commence_time'))
     scope = 'nba_live_'+hashlib.sha256(identity.encode()).hexdigest()[:16]
     with st.expander('🎯 NBA player props · ranked by cover chance', expanded=True):
+        if scoped is not None:
+            st.caption('Selected-game scan · only this matchup is collected. The full-slate scan is separate.')
         if current.get('nba_props_pending'):
             loading = payload.get('loading_progress', {})
             st.caption(loading.get('stage') or 'Preparing NBA player-prop inputs…')
@@ -3240,16 +3352,14 @@ def render_game_addons(league, game, result):
     if league in ('NFL', 'MLB', 'NBA'):
         import hashlib
         refresh_identity = '|'.join(str(game.get(k, '')) for k in ('home_team', 'away_team', 'commence_time'))
-        if st.button('Refresh and generate NBA player props' if league == 'NBA' else 'Refresh prop odds for this game', key='refresh_prop_odds_'+league+hashlib.sha256(refresh_identity.encode()).hexdigest()[:16]):
-            from dual_agent.odds_request_cache import refresh_game_props
-            matched = refresh_game_props(game.get('home_team'), game.get('away_team'))
+        if st.button('Refresh props for this NBA game' if league == 'NBA' else 'Refresh prop odds for this game', key='refresh_prop_odds_'+league+hashlib.sha256(refresh_identity.encode()).hexdigest()[:16]):
             if league == 'NBA':
-                started = start_nba_prop_loading(st.session_state.get('nba_prediction_pipeline_result') or result, priority_game=game)
-                if started:
-                    st.rerun()
-                else:
-                    st.info('An NBA prop scan is already running. Its progress is shown above.')
+                started = start_nba_game_prop_loading(game)
+                st.info('Scanning this game only; completed props appear below.' if started
+                        else 'This game already has a prop scan running. Its progress is shown below.')
             elif league in ('NFL','MLB'):
+                from dual_agent.odds_request_cache import refresh_game_props
+                refresh_game_props(game.get('home_team'), game.get('away_team'))
                 start_cross_refresh(league,st.session_state.get(cross_sport_state(league)) or result)
                 st.info('Refreshing props in the background. Existing cards remain visible.')
             else:
