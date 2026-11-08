@@ -266,7 +266,7 @@ def _nba_load_history_archive(path):
             if response.status_code == 200:
                 archive = response.json()
                 if archive.get('version') == 3 and isinstance(archive.get('players'), dict):
-                    path.write_text(json.dumps(archive))
+                    _nba_write_history_json(path, archive)
                     return archive
     except Exception:
         pass  # Optional remote storage must not prevent prop generation.
@@ -281,6 +281,12 @@ def _nba_save_remote_history_archive(archive):
         if not url or not key:
             archive['storage_status'] = 'Local history saved; remote storage is not configured.'
             return
+        try:
+            latest = json.loads((Path('nba_player_history_cache')/'player_histories_v3.json').read_text())
+            if latest.get('version') == 3:
+                archive['players'] = latest.get('players', {})
+        except (OSError, ValueError):
+            pass
         response = requests.post(str(url).rstrip('/')+'/storage/v1/object/market-edge-data/nba/props/player_histories_v3.json',
             headers={'apikey': key, 'Authorization': 'Bearer '+key,
                      'Content-Type': 'application/json', 'x-upsert': 'true'},
@@ -292,6 +298,7 @@ def _nba_save_remote_history_archive(archive):
 
 
 _NBA_PROP_HISTORY_LOCK = threading.RLock()
+_NBA_PROP_TRACKING_LOCK = threading.RLock()
 _NBA_PROP_PRIORITY = threading.Condition()
 _NBA_PROP_FOREGROUND = 0
 
@@ -301,7 +308,7 @@ from contextlib import contextmanager
 
 @contextmanager
 def nba_foreground_scan():
-    """Let explicit game scans take the next history-cache turn safely."""
+    """Retain the foreground-call interface; cache reads no longer queue."""
     global _NBA_PROP_FOREGROUND
     with _NBA_PROP_PRIORITY:
         _NBA_PROP_FOREGROUND += 1
@@ -315,34 +322,35 @@ def nba_foreground_scan():
 
 
 def _nba_history_batches(names, api_key, status=None, foreground=False):
-    # An in-flight batch completes before another writer enters the shared
-    # cache. The full slate then yields to an explicit selected-game scan.
-    waiting_reported = False
-    while True:
-        with _NBA_PROP_PRIORITY:
-            held = _NBA_PROP_FOREGROUND > 0 and not foreground
-        if held:
-            if status and not waiting_reported:
-                status('Full-slate history paused for selected-game refresh')
-                waiting_reported = True
-            with _NBA_PROP_PRIORITY:
-                _NBA_PROP_PRIORITY.wait(timeout=1)
-            continue
-        if not _NBA_PROP_HISTORY_LOCK.acquire(timeout=1):
-            if status and not waiting_reported:
-                status('Waiting for the current shared history batch to finish')
-                waiting_reported = True
-            continue
-        with _NBA_PROP_PRIORITY:
-            held = _NBA_PROP_FOREGROUND > 0 and not foreground
-        if held:
-            _NBA_PROP_HISTORY_LOCK.release()
-            continue
-        break
-    try:
-        yield from _nba_history_batches_locked(names, api_key, status)
-    finally:
-        _NBA_PROP_HISTORY_LOCK.release()
+    # Readers and provider requests never hold the archive writer lock.
+    # A slow full-slate request cannot prevent another game's cache read.
+    yield from _nba_history_batches_locked(names, api_key, status)
+
+
+def _nba_write_history_json(path, data):
+    """Merge concurrent archives and replace complete JSON under a short lock."""
+    import uuid
+    path = Path(path)
+    with _NBA_PROP_HISTORY_LOCK:
+        if path.name == 'player_histories_v3.json':
+            try:
+                latest = json.loads(path.read_text())
+            except (OSError, ValueError):
+                latest = {'version': 3, 'players': {}}
+            players = dict(latest.get('players', {}))
+            for key, entry in data.get('players', {}).items():
+                prior = players.get(key, {})
+                checked = pd.to_datetime(entry.get('checked_at'), utc=True, errors='coerce')
+                old = pd.to_datetime(prior.get('checked_at'), utc=True, errors='coerce')
+                if not prior or (pd.notna(checked) and (pd.isna(old) or checked >= old)):
+                    players[key] = entry
+            data['players'] = players
+        temporary = path.with_name(path.name+'.'+uuid.uuid4().hex+'.tmp')
+        try:
+            temporary.write_text(json.dumps(data))
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 def _nba_history_batches_locked(names, api_key, status=None):
@@ -357,9 +365,7 @@ def _nba_history_batches_locked(names, api_key, status=None):
     def notify(message):
         if status: status(message)
     def save(path, data):
-        temporary = path.with_suffix('.tmp')
-        temporary.write_text(json.dumps(data))
-        temporary.replace(path)
+        _nba_write_history_json(path, data)
     missing = []
     known = {}
     for name in dict.fromkeys(names):
@@ -911,7 +917,7 @@ def load_nba_prop_tracking(restore=False):
 def update_nba_prop_tracking(props):
     """Freeze one stronger offered side per exact line; settle verified finals only."""
     import hashlib
-    with _NBA_PROP_HISTORY_LOCK:
+    with _NBA_PROP_TRACKING_LOCK:
         ledger = load_nba_prop_tracking(restore=True)
         records = ledger['records']; now = pd.Timestamp.now(tz='UTC')
         candidates = sorted(props.get('game_picks', props.get('picks', [])),
