@@ -344,13 +344,39 @@ def _nba_write_history_json(path, data):
                 old = pd.to_datetime(prior.get('checked_at'), utc=True, errors='coerce')
                 if not prior or (pd.notna(checked) and (pd.isna(old) or checked >= old)):
                     players[key] = entry
-            data['players'] = players
+            # Keep the loader's entries reference live across checkpoints.
+            current_players = data.setdefault('players', {})
+            current_players.clear()
+            current_players.update(players)
         temporary = path.with_name(path.name+'.'+uuid.uuid4().hex+'.tmp')
         try:
             temporary.write_text(json.dumps(data))
             temporary.replace(path)
         finally:
             temporary.unlink(missing_ok=True)
+
+
+def _nba_cached_rows(entry, now):
+    """Read only previously completed, identity-verified observations."""
+    checked = pd.to_datetime(entry.get('checked_at'), utc=True, errors='coerce')
+    if not entry.get('player_id') or pd.isna(checked) or checked > now:
+        return []
+    rows = entry.get('rows')
+    if not isinstance(rows, list): return []
+    valid = {}
+    for row in rows:
+        if not isinstance(row, dict): continue
+        game = row.get('game') or {}
+        player = row.get('player') or {}
+        when = pd.to_datetime(row.get('source_date'), utc=True, errors='coerce')
+        if (str(player.get('id')) != str(entry['player_id']) or game.get('id') is None
+                or not str(game.get('status','')).startswith('Final') or pd.isna(when)
+                or not now-pd.Timedelta(days=365) < when < now
+                or nba_minutes(row.get('min')) is None):
+            continue
+        valid[str(game['id'])] = dict(row, history_checked_at=checked.isoformat(),
+            history_refresh_pending=now-checked >= pd.Timedelta(minutes=30))
+    return sorted(valid.values(), key=lambda row:(row['source_date'],str(row['game']['id'])))
 
 
 def _nba_history_batches_locked(names, api_key, status=None):
@@ -368,6 +394,7 @@ def _nba_history_batches_locked(names, api_key, status=None):
         _nba_write_history_json(path, data)
     missing = []
     known = {}
+    cached = {}
     for name in dict.fromkeys(names):
         key = nba_identity_key(name)
         entry = entries.get(key, {})
@@ -394,9 +421,13 @@ def _nba_history_batches_locked(names, api_key, status=None):
                     continue
         known[name] = entry
         checked = pd.to_datetime(entry.get('checked_at'), utc=True, errors='coerce')
-        if entry.get('player_id') and isinstance(entry.get('rows'), list) and pd.notna(checked) and pd.Timedelta(0) <= now-checked < pd.Timedelta(minutes=30):
-            yield name, entry['rows'], None if entry['rows'] else 'No completed played-game statistics returned for '+name+'.'
-        else:
+        cached[name] = _nba_cached_rows(entry, now)
+        if cached[name]:
+            # Every available cache is yielded in this first pass, before
+            # identity lookup, provider pagination, or any network refresh.
+            yield name, cached[name], None
+        fresh = pd.notna(checked) and pd.Timedelta(0) <= now-checked < pd.Timedelta(minutes=30)
+        if not fresh or not cached[name]:
             missing.append(name)
     if not missing:
         if not archive_path.exists():
@@ -454,11 +485,17 @@ def _nba_history_batches_locked(names, api_key, status=None):
             yield name, [], 'No unique NBA player identity for '+name+'.'
         else:
             resolved.append((name, matches[0]['id']))
-    resolved.sort(key=lambda item: not bool(known[item[0]].get('checked_at')))
+    # Give players with no usable saved history the first download turn.
+    resolved.sort(key=lambda item: bool(cached.get(item[0])))
     batches = []
-    for has_history in (True, False):
-        subset = [item for item in resolved if bool(known[item[0]].get('checked_at')) == has_history]
-        batches.extend(subset[i:i+8] for i in range(0, len(subset), 8))
+    for has_history in (False, True):
+        subset = [item for item in resolved if bool(cached.get(item[0])) == has_history]
+        if has_history:
+            batches.extend(subset[i:i+8] for i in range(0, len(subset), 8))
+        else:
+            # A first-time player finishes independently, without waiting for
+            # seven other players' older date windows to finish downloading.
+            batches.extend([[item] for item in subset])
     for offset, batch in enumerate(batches):
         ids = {pid for name, pid in batch}; rows_by_id = {pid: [] for pid in ids}
         checked_dates = [pd.to_datetime(known[name].get('checked_at'), utc=True, errors='coerce') for name, pid in batch]
@@ -504,7 +541,7 @@ def _nba_history_batches_locked(names, api_key, status=None):
             # Discard all partial batch rows: incomplete samples must not drive picks.
             issue = _nba_request_issue(exc)
             for name, pid in batch:
-                yield name, [], 'NBA stats for '+name+': '+issue
+                yield name, cached.get(name, []), 'NBA stats for '+name+': '+issue
             if issue.startswith(('HTTP 401:', 'HTTP 403:')):
                 notify('Player-history scan stopped: '+issue)
                 return  # Retrying other players cannot repair denied API access.
@@ -516,7 +553,8 @@ def _nba_history_batches_locked(names, api_key, status=None):
             entries[nba_identity_key(name)] = {'player_id': pid, 'checked_at': now.isoformat(), 'rows': rows}
             # Checkpoint each completed player locally; partial batches are never saved.
             save(archive_path, archive)
-            yield name, rows, None if rows else 'No completed played-game statistics returned for '+name+'.'
+            returned = [dict(row, history_checked_at=now.isoformat(), history_refresh_pending=False) for row in rows]
+            yield name, returned, None if rows else 'No completed played-game statistics returned for '+name+'.'
 
     _nba_save_remote_history_archive(archive)
     save(archive_path, archive)
@@ -1137,6 +1175,8 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
             star_key(name) not in preferred, star_key(name) not in quoted_names,
             priority.get(star_key(name), pd.Timestamp.max.tz_localize('UTC')), name)) if nba_key else []
         completed = 0
+        history_revision = 0
+        processed_players = set()
         last_scored = -1
         last_publish = 0.0
         last_partial = {}
@@ -1146,7 +1186,7 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
             tick = time.monotonic()
             # A network-page update is progress even before a player completes.
             # Reuse scored rows rather than silently dropping these updates.
-            if completed == last_scored:
+            if history_revision == last_scored:
                 if tick-last_publish < 1:
                     return
                 partial = dict(last_partial)
@@ -1161,24 +1201,28 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
                 calculation_seconds += time.perf_counter()-scoring_started
                 partial.update(probability_source='player_history', statistics_source='BALLDONTLIE')
                 last_partial = partial
-                last_scored = completed
+                last_scored = history_revision
             last_publish = tick
             partial['errors'] = list(errors)
             partial['loading_progress'] = {'completed': completed, 'total': len(names), 'stage': stage, 'updated_at': pd.Timestamp.now(tz='UTC').isoformat(),
                 'sportsbook_lines': len(quotes), 'players_with_history': sum(bool(rows) for rows in history_by_name.values()),
-                'calculated_props': len(partial.get('game_picks', []))}
+                'calculated_props': len(partial.get('game_picks', [])),
+                'players_using_saved_history': sum(any(r.get('history_refresh_pending') for r in rows) for rows in history_by_name.values())}
             progress(partial)
         history_started = time.perf_counter()
         history_scoring_before = calculation_seconds
         publish('Checking saved player histories')
-        # Resolve and fetch one bounded group before touching later identities.
-        # The loader still reuses the same shared catalog and history archive.
-        for offset in range(0, len(names), 8):
-            for player, history, error in _nba_history_batches(names[offset:offset+8], nba_key, status=publish, foreground=foreground):
+        # One loader first emits ALL saved players, then does incremental
+        # updates. A refreshed player replaces its own sample, not its counter.
+        for player, history, error in _nba_history_batches(names, nba_key, status=publish, foreground=foreground):
+            if history or player not in history_by_name:
                 history_by_name[player] = history
-                completed += 1
-                if error: errors.append(error)
-                publish('Processed '+player)
+                history_revision += 1
+            processed_players.add(star_key(player))
+            completed = len(processed_players)
+            if error: errors.append(error)
+            cached_only = any(row.get('history_refresh_pending') for row in history)
+            publish(('Using saved history for ' if cached_only else 'Processed ')+player)
         last_scored = -1
         publish('Player history checks finished; completing prop calculations')
         timings['Player history and storage'] = max(0.0, time.perf_counter()-history_started-(calculation_seconds-history_scoring_before))
@@ -1343,6 +1387,8 @@ def _rank_prop_candidates(league, games, groups, history_by_name, errors,
                 picks.append({'Player':player,'Market':MARKETS[league][market][0],'Pick':side,'Line':line,
                               'Market chance':market_p,'Best sportsbook':best['book'],'Best decimal odds':best[price_key], 'Sportsbook offers':[{'book':q['book'], 'decimal_odds':q[price_key], 'updated_at':q['updated_at']} for q in available], 'Estimated return per unit':expected_return,'Value eligible':value_eligible,'Break-even cover chance':1/best[price_key],'Estimated push chance':push_chance,'Books':len(available),'Game':first['away_team']+' @ '+first['home_team'],
                               'start_time':first['start_time'],'Captured UTC':first['capture_time'],
+                              **({'History checked UTC': nba_rows[-1].get('history_checked_at') if nba_rows else None,
+                                  'History refresh pending': any(r.get('history_refresh_pending') for r in nba_rows)} if league=='NBA' else {}),
                               **({'Participation status': participation, 'Event match': first.get('Event match'), 'game_id':int(first['game_id']), 'player_id':int(identity[0])} if league=='MLB' else {}), **estimate})
         if league in ('MLB', 'NBA') and not qualified:
             excluded(first, player, market, line, 'No offered side has sufficient usable history for an estimate.')
