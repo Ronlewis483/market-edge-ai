@@ -406,7 +406,7 @@ def nfl_prop_market_diagnostics(event, lines, history, forecasts, source_issue=N
     return diagnostics
 
 
-def automatic_nfl_props(predictions, key, on_props=None):
+def automatic_nfl_props(predictions, key, on_props=None, on_status=None):
     """Reuse existing NFL prop guards/ranking, scoped to predicted games."""
     from dual_agent.nfl_player_props_ui import cached_events, cached_props, cached_player_history, upcoming_week_events
     from dual_agent.nfl_player_props import MARKETS, normalize_props
@@ -427,6 +427,7 @@ def automatic_nfl_props(predictions, key, on_props=None):
         payload = response.json()
         return sorted({m['key'] for b in payload.get('bookmakers',[]) for m in b.get('markets',[])
                        if str(m.get('key','')).startswith('player_')})
+    if on_status: on_status('Matching this game to sportsbook player-prop events')
     now = pd.Timestamp.now(tz='UTC')
     predicted = records(predictions)
     selected = [event for event in upcoming_week_events(cached_events(key), now)
@@ -464,6 +465,7 @@ def automatic_nfl_props(predictions, key, on_props=None):
     history_index = None
     processed = set()
     def score_ready(event_id, group):
+        if on_status: on_status(f'Calculating NFL props from {len(group)} returned listings')
         try:
             props = run_nfl_player_prop_prediction_pipeline(group, history,
                 window=12, max_results=200, horizon_days=7, retain_all_qualified=True, include_value_candidates=True, history_index=history_index)
@@ -494,6 +496,7 @@ def automatic_nfl_props(predictions, key, on_props=None):
     # history is ready, without waiting for the slowest remaining game.
     with ThreadPoolExecutor(max_workers=6) as quote_pool, ThreadPoolExecutor(max_workers=4) as pool:
         season = now.year if now.month >= 8 else now.year-1
+        if on_status: on_status('Loading cached NFL player history and current prop quotes')
         history_job = pool.submit(cached_player_history, (season-1, season))
         pending = {pool.submit(load, event): event for event in selected}
         for future in as_completed([history_job, *pending]):
@@ -504,6 +507,7 @@ def automatic_nfl_props(predictions, key, on_props=None):
                         history = pd.DataFrame()
                     if not history.empty:
                         history_index = pipeline_module.build_player_history_index(history)
+                        if on_status: on_status(f'NFL history ready: {len(history)} rows; calculating listed props')
                 except Exception as exc:
                     history = pd.DataFrame()
                     issues.append(f'NFL player history could not be loaded ({type(exc).__name__}).')
