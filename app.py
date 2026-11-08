@@ -3291,6 +3291,8 @@ def render_prop_comparisons(props, pending=False, limit=5, scope='main'):
                     else:
                         st.caption('Forecast only · no matching sportsbook bet found')
                     if prop.get('Statistics source'): st.caption('Statistics: '+prop['Statistics source'])
+                    if prop.get('History refresh pending'):
+                        st.caption('Uses saved completed-game history; latest results have not yet been verified. History checked: '+str(prop.get('History checked UTC') or 'unknown'))
                     if prop.get('Estimate method'): st.caption(prop['Estimate method'])
                     if prop.get('Probability reliability'): st.caption(prop['Probability reliability'])
                     if prop.get('Neural fallback reason'): st.caption(prop['Neural fallback reason'])
