@@ -1210,6 +1210,15 @@ def ticket_cached_sources(sports=None, session=None):
                 result['player_props']=restored
         if not has_rows(result.get('all_predictions')) and not has_rows(result.get('predictions')):
             result['all_predictions']=saved.get('all_predictions',saved.get('predictions',[]))
+        if sport == 'NBA':
+            # Selected-game workers are independent of the slate worker. Their
+            # completed/partial props must also reach ticket preparation.
+            props = result.get('player_props', {})
+            for scoped in session.get('ai_ticket_nba_game_results', {}).values():
+                incoming = scoped.get('player_props', {})
+                if incoming.get('game_picks') or incoming.get('picks'):
+                    props = merge_nba_display_props(props, incoming)
+            result = dict(result, player_props=props)
         sources[sport]=result
         if sport=='NFL':
             # Dedicated ticket results never overwrite the regular NFL page.
@@ -1225,7 +1234,11 @@ def ticket_cached_sources(sports=None, session=None):
 
 
 def drain_ticket_prop_updates():
-    """Nonblocking collection of sport results on explicit user interaction."""
+    """Nonblocking collection; no odds requests or model generation."""
+    for job in list(st.session_state.get('nba_game_prop_jobs', {}).values()):
+        game = job.get('game')
+        if game:
+            collect_nba_game_prop_updates(game)
     from queue import Empty
     queue=st.session_state.get('ai_ticket_nfl_updates')
     latest=None
@@ -1388,7 +1401,9 @@ def ticket_offer_inputs(sports):
     from time import monotonic
     snapshot = {'ai_ticket_book': 'all',
                 'ai_ticket_nfl_books': dict(st.session_state.get('ai_ticket_nfl_books', {})),
-                'ai_ticket_local_files': dict(st.session_state.get('ai_ticket_local_files', {}))}
+                'ai_ticket_local_files': dict(st.session_state.get('ai_ticket_local_files', {})),
+                'ai_ticket_nba_game_results': {k: dict(v.get('result') or {})
+                    for k,v in st.session_state.get('nba_game_prop_jobs', {}).items()}}
     signature = [tuple(sports), snapshot['ai_ticket_book']]
     for league, state, path in [('NFL','nfl_prediction_pipeline_result','sports_prop_workspace/nfl_latest.json'),
                                ('NBA','nba_prediction_pipeline_result','nba_player_history_cache/latest_prop_results_v1.json'),
@@ -1403,6 +1418,10 @@ def ticket_offer_inputs(sports):
         except OSError:
             file_signature = None
         signature.append((league, id(st.session_state.get(state)), id(value.get('player_props')), id(data), file_signature))
+    if 'NBA' in sports:
+        signature.append(tuple(sorted((k, id(v.get('player_props')),
+            id(v.get('player_props', {}).get('game_picks')))
+            for k,v in snapshot['ai_ticket_nba_game_results'].items())))
     signature.append(tuple(sorted((b,id(r)) for b,r in snapshot['ai_ticket_nfl_books'].items())))
     signature = tuple(signature)
     pending = st.session_state.get('ai_ticket_prepare_future')
@@ -1423,13 +1442,14 @@ def ticket_offer_inputs(sports):
         st.session_state['ai_ticket_prepare_signature'] = signature
         st.session_state['ai_ticket_prepare_future'] = ticket_prepare_pool().submit(prepare_ticket_offers, sports, snapshot)
         st.session_state['ai_ticket_prepare_started'] = monotonic()
-        # The next user refresh reads the completed preparation; no automatic redraw.
+        # The results fragment consumes completion on its next local poll.
     return None
 
 
 def render_ai_ticket_results():
-    interval = None  # Background preparation never redraws the ticket controls.
-    return st.fragment(run_every=interval)(_render_ai_ticket_results)()
+    # Only the results panel polls. Sport, ticket-size and payout controls stay
+    # outside this fragment; polling never calls the paid collection endpoint.
+    return st.fragment(run_every='5s')(_render_ai_ticket_results)()
 
 
 def _render_ai_ticket_results():
