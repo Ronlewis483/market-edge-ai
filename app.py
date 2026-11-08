@@ -1219,6 +1219,9 @@ def ticket_cached_sources(sports=None, session=None):
                 if incoming.get('game_picks') or incoming.get('picks'):
                     props = merge_nba_display_props(props, incoming)
             result = dict(result, player_props=props)
+        if sport == 'NFL':
+            for scoped in session.get('ai_ticket_nfl_game_results', {}).values():
+                result = merge_nfl_game_props(result,scoped.get('result',{}),scoped['game'])
         sources[sport]=result
         if sport=='NFL':
             # Dedicated ticket results never overwrite the regular NFL page.
@@ -1239,6 +1242,8 @@ def drain_ticket_prop_updates():
         game = job.get('game')
         if game:
             collect_nba_game_prop_updates(game)
+    for job in list(st.session_state.get('nfl_game_prop_jobs', {}).values()):
+        if job.get('game'): collect_nfl_game_prop_updates(job['game'])
     from queue import Empty
     queue=st.session_state.get('ai_ticket_nfl_updates')
     latest=None
@@ -1402,6 +1407,8 @@ def ticket_offer_inputs(sports):
     snapshot = {'ai_ticket_book': 'all',
                 'ai_ticket_nfl_books': dict(st.session_state.get('ai_ticket_nfl_books', {})),
                 'ai_ticket_local_files': dict(st.session_state.get('ai_ticket_local_files', {})),
+                'ai_ticket_nfl_game_results': {k: {'game':dict(v['game']), 'result':dict(v.get('result') or {})}
+                    for k,v in st.session_state.get('nfl_game_prop_jobs', {}).items()},
                 'ai_ticket_nba_game_results': {k: dict(v.get('result') or {})
                     for k,v in st.session_state.get('nba_game_prop_jobs', {}).items()}}
     signature = [tuple(sports), snapshot['ai_ticket_book']]
@@ -1418,6 +1425,9 @@ def ticket_offer_inputs(sports):
         except OSError:
             file_signature = None
         signature.append((league, id(st.session_state.get(state)), id(value.get('player_props')), id(data), file_signature))
+    if 'NFL' in sports:
+        signature.append(tuple(sorted((k,id(v['result'].get('nfl_player_props')))
+            for k,v in snapshot['ai_ticket_nfl_game_results'].items())))
     if 'NBA' in sports:
         signature.append(tuple(sorted((k, id(v.get('player_props')),
             id(v.get('player_props', {}).get('game_picks')))
@@ -1442,14 +1452,13 @@ def ticket_offer_inputs(sports):
         st.session_state['ai_ticket_prepare_signature'] = signature
         st.session_state['ai_ticket_prepare_future'] = ticket_prepare_pool().submit(prepare_ticket_offers, sports, snapshot)
         st.session_state['ai_ticket_prepare_started'] = monotonic()
-        # The results fragment consumes completion on its next local poll.
+        # The explicit completed-results button consumes finished preparation.
     return None
 
 
 def render_ai_ticket_results():
-    # Only the results panel polls. Sport, ticket-size and payout controls stay
-    # outside this fragment; polling never calls the paid collection endpoint.
-    return st.fragment(run_every='5s')(_render_ai_ticket_results)()
+    # No timed reruns. Explicit checks read saved work without rescanning odds.
+    return st.fragment(run_every=None)(_render_ai_ticket_results)()
 
 
 def _render_ai_ticket_results():
@@ -2028,6 +2037,93 @@ def drain_cross_updates(league):
         st.session_state.pop(key+'_enrichment_updates',None)
 
 
+def merge_nfl_game_props(current, scoped, game):
+    from dual_agent.game_prediction_addons import matching_game_rows
+    merged = dict(current or {})
+    incoming = scoped.get('nfl_player_props')
+    if incoming is not None and len(incoming):
+        existing = merged.get('nfl_player_props')
+        rows = existing.to_dict('records') if isinstance(existing,pd.DataFrame) else list(existing or [])
+        added = incoming.to_dict('records') if isinstance(incoming,pd.DataFrame) else list(incoming)
+        # Refresh this matchup without deleting props for other games.
+        old_game = matching_game_rows(game, rows)
+        rows = [r for r in rows if r not in old_game]
+        merged['nfl_player_props'] = pd.DataFrame(rows+added)
+    merged['prop_issues'] = scoped.get('prop_issues', [])
+    if scoped.get('prop_diagnostics'):
+        merged['prop_diagnostics'] = scoped['prop_diagnostics']
+    merged['game_prop_scan_pending'] = scoped.get('game_prop_scan_pending',False)
+    merged['game_prop_stage'] = scoped.get('game_prop_stage')
+    return merged
+
+
+def generate_nfl_game_props(game, odds_key, updates, context=None):
+    import copy
+    if context is not None:
+        import threading
+        from streamlit.runtime.scriptrunner import add_script_run_ctx
+        add_script_run_ctx(threading.current_thread(),context)
+    from dual_agent.game_prediction_addons import automatic_nfl_props
+    current = {'nfl_player_props':pd.DataFrame(), 'prop_issues':[], 'game_prop_scan_pending':True}
+    def publish(props=None, stage=None):
+        if props is not None: current['nfl_player_props'] = props
+        if stage: current['game_prop_stage'] = stage
+        updates.put(copy.deepcopy(current))
+    try:
+        props, issues = automatic_nfl_props(pd.DataFrame([dict(game)]),odds_key,
+            on_props=lambda props:publish(props=props),on_status=lambda stage:publish(stage=stage))
+        current.update(nfl_player_props=props,prop_issues=issues,
+            prop_diagnostics=props.attrs.get('prop_diagnostics',[]))
+    except Exception as exc:
+        current['prop_issues'].append('NFL selected-game props failed: '+type(exc).__name__+': '+str(exc))
+    current.update(game_prop_scan_pending=False,game_prop_stage='Selected-game NFL prop scan finished')
+    updates.put(copy.deepcopy(current))
+    return current
+
+
+def start_nfl_game_prop_loading(game):
+    from queue import Queue
+    key = nba_prop_game_key(game)
+    jobs = st.session_state.setdefault('nfl_game_prop_jobs',{})
+    previous = jobs.get(key,{})
+    future = previous.get('future')
+    if future is not None and not future.done(): return False
+    from dual_agent.odds_request_cache import refresh_game_props
+    refresh_game_props(game.get('home_team'),game.get('away_team'))
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        context = get_script_run_ctx()
+    except ImportError: context = None
+    updates = Queue()
+    jobs[key] = {'game':dict(game),'updates':updates,'result':dict(previous.get('result') or {},
+        game_prop_scan_pending=True,game_prop_stage='Starting this game’s NFL prop scan'),
+        'future':nba_game_prop_pool().submit(generate_nfl_game_props,dict(game),
+            prediction_api_key('ODDS_API_KEY','THE_ODDS_API_KEY'),updates,context)}
+    return True
+
+
+def collect_nfl_game_prop_updates(game):
+    from queue import Empty
+    job = st.session_state.get('nfl_game_prop_jobs',{}).get(nba_prop_game_key(game))
+    if not job: return None
+    changed = False
+    queue = job.get('updates')
+    if queue is not None:
+        for _ in range(100):
+            try: job['result'] = queue.get_nowait(); changed = True
+            except Empty: break
+    future = job.get('future')
+    if future is not None and future.done():
+        try: job['result'] = future.result()
+        except Exception as exc:
+            job['result'].update(game_prop_scan_pending=False,prop_issues=['NFL game worker failed: '+type(exc).__name__])
+        job.pop('future',None);job.pop('updates',None);changed = True
+    if changed:
+        current = st.session_state.get('nfl_prediction_pipeline_result') or {}
+        st.session_state['nfl_prediction_pipeline_result'] = merge_nfl_game_props(current,job['result'],game)
+    return job['result']
+
+
 def render_cross_prop_cards(league, game, fallback):
     interval = None  # Display updates only on user interaction.
     return st.fragment(run_every=interval)(_render_cross_prop_cards)(league, game, fallback)
@@ -2038,7 +2134,13 @@ def _render_cross_prop_cards(league, game, fallback):
     from dual_agent.sports_prop_workspace import prop_rows,normalized
     from dual_agent.game_prediction_addons import matching_game_rows
     from dual_agent.preferred_sportsbooks import allowed
+    st.button('Show completed '+league+' props', key='completed_'+league+'_'+nba_prop_game_key(game),
+              help='Read finished work without rescanning sportsbook odds.')
+    drain_cross_updates(league)
     current = st.session_state.get(cross_sport_state(league)) or fallback or {}
+    scoped = collect_nfl_game_prop_updates(game) if league == 'NFL' else None
+    if scoped is not None:
+        current = merge_nfl_game_props(current,scoped,game)
     props = matching_game_rows(game,prop_rows(league,current))
     if not props:
         archive = 'nfl_saved_prop_cards' if league=='NFL' else 'mlb_saved_props_cards'
@@ -2048,8 +2150,14 @@ def _render_cross_prop_cards(league, game, fallback):
     identity = '|'.join(str(game.get(k,game.get({'home_team':'Home','away_team':'Away','commence_time':'start_time'}.get(k,k),''))) for k in ('home_team','away_team','commence_time'))
     scope = league.lower()+'_live_'+hashlib.sha256(identity.encode()).hexdigest()[:16]
     with st.expander('🎯 '+league+' player props · ranked by cover chance',expanded=True):
-        if current.get('workspace_pending') or current.get('enrichment_pending'):
+        if scoped is not None:
+            st.caption(current.get('game_prop_stage') or 'Selected-game NFL prop scan')
+            if scoped.get('game_prop_scan_pending'):
+                st.caption('Use Show completed NFL props to display progress; this panel does not refresh itself.')
+        elif current.get('workspace_pending') or current.get('enrichment_pending'):
             st.caption('Refreshing in the background · saved cards remain visible.')
+        for issue in current.get('prop_issues', [])[-6:]:
+            st.warning(str(issue))
         stamp = [normalized(league,r)['captured_at'] for r in props]
         valid = [t for t in stamp if pd.notna(t)]
         if valid:
@@ -2315,16 +2423,15 @@ def collect_nba_game_prop_updates(game):
 
 
 def render_nba_live_prop_cards(game, fallback):
-    # Poll only the prop panel while a scan is active. No page rerun, API calls,
-    # winner recalculation, or automatic scan restart occurs here.
-    future = st.session_state.get('nba_enrichment_future')
-    game_job = st.session_state.get('nba_game_prop_jobs', {}).get(nba_prop_game_key(game), {})
-    interval = '5s' if future is not None or game_job.get('future') is not None else None
+    # Background work only publishes to its queue; explicit checks render it.
+    interval = None  # Background work never schedules a display redraw.
     return st.fragment(run_every=interval)(_render_nba_live_prop_cards)(game, fallback)
 
 
 def _render_nba_live_prop_cards(game, fallback):
     """Only this game's cards refresh; no network requests or full-page reruns."""
+    st.button('Show completed props for this game', key='nba_completed_'+nba_prop_game_key(game),
+              help='Read completed background work; no new API requests.')
     current = collect_nba_prop_updates() or fallback or {}
     scoped = collect_nba_game_prop_updates(game)
     if scoped is not None:
@@ -3377,7 +3484,10 @@ def render_game_addons(league, game, result):
                 started = start_nba_game_prop_loading(game)
                 st.info('Scanning this game only; completed props appear below.' if started
                         else 'This game already has a prop scan running. Its progress is shown below.')
-            elif league in ('NFL','MLB'):
+            elif league == 'NFL':
+                started = start_nfl_game_prop_loading(game)
+                st.info('Collecting NFL props for this game directly; winner context and spread processing are not prerequisites.' if started else 'This game’s NFL prop scan is already running.')
+            elif league == 'MLB':
                 from dual_agent.odds_request_cache import refresh_game_props
                 refresh_game_props(game.get('home_team'), game.get('away_team'))
                 start_cross_refresh(league,st.session_state.get(cross_sport_state(league)) or result)
