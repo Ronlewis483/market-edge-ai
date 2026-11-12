@@ -1584,15 +1584,19 @@ def _render_ai_ticket_results():
     possible = len(build_suggested_ticket(candidates, book, 10, same_game,
                                           include_specialty, diversify_markets))
     quote_status = ticket_quote_status(diagnostics, selected_sports, book)
-    active = [s for s in selected_sports if
-              (st.session_state.get(s.lower() + '_enrichment_future') is not None
-               and not st.session_state[s.lower() + '_enrichment_future'].done())]
-    ticket_future=st.session_state.get('ai_ticket_nfl_future')
-    if 'NFL' in selected_sports and ticket_future is not None and not ticket_future.done() and 'NFL' not in active:
-        active.append('NFL')
-    nba_ticket_future = st.session_state.get('ai_ticket_nba_future')
-    if 'NBA' in selected_sports and nba_ticket_future is not None and not nba_ticket_future.done():
-        active.append('NBA')
+    # A sport-page enrichment job is not the dedicated ticket collector.
+    # NBA/NFL scans must not inherit another page's busy flag; only a pending
+    # ticket collector prevents a duplicate ticket scan for that sport.
+    active = []
+    for league in selected_sports:
+        state = ('ai_ticket_'+league.lower()+'_future' if league in ('NBA','NFL')
+                 else league.lower()+'_enrichment_future')
+        future = st.session_state.get(state)
+        if future is not None and not future.done():
+            active.append(league)
+    page_nba = st.session_state.get('nba_enrichment_future')
+    if 'NBA' in selected_sports and 'NBA' not in active and page_nba is not None and not page_nba.done():
+        st.caption('A separate NBA game-page scan is running. You can start the ticket-specific scan below without waiting for it.')
     for league in selected_sports:
         if sources.get(league, {}).get('ticket_collection_stage') and league != 'NFL':
             st.caption(league+': '+sources[league]['ticket_collection_stage'])
