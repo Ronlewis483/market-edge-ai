@@ -1079,7 +1079,7 @@ def load_nba_prop_results():
             'nba_props_pending': False, 'restored_saved_results': True}
 
 
-def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapshots=None, nba_key=None, progress=None, nba_history_enabled=True, priority_game=None, foreground=False):
+def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapshots=None, nba_key=None, progress=None, nba_history_enabled=True, priority_game=None, foreground=False, quoted_players_only=False):
     scan_started = time.perf_counter()
     calculation_seconds = 0.0
     timings = {}
@@ -1089,7 +1089,26 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
         progress({'picks': [], 'game_picks': [], 'errors': [], 'loading_progress': {'stage': 'Finding sportsbook lines', 'completed': 0, 'total': 0}})
     prepared_nba_context = None
     prepared_star_rosters = None
-    if league == 'NBA' and nba_history_enabled:
+    if league == 'NBA' and nba_history_enabled and quoted_players_only:
+        # A ticket has nothing to score without an actual offered line. Avoid
+        # injury/roster/history work entirely when quote collection is empty.
+        try:
+            quotes, errors = fetch_prop_quotes(league, games, odds_key)
+        except Exception as exc:
+            quotes, errors = [], ['NBA sportsbook lines unavailable: '+_nba_request_issue(exc)]
+        timings['Sportsbook collection'] = time.perf_counter()-scan_started
+        prepared_star_rosters = {}
+        prepared_nba_context = {}
+        if quotes:
+            if progress:
+                progress({'game_picks':[], 'errors':list(errors), 'loading_progress':{
+                    'stage':'Loading NBA matchup context for returned sportsbook lines',
+                    'sportsbook_lines':len(quotes), 'players_with_history':0, 'calculated_props':0}})
+            try:
+                prepared_nba_context = load_nba_matchup_context(nba_key)
+            except Exception as exc:
+                prepared_nba_context = {'issue':'NBA matchup context unavailable: '+_nba_request_issue(exc)}
+    elif league == 'NBA' and nba_history_enabled:
         from concurrent.futures import ThreadPoolExecutor
         from dual_agent.nba_star_spotlight import collect_star_rosters
         def timed_input(function, *args):
@@ -1125,8 +1144,11 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
                 raise
             quotes, errors = [], [f'NBA sportsbook lines unavailable: {type(exc).__name__}: {exc}.']
         timings['Sportsbook collection'] = time.perf_counter()-scan_started
-    if not quotes and league != 'NBA':
-        return {'picks':[], 'message':'No fresh eligible sportsbook player-prop lines are available for upcoming games.', 'errors':errors}
+    if not quotes and (league != 'NBA' or quoted_players_only):
+        return {'picks':[], 'game_picks':[], 'message':'No fresh eligible sportsbook player-prop lines were returned. Player-history work was skipped because there are no lines to score.',
+                'errors':errors, 'scan_complete':True,
+                'loading_progress':{'stage':'No usable sportsbook lines returned', 'sportsbook_lines':0,
+                                    'players_with_history':0, 'calculated_props':0}}
     if league == 'NBA' and not nba_history_enabled:
         return nba_sportsbook_prop_picks(quotes, errors)
     groups = {}
