@@ -54,6 +54,25 @@ def prop(player='Player One', book='underdog', now=None):
             'Sportsbook offers': [{'book': book, 'decimal_odds': 1.91, 'updated_at': now.isoformat()}]}
 
 
+def history(pid, now, count=30):
+    rows = []
+    for day in range(count):
+        when = now-pd.Timedelta(days=day+1)
+        rows.append(dict(player={'id':pid}, team={'id':pid}, min='30:00',
+            pts=18+day%7, reb=5, ast=4, fg3m=2, blk=1, stl=1, turnover=2,
+            source_date=when.isoformat(), history_provider='balldontlie',
+            game={'id':pid*1000+day,'status':'Final','date':when.isoformat()}))
+    return rows
+
+
+def quote(name, now, start=None):
+    return dict(player=name, line=20.5, market='player_points', book='prizepicks',
+        event_id='nba-event', home_team='Milwaukee Bucks', away_team='Boston Celtics',
+        start_time=start or (now+pd.Timedelta(hours=5)).isoformat(),
+        updated_at=now.isoformat(), capture_time=now.isoformat(),
+        over_probability=.5, over_decimal_odds=1.91, under_decimal_odds=1.91)
+
+
 class TicketBuilderTests(unittest.TestCase):
     def setUp(self):
         self.app = app_helpers()
@@ -74,30 +93,53 @@ class TicketBuilderTests(unittest.TestCase):
             self.assertEqual(len(self.app['ticket_prop_candidates'](restored)), 1)
             self.assertFalse(restored['NBA'].get('predictions'))
 
-    def test_collector_discovers_events_and_publishes_before_finishing(self):
+    def test_collector_prepares_history_then_scores_fresh_lines_without_reloading(self):
+        from dual_agent.sports_player_prop_predictions import nba_score_cached_quotes
         now = pd.Timestamp.now(tz='UTC')
         event = dict(id='nba-event', home_team='Milwaukee Bucks', away_team='Boston Celtics',
                      commence_time=(now+pd.Timedelta(hours=5)).isoformat())
-        published = []
-        def generate(league, games, odds_key, **kwargs):
-            self.assertEqual(games[0]['event_id'], 'nba-event')
-            self.assertNotIn('confidence', games[0])
-            self.assertTrue(kwargs['nba_history_enabled'])
-            self.assertTrue(kwargs['foreground'])
-            self.assertTrue(kwargs['quoted_players_only'])
-            kwargs['progress']({'game_picks': [prop()], 'picks': [prop()]})
-            self.assertTrue(ticket_sources.prop_records(published[-1]['player_props']))
-            self.assertFalse(published[-1]['ticket_scan_complete'])
-            # A final status-only result must not erase the partial forecast.
-            return {'game_picks': [], 'message': 'Complete'}
-        with workspace(), patch('dual_agent.sports_player_prop_predictions._get', return_value=[event, event]), \
-             patch('dual_agent.sports_player_prop_predictions.generate_player_prop_picks', side_effect=generate), \
-             patch('dual_agent.odds_request_cache.refresh_game_props') as refresh:
-            result = ticket_sources.collect_nba_ticket_props('odds', 'nba', published.append)
-            refresh.assert_called_once_with('Milwaukee Bucks', 'Boston Celtics')
+        names = ['Player One','Player Two','Player Three','Player Four','Player Five']
+        discovery = [quote(name, now=now, start=event['commence_time']) for name in names]
+        refreshed = [dict(q,line=25.5,over_decimal_odds=2.1,under_decimal_odds=1.8) for q in discovery]
+        histories = {name:history(i+1,now) for i,name in enumerate(names)}
+        calls = []; published = []
+        def fetch(*args):
+            calls.append('quotes')
+            return (discovery if calls.count('quotes') == 1 else refreshed), []
+        def prepare(wanted, key, **kwargs):
+            self.assertEqual(kwargs['cold_batch_size'], 5)
+            self.assertEqual(calls.count('quotes'), 1)
+            # Cached estimates have already been published before downloading.
+            self.assertTrue(any(ticket_sources.prop_records(r['player_props']) for r in published))
+            calls.append('history')
+            kwargs['status']('Loading recent player history')
+            for name in wanted:
+                yield name, histories[name], None
+        def score(*args, **kwargs):
+            calls.append('score')
+            return nba_score_cached_quotes(*args, **kwargs)
+        with workspace(), patch('dual_agent.sports_player_prop_predictions._get', return_value=[event,event]), \
+             patch('dual_agent.sports_player_prop_predictions.fetch_prop_quotes', side_effect=fetch), \
+             patch('dual_agent.sports_player_prop_predictions.nba_cached_histories', return_value={names[0]:histories[names[0]]}), \
+             patch('dual_agent.sports_player_prop_predictions._nba_history_batches', side_effect=prepare), \
+             patch('dual_agent.sports_player_prop_predictions.nba_score_cached_quotes', side_effect=score), \
+             patch('dual_agent.sports_player_prop_predictions.load_nba_matchup_context', return_value={}), \
+             patch('dual_agent.odds_request_cache.refresh_game_props') as refresh, \
+             patch('requests.sessions.Session.request', side_effect=AssertionError('No live HTTP in offline checks')):
+            result = ticket_sources.collect_nba_ticket_props('odds','nba',published.append)
+            self.assertEqual(refresh.call_count, 2)
             self.assertTrue(result['ticket_scan_complete'])
-            self.assertEqual(len(result['all_predictions']), 1)
-            self.assertEqual(len(ticket_sources.prop_records(result['player_props'])), 1)
+            self.assertEqual(result['ticket_quote_passes'], 2)
+            self.assertEqual(calls.count('history'), 1)
+            self.assertEqual(calls[-2:], ['quotes','score'])
+            rows = ticket_sources.prop_records(result['player_props'])
+            self.assertTrue(rows)
+            self.assertTrue(all(r['Line'] == 25.5 for r in rows))
+            candidates = self.candidates(rows)
+            picks = self.app['build_suggested_ticket'](candidates,'prizepicks',5)
+            self.assertEqual(len(picks), 5)
+            self.assertEqual(len({r['player'] for r in picks}), 5)
+            self.assertTrue(all(r['book'] == 'prizepicks' for r in picks))
 
     def test_old_events_are_not_requested_or_faked(self):
         event = dict(id='past', home_team='A', away_team='B', commence_time='2020-01-01T00:00:00Z')
@@ -240,6 +282,89 @@ class TicketBuilderTests(unittest.TestCase):
         self.assertIn('429', text)
         self.assertNotIn('SECRET', text)
         self.assertNotIn('https', text)
+
+    def test_warm_scan_does_not_fetch_quotes_twice(self):
+        now = pd.Timestamp.now(tz='UTC')
+        event = dict(id='nba-event',home_team='Milwaukee Bucks',away_team='Boston Celtics',
+                     commence_time=(now+pd.Timedelta(hours=5)).isoformat())
+        quotes = [quote('Player One',now)]
+        with workspace(), patch('dual_agent.sports_player_prop_predictions._get',return_value=[event]), \
+             patch('dual_agent.sports_player_prop_predictions.fetch_prop_quotes',return_value=(quotes,[])) as fetch, \
+             patch('dual_agent.sports_player_prop_predictions.nba_cached_histories',return_value={'Player One':history(1,now)}), \
+             patch('dual_agent.sports_player_prop_predictions._nba_history_batches',return_value=iter(())), \
+             patch('dual_agent.sports_player_prop_predictions.load_nba_matchup_context',return_value={}), \
+             patch('dual_agent.odds_request_cache.refresh_game_props'), \
+             patch('requests.sessions.Session.request',side_effect=AssertionError('No live HTTP')):
+            result = ticket_sources.collect_nba_ticket_props('odds','nba')
+        fetch.assert_called_once()
+        self.assertEqual(result['ticket_quote_passes'],1)
+        self.assertTrue(result['ticket_scan_complete'])
+
+    def test_prepared_history_scorer_rejects_expired_quotes_without_requests(self):
+        from dual_agent.sports_player_prop_predictions import nba_score_cached_quotes
+        now = pd.Timestamp.now(tz='UTC')
+        q = quote('Player One',now-pd.Timedelta(minutes=31))
+        with patch('requests.sessions.Session.request', side_effect=AssertionError('No HTTP')):
+            result = nba_score_cached_quotes([], [q], {'Player One':history(1,now)}, now=now)
+        self.assertEqual(result['game_picks'], [])
+
+    def test_completed_empty_scan_does_not_resurrect_old_fresh_offers(self):
+        session = {'nba_prediction_pipeline_result':{'player_props':{'game_picks':[prop()]}},
+                   'ai_ticket_nba_result':{'ticket_scan_complete':True,'player_props':{'game_picks':[],'picks':[]}}}
+        with workspace():
+            result = self.app['ticket_cached_sources'](['NBA'],session=session)
+        self.assertEqual(self.app['ticket_prop_candidates'](result), [])
+
+    def test_cache_reader_validates_id_and_does_not_download_player_history(self):
+        from dual_agent.sports_player_prop_predictions import nba_cached_histories
+        now = pd.Timestamp.now(tz='UTC')
+        archive = {'version':3,'players':{'Player One':{'player_id':1,'checked_at':now.isoformat(),
+                                                     'rows':history(1,now)+history(99,now)}}}
+        with workspace(), patch('dual_agent.sports_player_prop_predictions._nba_load_history_archive', return_value=archive), \
+             patch('dual_agent.sports_player_prop_predictions._get', side_effect=AssertionError('No player-data downloads')):
+            rows = nba_cached_histories(['Player One','Missing'],now)
+        self.assertEqual(len(rows['Player One']),30)
+        self.assertEqual({r['player']['id'] for r in rows['Player One']},{1})
+        self.assertEqual(rows['Missing'],[])
+
+    def test_cold_histories_share_complete_paginated_batches(self):
+        from dual_agent.sports_player_prop_predictions import _nba_history_batches
+        now = pd.Timestamp.now(tz='UTC')
+        names = ['Player One','Player Two','Player Three','Player Four','Player Five']
+        catalog = [dict(id=i+1,first_name='Player',last_name=name.split()[-1]) for i,name in enumerate(names)]
+        samples = [r for i in range(5) for r in history(i+1,now)]
+        stat_requests = []
+        def provider(url,key,params,bdl):
+            if url.endswith('/players/active'):
+                return {'data':catalog,'meta':{}}
+            self.assertTrue(url.endswith('/stats'))
+            stat_requests.append(params)
+            self.assertEqual(params['player_ids[]'],[1,2,3,4,5])
+            return {'data':samples[100:] if params.get('cursor') else samples[:100],
+                    'meta':{} if params.get('cursor') else {'next_cursor':'next'}}
+        with workspace(), patch('dual_agent.sports_player_prop_predictions._get',side_effect=provider), \
+             patch('dual_agent.sports_player_prop_predictions._nba_load_history_archive',return_value={'version':3,'players':{}}), \
+             patch('dual_agent.sports_player_prop_predictions._nba_save_remote_history_archive'):
+            ready = list(_nba_history_batches(names,'nba',cold_batch_size=5))
+        self.assertEqual(len(stat_requests),2)
+        self.assertEqual(len(ready),5)
+        self.assertTrue(all(len(rows)==30 and error is None for _,rows,error in ready))
+
+    def test_partial_history_pagination_never_becomes_training_or_scoring_data(self):
+        from dual_agent.sports_player_prop_predictions import _nba_history_batches
+        now = pd.Timestamp.now(tz='UTC')
+        catalog = [dict(id=1,first_name='Player',last_name='One')]
+        def provider(url,key,params,bdl):
+            if url.endswith('/players/active'): return {'data':catalog,'meta':{}}
+            if params.get('cursor'): raise RuntimeError('HTTP 503')
+            return {'data':history(1,now),'meta':{'next_cursor':'next'}}
+        with workspace(), patch('dual_agent.sports_player_prop_predictions._get',side_effect=provider), \
+             patch('dual_agent.sports_player_prop_predictions._nba_load_history_archive',return_value={'version':3,'players':{}}), \
+             patch('dual_agent.sports_player_prop_predictions._nba_save_remote_history_archive'):
+            ready = list(_nba_history_batches(['Player One'],'nba',cold_batch_size=5))
+        self.assertEqual(len(ready),1)
+        self.assertEqual(ready[0][1],[])
+        self.assertIn('503',ready[0][2])
 
     def test_scan_failure_preserves_partial_rows(self):
         from queue import Queue
