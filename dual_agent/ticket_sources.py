@@ -1,6 +1,7 @@
 """Ticket-only prop collection and small helpers; never generate game winners."""
 import copy
 import json
+import re
 from pathlib import Path
 import time
 
@@ -64,6 +65,16 @@ def save_ticket_source(sport, result):
     temp.replace(path)
 
 
+def safe_ticket_error(exc):
+    # Provider exceptions can include URLs with credentials. Report only type
+    # and HTTP status; detailed stat/identity errors arrive in the scan payload.
+    status = getattr(getattr(exc, 'response', None), 'status_code', None)
+    if status is None:
+        match = re.search(r'HTTP[ :]+([1-5][0-9]{2})', str(exc), re.IGNORECASE)
+        status = int(match.group(1)) if match else None
+    return type(exc).__name__ + ('; HTTP '+str(status) if status else '')
+
+
 def collect_nba_ticket_props(odds_key, nba_key, publish=None, context=None):
     """Discover NBA events directly, then reuse the existing statistical estimator."""
     if not odds_key or not nba_key:
@@ -114,6 +125,11 @@ def collect_nba_ticket_props(odds_key, nba_key, publish=None, context=None):
                           commence_time=start.isoformat(), start_time=start.isoformat()))
     games.sort(key=lambda g: g['start_time'])
     result['all_predictions'] = games  # Event descriptors only; no winner estimates.
+    # This function runs only after an explicit scan click. Invalidate the exact
+    # games' cached quotes once; timer-driven display checks never do this.
+    from .odds_request_cache import refresh_game_props
+    for game in games:
+        refresh_game_props(game['home_team'], game['away_team'])
     if not games:
         return send({'game_picks': [], 'picks': [], 'message': 'No upcoming NBA events were returned by the sportsbook feed.'},
                     stage='NBA scan finished: no upcoming sportsbook events', complete=True)
@@ -124,8 +140,8 @@ def collect_nba_ticket_props(odds_key, nba_key, publish=None, context=None):
 
     try:
         props = generate_player_prop_picks('NBA', games, odds_key, nba_key=nba_key,
-                                          progress=progress, nba_history_enabled=True, foreground=True)
+                                          progress=progress, nba_history_enabled=True, foreground=True, quoted_players_only=True)
     except Exception as exc:
-        send(stage='NBA scan stopped ('+type(exc).__name__+'); completed estimates are preserved', complete=True)
+        send(stage='NBA scan stopped ('+safe_ticket_error(exc)+'); completed estimates are preserved', complete=True)
         raise
     return send(props, 'NBA prop scan finished', complete=True)
