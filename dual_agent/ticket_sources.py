@@ -4,8 +4,49 @@ import json
 import re
 from pathlib import Path
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from hashlib import sha256
 
 import pandas as pd
+
+
+_context_lock = threading.Lock()
+_context_pool = None
+_context_job = None
+_context_key = None
+_context_started = 0.
+
+
+def start_nba_context_refresh(api_key, script_context=None):
+    """At most one background ticket context refresh per process; never wait.
+
+    The worker only updates the context cache. Collector queues are owned by
+    the collector, so a late worker cannot publish into a finished scan.
+    Completed attempts are reused for 15 minutes, including failed attempts.
+    """
+    global _context_pool, _context_job, _context_key, _context_started
+    fingerprint = sha256(api_key.encode()).hexdigest()
+    with _context_lock:
+        if _context_job is not None:
+            if not _context_job.done():
+                return _context_job if fingerprint == _context_key else None
+            if fingerprint == _context_key and time.monotonic()-_context_started < 900:
+                return _context_job
+        if _context_pool is None:
+            _context_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='nba-ticket-context')
+
+        def refresh():
+            if script_context is not None:
+                from streamlit.runtime.scriptrunner import add_script_run_ctx
+                add_script_run_ctx(threading.current_thread(), script_context)
+            from .sports_player_prop_predictions import load_nba_matchup_context
+            return load_nba_matchup_context(api_key)
+
+        _context_key = fingerprint
+        _context_started = time.monotonic()
+        _context_job = _context_pool.submit(refresh)
+        return _context_job
 
 
 def records(value):
@@ -154,19 +195,38 @@ def collect_nba_ticket_props(odds_key, nba_key, publish=None, context=None):
         first_start[key] = min(first_start.get(key,start),start)
     names = [named[key] for key in sorted(named,key=lambda k:(-len(coverage[k]),first_start[k],named[k]))]
     histories = nba_cached_histories(names)
-    send(stage='Loading NBA matchup context; cached player histories are already available')
     try:
-        matchup = load_nba_matchup_context(nba_key)
+        matchup = load_nba_matchup_context(nba_key, cache_only=True)
     except Exception as exc:
         matchup = {'issue':'NBA matchup context unavailable: '+safe_ticket_error(exc)}
-    if matchup.get('issue'):
-        issues.append(matchup['issue'])
+    context_job = None
+
+    def update_context():
+        nonlocal matchup, context_job
+        if context_job is not None and context_job.done():
+            try:
+                matchup = context_job.result()
+            except Exception as exc:
+                # Retain cached known exclusions if the refresh fails.
+                matchup = dict(matchup, injury_complete=False,
+                    issue='NBA matchup refresh unavailable: '+safe_ticket_error(exc))
+            context_job = None
+        if matchup.get('injury_complete'):
+            checked = pd.to_datetime(matchup.get('checked_at'), utc=True, errors='coerce')
+            age = pd.Timestamp.now(tz='UTC')-checked
+            if pd.isna(checked) or not pd.Timedelta(0) <= age < pd.Timedelta(minutes=15):
+                matchup = dict(matchup, injury_complete=False, injury_stale=True,
+                    issue='NBA injury snapshot needs refreshing; estimates are conditional on playing.')
+                context_job = start_nba_context_refresh(nba_key, context)
 
     def prepared_count():
         return len({nba_identity_key(name) for name,rows in histories.items() if len(rows)>=10})
 
     def score(lines, stage, complete=False):
-        props = nba_score_cached_quotes(games,lines,histories,matchup,issues)
+        update_context()
+        context_issues = [matchup['issue']] if matchup.get('issue') else []
+        props = nba_score_cached_quotes(games,lines,histories,matchup,issues+context_issues)
+        props['availability_refresh_pending'] = context_job is not None
         props['loading_progress'].update(prepared_players=prepared_count(), total_players=len(names),
             players_with_history=sum(bool(rows) for rows in histories.values()))
         props['ticket_quote_passes'] = result.get('ticket_quote_passes',1)
@@ -174,6 +234,10 @@ def collect_nba_ticket_props(odds_key, nba_key, publish=None, context=None):
 
     result['ticket_quote_passes'] = 1
     score(quotes,'Scored saved histories first; preparing missing or outdated player histories')
+    # Start optional provider work only AFTER publishing cached estimates.
+    # No result()/executor shutdown wait may block scoring or completion.
+    if not matchup.get('injury_complete'):
+        context_job = start_nba_context_refresh(nba_key, context)
     last_count = prepared_count(); last_scored = time.monotonic()
     errors = set(issues)
     history_network_work = False
@@ -193,7 +257,7 @@ def collect_nba_ticket_props(odds_key, nba_key, publish=None, context=None):
             if error and error not in errors:
                 issues.append(error); errors.add(error)
             count = prepared_count()
-            if count >= last_count+5 or time.monotonic()-last_scored >= 10:
+            if count > last_count or time.monotonic()-last_scored >= 10:
                 score(quotes,f'{count} player histories prepared; completed estimates are available')
                 last_count = count; last_scored = time.monotonic()
     except Exception as exc:
@@ -212,12 +276,7 @@ def collect_nba_ticket_props(odds_key, nba_key, publish=None, context=None):
     if not history_network_work and quotes_current:
         # A fully warm scan does not need to pay for identical quotes twice.
         return score(quotes,'NBA ticket scan finished using prepared history and current lines',complete=True)
-    try:
-        matchup = load_nba_matchup_context(nba_key)
-        if matchup.get('issue'): issues.append(matchup['issue'])
-    except Exception as exc:
-        matchup = {'issue':'NBA matchup context unavailable: '+safe_ticket_error(exc)}
-        issues.append(matchup['issue'])
+    update_context()
     send(stage=f'{prepared_count()} player histories prepared; collecting current sportsbook lines')
     for game in ready_games:
         refresh_game_props(game['home_team'],game['away_team'])
