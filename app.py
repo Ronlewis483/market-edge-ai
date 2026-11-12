@@ -1130,6 +1130,8 @@ def ticket_prop_candidates(results, now=None, diagnostics=None):
                     'neural_calibration_end','estimate_method') if k in row})
                 if sport=='NBA':
                     candidate['estimate_method']=row.get('Estimate method','')
+                    candidate['availability_status']=row.get('Availability status',
+                        'Injury status unverified; forecast is conditional on playing')
                 if live:
                     observed=stamp(offer.get('observed_at'))
                     if pd.isna(observed) or not zero<=now-observed<=pd.Timedelta(seconds=90):
@@ -1853,6 +1855,8 @@ def _render_ai_ticket_results():
             st.markdown(f'**Leg {i} · {leg["player"]} · {leg["side"]} '
                         f'{leg["line"]:g} {leg["market"]}**')
             st.write(f'Estimated cover chance: **{leg["chance"]:.1%}**')
+            if leg.get('availability_status'):
+                st.caption(leg['availability_status'])
             from dual_agent.ticket_value import single_value
             leg_value = single_value(leg) if book not in ('underdog','prizepicks') else None
             if leg_value:
