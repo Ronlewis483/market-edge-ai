@@ -1282,7 +1282,8 @@ def drain_ticket_prop_updates():
             st.session_state['ai_ticket_nba_result'] = nba_future.result()
             st.session_state.pop('ai_ticket_refresh_issue', None)
         except Exception as exc:
-            st.session_state['ai_ticket_refresh_issue'] = 'NBA ticket scan stopped ('+type(exc).__name__+'). Completed estimates remain available.'
+            from dual_agent.ticket_sources import safe_ticket_error
+            st.session_state['ai_ticket_refresh_issue'] = 'NBA ticket scan stopped ('+safe_ticket_error(exc)+'). Completed estimates remain available.'
         st.session_state.pop('ai_ticket_nba_future', None)
         st.session_state.pop('ai_ticket_nba_updates', None)
     queue=st.session_state.get('ai_ticket_nfl_updates')
@@ -1375,6 +1376,8 @@ def start_nfl_ticket_refresh(book,include_specialty=False):
     from dual_agent.nfl_live_ticket_props import collect_ticket_props
     updates=Queue();key=prediction_api_key('ODDS_API_KEY','THE_ODDS_API_KEY')
     st.session_state.pop('ai_ticket_refresh_issue',None)
+    st.session_state.pop('ai_ticket_build_issue',None)
+    st.session_state.pop('ai_ticket_prepare_error',None)
     st.session_state['ai_ticket_nfl_updates']=updates
     st.session_state['ai_ticket_nfl_future']=nfl_ticket_pool().submit(
         collect_ticket_props,key,book,include_specialty,updates.put)
@@ -1392,6 +1395,8 @@ def start_nba_ticket_refresh():
     except ImportError:
         context = None
     updates = Queue()
+    st.session_state.pop('ai_ticket_build_issue', None)
+    st.session_state.pop('ai_ticket_prepare_error', None)
     st.session_state['ai_ticket_nba_updates'] = updates
     st.session_state['ai_ticket_nba_future'] = ticket_prepare_pool().submit(
         collect_nba_ticket_props, prediction_api_key('ODDS_API_KEY','THE_ODDS_API_KEY'),
@@ -1528,8 +1533,9 @@ def ticket_offer_inputs(sports):
 
 
 def render_ai_ticket_results():
-    # No timed reruns. Explicit checks read saved work without rescanning odds.
-    return st.fragment(run_every=None)(_render_ai_ticket_results)()
+    # Only this fragment polls completed work. Never rerun the whole page or
+    # start provider requests from a timer; saved quotes keep their timestamps.
+    return st.fragment(run_every=3)(_render_ai_ticket_results)()
 
 
 def _render_ai_ticket_results():
@@ -1550,7 +1556,7 @@ def _render_ai_ticket_results():
             st.error(st.session_state['ai_ticket_prepare_error'])
             if st.button('Retry saved-offer check', key='ai_ticket_prepare_retry'):
                 st.session_state.pop('ai_ticket_prepare_error', None)
-                st.rerun(scope='app')
+                st.rerun(scope='fragment')
         prepared = ({}, {}, [], 0.)
     sources, diagnostics, candidates, prepare_seconds = prepared
     legs = st.session_state['ai_ticket_legs']
@@ -1597,6 +1603,15 @@ def _render_ai_ticket_results():
                     for issue in issues[-8:]: st.warning(issue)
     nfl_source=sources.get('NFL',{})
     if nfl_source.get('ticket_collection_stage'): st.caption(nfl_source['ticket_collection_stage'])
+    if 'NBA' in active:
+        live_scan = st.session_state.get('ai_ticket_nba_result') or {}
+        progress = (live_scan.get('player_props') or {}).get('loading_progress') or {}
+        if live_scan.get('ticket_collection_stage'):
+            st.info('NBA scan: '+str(live_scan['ticket_collection_stage']))
+        if progress:
+            st.caption(f"NBA: {progress.get('sportsbook_lines',0)} sportsbook lines · "
+                       f"{progress.get('players_with_history',0)} players with loaded history · "
+                       f"{progress.get('calculated_props',0)} calculated props")
     fingerprint = ticket_offer_fingerprint(eligible)
     entry_return = payouts.get(book) if book in ('underdog','prizepicks') else None
     from dual_agent.ticket_value import rank_offers, review_ticket
@@ -1615,7 +1630,7 @@ def _render_ai_ticket_results():
                f'({quote_status["no_listing"]} without any sportsbook listings).')
     if active:
         st.info('Refreshing ' + ', '.join(active) + ' in the background. These scans may '
-                'supply new offers. Use Check for completed props above to load finished estimates without restarting the scan. Expired or missing lines are not counted as playable.')
+                'supply new offers. Completed estimates appear automatically here; the rest of the page is not reloaded. Expired or missing lines are not counted as playable.')
     elif quote_status['listings'] == 0 and quote_status['saved']:
         st.info(f'No {PLATFORMS[book]} quotes were found in the saved model results. '
                 'The data provider may not cover this sportsbook or its offered markets; '
@@ -1626,7 +1641,7 @@ def _render_ai_ticket_results():
 
     # Build only from verified cached offers; empty tickets are not valid output.
     if st.button('Build my ticket', type='primary', use_container_width=True,
-                 key='ai_build_ticket', disabled=not candidates and st.session_state.get('ai_ticket_prepare_future') is not None):
+                 key='ai_build_ticket', disabled=len(selected['legs']) < legs):
         picks = selected['legs']
         if len(picks) == legs:
             st.session_state['ai_suggested_ticket'] = {
@@ -1655,7 +1670,7 @@ def _render_ai_ticket_results():
             st.session_state['ai_ticket_build_issue'] = (
                 f'Found {len(picks)} eligible legs; {legs} were requested. '
                 'Scan current offers or choose a smaller ticket size. No incomplete ticket was generated.')
-    if st.session_state.get('ai_ticket_build_issue'):
+    if st.session_state.get('ai_ticket_build_issue') and not active:
         st.info(st.session_state['ai_ticket_build_issue'])
     if possible < legs:
         if not include_specialty and offered and not standard:
@@ -1665,7 +1680,7 @@ def _render_ai_ticket_results():
             st.info(f'Only {len(value_pool)} offers passed price-value screening; {legs} legs were requested. More listings alone do not establish value.')
         elif eligible:
             st.info(f'Only {possible} distinct-player legs passed the current listing, freshness and eligibility checks; {legs} were requested. There is no per-game player limit.')
-        elif quote_status['saved'] == 0:
+        elif quote_status['saved'] == 0 and not active:
             st.info('No saved props are loaded yet. Scan below to collect NFL/NBA props directly; game winner predictions are not required. MLB uses its existing saved matchup data.')
         elif not offered and not active and not quote_status['listings']:
             st.info(f'The saved provider data contains no {PLATFORMS[book]} listings. '
