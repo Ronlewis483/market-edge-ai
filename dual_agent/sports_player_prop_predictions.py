@@ -321,10 +321,12 @@ def nba_foreground_scan():
 
 
 
-def _nba_history_batches(names, api_key, status=None, foreground=False):
+def _nba_history_batches(names, api_key, status=None, foreground=False, cold_batch_size=1):
     # Readers and provider requests never hold the archive writer lock.
     # A slow full-slate request cannot prevent another game's cache read.
-    yield from _nba_history_batches_locked(names, api_key, status)
+    if not isinstance(cold_batch_size, int) or not 1 <= cold_batch_size <= 8:
+        raise ValueError('Cold history batch size must be between one and eight')
+    yield from _nba_history_batches_locked(names, api_key, status, cold_batch_size)
 
 
 def _nba_write_history_json(path, data):
@@ -379,7 +381,7 @@ def _nba_cached_rows(entry, now):
     return sorted(valid.values(), key=lambda row:(row['source_date'],str(row['game']['id'])))
 
 
-def _nba_history_batches_locked(names, api_key, status=None):
+def _nba_history_batches_locked(names, api_key, status=None, cold_batch_size=1):
     """Yield completed player histories; never cache an incomplete stats batch."""
     now = pd.Timestamp.now(tz='UTC')
     root = Path('nba_player_history_cache'); root.mkdir(exist_ok=True)
@@ -493,9 +495,9 @@ def _nba_history_batches_locked(names, api_key, status=None):
         if has_history:
             batches.extend(subset[i:i+8] for i in range(0, len(subset), 8))
         else:
-            # A first-time player finishes independently, without waiting for
-            # seven other players' older date windows to finish downloading.
-            batches.extend([[item] for item in subset])
+            # Ticket preparation may group a few cold players per request.
+            # Every date window still finishes before any batch is published.
+            batches.extend(subset[i:i+cold_batch_size] for i in range(0,len(subset),cold_batch_size))
     for offset, batch in enumerate(batches):
         ids = {pid for name, pid in batch}; rows_by_id = {pid: [] for pid in ids}
         checked_dates = [pd.to_datetime(known[name].get('checked_at'), utc=True, errors='coerce') for name, pid in batch]
@@ -1079,6 +1081,55 @@ def load_nba_prop_results():
             'nba_props_pending': False, 'restored_saved_results': True}
 
 
+def nba_cached_histories(names, now=None):
+    """Read verified completed rows without making any player-data requests."""
+    now = pd.Timestamp.now(tz='UTC') if now is None else pd.Timestamp(now)
+    root = Path('nba_player_history_cache'); root.mkdir(exist_ok=True)
+    archive = _nba_load_history_archive(root/'player_histories_v3.json')
+    by_key = {}
+    for name, entry in archive.get('players', {}).items():
+        if isinstance(entry, dict) and entry.get('player_id'):
+            by_key.setdefault(nba_identity_key(name), []).append(entry)
+    result = {}
+    for name in dict.fromkeys(names):
+        entries = by_key.get(nba_identity_key(name), [])
+        # An alias collision between different provider IDs is not a match.
+        if len({str(entry['player_id']) for entry in entries}) != 1:
+            result[name] = []
+            continue
+        entry = max(entries, key=lambda entry:str(entry.get('checked_at','')))
+        result[name] = _nba_cached_rows(entry, now)
+    return result
+
+
+def nba_score_cached_quotes(games, quotes, histories, context=None, errors=None, now=None):
+    """Apply the existing NBA estimator to exact lines and prepared histories.
+
+    No history downloads, winner generation or training. Original sportsbook
+    update times are retained; the scorer cannot turn an expired quote fresh.
+    """
+    now = pd.Timestamp.now(tz='UTC') if now is None else pd.Timestamp(now)
+    by_key = {nba_identity_key(name): rows for name,rows in histories.items()}
+    groups = {}; named = {}
+    for quote in quotes:
+        start = pd.to_datetime(quote.get('start_time'), utc=True, errors='coerce')
+        updated = pd.to_datetime(quote.get('updated_at'), utc=True, errors='coerce')
+        if (pd.isna(start) or pd.isna(updated) or not now < start <= now+pd.Timedelta(days=7)
+                or not pd.Timedelta(0) <= now-updated <= pd.Timedelta(minutes=30) or updated >= start
+                or quote.get('market') not in MARKETS['NBA']):
+            continue
+        name = quote['player']
+        named[name] = by_key.get(nba_identity_key(name), [])
+        groups.setdefault((quote['event_id'],name,quote['market'],quote['line']), []).append(quote)
+    result = _rank_prop_candidates('NBA',games,groups,named,list(errors or []),{}, {}, {},nba_context=context or {})
+    result.update(probability_source='player_history', statistics_source='BALLDONTLIE',
+                  scan_complete=False, ticket_history_mode='prepared_history_only')
+    result['loading_progress'] = dict(stage='Scored current lines from saved player history',
+        sportsbook_lines=sum(map(len,groups.values())), players_with_history=sum(bool(rows) for rows in named.values()),
+        calculated_props=len(result.get('game_picks',[])))
+    return result
+
+
 def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapshots=None, nba_key=None, progress=None, nba_history_enabled=True, priority_game=None, foreground=False, quoted_players_only=False):
     scan_started = time.perf_counter()
     calculation_seconds = 0.0
@@ -1307,7 +1358,7 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
 
 def _rank_prop_candidates(league, games, groups, history_by_name, errors,
                           star_rosters, identities, mlb_histories, nba_context=None):
-    if league == 'NBA':
+    if league == 'NBA' and star_rosters:
         from dual_agent.nba_star_spotlight import build_star_spotlights
     picks = []; exclusions = []; pitcher_forecasts = []
     def excluded(first, player, market, line, reason):
@@ -1423,6 +1474,6 @@ def _rank_prop_candidates(league, games, groups, history_by_name, errors,
             seen.add(key);chosen.append(pick)
         # Retain eligible picks for every matchup; the global list stays top ten.
     return {'picks':chosen[:10],'game_picks':chosen,'errors':errors,
-            **({'star_spotlights': build_star_spotlights(games, star_rosters, history_by_name, chosen), 'unavailable_players':(nba_context or {}).get('blocked_player_names',[]), 'nba_prop_model_version':3} if league == 'NBA' else {}),
+            **({'star_spotlights': build_star_spotlights(games, star_rosters, history_by_name, chosen) if star_rosters else [], 'unavailable_players':(nba_context or {}).get('blocked_player_names',[]), 'nba_prop_model_version':3} if league == 'NBA' else {}),
             **({'exclusions': exclusions, 'quoted_candidates':len(groups), 'pitcher_forecasts':pitcher_forecasts} if league in ('MLB','NBA') else {}), 'message':f'{len(chosen)} player-prop estimates ranked from actual lines and prior appearances.',
             'note':'Estimated chance is conditional on no push and player participation. Estimates are not calibrated; no availability or injury clearance is implied.'}
