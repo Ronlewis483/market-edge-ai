@@ -407,6 +407,11 @@ def train(client=None):
             oldm,newm=scores(held.home_win,oldp),scores(held.home_win,newp)
             report['incumbent_comparison']={'incumbent':oldm,'candidate':newm}
             activate=activate and newm['accuracy']>=oldm['accuracy'] and newm['brier']<=oldm['brier'] and newm['log_loss']<oldm['log_loss']
+    # Historical reconstruction cannot fairly assess an incumbent's live-only
+    # feedback inputs. Retain that serving model until a compatible comparison.
+    if incumbent and incumbent.get('live_feedback'):
+        activate=False
+        report['activation_reason']='Retained live-feedback incumbent pending a frozen-forecast comparison'
     now=datetime.now(timezone.utc).isoformat()
     artifact={'schema':2,'architecture':'original_offset_neural_player_residual',
               'trained_at':now,'context_refreshed_at':now,'columns':columns,'base_columns':base_columns,
@@ -484,6 +489,14 @@ def predict(artifact, base_features, original_probability, neural_probability, h
             'checks_passed':bool(artifact['checks_passed'])}
 
     result['experience_context']={**extra,'availability_scenario_known':int(conditional is not None)}
+    from .nba_live_feedback import frozen_context, apply
+    context = frozen_context(result['experience_context'], base_features.iloc[0].to_dict())
+    adjusted, feedback_id, feedback_status = apply(artifact, connected, context, start, now)
+    result.update(base_connected_home_probability=connected, feedback_context=context,
+                  live_feedback_status=feedback_status, live_feedback_model_id=feedback_id,
+                  connected_home_probability=adjusted, combined_home_probability=adjusted)
+    if feedback_id:
+        result['model_id'] = feedback_id
     from .shared_experience import attach
     result['evidence_confidence']=attach('NBA',result)
     return result
@@ -527,9 +540,9 @@ def refresh(client=None):
     artifact['context_refreshed_at']=now.isoformat()
     client.write(ARTIFACT,artifact,compressed=True,replace=True)
     comparison = grade(client,checkpoint)
-    # Retain the existing graded ledger; parameter search is handled by train().
+    feedback = learn_from_results(client, artifact, comparison)
     print(json.dumps({'status':'unified_context_refreshed','tree_weights_changed':False,'sports_api_requests':0,
-                      'fresh_matchup_reports':len(availability)}))
+                      'fresh_matchup_reports':len(availability),'live_feedback':feedback}))
 
 
 def save_forecasts(client, predictions):
@@ -611,62 +624,12 @@ def grade(client, checkpoint):
 
 
 def learn_from_results(client, artifact, state):
-    """Prospective calibration of correction strength, never probability weights."""
-    family=artifact.get('family_id',artifact['model_id'])
-    earliest={}
-    for r in state.get('results',{}).values():
-        if r.get('source_player_model_id')!=family or r.get('architecture')!='original_offset_neural_player_residual' or not r.get('label_observed_at'):continue
-        event=r['event_id']
-        if event not in earliest or pd.Timestamp(r['captured_at'])<pd.Timestamp(earliest[event]['captured_at']):earliest[event]=r
-    rows=sorted(earliest.values(),key=lambda r:(r['start_time'],r['event_id']))
-    report={'status':'waiting_for_connected_results','graded_unique_games':len(rows),
-            'correction_changed':False,'sports_api_requests':0,'minimum_games':{'train':80,'validation':25,'test':25}}
-    if len(rows)<130 or len(rows)<artifact.get('last_learning_count',0)+30:
-        client.write(ROOT+'learning_report.json',report,replace=True);return report
-    dates=sorted({r['start_time'][:10] for r in rows})
-    candidates=[]
-    for i,a in enumerate(dates[1:-1],1):
-        n1=sum(r['start_time'][:10]<a for r in rows)
-        for b in dates[i+1:]:
-            n2=sum(a<=r['start_time'][:10]<b for r in rows);n3=len(rows)-n1-n2
-            if n1>=80 and n2>=25 and n3>=25:candidates.append(((n1-.6*len(rows))**2+(n2-.2*len(rows))**2+(n3-.2*len(rows))**2,a,b))
-    if not candidates:
-        client.write(ROOT+'learning_report.json',report,replace=True);return report
-    _,a,b=min(candidates)
-    groups=[[r for r in rows if r['start_time'][:10]<a],[r for r in rows if a<=r['start_time'][:10]<b],[r for r in rows if r['start_time'][:10]>=b]]
-    for i in (0,1):
-        boundary=min(pd.Timestamp(r['captured_at']) for g in groups[i+1:] for r in g)
-        groups[i]=[r for r in groups[i] if pd.Timestamp(r['label_observed_at'])<boundary]
-    report['partition_games']=dict(zip(('train','validation','test'),map(len,groups)))
-    if any(len(g)<n or min(sum(r['outcome']==v for r in g) for v in (0,1))<5 for g,n in zip(groups,(80,25,25))):
-        client.write(ROOT+'learning_report.json',report,replace=True);return report
-    def metric(g,gain):
-        return scores(np.array([r['outcome'] for r in g]),bounded_probability(
-            [r['original_home_probability'] for r in g],[r['raw_correction_logit'] for r in g],gain))
-    def rank(g,gain):
-        m=metric(g,gain);return -m['accuracy'],m['brier'],m['log_loss']
-    fitted=min([0.,.25,.5,.75,1.],key=lambda gain:rank(groups[0],gain))
-    gain=min([artifact['correction_gain'],0.,fitted],key=lambda v:rank(groups[1],v))
-    passed=True
-    for label,g in zip(('validation','test'),groups[1:]):
-        old,original,new=metric(g,artifact['correction_gain']),metric(g,0.),metric(g,gain)
-        report[label]={'previous_connected':old,'original':original,'proposed_connected':new}
-        passed=passed and all(new['accuracy']>m['accuracy'] and new['brier']<=m['brier'] and new['log_loss']<=m['log_loss'] for m in (old,original))
-    report.update(status='connected_correction_reviewed',proposed_gain=gain,checks_passed=bool(passed))
-    artifact['last_learning_count']=len(rows)
-    if passed:
-        artifact['correction_gain']=gain;artifact['checks_passed']=True
-        artifact['model_id']='nba_connected_'+hashlib.sha256(json.dumps([family,gain,[r['event_id'] for r in rows]]).encode()).hexdigest()[:16]
-        report.update(correction_changed=True,model_id=artifact['model_id'])
-        client.write(ROOT+'candidates/'+artifact['model_id']+'.json.gz',artifact,compressed=True)
-    client.write(ARTIFACT,artifact,compressed=True,replace=True)
-    client.write(ROOT+'learning_report.json',report,replace=True)
-    print(json.dumps(report));return report
+    """Train prospective corrections independently of historical readiness."""
+    from .nba_live_feedback import learn
+    return learn(client, artifact, state)
 
 
 if __name__=='__main__':
-    import sys
-    if '--refresh' in sys.argv:
-        refresh()
-        train()
-    else:train()
+    # Manual and collector-triggered runs both grade/learn before readiness training.
+    refresh()
+    train()
