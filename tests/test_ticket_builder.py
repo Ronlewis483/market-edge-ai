@@ -76,6 +76,9 @@ def quote(name, now, start=None):
 class TicketBuilderTests(unittest.TestCase):
     def setUp(self):
         self.app = app_helpers()
+        refresh = patch('dual_agent.ticket_sources.start_nba_context_refresh', return_value=None)
+        refresh.start()
+        self.addCleanup(refresh.stop)
 
     def candidates(self, rows):
         return self.app['ticket_prop_candidates']({'NBA': {'player_props': {'game_picks': rows}}})
@@ -399,6 +402,112 @@ class TicketBuilderTests(unittest.TestCase):
         saved = self.app['st'].session_state['ai_ticket_nba_result']
         self.assertEqual(len(ticket_sources.prop_records(saved['player_props'])), 1)
         self.assertIn('Completed estimates remain', self.app['st'].session_state['ai_ticket_refresh_issue'])
+
+
+    def test_pending_context_cannot_block_five_cached_players(self):
+        now = pd.Timestamp.now(tz='UTC')
+        names = ['Player '+str(i) for i in range(5)]
+        quotes = [quote(name, now) for name in names]
+        event = dict(id='nba-event',home_team='Milwaukee Bucks',away_team='Boston Celtics',
+                     commence_time=quotes[0]['start_time'])
+        published = []
+        pending = Future()
+        pending.result = MagicMock(side_effect=AssertionError('Must not wait for context'))
+        def begin(*args):
+            rows = ticket_sources.prop_records(published[-1]['player_props'])
+            self.assertEqual(len({r['Player'] for r in rows}), 5)
+            return pending
+        with workspace(), patch('dual_agent.sports_player_prop_predictions._get',return_value=[event]), \
+             patch('dual_agent.sports_player_prop_predictions.fetch_prop_quotes',return_value=(quotes,[])), \
+             patch('dual_agent.sports_player_prop_predictions.nba_cached_histories',
+                   return_value={name:history(i+1,now) for i,name in enumerate(names)}), \
+             patch('dual_agent.sports_player_prop_predictions._nba_history_batches',return_value=iter(())), \
+             patch('dual_agent.sports_player_prop_predictions.load_nba_matchup_context',return_value={}) as load, \
+             patch('dual_agent.ticket_sources.start_nba_context_refresh',side_effect=begin), \
+             patch('dual_agent.odds_request_cache.refresh_game_props'), \
+             patch('requests.sessions.Session.request',side_effect=AssertionError('No HTTP')):
+            result = ticket_sources.collect_nba_ticket_props('odds','nba',published.append)
+        load.assert_called_once_with('nba',cache_only=True)
+        pending.result.assert_not_called()
+        self.assertTrue(result['ticket_scan_complete'])
+        self.assertTrue(result['player_props']['availability_refresh_pending'])
+        candidates = self.candidates(ticket_sources.prop_records(result['player_props']))
+        self.assertEqual(len(self.app['build_suggested_ticket'](candidates,'prizepicks',5)),5)
+        self.assertTrue(all('conditional' in row['availability_status'] for row in candidates))
+
+    def test_new_players_publish_immediately_and_fresh_context_removes_known_out(self):
+        now = pd.Timestamp.now(tz='UTC')
+        quotes = [quote('Player One',now),quote('Player Two',now)]
+        event = dict(id='nba-event',home_team='Milwaukee Bucks',away_team='Boston Celtics',
+                     commence_time=quotes[0]['start_time'])
+        published = []; ready = Future()
+        def prepare(*args,**kwargs):
+            yield 'Player One',history(1,now),None
+            # No five-player/ten-second gate: first completed player is visible.
+            self.assertTrue(any(ticket_sources.prop_records(r['player_props']) for r in published))
+            ready.set_result({'injury_complete':True,'checked_at':now.isoformat(),
+                'injuries':{1:[{'status':'Out'}]},'blocked_player_names':['playerone']})
+            yield 'Player Two',history(2,now),None
+        with workspace(), patch('dual_agent.sports_player_prop_predictions._get',return_value=[event]), \
+             patch('dual_agent.sports_player_prop_predictions.fetch_prop_quotes',return_value=(quotes,[])), \
+             patch('dual_agent.sports_player_prop_predictions.nba_cached_histories',return_value={}), \
+             patch('dual_agent.sports_player_prop_predictions._nba_history_batches',side_effect=prepare), \
+             patch('dual_agent.sports_player_prop_predictions.load_nba_matchup_context',return_value={}), \
+             patch('dual_agent.ticket_sources.start_nba_context_refresh',return_value=ready), \
+             patch('dual_agent.odds_request_cache.refresh_game_props'), \
+             patch('requests.sessions.Session.request',side_effect=AssertionError('No HTTP')):
+            result = ticket_sources.collect_nba_ticket_props('odds','nba',published.append)
+        self.assertEqual({r['Player'] for r in ticket_sources.prop_records(result['player_props'])},{'Player Two'})
+        self.assertFalse(result['player_props']['availability_refresh_pending'])
+
+    def test_cache_only_context_preserves_stale_exclusions_without_network_or_writes(self):
+        from dual_agent.sports_player_prop_predictions import load_nba_matchup_context, nba_availability
+        import json
+        now = pd.Timestamp.now(tz='UTC')
+        old = {'checked_at':(now-pd.Timedelta(hours=1)).isoformat(),'complete':True,
+               'records':[{'status':'Out','player':{'id':1,'first_name':'Player','last_name':'One'}}]}
+        with workspace(), patch('requests.sessions.Session.request',side_effect=AssertionError('No HTTP')), \
+             patch.dict('sys.modules',{'dual_agent.balldontlie_data':types.SimpleNamespace(_setting=lambda name,default:default)}):
+            root = Path('nba_player_history_cache'); root.mkdir()
+            path = root/'injury_context_v1.json'; path.write_text(json.dumps(old))
+            original = path.read_text()
+            result = load_nba_matchup_context('nba',cache_only=True)
+            self.assertEqual(path.read_text(),original)
+        self.assertFalse(result['injury_complete'])
+        self.assertTrue(result['injury_stale'])
+        blocked,status,_ = nba_availability(history(1,now),result)
+        self.assertTrue(blocked)
+        self.assertIn('current status unverified',status)
+
+    def test_failed_context_refresh_retains_known_out_reports(self):
+        from dual_agent.sports_player_prop_predictions import load_nba_matchup_context, nba_availability
+        import json
+        now = pd.Timestamp.now(tz='UTC')
+        old = {'checked_at':(now-pd.Timedelta(hours=1)).isoformat(),'complete':True,
+               'records':[{'status':'Out','player':{'id':1}}]}
+        with workspace(), patch('dual_agent.sports_player_prop_predictions._get',side_effect=RuntimeError('HTTP 429')), \
+             patch.dict('sys.modules',{'dual_agent.balldontlie_data':types.SimpleNamespace(_setting=lambda name,default:default)}):
+            root = Path('nba_player_history_cache'); root.mkdir()
+            (root/'injury_context_v1.json').write_text(json.dumps(old))
+            result = load_nba_matchup_context('nba')
+        self.assertFalse(result['injury_complete'])
+        self.assertTrue(nba_availability(history(1,now),result)[0])
+
+
+class ContextWorkerTests(unittest.TestCase):
+    def test_one_shared_pending_worker_and_no_wait_or_duplicate_submission(self):
+        pending = Future()
+        pool = MagicMock()
+        pool.submit.return_value = pending
+        with patch.multiple(ticket_sources,_context_pool=pool,_context_job=None,
+                            _context_key=None,_context_started=0.):
+            first = ticket_sources.start_nba_context_refresh('nba')
+            second = ticket_sources.start_nba_context_refresh('nba')
+            other = ticket_sources.start_nba_context_refresh('other-account')
+            self.assertIs(first,pending)
+            self.assertIs(second,pending)
+            self.assertIsNone(other)
+            pool.submit.assert_called_once()
 
 
 if __name__ == '__main__':
