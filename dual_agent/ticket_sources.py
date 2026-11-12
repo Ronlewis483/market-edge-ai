@@ -83,7 +83,10 @@ def collect_nba_ticket_props(odds_key, nba_key, publish=None, context=None):
         import threading
         from streamlit.runtime.scriptrunner import add_script_run_ctx
         add_script_run_ctx(threading.current_thread(), context)
-    from .sports_player_prop_predictions import _get, generate_player_prop_picks
+    from .sports_player_prop_predictions import (
+        _get, fetch_prop_quotes, nba_cached_histories, nba_score_cached_quotes,
+        _nba_history_batches, nba_identity_key, load_nba_matchup_context,
+    )
     now = pd.Timestamp.now(tz='UTC')
     result = {'player_props': {}, 'all_predictions': [], 'ticket_scan_complete': False}
     last_saved = 0.
@@ -94,7 +97,7 @@ def collect_nba_ticket_props(odds_key, nba_key, publish=None, context=None):
             previous = result['player_props']
             merged = dict(previous, **props)
             # Status-only updates do not erase already completed estimates.
-            if not prop_records(props) and prop_records(previous):
+            if not complete and not prop_records(props) and prop_records(previous):
                 merged.update(game_picks=prop_records(previous), picks=prop_records(previous)[:10])
             result['player_props'] = merged
         result.update(ticket_scan_complete=complete, ticket_checked_at=pd.Timestamp.now(tz='UTC').isoformat())
@@ -125,23 +128,108 @@ def collect_nba_ticket_props(odds_key, nba_key, publish=None, context=None):
                           commence_time=start.isoformat(), start_time=start.isoformat()))
     games.sort(key=lambda g: g['start_time'])
     result['all_predictions'] = games  # Event descriptors only; no winner estimates.
-    # This function runs only after an explicit scan click. Invalidate the exact
-    # games' cached quotes once; timer-driven display checks never do this.
-    from .odds_request_cache import refresh_game_props
-    for game in games:
-        refresh_game_props(game['home_team'], game['away_team'])
     if not games:
         return send({'game_picks': [], 'picks': [], 'message': 'No upcoming NBA events were returned by the sportsbook feed.'},
                     stage='NBA scan finished: no upcoming sportsbook events', complete=True)
 
-    def progress(props):
-        stage = (props.get('loading_progress') or {}).get('stage', 'Calculating NBA player props')
-        send(props, stage)
+    from .odds_request_cache import refresh_game_props
+    # One discovery pass identifies only players actually offered by the books.
+    # Do not pay for repeated quote collection while history is being prepared.
+    send(stage='Finding listed NBA players for history preparation')
+    for game in games:
+        refresh_game_props(game['home_team'],game['away_team'])
+    quotes, issues = fetch_prop_quotes('NBA', games, odds_key)
+    if not quotes:
+        return send({'game_picks':[], 'picks':[], 'errors':issues,
+                     'message':'No usable sportsbook player-prop lines were returned; player-history downloads were skipped.'},
+                    stage='NBA scan finished: no listed player lines returned', complete=True)
+    # Prepare widely listed players first, so a completed batch is useful at
+    # more than one platform. Aliases share one history request, never votes.
+    named = {}; coverage = {}; first_start = {}
+    for q in quotes:
+        key = nba_identity_key(q['player'])
+        named.setdefault(key,q['player'])
+        coverage.setdefault(key,set()).add(q['book'])
+        start = pd.Timestamp(q['start_time'])
+        first_start[key] = min(first_start.get(key,start),start)
+    names = [named[key] for key in sorted(named,key=lambda k:(-len(coverage[k]),first_start[k],named[k]))]
+    histories = nba_cached_histories(names)
+    send(stage='Loading NBA matchup context; cached player histories are already available')
+    try:
+        matchup = load_nba_matchup_context(nba_key)
+    except Exception as exc:
+        matchup = {'issue':'NBA matchup context unavailable: '+safe_ticket_error(exc)}
+    if matchup.get('issue'):
+        issues.append(matchup['issue'])
+
+    def prepared_count():
+        return len({nba_identity_key(name) for name,rows in histories.items() if len(rows)>=10})
+
+    def score(lines, stage, complete=False):
+        props = nba_score_cached_quotes(games,lines,histories,matchup,issues)
+        props['loading_progress'].update(prepared_players=prepared_count(), total_players=len(names),
+            players_with_history=sum(bool(rows) for rows in histories.values()))
+        props['ticket_quote_passes'] = result.get('ticket_quote_passes',1)
+        return send(props,stage,complete)
+
+    result['ticket_quote_passes'] = 1
+    score(quotes,'Scored saved histories first; preparing missing or outdated player histories')
+    last_count = prepared_count(); last_scored = time.monotonic()
+    errors = set(issues)
+    history_network_work = False
+
+    def history_status(message):
+        nonlocal history_network_work
+        history_network_work = True
+        send(stage='Preparing player history: '+str(message))
 
     try:
-        props = generate_player_prop_picks('NBA', games, odds_key, nba_key=nba_key,
-                                          progress=progress, nba_history_enabled=True, foreground=True, quoted_players_only=True)
+        # Five cold players share each stats request. Provider pacing remains in
+        # the existing loader; incomplete pagination is never used as history.
+        for player, rows, error in _nba_history_batches(names,nba_key,status=history_status,
+                                                       foreground=True,cold_batch_size=5):
+            if rows or player not in histories:
+                histories[player] = rows
+            if error and error not in errors:
+                issues.append(error); errors.add(error)
+            count = prepared_count()
+            if count >= last_count+5 or time.monotonic()-last_scored >= 10:
+                score(quotes,f'{count} player histories prepared; completed estimates are available')
+                last_count = count; last_scored = time.monotonic()
     except Exception as exc:
-        send(stage='NBA scan stopped ('+safe_ticket_error(exc)+'); completed estimates are preserved', complete=True)
-        raise
-    return send(props, 'NBA prop scan finished', complete=True)
+        issues.append('Player-history preparation stopped: '+safe_ticket_error(exc))
+
+    # History may have taken longer than a quote's lifetime. Collect current
+    # lines once after preparation, and recompute for the NEW exact thresholds.
+    # Only games with usable history need this second (and final) quote pass.
+    ready_names = {nba_identity_key(name) for name,rows in histories.items() if len(rows)>=10}
+    ready_events = {q['event_id'] for q in quotes if nba_identity_key(q['player']) in ready_names}
+    ready_games = [game for game in games if game['event_id'] in ready_events]
+    if not ready_games:
+        return score([], 'NBA scan finished: no players have sufficient usable prepared history', complete=True)
+    quote_now = pd.Timestamp.now(tz='UTC')
+    quotes_current = all(pd.Timedelta(0) <= quote_now-pd.Timestamp(q['updated_at']) <= pd.Timedelta(minutes=30) for q in quotes)
+    if not history_network_work and quotes_current:
+        # A fully warm scan does not need to pay for identical quotes twice.
+        return score(quotes,'NBA ticket scan finished using prepared history and current lines',complete=True)
+    try:
+        matchup = load_nba_matchup_context(nba_key)
+        if matchup.get('issue'): issues.append(matchup['issue'])
+    except Exception as exc:
+        matchup = {'issue':'NBA matchup context unavailable: '+safe_ticket_error(exc)}
+        issues.append(matchup['issue'])
+    send(stage=f'{prepared_count()} player histories prepared; collecting current sportsbook lines')
+    for game in ready_games:
+        refresh_game_props(game['home_team'],game['away_team'])
+    result['ticket_quote_passes'] = 2
+    try:
+        current_quotes, quote_issues = fetch_prop_quotes('NBA',ready_games,odds_key)
+        issues.extend(quote_issues)
+    except Exception as exc:
+        issues.append('Current sportsbook quotes unavailable: '+safe_ticket_error(exc))
+        current_quotes = []
+    # No player-history calls occur after this point. Updated lines are scored
+    # from the prepared rows rather than attaching new quotes to old chances.
+    stage = ('NBA ticket scan finished: current quotes scored from prepared histories' if current_quotes
+             else 'History prepared, but no current sportsbook lines were returned; see input issues')
+    return score(current_quotes,stage,complete=True)
