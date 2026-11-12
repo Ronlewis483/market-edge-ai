@@ -488,7 +488,17 @@ def render_prediction_workspace(league, predictions, result):
     if search.strip():
         mask = frame.home_team.astype(str).str.contains(search.strip(), case=False, regex=False) | frame.away_team.astype(str).str.contains(search.strip(), case=False, regex=False)
         frame = frame.loc[mask]
-    frame = frame.sort_values('confidence', ascending=False, kind='stable')
+    today_count = 0
+    if league == 'NFL':
+        from dual_agent.nfl_prediction_jobs import prioritize_today
+        frame = prioritize_today(frame)
+        today_count = int(frame['_nfl_today'].sum())
+        all_today = prioritize_today(predictions)
+        hidden_today = int(all_today['_nfl_today'].sum())-today_count
+        if hidden_today > 0:
+            st.info(f"{hidden_today} of today's NFL games are hidden by the current filters. Select All predictions and clear the team search to include them.")
+    else:
+        frame = frame.sort_values('confidence', ascending=False, kind='stable')
     if frame.empty:
         st.info('No games match these filters. Try another team or confidence level.')
         return
@@ -503,10 +513,16 @@ def render_prediction_workspace(league, predictions, result):
     left, right = st.columns([1, 1.25], gap='large')
     with left:
         st.subheader(f'{league} game picks')
-        st.caption(f'{len(games)} games · strongest ten first, then the remaining slate')
+        st.caption(f'{len(games)} games · '+("today's games first, then the remaining week ranked by confidence" if league == 'NFL' else 'strongest ten first, then the remaining slate'))
         with st.container(height=650, border=True):
             for rank, game in enumerate(games, 1):
-                if rank == 1:
+                if league == 'NFL' and rank == 1:
+                    st.markdown("**TODAY'S GAMES**" if today_count else '**UPCOMING WEEK · STRONGEST FIRST**')
+                elif league == 'NFL' and rank == today_count+1:
+                    st.markdown('**UPCOMING WEEK · STRONGEST FIRST**')
+                elif league == 'NFL':
+                    pass
+                elif rank == 1:
                     st.markdown('**⭐ STRONGEST TEN**')
                 elif rank == 11:
                     st.markdown('**ALL REMAINING GAMES**')
@@ -880,7 +896,7 @@ def render_league_prediction_results(
         st.markdown("---")
 
         st.caption(
-            "The strongest ten picks appear first; the remaining games are ranked by "
+            ("Today's NFL games appear first; the remaining games are ranked by " if league_name == 'NFL' else "The strongest ten picks appear first; the remaining games are ranked by ") +
             "model confidence. Confidence "
             "represents estimated win probability and does not "
             "by itself indicate betting value."
@@ -3032,65 +3048,8 @@ def nfl_enrichment_pool():
 
 
 def enrich_nfl_result(result, feature_games, odds_key, progress_queue=None, context=None):
-    """Run external enrichment without reading or writing session state."""
-    import copy
-    result = copy.deepcopy(result)
-    if context is not None:
-        import threading
-        from streamlit.runtime.scriptrunner import add_script_run_ctx
-        add_script_run_ctx(threading.current_thread(),context)
-    from dual_agent.sports_prop_workspace import merge_result,checkpoint,track
-    previous = copy.deepcopy(result)
-    def publish_props(props):
-        partial = merge_result('NFL',previous,dict(result,nfl_player_props=props))
-        partial.update(workspace_pending=True,enrichment_pending=True)
-        if progress_queue is not None: progress_queue.put(copy.deepcopy(partial))
-        try:
-            checkpoint('NFL',partial); track('NFL',partial)
-        except Exception:
-            partial['workspace_issue'] = 'NFL predictions are ready; local saving is unavailable.'
-    from time import perf_counter
-    context_clock = perf_counter()
-    try:
-        from dual_agent.nfl_live_context import attach_context
-        result['predictions'] = attach_context(result.get('predictions'), result.get('live_odds'))
-    except Exception as exc:
-        result['context_issue'] = 'NFL context retrieval unavailable (' + type(exc).__name__ + ')'
-    result.setdefault('nfl_stage_timings_seconds', {})['context'] = round(perf_counter()-context_clock, 3)
-    correction_clock = perf_counter()
-    try:
-        from dual_agent.nfl_connected_engine import finalize_connected_result
-        result = finalize_connected_result(result)
-    except Exception as exc:
-        result['connected_learning_issue'] = 'NFL connected finalization unavailable (' + type(exc).__name__ + ')'
-    result.setdefault('nfl_stage_timings_seconds', {})['connected_finalization'] = round(perf_counter()-correction_clock, 3)
-    result['nfl_generation_stage'] = 'Winner predictions ready; player props are loading'
-    if progress_queue is not None:
-        progress_queue.put(copy.deepcopy(result))
-    props_clock = perf_counter()
-    try:
-        from dual_agent.game_prediction_addons import enhance_result
-        result = enhance_result("NFL", result, odds_key, feature_games,on_props=publish_props)
-    except Exception as exc:
-        result['prop_issues'] = ['NFL add-ons unavailable ('+type(exc).__name__+'); winner predictions are preserved.']
-    result.setdefault('nfl_stage_timings_seconds', {})['player_props_and_spreads'] = round(perf_counter()-props_clock, 3)
-    result['nfl_generation_stage'] = 'NFL scan complete'
-    result = merge_result('NFL',previous,result)
-    result.update(enrichment_pending=False,workspace_pending=False,workspace_saved_at=pd.Timestamp.now(tz='UTC').isoformat())
-    if progress_queue is not None: progress_queue.put(copy.deepcopy(result))
-    try:
-        track('NFL',result); checkpoint('NFL',result)
-    except Exception:
-        result['workspace_issue'] = 'NFL predictions are ready; local saving is unavailable.'
-    try:
-        from dual_agent.nfl_player_props_ui import cached_player_history
-        from dual_agent.sports_prop_workspace import settle_nfl
-        year = pd.Timestamp.now(tz='UTC').year
-        settle_nfl(cached_player_history((year-1,year)))
-    except Exception: pass
-    try: checkpoint('NFL',result,remote=True)
-    except Exception: pass
-    return result
+    from dual_agent.nfl_prediction_jobs import enrich_result
+    return enrich_result(result, feature_games, odds_key, progress_queue, context)
 
 
 @st.fragment
@@ -3128,47 +3087,11 @@ def nfl_generation_pool():
 
 def generate_nfl_in_background(previous, historical_accuracy, historical_sample, odds_key,
                                updates, progress, revision, context=None):
-    """Run cold history, odds, connected winners and props off the UI thread."""
-    import copy
-    from time import perf_counter
-    from concurrent.futures import ThreadPoolExecutor
-    def bind_context():
-        if context is not None:
-            import threading
-            from streamlit.runtime.scriptrunner import add_script_run_ctx
-            add_script_run_ctx(threading.current_thread(), context)
-    bind_context()
-    def report(message):
-        progress.put(('stage', message))
-    def timed_load(name, function):
-        bind_context()
-        started = perf_counter()
-        value = function()
-        return value, round(perf_counter()-started, 3)
-    report('Loading current NFL results and sportsbook lines')
-    # Independent requests overlap; neither source is fetched a second time.
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        history_job = pool.submit(timed_load, 'history', load_nfl_history_bundle)
-        odds_job = pool.submit(timed_load, 'odds', get_live_nfl_moneylines)
-        bundle, history_seconds = history_job.result()
-        progress.put(('history', bundle))
-        report('NFL history ready; checking sportsbook lines')
-        try:
-            live_odds, odds_seconds = odds_job.result()
-        except Exception:
-            live_odds, odds_seconds = pd.DataFrame(), 0
-            report("Sportsbook lines unavailable; checking the NFL schedule for winner forecasts")
-    report('Calculating NFL matchups')
-    result = run_nfl_prediction_pipeline(feature_games=bundle[1],
-        historical_accuracy=historical_accuracy, historical_sample=historical_sample,
-        live_odds=live_odds, on_progress=report)
-    result.setdefault('nfl_stage_timings_seconds', {}).update(
-        history=history_seconds, odds=odds_seconds)
-    from dual_agent.sports_prop_workspace import merge_result
-    result = merge_result('NFL', copy.deepcopy(previous or {}), result)
-    result.update(nfl_winner_revision=revision, workspace_pending=True, enrichment_pending=True)
-    report('Checking quarterbacks, injuries and weather for connected predictions')
-    return enrich_nfl_result(result, bundle[1], odds_key, updates, context)
+    from dual_agent.nfl_prediction_jobs import generate
+    return generate(previous, historical_accuracy, historical_sample, odds_key,
+        updates, progress, revision, context, load_history=load_nfl_history_bundle,
+        load_odds=get_live_nfl_moneylines, run_pipeline=run_nfl_prediction_pipeline,
+        enrich=enrich_nfl_result)
 
 
 def start_nfl_prediction_request():
@@ -3204,12 +3127,16 @@ def start_nfl_prediction_request():
 
 
 def render_nfl_generation_progress():
-    interval = None  # Background generation never triggers page refreshes.
-    return st.fragment(run_every=interval)(_render_nfl_generation_progress)()
+    # Winner cards live outside this control. A manual check must rerender
+    # those cards too, rather than updating an isolated progress fragment.
+    # There is no timer and background generation never triggers a rerun.
+    return _render_nfl_generation_progress()
 
 
 def _render_nfl_generation_progress():
     """Mounted even before the first result; publish winner cards before props finish."""
+    st.button('Check for updated NFL results', key='nfl_check_updated_results',
+              help='Display completed background work without starting another scan.')
     from queue import Empty
     progress = st.session_state.get('nfl_generation_progress')
     if progress is not None:
@@ -3232,7 +3159,7 @@ def _render_nfl_generation_progress():
     current = st.session_state.get('nfl_prediction_pipeline_result') or {}
     predictions = current.get('predictions')
     revision = current.get('nfl_winner_revision')
-    if revision and predictions is not None and len(predictions) and revision != st.session_state.get('nfl_displayed_winner_revision'):
+    if revision and predictions is not None and len(predictions):
         st.session_state['nfl_displayed_winner_revision'] = revision
         for session_key, result_key in [('live_nfl_moneylines','live_odds'),
                 ('best_nfl_moneylines','best_lines'), ('live_nfl_predictions','predictions'),
@@ -3248,6 +3175,15 @@ def _render_nfl_generation_progress():
     elif st.session_state.get('nfl_enrichment_future') is not None:
         stage = current.get('nfl_generation_stage') if revision == st.session_state.get('nfl_requested_winner_revision') else None
         st.info(stage or st.session_state.get('nfl_generation_stage', 'NFL scan running'))
+    if current.get('connected_context_pending'):
+        if st.session_state.get('nfl_enrichment_future') is not None:
+            st.caption('Initial NFL team forecasts are visible. Current context and the approved learned correction are still pending; use Check for updated NFL results to display completed work.')
+        else:
+            st.caption('These are saved initial NFL forecasts. Generate NFL predictions to update current context and the approved learned correction.')
+    if current.get('prediction_errors'):
+        with st.expander('NFL matchups that could not be predicted'):
+            for error in current['prediction_errors']:
+                st.write(error)
 
 
 def remember_game_addons(league, result):
@@ -4184,7 +4120,7 @@ if page == "🏠 Home":
             st.markdown("---")
 
             st.caption(
-                "The strongest ten picks appear first; the remaining games are ranked by "
+                "Today's NFL games appear first; the remaining games are ranked by "
                 "model confidence. Confidence "
                 "represents estimated win probability and does not "
                 "by itself indicate betting value."
