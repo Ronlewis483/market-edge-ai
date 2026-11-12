@@ -1010,8 +1010,9 @@ def ticket_prop_candidates(results, now=None, diagnostics=None):
                             'Quote age': age})
 
         payload = (result or {}).get('player_props', {})
+        from dual_agent.ticket_sources import prop_records
         data = ((result or {}).get('nfl_player_props', []) if sport == 'NFL'
-                else payload.get('game_picks', payload.get('picks', [])))
+                else prop_records(payload))
         rows = data.to_dict('records') if isinstance(data, pd.DataFrame) else list(data or [])
         for row in rows:
             count('saved props')
@@ -1146,8 +1147,8 @@ def ticket_prop_candidates(results, now=None, diagnostics=None):
 def build_suggested_ticket(candidates, book, legs, same_game=True,
                            include_specialty=False, diversify_markets=True):
     """Select the strongest listed distinct-player offers without game quotas."""
-    if legs not in range(3, 11):
-        raise ValueError('Choose 3 to 10 legs.')
+    if legs not in range(2, 11):
+        raise ValueError('Choose 2 to 10 legs.')
     pool = [c for c in candidates if c['book'] == book and
             (include_specialty or ticket_is_standard(c['sport'], c['market']))]
     from dual_agent.ticket_value import rank_offers
@@ -1222,6 +1223,24 @@ def ticket_cached_sources(sports=None, session=None):
         if sport == 'NFL':
             for scoped in session.get('ai_ticket_nfl_game_results', {}).values():
                 result = merge_nfl_game_props(result,scoped.get('result',{}),scoped['game'])
+        from dual_agent.ticket_sources import records as ticket_records, prop_records
+        try:
+            ticket_path = Path('sports_prop_workspace')/(sport.lower()+'_ticket_latest.json')
+            ticket_saved = json.loads(ticket_path.read_text())
+        except (OSError, ValueError):
+            ticket_saved = {}
+        if sport == 'NBA':
+            dedicated = session.get('ai_ticket_nba_result') or ticket_saved
+            props = dict(result.get('player_props') or {})
+            incoming = dedicated.get('player_props') or {}
+            combined = prop_records(props) + prop_records(incoming)
+            props.update({k:v for k,v in incoming.items() if k not in ('game_picks','picks')})
+            props.update(game_picks=combined, picks=combined[:10])
+            result = dict(result, player_props=props)
+            if dedicated.get('ticket_collection_stage'):
+                result['ticket_collection_stage'] = dedicated['ticket_collection_stage']
+        elif sport == 'NFL' and ticket_saved:
+            result['nfl_player_props'] = ticket_records(result.get('nfl_player_props')) + ticket_records(ticket_saved.get('nfl_player_props'))
         sources[sport]=result
         if sport=='NFL':
             # Dedicated ticket results never overwrite the regular NFL page.
@@ -1245,6 +1264,27 @@ def drain_ticket_prop_updates():
     for job in list(st.session_state.get('nfl_game_prop_jobs', {}).values()):
         if job.get('game'): collect_nfl_game_prop_updates(job['game'])
     from queue import Empty
+    queue = st.session_state.get('ai_ticket_nba_updates')
+    if queue is not None:
+        for _ in range(50):
+            try:
+                latest = queue.get_nowait()
+            except Empty:
+                break
+            previous = st.session_state.get('ai_ticket_nba_result') or {}
+            if previous and not latest.get('ticket_scan_complete'):
+                latest = dict(latest, player_props=merge_nba_display_props(
+                    previous.get('player_props', {}), latest.get('player_props', {})))
+            st.session_state['ai_ticket_nba_result'] = latest
+    nba_future = st.session_state.get('ai_ticket_nba_future')
+    if nba_future is not None and nba_future.done():
+        try:
+            st.session_state['ai_ticket_nba_result'] = nba_future.result()
+            st.session_state.pop('ai_ticket_refresh_issue', None)
+        except Exception as exc:
+            st.session_state['ai_ticket_refresh_issue'] = 'NBA ticket scan stopped ('+type(exc).__name__+'). Completed estimates remain available.'
+        st.session_state.pop('ai_ticket_nba_future', None)
+        st.session_state.pop('ai_ticket_nba_updates', None)
     queue=st.session_state.get('ai_ticket_nfl_updates')
     latest=None
     if queue is not None:
@@ -1256,6 +1296,11 @@ def drain_ticket_prop_updates():
         if len(latest.get('nfl_player_props',[]))==0 and not latest.get('ticket_scan_complete') and previous:
             latest=dict(latest,nfl_player_props=previous.get('nfl_player_props',[]))
         st.session_state.setdefault('ai_ticket_nfl_books',{})[latest['ticket_book']]=latest
+        try:
+            from dual_agent.ticket_sources import save_ticket_source
+            save_ticket_source('NFL', latest)
+        except (OSError, ValueError):
+            pass
     future=st.session_state.get('ai_ticket_nfl_future')
     if future is not None and future.done():
         try:
@@ -1336,13 +1381,31 @@ def start_nfl_ticket_refresh(book,include_specialty=False):
     return True
 
 
+def start_nba_ticket_refresh():
+    pending = st.session_state.get('ai_ticket_nba_future')
+    if pending is not None and not pending.done(): return False
+    from queue import Queue
+    from dual_agent.ticket_sources import collect_nba_ticket_props
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        context = get_script_run_ctx()
+    except ImportError:
+        context = None
+    updates = Queue()
+    st.session_state['ai_ticket_nba_updates'] = updates
+    st.session_state['ai_ticket_nba_future'] = ticket_prepare_pool().submit(
+        collect_nba_ticket_props, prediction_api_key('ODDS_API_KEY','THE_ODDS_API_KEY'),
+        prediction_api_key('BALLDONTLIE_API_KEY'), updates.put, context)
+    return True
+
+
 def ticket_offer_fingerprint(candidates):
     """Detect changed/expired offers without touching provider endpoints."""
     import hashlib
     import json
     identity = [
-        [r['sport'], r['book'], r['game'], r['player'], str(r['market']),
-         r['side'], r['line'], r['chance'], r['quote_time'],r.get('live_snapshot_at')]
+        [r['sport'], r['book'], r['game'], r['start'], r['player'], str(r['market']),
+         r['side'], r['line'], r['chance'], r.get('decimal_odds'), r['quote_time'],r.get('live_snapshot_at')]
         for r in candidates
     ]
     identity.sort(key=lambda r: tuple(str(v) for v in r))
@@ -1369,9 +1432,9 @@ def ticket_quote_status(diagnostics, sports, book):
 def render_ai_ticket_builder():
     from dual_agent.preferred_sportsbooks import PLATFORMS
     st.title('🎫 AI Ticket Builder')
-    st.caption('Build 3–10 legs from listed sportsbook props. NFL supports upcoming and active regulation games; live estimates use current stats and clock. Standard prop categories are preferred. Cover chances are estimates, not guarantees.')
+    st.caption('Build 2–10 legs from listed sportsbook props. NFL supports upcoming and active regulation games; live estimates use current stats and clock. Standard prop categories are preferred. Cover chances are estimates, not guarantees.')
     columns=st.columns(2)
-    with columns[0]: legs=st.selectbox('Ticket size',list(range(3,11)),format_func=lambda n:f'{n} legs',key='ai_ticket_legs')
+    with columns[0]: legs=st.selectbox('Ticket size',list(range(2,11)),index=1,format_func=lambda n:f'{n} legs',key='ai_ticket_legs')
     with columns[1]: sport=st.selectbox('Sports',['All sports','NFL','NBA','MLB'],key='ai_ticket_sport')
     st.caption('Checking all configured platforms: '+', '.join(PLATFORMS.values())+'. Each ticket stays within one platform; feed coverage can vary.')
     st.checkbox('Include specialty / defensive markets (e.g. assisted tackles)',value=False,key='ai_ticket_specialty')
@@ -1405,6 +1468,7 @@ def ticket_offer_inputs(sports):
     from pathlib import Path
     from time import monotonic
     snapshot = {'ai_ticket_book': 'all',
+                'ai_ticket_nba_result': dict(st.session_state.get('ai_ticket_nba_result') or {}),
                 'ai_ticket_nfl_books': dict(st.session_state.get('ai_ticket_nfl_books', {})),
                 'ai_ticket_local_files': dict(st.session_state.get('ai_ticket_local_files', {})),
                 'ai_ticket_nfl_game_results': {k: {'game':dict(v['game']), 'result':dict(v.get('result') or {})}
@@ -1432,6 +1496,7 @@ def ticket_offer_inputs(sports):
         signature.append(tuple(sorted((k, id(v.get('player_props')),
             id(v.get('player_props', {}).get('game_picks')))
             for k,v in snapshot['ai_ticket_nba_game_results'].items())))
+    signature.append(id(st.session_state.get('ai_ticket_nba_result')))
     signature.append(tuple(sorted((b,id(r)) for b,r in snapshot['ai_ticket_nfl_books'].items())))
     signature = tuple(signature)
     pending = st.session_state.get('ai_ticket_prepare_future')
@@ -1447,12 +1512,18 @@ def ticket_offer_inputs(sports):
         pending = None
     prepared = st.session_state.get('ai_ticket_prepared')
     if prepared and prepared[0] == signature and monotonic()-prepared[1] < 30:
-        return prepared[2]
+        from dual_agent.ticket_sources import fresh_candidates
+        sources, diagnostics, candidates, elapsed = prepared[2]
+        return sources, diagnostics, fresh_candidates(candidates, sports), elapsed
     if pending is None and not st.session_state.get('ai_ticket_prepare_error'):
         st.session_state['ai_ticket_prepare_signature'] = signature
         st.session_state['ai_ticket_prepare_future'] = ticket_prepare_pool().submit(prepare_ticket_offers, sports, snapshot)
         st.session_state['ai_ticket_prepare_started'] = monotonic()
         # The explicit completed-results button consumes finished preparation.
+    if prepared:
+        from dual_agent.ticket_sources import fresh_candidates
+        sources, diagnostics, candidates, elapsed = prepared[2]
+        return sources, diagnostics, fresh_candidates(candidates, sports), elapsed
     return None
 
 
@@ -1480,7 +1551,7 @@ def _render_ai_ticket_results():
             if st.button('Retry saved-offer check', key='ai_ticket_prepare_retry'):
                 st.session_state.pop('ai_ticket_prepare_error', None)
                 st.rerun(scope='app')
-        return
+        prepared = ({}, {}, [], 0.)
     sources, diagnostics, candidates, prepare_seconds = prepared
     legs = st.session_state['ai_ticket_legs']
     same_game = True
@@ -1494,9 +1565,9 @@ def _render_ai_ticket_results():
         choices.append({'book':platform,'legs':picks})
     selected, comparisons = choose_book_ticket(choices, legs, payouts)
     book = selected['book']
-    st.caption('Automatic platform comparison · current selection: '+PLATFORMS[book])
+    st.caption('Automatic platform comparison · '+('strongest listed selection: '+PLATFORMS[book] if candidates else 'no current listed offers loaded'))
     with st.expander('Compare tickets across platforms', expanded=True):
-        st.dataframe(pd.DataFrame([{'Platform':PLATFORMS[r['book']], 'Compatible legs':r['count'],
+        st.dataframe(pd.DataFrame([{'Platform':PLATFORMS[r['book']], 'Listed legs':r['count'],
             'Value assessment':r['status'].replace('_',' '), 'Estimated net per $1':r['return_per_unit']} for r in comparisons]), hide_index=True)
     offered = [r for r in candidates if r['book'] == book]
     standard = [r for r in offered if ticket_is_standard(r['sport'], r['market'])]
@@ -1510,7 +1581,12 @@ def _render_ai_ticket_results():
     ticket_future=st.session_state.get('ai_ticket_nfl_future')
     if 'NFL' in selected_sports and ticket_future is not None and not ticket_future.done() and 'NFL' not in active:
         active.append('NFL')
+    nba_ticket_future = st.session_state.get('ai_ticket_nba_future')
+    if 'NBA' in selected_sports and nba_ticket_future is not None and not nba_ticket_future.done():
+        active.append('NBA')
     for league in selected_sports:
+        if sources.get(league, {}).get('ticket_collection_stage') and league != 'NFL':
+            st.caption(league+': '+sources[league]['ticket_collection_stage'])
         payload = sources.get(league, {}).get('player_props', {})
         if league == 'NBA':
             stage = payload.get('loading_progress', {}).get('stage')
@@ -1527,16 +1603,19 @@ def _render_ai_ticket_results():
     value_pool = rank_offers(eligible, book)
     st.caption(f'{len(value_pool)} offers remain after price-value screening.' if book not in ('underdog','prizepicks') else 'Pick’em value requires the actual entry payout; individual feed prices are not treated as entry payouts.')
 
-    st.caption(f'**Ready to build:** {len(eligible)} fresh, listed {PLATFORMS[book]} offers '
-               f'({len(standard)} standard / {len(offered)-len(standard)} specialty) '
-               f'· up to {possible} compatible legs.')
+    if candidates:
+        st.caption(f'**Ready to build:** {len(eligible)} fresh, listed {PLATFORMS[book]} offers '
+                   f'({len(standard)} standard / {len(offered)-len(standard)} specialty) '
+                   f'· up to {possible} distinct-player legs.')
+    else:
+        st.caption('**Ready to build:** no current listed offers loaded across the configured platforms.')
     st.caption(f'**Awaiting a new quote:** {quote_status["expired"]} expired listings '
                f'· **Excluded due to mismatches or missing information:** {quote_status["invalid"]} listings '
                f'· **Saved model props:** {quote_status["saved"]} '
                f'({quote_status["no_listing"]} without any sportsbook listings).')
     if active:
         st.info('Refreshing ' + ', '.join(active) + ' in the background. These scans may '
-                'supply new offers; currently expired or missing lines are NOT being counted as playable.')
+                'supply new offers. Use Check for completed props above to load finished estimates without restarting the scan. Expired or missing lines are not counted as playable.')
     elif quote_status['listings'] == 0 and quote_status['saved']:
         st.info(f'No {PLATFORMS[book]} quotes were found in the saved model results. '
                 'The data provider may not cover this sportsbook or its offered markets; '
@@ -1547,14 +1626,14 @@ def _render_ai_ticket_results():
 
     # Build only from verified cached offers; empty tickets are not valid output.
     if st.button('Build my ticket', type='primary', use_container_width=True,
-                 key='ai_build_ticket'):
+                 key='ai_build_ticket', disabled=not candidates and st.session_state.get('ai_ticket_prepare_future') is not None):
         picks = selected['legs']
-        if picks:
+        if len(picks) == legs:
             st.session_state['ai_suggested_ticket'] = {
                 'book': book, 'requested': legs, 'sport': sport,
                 'same_game': same_game,
                 'created_at': pd.Timestamp.now(tz='UTC').isoformat(),
-                'legs': picks, 'offer_fingerprint': fingerprint,
+                'legs': picks, 'offer_fingerprint': ticket_offer_fingerprint(picks),
                 'include_specialty': include_specialty,
                 'diversify_markets': diversify_markets,
                 'entry_return': entry_return,
@@ -1574,14 +1653,10 @@ def _render_ai_ticket_results():
         else:
             st.session_state.pop('ai_suggested_ticket', None)
             st.session_state['ai_ticket_build_issue'] = (
-                f'No fresh, compatible {PLATFORMS[book]} picks passed the current checks. For priced sportsbooks, the model must also beat the break-even price. '
-                'Wait for the scan to complete and check its results, or '
-                'collect new sportsbook offers. No ticket was generated.')
+                f'Found {len(picks)} eligible legs; {legs} were requested. '
+                'Scan current offers or choose a smaller ticket size. No incomplete ticket was generated.')
     if st.session_state.get('ai_ticket_build_issue'):
-        if not eligible:
-            st.warning(st.session_state['ai_ticket_build_issue'])
-        else:
-            st.session_state.pop('ai_ticket_build_issue', None)
+        st.info(st.session_state['ai_ticket_build_issue'])
     if possible < legs:
         if not include_specialty and offered and not standard:
             st.info('Only specialty markets are currently listed for this sportsbook. '
@@ -1591,7 +1666,7 @@ def _render_ai_ticket_results():
         elif eligible:
             st.info(f'Only {possible} distinct-player legs passed the current listing, freshness and eligibility checks; {legs} were requested. There is no per-game player limit.')
         elif quote_status['saved'] == 0:
-            st.info('No saved model props were found. NFL can collect active and upcoming games directly below. For NBA/MLB, generate game predictions first.')
+            st.info('No saved props are loaded yet. Scan below to collect NFL/NBA props directly; game winner predictions are not required. MLB uses its existing saved matchup data.')
         elif not offered and not active and not quote_status['listings']:
             st.info(f'The saved provider data contains no {PLATFORMS[book]} listings. '
                     'A new scan may help, but this sportsbook may not be in the provider feed.')
@@ -1635,11 +1710,13 @@ def _render_ai_ticket_results():
                'Player histories and cached predictions are reused where supported. '
                'A provider listing must match the selected sportsbook; no substitute line is fabricated.')
     if st.button('Scan all sportsbooks / refresh props',
-                 key='ai_ticket_collect_props', disabled=bool(active),
+                 key='ai_ticket_collect_props', disabled=all(s in active for s in selected_sports),
                  use_container_width=True):
         notices = []
         for s in selected_sports:
             result = sources.get(s, {})
+            if s in active:
+                notices.append(s+': a scan is already running; completed props are retained.'); continue
             if s=='NFL':
                 if not prediction_api_key('ODDS_API_KEY','THE_ODDS_API_KEY'):
                     notices.append('NFL: sportsbook API key is missing.'); continue
@@ -1647,6 +1724,15 @@ def _render_ai_ticket_results():
                     start_nfl_ticket_refresh('all',include_specialty)
                     notices.append('NFL: collecting all configured sportsbooks together for active and upcoming games.')
                 except Exception as exc: notices.append('NFL ticket collector unavailable ('+type(exc).__name__+'). Install nfl_live_ticket_props.py and odds_request_cache.py.')
+                continue
+            if s == 'NBA':
+                if not prediction_api_key('ODDS_API_KEY','THE_ODDS_API_KEY') or not prediction_api_key('BALLDONTLIE_API_KEY'):
+                    notices.append('NBA: Odds API and BallDontLie keys are required.'); continue
+                try:
+                    start_nba_ticket_refresh()
+                    notices.append('NBA: collecting listed props directly; winner predictions are not required.')
+                except Exception as exc:
+                    notices.append('NBA ticket scan could not start ('+type(exc).__name__+').')
                 continue
             games = result.get('all_predictions', result.get('predictions', []))
             games = games.to_dict('records') if isinstance(games, pd.DataFrame) else list(games or [])
@@ -1682,17 +1768,22 @@ def _render_ai_ticket_results():
     ticket = st.session_state.get('ai_suggested_ticket')
     if not ticket:
         return
-    if (ticket.get('book') != book or ticket.get('sport') != sport or
+    if (ticket.get('sport') != sport or
             ticket.get('requested') != legs or ticket.get('same_game') != same_game or
             ticket.get('include_specialty') != include_specialty or
             ticket.get('diversify_markets') != diversify_markets or
-            ticket.get('entry_return') != entry_return):
+            ticket.get('entry_return') != (payouts.get(ticket['book']) if ticket['book'] in ('underdog','prizepicks') else None)):
         st.info('Ticket settings changed. Press Build my ticket to apply the new selections.')
         return
-    if ticket.get('offer_fingerprint') != fingerprint:
+    from dual_agent.ticket_sources import current_ticket_legs
+    current_legs = current_ticket_legs(ticket['legs'], candidates)
+    if ticket.get('offer_fingerprint') != ticket_offer_fingerprint(current_legs):
         st.info('Available sportsbook offers have changed or expired since this ticket was built. '
                 'Press Build my ticket to recalculate using the current verified listings.')
         return
+    book = ticket['book']
+    entry_return = ticket.get('entry_return')
+    eligible = [r for r in candidates if r['book'] == book and (include_specialty or r['standard_market'])]
     st.subheader(f'{PLATFORMS[ticket["book"]]} · {len(ticket["legs"])} of {ticket["requested"]} legs')
     if len(ticket['legs']) < ticket['requested']:
         st.info('Too few eligible offers to complete this ticket. No unlisted or conflicting '
