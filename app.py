@@ -1233,7 +1233,10 @@ def ticket_cached_sources(sports=None, session=None):
             dedicated = session.get('ai_ticket_nba_result') or ticket_saved
             props = dict(result.get('player_props') or {})
             incoming = dedicated.get('player_props') or {}
-            combined = prop_records(props) + prop_records(incoming)
+            # A completed explicit ticket scan is the current NBA offer set.
+            # Do not resurrect withdrawn/changed lines from an older winner scan.
+            combined = (prop_records(incoming) if dedicated.get('ticket_scan_complete')
+                        else prop_records(props) + prop_records(incoming))
             props.update({k:v for k,v in incoming.items() if k not in ('game_picks','picks')})
             props.update(game_picks=combined, picks=combined[:10])
             result = dict(result, player_props=props)
