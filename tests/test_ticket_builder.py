@@ -20,7 +20,7 @@ APP = Path(__file__).resolve().parents[1]/'app.py'
 NAMES = {'ticket_market_label', 'ticket_is_standard', 'ticket_prop_candidates',
          'build_suggested_ticket', 'ticket_cached_sources', 'ticket_offer_fingerprint',
          'ticket_quote_status', 'ticket_offer_inputs', 'prepare_ticket_offers',
-         '_render_ai_ticket_results', 'drain_ticket_prop_updates', 'merge_nba_display_props'}
+         '_render_ai_ticket_results', 'drain_ticket_prop_updates', 'merge_nba_display_props', 'render_ai_ticket_results'}
 
 
 def app_helpers():
@@ -84,14 +84,17 @@ class TicketBuilderTests(unittest.TestCase):
             self.assertNotIn('confidence', games[0])
             self.assertTrue(kwargs['nba_history_enabled'])
             self.assertTrue(kwargs['foreground'])
+            self.assertTrue(kwargs['quoted_players_only'])
             kwargs['progress']({'game_picks': [prop()], 'picks': [prop()]})
             self.assertTrue(ticket_sources.prop_records(published[-1]['player_props']))
             self.assertFalse(published[-1]['ticket_scan_complete'])
             # A final status-only result must not erase the partial forecast.
             return {'game_picks': [], 'message': 'Complete'}
         with workspace(), patch('dual_agent.sports_player_prop_predictions._get', return_value=[event, event]), \
-             patch('dual_agent.sports_player_prop_predictions.generate_player_prop_picks', side_effect=generate):
+             patch('dual_agent.sports_player_prop_predictions.generate_player_prop_picks', side_effect=generate), \
+             patch('dual_agent.odds_request_cache.refresh_game_props') as refresh:
             result = ticket_sources.collect_nba_ticket_props('odds', 'nba', published.append)
+            refresh.assert_called_once_with('Milwaukee Bucks', 'Boston Celtics')
             self.assertTrue(result['ticket_scan_complete'])
             self.assertEqual(len(result['all_predictions']), 1)
             self.assertEqual(len(ticket_sources.prop_records(result['player_props'])), 1)
@@ -149,7 +152,7 @@ class TicketBuilderTests(unittest.TestCase):
     def fake_ui(self, click=None):
         ui = MagicMock()
         ui.session_state = dict(ai_ticket_sport='NBA', ai_ticket_legs=3, ai_ticket_specialty=False)
-        ui.button.side_effect = lambda label, **kwargs: label == click
+        ui.button.side_effect = lambda label, **kwargs: label == click and not kwargs.get('disabled', False)
         self.app.update(st=ui, drain_ticket_prop_updates=lambda: None, ticket_offer_inputs=lambda sports: None)
         return ui
 
@@ -175,7 +178,8 @@ class TicketBuilderTests(unittest.TestCase):
         self.app['ticket_offer_inputs'] = lambda sports: ({}, {}, candidates, 0.)
         self.app['_render_ai_ticket_results']()
         self.assertNotIn('ai_suggested_ticket', ui.session_state)
-        self.assertIn('Found 2 eligible legs; 3 were requested', ui.session_state['ai_ticket_build_issue'])
+        build = next(call for call in ui.button.call_args_list if call.args[0] == 'Build my ticket')
+        self.assertTrue(build.kwargs['disabled'])
 
     def test_empty_scan_progress_does_not_hide_previous_completed_estimates(self):
         from queue import Queue
@@ -185,6 +189,57 @@ class TicketBuilderTests(unittest.TestCase):
             ai_ticket_nba_result={'player_props': {'game_picks': [prop()]}})
         self.app['drain_ticket_prop_updates']()
         self.assertEqual(len(self.app['st'].session_state['ai_ticket_nba_result']['player_props']['game_picks']), 1)
+
+    def test_fragment_ticks_consume_scan_results_without_check_button_or_network(self):
+        from queue import Queue
+        ui = self.fake_ui()
+        # Restore the actual app functions replaced by fake_ui.
+        actual = app_helpers()
+        self.app.update({name:actual[name] for name in ('drain_ticket_prop_updates','ticket_offer_inputs')})
+        # Imported function globals must use this test's UI/session and helpers.
+        actual.update(self.app)
+        self.app = actual
+        queue = Queue()
+        queue.put({'player_props':{'game_picks':[prop('One'),prop('Two'),prop('Three')]},
+                   'ticket_scan_complete':False})
+        ui.session_state['ai_ticket_nba_updates'] = queue
+        running = Future()
+        ui.session_state['ai_ticket_nba_future'] = running
+        class ImmediatePool:
+            def submit(self, function, *args):
+                completed = Future()
+                completed.set_result(function(*args))
+                return completed
+        self.app['ticket_prepare_pool'] = lambda: ImmediatePool()
+        def fragment(**kwargs):
+            self.assertEqual(kwargs['run_every'], 3)
+            return lambda function: function
+        ui.fragment.side_effect = fragment
+        with workspace(), patch('requests.sessions.Session.request', side_effect=AssertionError('No provider requests')):
+            self.app['render_ai_ticket_results']()  # Timer tick schedules saved-offer prep.
+            self.app['render_ai_ticket_results']()  # Next tick consumes the completed prep.
+        self.assertEqual(len(ui.session_state['ai_ticket_prepared'][2][2]), 3)
+        build = [call for call in ui.button.call_args_list if call.args[0] == 'Build my ticket'][-1]
+        self.assertFalse(build.kwargs['disabled'])
+        ui.rerun.assert_not_called()
+
+    def test_no_quotes_skip_all_player_history_and_matchup_fetching(self):
+        from dual_agent.sports_player_prop_predictions import generate_player_prop_picks
+        with patch('dual_agent.sports_player_prop_predictions.fetch_prop_quotes', return_value=([], ['No quotes'])), \
+             patch('dual_agent.sports_player_prop_predictions.load_nba_matchup_context') as context, \
+             patch('dual_agent.sports_player_prop_predictions._nba_history_batches') as history:
+            result = generate_player_prop_picks('NBA', [], 'odds', nba_key='nba', quoted_players_only=True)
+        history.assert_not_called()
+        context.assert_not_called()
+        self.assertEqual(result['game_picks'], [])
+        self.assertTrue(result['scan_complete'])
+
+    def test_scan_errors_report_http_status_without_credentials(self):
+        error = RuntimeError('HTTP 429 https://provider/odds?apiKey=SECRET')
+        text = ticket_sources.safe_ticket_error(error)
+        self.assertIn('429', text)
+        self.assertNotIn('SECRET', text)
+        self.assertNotIn('https', text)
 
     def test_scan_failure_preserves_partial_rows(self):
         from queue import Queue
