@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import time
 import threading
+import tempfile
 import re
 from pathlib import Path
 import unicodedata
@@ -673,15 +674,21 @@ def nba_minutes(value):
         return None
 
 
-def load_nba_matchup_context(api_key):
+def load_nba_matchup_context(api_key, cache_only=False):
     """One cached league injury snapshot; defense uses existing game cache only."""
     now = pd.Timestamp.now(tz='UTC'); root = Path('nba_player_history_cache'); root.mkdir(exist_ok=True)
-    path = root/'injury_context_v1.json'; injury = None
+    path = root/'injury_context_v1.json'; injury = None; saved_injury = None
     try:
         saved = json.loads(path.read_text())
+        if isinstance(saved.get('records'), list): saved_injury = saved
         stamp = pd.to_datetime(saved.get('checked_at'),utc=True,errors='coerce')
         if pd.notna(stamp) and pd.Timedelta(0)<=now-stamp<pd.Timedelta(minutes=15): injury=saved
     except (OSError,ValueError): pass
+    if injury is None and cache_only:
+        # Preserve known exclusions from an older snapshot, but never describe
+        # its absence of injury reports as current clearance.
+        injury = dict(saved_injury or {'checked_at':None,'records':[]}, complete=False,
+                      stale=True, issue='Current NBA injury verification pending; estimates are conditional on playing.')
     if injury is None:
         try:
             if not api_key: raise RuntimeError('Player-data API key unavailable')
@@ -699,9 +706,18 @@ def load_nba_matchup_context(api_key):
             else: raise ValueError('Injury pagination incomplete')
             injury={'checked_at':now.isoformat(),'complete':True,'records':items}
         except Exception as exc:
-            injury={'checked_at':now.isoformat(),'complete':False,'records':[],
+            injury={'checked_at':(saved_injury or {}).get('checked_at',now.isoformat()),
+                    'complete':False,'records':(saved_injury or {}).get('records',[]),'stale':True,
                     'issue':'NBA injury feed unavailable: '+_nba_request_issue(exc)}
-        temp=path.with_suffix('.tmp'); temp.write_text(json.dumps(injury)); temp.replace(path)
+        # Game-page and ticket scans can finish concurrently. Give each writer
+        # its own temporary file; readers only ever see an atomic snapshot.
+        with tempfile.NamedTemporaryFile(mode='w',dir=root,suffix='.tmp',delete=False) as handle:
+            handle.write(json.dumps(injury))
+            temp = Path(handle.name)
+        try:
+            temp.replace(path)
+        finally:
+            temp.unlink(missing_ok=True)
     from dual_agent.balldontlie_data import _setting
     game_root=Path(_setting('NBA_HISTORY_CACHE_DIR','.market_edge_cache/nba_history'))
     games={}; teams={}; player_teams={}
@@ -733,6 +749,7 @@ def load_nba_matchup_context(api_key):
                 or re.search(r'(?:will be limited to (?:about )?\d+(?:-\d+)? minutes|on a minutes restriction|under a minutes restriction|minutes will be restricted)',str(item.get('description','')),re.I)):
             blocked.append(nba_identity_key(player.get('first_name','')+' '+player.get('last_name','')))
     return {'checked_at':injury['checked_at'],'injury_complete':injury['complete'],
+            'injury_stale':injury.get('stale',False),
             'injuries':injuries,'blocked_player_names':blocked,'games':list(games.values()),
             'teams':teams,'player_teams':player_teams,'issue':injury.get('issue')}
 
@@ -751,6 +768,8 @@ def nba_availability(rows, context):
     else:
         status='Injury status unverified; forecast is conditional on playing'
     if restriction: status+=' · minutes restriction reported; future cap unverified'
+    if context.get('injury_stale') and reports:
+        status+=' · cached report; current status unverified, conditional on playing'
     return blocked,status,restriction
 
 
