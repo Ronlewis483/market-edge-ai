@@ -1533,9 +1533,9 @@ def ticket_offer_inputs(sports):
 
 
 def render_ai_ticket_results():
-    # Only this fragment polls completed work. Never rerun the whole page or
-    # start provider requests from a timer; saved quotes keep their timestamps.
-    return st.fragment(run_every=3)(_render_ai_ticket_results)()
+    # Background scans keep running, but never repaint the ticket workspace
+    # on a timer. Only explicit user actions read and display new results.
+    return st.fragment(run_every=None)(_render_ai_ticket_results)()
 
 
 def _render_ai_ticket_results():
@@ -1596,7 +1596,7 @@ def _render_ai_ticket_results():
         payload = sources.get(league, {}).get('player_props', {})
         if league == 'NBA':
             stage = payload.get('loading_progress', {}).get('stage')
-            if stage: st.caption('NBA: '+str(stage))
+            if stage: st.caption('NBA last checked stage: '+str(stage))
             issues = list(dict.fromkeys(str(e) for e in payload.get('errors', [])))
             if issues:
                 with st.expander('NBA prop input issues', expanded=not payload.get('game_picks')):
@@ -1630,7 +1630,7 @@ def _render_ai_ticket_results():
                f'({quote_status["no_listing"]} without any sportsbook listings).')
     if active:
         st.info('Refreshing ' + ', '.join(active) + ' in the background. These scans may '
-                'supply new offers. Completed estimates appear automatically here; the rest of the page is not reloaded. Expired or missing lines are not counted as playable.')
+                'supply new offers without refreshing this page. Use Check for completed props above when you want to display new results. Expired or missing lines are not counted as playable.')
     elif quote_status['listings'] == 0 and quote_status['saved']:
         st.info(f'No {PLATFORMS[book]} quotes were found in the saved model results. '
                 'The data provider may not cover this sportsbook or its offered markets; '
