@@ -214,6 +214,28 @@ class TicketBuilderTests(unittest.TestCase):
         start.assert_called_once()
         self.assertIn('winner predictions are not required', ui.session_state['ai_ticket_refresh_notice'])
 
+    def test_game_page_scan_does_not_block_dedicated_ticket_collector(self):
+        ui = self.fake_ui('Scan all sportsbooks / refresh props')
+        old_job = Future()
+        ui.session_state['nba_enrichment_future'] = old_job
+        start = MagicMock()
+        self.app.update(start_nba_ticket_refresh=start, prediction_api_key=lambda *args:'configured')
+        self.app['_render_ai_ticket_results']()
+        start.assert_called_once()
+        self.assertIs(ui.session_state['nba_enrichment_future'],old_job)
+        self.assertFalse(old_job.cancelled())
+        self.assertIn('collecting listed props directly',ui.session_state['ai_ticket_refresh_notice'])
+
+    def test_pending_ticket_collector_still_blocks_duplicate_scan(self):
+        ui = self.fake_ui('Scan all sportsbooks / refresh props')
+        ui.session_state['ai_ticket_nba_future'] = Future()
+        start = MagicMock()
+        self.app.update(start_nba_ticket_refresh=start, prediction_api_key=lambda *args:'configured')
+        self.app['_render_ai_ticket_results']()
+        start.assert_not_called()
+        button = next(c for c in ui.button.call_args_list if c.args[0]=='Scan all sportsbooks / refresh props')
+        self.assertTrue(button.kwargs['disabled'])
+
     def test_partial_shortlist_is_not_stored_as_completed_ticket(self):
         ui = self.fake_ui('Build my ticket')
         candidates = self.candidates([prop('One'), prop('Two')])
