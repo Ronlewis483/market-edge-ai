@@ -190,7 +190,7 @@ class TicketBuilderTests(unittest.TestCase):
         self.app['drain_ticket_prop_updates']()
         self.assertEqual(len(self.app['st'].session_state['ai_ticket_nba_result']['player_props']['game_picks']), 1)
 
-    def test_fragment_ticks_consume_scan_results_without_check_button_or_network(self):
+    def test_explicit_checks_consume_results_without_automatic_redraw_or_network(self):
         from queue import Queue
         ui = self.fake_ui()
         # Restore the actual app functions replaced by fake_ui.
@@ -212,12 +212,12 @@ class TicketBuilderTests(unittest.TestCase):
                 return completed
         self.app['ticket_prepare_pool'] = lambda: ImmediatePool()
         def fragment(**kwargs):
-            self.assertEqual(kwargs['run_every'], 3)
+            self.assertIsNone(kwargs['run_every'])
             return lambda function: function
         ui.fragment.side_effect = fragment
         with workspace(), patch('requests.sessions.Session.request', side_effect=AssertionError('No provider requests')):
-            self.app['render_ai_ticket_results']()  # Timer tick schedules saved-offer prep.
-            self.app['render_ai_ticket_results']()  # Next tick consumes the completed prep.
+            self.app['render_ai_ticket_results']()  # Explicit render schedules saved-offer prep.
+            self.app['render_ai_ticket_results']()  # Next explicit check consumes completed work.
         self.assertEqual(len(ui.session_state['ai_ticket_prepared'][2][2]), 3)
         build = [call for call in ui.button.call_args_list if call.args[0] == 'Build my ticket'][-1]
         self.assertFalse(build.kwargs['disabled'])
