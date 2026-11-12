@@ -30,7 +30,9 @@ jobs:
           python-version: '3.12'
       - name: Install dependencies
         run: python -m pip install requests==2.32.5 numpy==2.3.5 pandas scipy==1.17.0 scikit-learn==1.8.0
-      - name: Train connected engine and compare final predictions
+      - name: Verify live NBA feedback safeguards
+        run: python -m unittest discover -s tests -p 'test_nba_live_feedback.py'
+      - name: Grade saved forecasts and train connected engine
         if: ${{ github.event_name == 'workflow_dispatch' }}
         run: python -u -m dual_agent.nba_unified_winner
       - name: Refresh context, grade and readiness-train NBA experiments
