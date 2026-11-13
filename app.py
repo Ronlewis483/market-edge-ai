@@ -2306,12 +2306,18 @@ def _render_cross_prop_cards(league, game, fallback):
         render_prop_category_buttons(markets,scope+'_market','All supported markets')
         selected = st.selectbox(league+' prop market',['All supported markets']+markets,key=scope+'_market')
         shown = props if selected=='All supported markets' else [r for r in props if normalized(league,r)['market']==selected]
-        render_prop_comparisons(shown,pending=current.get('workspace_pending',current.get('enrichment_pending',False)),scope=scope)
+        pending = (bool(scoped.get('game_prop_scan_pending')) if scoped is not None else
+                   bool(current.get('workspace_pending') or current.get('enrichment_pending')))
+        if not shown and selected != 'All supported markets':
+            st.caption(f'No completed {selected} props are loaded for this game yet. {len(props)} props are loaded across all categories.'+
+                       (' The scan is still running; changing categories does not restart it. Use Show completed '+league+' props to display new results.' if pending else ' Check the category details below or refresh this game’s props.'))
+        render_prop_comparisons(shown,pending=pending,scope=scope)
         if league=='MLB':
             mapped = [dict(r,market=r.get('Market'),player=r.get('Player')) for r in props]
             render_prop_category_rankings(mapped,league)
         else:
-            reasons = [r for r in current.get('prop_diagnostics',[]) if r.get('home_team')==game.get('home_team') and r.get('away_team')==game.get('away_team')]
+            reasons = [r for r in current.get('prop_diagnostics',[]) if r.get('home_team')==game.get('home_team') and r.get('away_team')==game.get('away_team')
+                       and (selected=='All supported markets' or r.get('market')==selected)]
             if not shown and reasons:
                 with st.expander('Why this category has no props',expanded=False):
                     for reason in reasons[:8]: st.caption(str(reason.get('reason',reason)))
