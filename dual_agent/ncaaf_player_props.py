@@ -343,23 +343,6 @@ def _ui_pool():
     return pool()
 
 
-def render_training_controls():
-    import streamlit as st
-    with st.expander('NCAAF automated learning status'):
-        st.caption('History collection runs daily in GitHub Actions; model training runs weekly. No training is performed while loading this page.')
-        try:
-            from dual_agent.ncaaf_storage import runtime_bundle
-            bundle=runtime_bundle();report=bundle.get('training_report',{})
-            st.write('Latest workflow status: '+str(report.get('status','Awaiting first workflow run')))
-            st.caption('History snapshot: '+str(bundle.get('checked_at','Not available')))
-            st.json(report)
-            st.write('Prospective frozen-forecast results')
-            st.json(bundle.get('prospective_results',{}))
-            st.write('Frozen prop offer results (correlated offers, not independent games)')
-            st.json(bundle.get('prop_results',{}))
-        except (RuntimeError,ValueError):
-            st.info('Run the NCAAF automated learning workflow in bootstrap mode, then generate predictions. Check SUPABASE_URL and SUPABASE_KEY in app secrets.')
-        st.caption('The first saved connected winner is experimental if it has not passed historical checks. Later challengers must pass comparisons before replacing it. Prop markets require their own validation. Missing injuries and uncertain stat coverage remain limitations.')
 
 
 def render_props_panel(game):
@@ -385,7 +368,7 @@ def render_props_panel(game):
     if future is not None:st.caption('Checking this game in the background. Existing cards remain visible; use Show completed props when ready.')
     result=st.session_state.get(key) or _read('game_'+gid+'.json',{})
     if not result:
-        st.info('Prepare/train the NCAAF player model above, then generate this game\u2019s listed player props.')
+        st.info('The NCAAF player model is not ready. Check the automated learning workflow and Model Accuracy, then generate this game\u2019s listed player props.')
         return
     picks=[r for r in result.get('picks',[]) if stamp(r.get('quote_time')) and timedelta(0)<=now-stamp(r['quote_time'])<=timedelta(minutes=30)
            and stamp(r.get('commence_time')) and now<stamp(r['commence_time'])]
