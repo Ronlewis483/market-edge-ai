@@ -2,6 +2,86 @@
 
 import pandas as pd
 import nflreadpy as nfl
+import json
+from pathlib import Path
+import tempfile
+
+
+_PROP_HISTORY_ROOT = Path('nfl_player_history_cache')
+
+
+def load_cached_player_history(seasons, now=None, store=None):
+    """Reuse automation's RAW season rows, not scaled regression datasets.
+
+    Current-season cache checks expire after 15 minutes. Past seasons remain
+    reusable. Only missing/stale seasons need the existing provider loader.
+    Automation collection continues to call load_player_history() directly.
+    """
+    now = pd.Timestamp.now(tz='UTC') if now is None else pd.Timestamp(now)
+    now = now.tz_localize('UTC') if now.tzinfo is None else now.tz_convert('UTC')
+    seasons = sorted({int(year) for year in seasons})
+    if not seasons or len(seasons)>4:raise ValueError('Choose between one and four NFL seasons.')
+    current_season = now.year if now.month>=8 else now.year-1
+    parts=[];sources={};remote_attempted=store is not None
+
+    def usable(payload, year):
+        if not isinstance(payload,dict) or not isinstance(payload.get('rows'),list) or not payload['rows']:
+            return None
+        checked=pd.to_datetime(payload.get('collected_at'),utc=True,errors='coerce')
+        if pd.isna(checked) or checked>now:return None
+        if year>=current_season and now-checked>=pd.Timedelta(minutes=15):return None
+        frame=pd.DataFrame(payload['rows'])
+        if not {'player','market','game_time','value','team','opponent','is_home'}.issubset(frame):return None
+        times=pd.to_datetime(frame.game_time,utc=True,errors='coerce')
+        start=pd.Timestamp(f'{year}-08-01',tz='UTC');end=pd.Timestamp(f'{year+1}-03-01',tz='UTC')
+        if not (times.notna() & times.ge(start) & times.lt(end) & times.le(checked)).all():return None
+        frame['game_time']=times
+        return frame
+
+    def save(path,payload):
+        temporary=None
+        try:
+            path.parent.mkdir(exist_ok=True)
+            with tempfile.NamedTemporaryFile(mode='w',dir=path.parent,suffix='.tmp',delete=False) as handle:
+                temporary=Path(handle.name)
+                json.dump(payload,handle,allow_nan=False)
+            temporary.replace(path)
+        except (OSError,ValueError):pass  # Usable rows still reach the scorer.
+        finally:
+            if temporary is not None:temporary.unlink(missing_ok=True)
+
+    for year in seasons:
+        path=_PROP_HISTORY_ROOT/f'season_{year}_raw_v1.json'
+        try:payload=json.loads(path.read_text())
+        except (OSError,ValueError):payload=None
+        frame=usable(payload,year)
+        source='local raw history'
+        if frame is None:
+            if not remote_attempted:
+                remote_attempted=True
+                try:
+                    from dual_agent.sports_connected_winner import Store
+                    store=Store()
+                except Exception:store=None
+            try:
+                # history.json.gz contains training-normalized values. Never
+                # use it to estimate raw passing/rushing/reception thresholds.
+                payload=store.read(f'sports/connected_winners_v1/nfl/props/seasons/{year}.json.gz') if store is not None else None
+            except Exception:payload=None
+            frame=usable(payload,year)
+            source='automation raw history'
+            if frame is not None:save(path,payload)
+        if frame is None:
+            frame=load_player_history([year])
+            payload={'season':year,'collected_at':now.isoformat(),
+                     'rows':json.loads(frame.to_json(orient='records',date_format='iso'))}
+            if usable(payload,year) is None:raise ValueError(f'NFL {year} history was empty or could not be verified as completed season data.')
+            source='provider history'
+            save(path,payload)
+        parts.append(frame);sources[str(year)]=source
+    result=pd.concat(parts,ignore_index=True).drop_duplicates(['player','market','game_time'])
+    result.attrs.update(history_sources=sources,history_checked_at=now.isoformat())
+    return result
 
 
 STAT_COLUMNS = {
