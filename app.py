@@ -1148,6 +1148,8 @@ def ticket_prop_candidates(results, now=None, diagnostics=None):
                     candidate['estimate_method']=row.get('Estimate method','')
                     candidate['availability_status']=row.get('Availability status',
                         'Injury status unverified; forecast is conditional on playing')
+                if sport=='NFL' and isinstance(row.get('history_reliability'),str):
+                    candidate['history_reliability']=row['history_reliability']
                 if live:
                     observed=stamp(offer.get('observed_at'))
                     if pd.isna(observed) or not zero<=now-observed<=pd.Timedelta(seconds=90):
@@ -1873,6 +1875,8 @@ def _render_ai_ticket_results():
             st.write(f'Estimated cover chance: **{leg["chance"]:.1%}**')
             if leg.get('availability_status'):
                 st.caption(leg['availability_status'])
+            if leg.get('history_reliability'):
+                st.caption(leg['history_reliability'])
             from dual_agent.ticket_value import single_value
             leg_value = single_value(leg) if book not in ('underdog','prizepicks') else None
             if leg_value:
@@ -2311,7 +2315,10 @@ def _render_cross_prop_cards(league, game, fallback):
         if not shown and selected != 'All supported markets':
             st.caption(f'No completed {selected} props are loaded for this game yet. {len(props)} props are loaded across all categories.'+
                        (' The scan is still running; changing categories does not restart it. Use Show completed '+league+' props to display new results.' if pending else ' Check the category details below or refresh this game’s props.'))
-        render_prop_comparisons(shown,pending=pending,scope=scope)
+        display_limit = 5
+        if league == 'NFL':
+            display_limit = None if st.checkbox('Show all completed props in this category',key=scope+'_show_all_props') else 20
+        render_prop_comparisons(shown,pending=pending,scope=scope,limit=display_limit)
         if league=='MLB':
             mapped = [dict(r,market=r.get('Market'),player=r.get('Player')) for r in props]
             render_prop_category_rankings(mapped,league)
@@ -3246,6 +3253,7 @@ def prop_comparisons(props):
                    'Best sportsbook':original.get('best_sportsbook'),
                    'Best decimal odds':original.get('best_decimal_odds'),
                    'Prior games':original.get('sample_size',0),
+                   'Probability reliability':original.get('history_reliability') if isinstance(original.get('history_reliability'),str) else None,
                    'Game':str(original.get('away_team',''))+' @ '+str(original.get('home_team','')),
                    'start_time':original.get('game_time'), '_nfl_original':original})
             candidates.append(prop)
