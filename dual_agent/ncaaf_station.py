@@ -128,7 +128,7 @@ def render_station():
         return ThreadPoolExecutor(max_workers=2)
     st.title('NCAA Football | Connected Engine')
     st.caption('FBS college football \xb7 upcoming seven days \xb7 CollegeFootballData + your existing Odds API.')
-    st.caption('One final forecast: college base engine \u2192 NCAA-trained neural signal \u2192 bounded context correction. No probability averaging or NBA/NFL weights. Winner inputs cover team history, rest and neutral venues. College-only player-prop regression is configured separately below; injury and starter status remain unverified.')
+    st.caption('College football forecasts use saved college-only models. Player injury and starter status remain unverified. Training results and model checks are available in Model Accuracy.')
     if st.button('Generate NCAA connected predictions',type='primary',key='ncaaf_load'):
         pending = st.session_state.get('ncaaf_station_future')
         if pending is None or pending.done():
@@ -159,9 +159,6 @@ def render_station():
     result = st.session_state.get('ncaaf_station_result')
     st.caption('Generation may use CFBD and Odds API requests. Viewing saved results makes no requests. CFBD_API_KEY is required; odds comparisons are optional.')
     st.caption('Use Generate NCAA connected predictions for game winners. Data collection and training run separately in GitHub Actions.')
-    training_controls = _player_ui('render_training_controls')
-    if training_controls is not None:
-        training_controls()
     if not result:return
     if result.get('architecture') != 'original_offset_neural_context_residual_v1':
         st.info('Generate NCAA connected predictions to replace the earlier market-only results.')
