@@ -395,7 +395,7 @@ def nfl_prop_market_diagnostics(event, lines, history, forecasts, source_issue=N
             if unmatched:
                 reason += f' No matching completed {label.lower()} history for '+', '.join(sorted(unmatched))+'.'
             if short:
-                reason += ' Fewer than 8 usable non-push results in the last 12 appearances for '+', '.join(sorted(short))+'.'
+                reason += ' Fewer than 6 usable appearances or 4 non-push results in the last 12 appearances for '+', '.join(sorted(short))+'.'
             if usable:
                 reason += ' Usable history exists; the model returned no displayable prediction. Review the processing note.'
         diagnostics.append({'event_id': event.get('id'), 'home_team': event.get('home_team'),
