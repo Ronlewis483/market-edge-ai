@@ -114,6 +114,10 @@ def checkpoint(league, result, remote=False):
         keys = ['predictions','all_predictions','opportunities','nfl_player_props','player_props',
                 'spreads','prop_diagnostics','prop_issues','message','pipeline_version','created_at',
                 'validation_summary','model_source']
+        if league == 'NFL':
+            keys += ['nfl_generation_stage','nfl_winner_revision','connected_context_pending',
+                     'nfl_stage_timings_seconds','prediction_errors','market_issue','context_issue',
+                     'connected_learning_issue','workspace_pending','enrichment_pending']
         payload = {k:result[k] for k in keys if k in result}
         for k in ('predictions','all_predictions','opportunities','nfl_player_props'):
             if isinstance(payload.get(k),pd.DataFrame):
@@ -143,6 +147,7 @@ def restore_result(league):
     payload['opportunities'] = pd.DataFrame(payload.get('opportunities') or [])
     if league == 'NFL': payload['nfl_player_props'] = pd.DataFrame(payload.get('nfl_player_props',[]))
     payload['workspace_saved_at'] = payload.get('saved_at'); payload['workspace_pending'] = False
+    if league == 'NFL': payload['enrichment_pending'] = False  # A saved file is not a running worker.
     return payload
 
 
