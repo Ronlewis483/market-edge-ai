@@ -150,37 +150,42 @@ def market_context(game, odds):
 def attach_context(predictions, odds):
     if predictions is None or predictions.empty:return predictions
     schedule, fetched = fresh_schedule()
-    seasons = sorted({int(s) for s in schedule.loc[(schedule.start_time>pd.Timestamp.now(tz='UTC'))&(schedule.start_time<=pd.Timestamp.now(tz='UTC')+pd.Timedelta(days=8)),'season']})
-    feeds={}
+    frame=predictions.copy();contexts=[];matches_by_row=[]
+    # Normalize team names once, rather than repeatedly across the full
+    # historical schedule for both passes over every predicted matchup.
+    home_codes=schedule.home_team.map(team_code)
+    away_codes=schedule.away_team.map(team_code)
+    for _,game in frame.iterrows():
+        home,away=team_code(game.home_team),team_code(game.away_team)
+        matches=schedule.loc[(home_codes==home)&(away_codes==away)&(abs(schedule.start_time-pd.Timestamp(game.commence_time))<=pd.Timedelta(minutes=15))]
+        matches_by_row.append(matches.iloc[0] if len(matches)==1 else None)
+    seasons=sorted({int(match.season) for match in matches_by_row if match is not None})
+    feeds={};weather_jobs={}
+    # Venue weather does not depend on depth/injury downloads. Start both
+    # together in one bounded pool, without fetching either source twice.
     with ThreadPoolExecutor(max_workers=4) as pool:
         pending={(season,kind):pool.submit(player_feed,kind,season) for season in seasons for kind in ['depth_charts','injuries']}
+        for (_,game),match in zip(frame.iterrows(),matches_by_row):
+            if match is not None:
+                key=(str(match.stadium_id),game.commence_time.isoformat())
+                if key not in weather_jobs:
+                    weather_jobs[key]=pool.submit(kickoff_weather,match.stadium_id,game.commence_time.isoformat())
         for pair,future in pending.items():feeds[pair]=future.result()
-    frame=predictions.copy();contexts=[]
-    weather_jobs={}
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        for _,game in frame.iterrows():
-            home,away=team_code(game.home_team),team_code(game.away_team)
-            matches=schedule.loc[(schedule.home_team.map(team_code)==home)&(schedule.away_team.map(team_code)==away)&(abs(schedule.start_time-pd.Timestamp(game.commence_time))<=pd.Timedelta(minutes=15))]
-            if len(matches)==1:
-                match=matches.iloc[0]
-                key=(home,away,game.commence_time.isoformat())
-                weather_jobs[key]=pool.submit(kickoff_weather,match.stadium_id,game.commence_time.isoformat())
         weather_results={key:future.result() for key,future in weather_jobs.items()}
 
-    for _,game in frame.iterrows():
+    for (_,game),match in zip(frame.iterrows(),matches_by_row):
         now=pd.Timestamp.now(tz='UTC'); home,away=team_code(game.home_team),team_code(game.away_team)
-        matches=schedule.loc[(schedule.home_team.map(team_code)==home)&(schedule.away_team.map(team_code)==away)&(abs(schedule.start_time-pd.Timestamp(game.commence_time))<=pd.Timedelta(minutes=15))]
         context={'fetched_at':fetched,'market':market_context(game,odds),'issues':[],'probability_use':'Current team-history model remains the probability equation. Context controls readiness and explains gaps; no invented injury/weather percentage adjustments.'}
-        if len(matches)!=1:
+        if match is None:
             context['issues'].append('No unique current schedule match; QB, injury and venue context not attached to a guessed game')
         else:
-            match=matches.iloc[0];season=int(match.season)
+            season=int(match.season)
             depth,de=feeds.get((season,'depth_charts'),(pd.DataFrame(),'Depth feed unavailable'))
             injuries,ie=feeds.get((season,'injuries'),(pd.DataFrame(),'Injury feed unavailable'))
             context['issues'] += [e for e in [de,ie] if e]
             context['home']=team_context(home,depth,injuries,int(match.week),match.game_type,now)
             context['away']=team_context(away,depth,injuries,int(match.week),match.game_type,now)
-            context['weather']=weather_results.get((home,away,game.commence_time.isoformat()),{'issue':'Weather lookup unavailable'})
+            context['weather']=weather_results.get((str(match.stadium_id),game.commence_time.isoformat()),{'issue':'Weather lookup unavailable'})
             for side in ['home','away']:
                 context['issues']+=context[side]['issues']
                 qb=context[side].get('qb')
