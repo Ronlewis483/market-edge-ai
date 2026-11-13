@@ -10,13 +10,27 @@ This module does not execute wagers.
 """
 
 import re
-from dual_agent.preferred_sportsbooks import allowed, standalone_value
+from dual_agent.preferred_sportsbooks import allowed, standalone_value, PICKEM
 
 NFL_PROP_VALUE_VERSION = 1
 NFL_PROP_PROBABILITY_VERSION = 2
+MIN_HISTORY_GAMES = 6
+MIN_NONPUSH_GAMES = 4
 
 import numpy as np
 import pandas as pd
+
+
+def _decimal_price(offer):
+    """A pick'em listing need not have a per-leg price; never invent one."""
+    try: price=float(offer.get('american_odds'))
+    except (TypeError,ValueError): return None
+    if not np.isfinite(price) or abs(price)<100:return None
+    return 1+price/100 if price>0 else 1+100/abs(price)
+
+
+def _best_offer(offers):
+    return max(offers,key=lambda offer:_decimal_price(offer) or 0.)
 
 from dual_agent.nfl_player_props import (
     MARKETS,
@@ -136,7 +150,7 @@ def _estimate_prop(
         return None
     sample_size = len(values)
 
-    if sample_size < 8:
+    if sample_size < MIN_HISTORY_GAMES:
         return None
 
     weights = np.linspace(
@@ -190,7 +204,7 @@ def _estimate_prop(
             sample_size - pushes
         )
 
-    if eligible < 8:
+    if eligible < MIN_NONPUSH_GAMES:
         return None
 
     over_support = (
@@ -204,7 +218,9 @@ def _estimate_prop(
     )
 
     regression = None
-    if market != 'Anytime touchdown' and cutoff is not None:
+    # The saved regression's feature window still requires eight appearances.
+    # Six/seven-game samples use the existing smoothed historical estimator.
+    if market != 'Anytime touchdown' and cutoff is not None and sample_size >= 8:
         try:
             from dual_agent.player_prop_regression import estimate as regression_estimate
             regression = regression_estimate(values, line, side or 'OVER', 'NFL', market, cutoff)
@@ -324,6 +340,9 @@ def _estimate_prop(
             float(under_support),
         "sample_size":
             int(sample_size),
+        "non_push_games":int(eligible),
+        "history_reliability":('Limited history · fewer than 8 non-push results' if eligible<8
+                               else 'Historical estimate; future sportsbook accuracy is not calibrated'),
         "line_edge":
             float(line_edge),
         "normalized_edge":
@@ -351,14 +370,12 @@ def _compare_prop_outcomes(values, line, market, offered_sides, cutoff=None):
                'listed': bool(offers), 'qualifies': False,
                'reason': 'No matching sportsbook bet found'}
         if offers:
-            def decimal(offer):
-                price = float(offer['american_odds'])
-                return 1 + price/100 if price > 0 else 1 + 100/abs(price)
-            best = max(offers, key=decimal)
+            best = _best_offer(offers)
+            price = _decimal_price(best)
             push = 0.0 if market == 'Anytime touchdown' else float(np.mean(values == line))
-            value = (1-push) * (row['chance'] * decimal(best) - 1)
+            value = (1-push) * (row['chance'] * price - 1) if price is not None else None
             row.update(book=best['bookmaker_key'], american_odds=best['american_odds'],
-                       positive_value=bool(np.isfinite(value) and value > 0))
+                       positive_value=bool(value > 0) if value is not None else None)
             row['qualifies'] = True
             row['reason'] = 'Exact side offered with sufficient history; ranked by cover chance without a probability cutoff.'
         outcomes.append(row)
@@ -368,20 +385,23 @@ def _compare_prop_outcomes(values, line, market, offered_sides, cutoff=None):
 def _select_consensus_props(prop_lines):
     """Select a real, fresh offered line; never synthesize median handicaps."""
     keys = ['event_id', 'game_time', 'home_team', 'away_team', 'player', 'market_key']
-    required = keys + ['line', 'side', 'bookmaker_key', 'american_odds', 'last_update']
+    required = keys + ['line', 'side', 'bookmaker_key', 'last_update']
     if any(c not in prop_lines for c in required):
         return pd.DataFrame()
-    props = prop_lines[required].copy()
+    props = prop_lines.reindex(columns=required+['american_odds']).copy()
+    props['bookmaker_key']=props['bookmaker_key'].astype(str).str.strip().str.lower()
     props = props.loc[props['bookmaker_key'].map(allowed)]
     props['line'] = pd.to_numeric(props['line'], errors='coerce')
+    missing_price=props['american_odds'].isna()
     props['american_odds'] = pd.to_numeric(props['american_odds'], errors='coerce')
     props['side'] = props['side'].astype(str).str.upper()
     updated = pd.to_datetime(props['last_update'], utc=True, errors='coerce')
     age = pd.Timestamp.now(tz='UTC') - updated
     props = props.loc[age.between(pd.Timedelta(0), pd.Timedelta(minutes=30))
         & props['side'].isin(['OVER','UNDER','YES','NO'])
-        & np.isfinite(props['line']) & np.isfinite(props['american_odds'])
-        & (props['american_odds'].abs() >= 100)].dropna(subset=keys+['bookmaker_key'])
+        & np.isfinite(props['line'])
+        & ((np.isfinite(props['american_odds']) & (props['american_odds'].abs() >= 100))
+           | (props['bookmaker_key'].isin(PICKEM) & missing_price))].dropna(subset=keys+['bookmaker_key'])
     props = props.loc[props.bookmaker_key.astype(str).str.strip().ne('')]
     rows = []
     for identity, candidates in props.groupby(keys, dropna=False):
@@ -469,7 +489,7 @@ def run_nfl_player_prop_prediction_pipeline(
 
     if consensus_props.empty:
         empty = pd.DataFrame()
-        empty.attrs['reason'] = 'Offered lines were returned, but none had a usable side, price and quote updated within 30 minutes.'
+        empty.attrs['reason'] = 'No listed lines passed side, freshness and price checks. Sportsbooks need valid odds; pick’em platforms may omit individual prices.'
         return empty
 
     rows = []
@@ -571,19 +591,19 @@ def run_nfl_player_prop_prediction_pipeline(
             score = estimate[
                 "prediction_score"
             ]
-            def decimal_price(offer):
-                price = float(offer['american_odds'])
-                return 1 + price/100 if price > 0 else 1 + 100/abs(price)
-            best_offer = max(offered, key=decimal_price)
+            best_offer = _best_offer(offered)
             value_eligible = False
-            best_decimal = decimal_price(best_offer)
+            best_decimal = _decimal_price(best_offer)
             push_chance = 0.0 if market == 'Anytime touchdown' else float(np.mean(values == float(line)))
-            expected_return = (1-push_chance) * (estimate['historical_support'] * best_decimal - 1)
+            expected_return = ((1-push_chance) * (estimate['historical_support'] * best_decimal - 1)
+                               if best_decimal is not None else None)
 
 
 
 
-            if estimate['historical_support'] >= 0.70:
+            if estimate['non_push_games'] < 8:
+                confidence_group = 'LIMITED HISTORY'
+            elif estimate['historical_support'] >= 0.70:
                 confidence_group = (
                     "HIGH CONFIDENCE"
                 )
@@ -638,6 +658,8 @@ def run_nfl_player_prop_prediction_pipeline(
                         estimate[
                             "sample_size"
                         ],
+                    "non_push_games":estimate['non_push_games'],
+                    "history_reliability":estimate['history_reliability'],
                     "line_edge":
                         estimate[
                             "line_edge"
@@ -659,7 +681,7 @@ def run_nfl_player_prop_prediction_pipeline(
                     "estimated_return_per_unit": expected_return,
                     "value_eligible": value_eligible,
                     "estimated_push_chance": push_chance,
-                    "break_even_cover_chance": 1/best_decimal,
+                    "break_even_cover_chance": 1/best_decimal if best_decimal is not None else None,
                     "availability_checked_at": current_time.isoformat(),
                     "confidence_group":
                         confidence_group,
@@ -674,7 +696,7 @@ def run_nfl_player_prop_prediction_pipeline(
         results.attrs['exclusions'] = exclusions
         results.attrs['reason'] = (
             'No usable offered props: '
-            f"{exclusions['insufficient_history']} candidates lacked at least 8 usable non-push prior appearances; "
+            f"{exclusions['insufficient_history']} candidates lacked {MIN_HISTORY_GAMES} usable appearances with at least {MIN_NONPUSH_GAMES} non-push results; "
             f"{exclusions['unoffered_direction']} estimated sides had no matching listed bet. "
             'No probability or expected-value cutoff applies.'
         )
