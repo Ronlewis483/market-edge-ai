@@ -198,30 +198,21 @@ def render_station():
     if not games:
         st.info('No supported upcoming FBS predictions were produced. Games with unconfirmed kickoff times or insufficient prior history are excluded.')
         return
-    chosen = render_prediction_cards(games, result)
-    if chosen is None:
-        return
-    st.caption('Win probabilities remove each book\u2019s margin, then take the median across returned books. They are not independent model confidence or proof of a betting edge.')
-    for field,label in [('moneylines','Moneylines'),('spreads','Spreads'),('totals','Game totals')]:
-        st.markdown('**'+label+'**')
-        fresh = [q for q in chosen[field] if pd.Timedelta(0)<=now-pd.Timestamp(q['Quote UTC'])<=pd.Timedelta(minutes=30)]
-        if fresh:st.dataframe(pd.DataFrame(fresh).drop(columns=['book']),hide_index=True,use_container_width=True)
-        else:st.caption('No current quotes in this category. Refresh to check for new listings.')
-    st.caption('Winner predictions and player-prop regression are separate models. College props are provisional; no NCAA ticket placement or verified combined-ticket probability is provided.')
+    render_prediction_cards(games, result)
 
 
-def card_groups(games, now=None):
-    """Today first, then strongest ten remaining, then the rest; no duplicates."""
+def card_groups(games, now=None, today_only=False):
+    """Rank the whole selected window by model confidence, without duplicates."""
     from datetime import datetime, timezone
     from zoneinfo import ZoneInfo
     now = now or datetime.now(timezone.utc)
     today = now.astimezone(ZoneInfo('America/Chicago')).date()
     unique = {str(g['game_id']): g for g in games}
-    ranked = sorted(unique.values(), key=lambda g: (-float(g['model_confidence']), g['commence_time'], str(g['game_id'])))
-    current = [g for g in ranked if datetime.fromisoformat(g['commence_time'].replace('Z','+00:00')).astimezone(ZoneInfo('America/Chicago')).date() == today]
-    seen = {str(g['game_id']) for g in current}
-    remaining = [g for g in ranked if str(g['game_id']) not in seen]
-    return [("Today's picks", current), ('Strongest upcoming picks \xb7 up to 10', remaining[:10]), ('Remaining games', remaining[10:])]
+    def kickoff(game):
+        return datetime.fromisoformat(game['commence_time'].replace('Z','+00:00')).astimezone(timezone.utc)
+    selected = [g for g in unique.values() if not today_only or kickoff(g).astimezone(ZoneInfo('America/Chicago')).date()==today]
+    ranked = sorted(selected, key=lambda g: (-float(g['model_confidence']),kickoff(g),str(g['game_id'])))
+    return [('Top 10 most confident picks',ranked[:10]),('Remaining picks - highest to lowest confidence',ranked[10:])]
 
 
 def render_prediction_cards(games, result):
@@ -229,7 +220,7 @@ def render_prediction_cards(games, result):
     import pandas as pd
     import streamlit as st
     from html import escape
-    st.markdown('<div class="me-workspace-header"><div class="me-eyebrow">PREDICTION WORKSPACE \xb7 NCAA FOOTBALL</div><h2>Find your next pick</h2><p>Select a game to compare its connected forecast and listed sportsbook lines.</p></div>', unsafe_allow_html=True)
+    st.markdown('<div class="me-workspace-header"><div class="me-eyebrow">PREDICTION WORKSPACE \xb7 NCAA FOOTBALL</div><h2>Find your next pick</h2><p>Select a game to review its winner forecast and available player props.</p></div>', unsafe_allow_html=True)
     controls = st.columns([2,2,3])
     with controls[0]:
         window = st.selectbox('Game window', ['Next 7 days', 'Today'], key='ncaaf_card_window')
@@ -240,8 +231,7 @@ def render_prediction_cards(games, result):
     minimum = .8 if threshold.startswith('80') else .7 if threshold.startswith('70') else 0
     filtered = [g for g in games if float(g['model_confidence']) >= minimum and
                 (not search or search in g['home_team'].casefold() or search in g['away_team'].casefold())]
-    groups = card_groups(filtered)
-    if window == 'Today': groups = groups[:1]
+    groups = card_groups(filtered,today_only=window=='Today')
     visible = [g for _, rows in groups for g in rows]
     if not visible:
         st.info('No games match these filters. Try another team, window or confidence level.')
@@ -259,19 +249,21 @@ def render_prediction_cards(games, result):
     left, right = st.columns([1,1.25], gap='large')
     with left:
         st.subheader('NCAA game picks')
-        st.caption(f'{len(visible)} games \xb7 today first, then the strongest upcoming forecasts')
+        st.caption(f'{len(visible)} games - ranked from highest to lowest model confidence')
         with st.container(height=650, border=True):
+            rank = 0
             for title, rows in groups:
                 if not rows: continue
                 st.markdown('**'+title+'**')
                 for game in rows:
+                    rank += 1
                     gid = str(game['game_id'])
                     with st.container(border=True):
                         kickoff = pd.Timestamp(game['commence_time']).tz_convert('America/Chicago')
                         st.caption(kickoff.strftime('%b %d, %Y \xb7 %I:%M %p CT')+' \xb7 Upcoming')
-                        st.markdown('**'+game['away_team']+' @ '+game['home_team']+'**')
+                        st.markdown(f'**#{rank} - '+game['away_team']+' @ '+game['home_team']+'**')
                         badge(game['predicted_team'], game['model_confidence'])
-                        st.button('Selected game' if st.session_state[selection]==gid else 'View game & sportsbook lines',
+                        st.button('Selected game' if st.session_state[selection]==gid else 'View game & player props',
                             key='ncaaf_pick_'+gid, type='primary' if st.session_state[selection]==gid else 'secondary',
                             use_container_width=True, on_click=select_game, args=(gid,))
     chosen = by_id[st.session_state[selection]]
@@ -295,7 +287,6 @@ def render_prediction_cards(games, result):
                 st.write('Away win chance:', f"{chosen['model_away_probability']:.1%}")
                 st.caption('Connected NCAA engine \xb7 '+str(result['model_id']))
                 st.caption('Winner inputs: team history, rest and neutral venues. Individual player-strength and injury corrections are not inputs to this winner model.')
-            st.caption('Listed spreads and totals below are sportsbook offers, not model spread or total predictions.')
             props_panel = _player_ui('render_props_panel')
             if props_panel is not None:
                 props_panel(chosen)
