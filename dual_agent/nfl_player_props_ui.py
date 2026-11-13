@@ -5,7 +5,7 @@ import streamlit as st
 from dual_agent.nfl_player_props import (MARKETS, analyze, event_props, events,
                                           normalize_props, validate_history, walkforward)
 
-from dual_agent.nfl_player_history import load_player_history
+from dual_agent.nfl_player_history import load_cached_player_history
 from dual_agent.nfl_player_props import canonical_name
 from dual_agent.nfl_player_prop_prediction_pipeline import (
     run_nfl_player_prop_prediction_pipeline,
@@ -18,10 +18,10 @@ def cached_props(key, event_id, market_keys):
     return event_props(key,event_id,list(market_keys))
 
 
-@st.cache_data(ttl=21600, show_spinner=False)
+@st.cache_data(ttl=180, show_spinner=False)
 def cached_player_history(seasons):
     # Changed cache schema retains provider IDs and provider-supplied aliases.
-    history = validate_history(load_player_history(seasons))
+    history = validate_history(load_cached_player_history(seasons))
     history.attrs['player_alias_schema'] = 1
     return history
 
