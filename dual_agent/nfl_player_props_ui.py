@@ -297,6 +297,7 @@ def render_nfl_player_props():
                 left.metric('Model ranking score',f"{float(prop['prediction_score'])*100:.1f}/100")
                 right.metric('Estimated historical support',f"{float(prop['historical_support']):.1%}")
                 st.caption(f"Projection: {float(prop['projected_value']):.1f} · historical sample: {int(prop.get('sample_size',0))} games")
+                if isinstance(prop.get('history_reliability'),str):st.caption(prop['history_reliability'])
                 if st.button('Record this player prop',key=f"nfl_ranked_prop_record_{rank}", disabled=pd.to_datetime(prop.get('game_time'),utc=True)<=pd.Timestamp.now(tz='UTC')):
                     st.session_state['bet_builder_mode']='Single'
                     st.session_state['single_sport']='NFL'
