@@ -96,21 +96,74 @@ class LiveFeedbackTests(unittest.TestCase):
     def test_fits_real_saved_results_and_does_not_reuse_test_window(self):
         client, base = MemoryClient(), artifact()
         with patch('requests.sessions.Session.request', side_effect=AssertionError('No HTTP')):
-            report = feedback.learn(client, base, state(180))
+            report = feedback.learn(client, base, state(180), now='2026-11-16T12:00:00Z')
             self.assertTrue(report['trained'])
             self.assertTrue(report['activated'], report)
             self.assertTrue(report['checks_passed'])
             self.assertIn('live_feedback', client.data[unified.ARTIFACT])
             active_before = copy.deepcopy(base['live_feedback'])
-            again = feedback.learn(client, base, state(180))
+            again = feedback.learn(client, base, state(180), now='2026-11-18T12:00:00Z')
         self.assertFalse(again['trained'])
-        self.assertEqual(again['status'], 'unchanged_experiment_data_skipped')
+        self.assertEqual(again['status'], 'weekly_training_not_due')
         self.assertEqual(base['live_feedback'], active_before)
         self.assertFalse(report['controller']['planner_uses_final_test_metrics'])
         # Only genuinely later holdout outcomes can authorize another experiment.
-        expanded = feedback.learn(client, base, state(190))
+        expanded = feedback.learn(client, base, state(190), now='2026-11-23T12:00:00Z')
         self.assertFalse(expanded['trained'])
         self.assertIn(expanded['status'], ('waiting_for_25_new_results', 'waiting_for_fresh_test_results'))
+
+    def test_weekly_fit_reuses_all_history_and_reviews_results_between_fits(self):
+        client, base = MemoryClient(), artifact()
+        outcome={'status':'candidate_saved','trained':True,'activated':False,'checks_passed':False}
+        with patch.object(learner,'train',return_value=outcome.copy()) as fit:
+            first=feedback.learn(client,base,state(140),now='2026-11-16T12:00:00Z')
+            same=feedback.learn(client,base,state(150),now='2026-11-20T12:00:00Z')
+            self.assertEqual(fit.call_count,1)
+            self.assertEqual(same['status'],'weekly_training_not_due')
+            self.assertEqual(same['graded_unique_games'],150)
+            self.assertEqual(same['error_review']['games'],150)
+            self.assertIn('last_training',same)
+            feedback.learn(client,base,state(180),now='2026-11-23T12:00:00Z')
+            self.assertEqual(fit.call_count,2)
+            self.assertEqual(len(fit.call_args.args[2]),180)
+        self.assertEqual(first['learning_cadence'],'weekly')
+        self.assertNotIn(unified.ARTIFACT,client.data)
+
+    def test_no_new_outcomes_does_not_retrain_and_failed_attempt_can_retry(self):
+        client, base=MemoryClient(),artifact()
+        with patch.object(learner,'train',side_effect=RuntimeError('fit failed')):
+            with self.assertRaises(RuntimeError):
+                feedback.learn(client,base,state(140),now='2026-11-16T12:00:00Z')
+        schedule=feedback.FeedbackStore(client,base).read(learner.ROOT+'nba/weekly_learning.json.gz')
+        self.assertIsNone(schedule)
+        outcome={'status':'candidate_saved','trained':True,'activated':False}
+        with patch.object(learner,'train',return_value=outcome) as fit:
+            feedback.learn(client,base,state(140),now='2026-11-16T13:00:00Z')
+            waiting=feedback.learn(client,base,state(140),now='2026-11-23T12:00:00Z')
+            self.assertEqual(fit.call_count,1)
+            self.assertEqual(waiting['status'],'weekly_waiting_for_new_results')
+            feedback.learn(client,base,state(180),now='2026-11-24T12:00:00Z')
+            self.assertEqual(fit.call_count,2)
+
+    def test_week_boundary_uses_houston_not_utc(self):
+        client,base=MemoryClient(),artifact()
+        outcome={'status':'waiting_for_graded_forecasts','trained':False,'activated':False}
+        with patch.object(learner,'train',return_value=outcome) as fit:
+            sunday=feedback.learn(client,base,state(90),now='2026-11-16T05:30:00Z')
+            self.assertEqual(sunday['learning_week_start'],'2026-11-09')
+            monday=feedback.learn(client,base,state(100),now='2026-11-16T06:30:00Z')
+            self.assertEqual(monday['learning_week_start'],'2026-11-16')
+            self.assertEqual(fit.call_count,2)
+
+    def test_collector_refresh_does_not_fit_full_historical_candidate(self):
+        with patch.object(unified,'refresh') as refresh,patch.object(unified,'train') as train:
+            unified.run_learning_cycle(refresh_only=True)
+            refresh.assert_called_once()
+            train.assert_not_called()
+        with patch.object(unified,'refresh') as refresh,patch.object(unified,'train') as train:
+            unified.run_learning_cycle()
+            refresh.assert_called_once()
+            train.assert_called_once()
 
     def test_failed_candidate_never_overwrites_active(self):
         client, base = MemoryClient(), artifact()
