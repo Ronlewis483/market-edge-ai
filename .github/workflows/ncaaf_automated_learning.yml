@@ -43,6 +43,8 @@ jobs:
           cache-dependency-path: automation-requirements.txt
       - name: Install collection and training dependencies
         run: python -m pip install -r automation-requirements.txt
+      - name: Verify NCAA winner selection and weekly safeguards
+        run: python -m unittest discover -s tests -p 'test_ncaaf_*.py' -v
       - name: Collect, grade, readiness-train and publish NCAA weights
         run: python -m dual_agent.ncaaf_learning_job --mode "$REQUESTED_MODE" --max-weeks "$MAX_WEEKS"
       - name: Save workflow report
