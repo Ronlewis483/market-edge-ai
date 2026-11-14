@@ -6,6 +6,7 @@ from unittest.mock import Mock, patch
 
 from dual_agent import nba_matchup_accuracy as accuracy
 from dual_agent import nba_unified_winner as winner
+from dual_agent.nba_winner_box_context import scores
 
 
 class Source:
@@ -58,6 +59,27 @@ class AccuracyTests(unittest.TestCase):
             with self.assertRaises(ValueError):accuracy.evaluate(source)
         self.assertIs(source.http,original)
         self.assertEqual(source.objects[winner.ARTIFACT]['model_id'],'incumbent')
+
+    def test_incumbent_scoring_accepts_python_lists_and_rejects_invalid_values(self):
+        result=scores([0,1,1,0],[.2,.8,.6,.4])
+        self.assertEqual(result['accuracy'],1.)
+        self.assertEqual(result['games'],4)
+        for probabilities in ([.2], [.2,float('nan'),.6,.4], [.2,1.5,.6,.4]):
+            with self.assertRaises(ValueError):scores([0,1,1,0],probabilities)
+
+    def test_replay_never_removes_production_claims_or_skips_incumbent(self):
+        source=Source()
+        prefix='sports/connected_winners_v1/nba/experiments_v1/existing/'
+        source.objects[prefix+'state.json.gz']={'last_dataset':'old','tested_through':'2026-11-01'}
+        source.objects[prefix+'claims/old.json.gz']={'claimed_at':'2026-11-01'}
+        before=copy.deepcopy(source.objects)
+        store=accuracy.EvaluationStore(source)
+        self.assertIsNone(store.read(prefix+'state.json.gz'))
+        self.assertIsNone(store.read(prefix+'claims/old.json.gz'))
+        self.assertEqual(store.read(winner.ARTIFACT)['model_id'],'incumbent')
+        store.write(prefix+'state.json.gz',{'last_dataset':'diagnostic'})
+        self.assertEqual(store.read(prefix+'state.json.gz')['last_dataset'],'diagnostic')
+        self.assertEqual(source.objects,before)
 
     def test_failure_report_keeps_trace_but_redacts_credentials_and_urls(self):
         with patch.dict(os.environ, {'SUPABASE_KEY':'private-key-value'}):
