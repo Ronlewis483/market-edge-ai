@@ -173,7 +173,9 @@ def learn(client, artifact, state, now=None):
                   baseline_description='Frozen connected forecasts before live feedback',
                   error_review=error_review(rows), sports_api_requests=0)
     active = store.read(SPORTS_ROOT + 'nba/active.json.gz')
-    changed = bool(report.get('trained') and active and active.get('base_id') == identity(artifact) and active.get('checks_passed')
+    # A fit may have saved its approved artifact before a network failure while
+    # attaching it. Retry that handoff even when this week's fitting is complete.
+    changed = bool(active and active.get('base_id') == identity(artifact) and active.get('checks_passed')
                    and active != artifact.get('live_feedback'))
     if changed:
         artifact['live_feedback'] = active
