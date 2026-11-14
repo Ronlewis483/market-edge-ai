@@ -1,5 +1,6 @@
 """Verify evaluation cannot mutate production storage or report activation."""
 import copy
+import os
 import unittest
 from unittest.mock import Mock, patch
 
@@ -57,6 +58,19 @@ class AccuracyTests(unittest.TestCase):
             with self.assertRaises(ValueError):accuracy.evaluate(source)
         self.assertIs(source.http,original)
         self.assertEqual(source.objects[winner.ARTIFACT]['model_id'],'incumbent')
+
+    def test_failure_report_keeps_trace_but_redacts_credentials_and_urls(self):
+        with patch.dict(os.environ, {'SUPABASE_KEY':'private-key-value'}):
+            try:
+                raise TypeError('Invalid value private-key-value at https://example.supabase.co/storage?token=hidden')
+            except TypeError as exc:
+                report=accuracy.failure_report(exc)
+        self.assertEqual(report['error_type'],'TypeError')
+        self.assertNotIn('private-key-value',report['error_message'])
+        self.assertNotIn('token=hidden',report['error_message'])
+        self.assertEqual(report['error_trace'][-1]['function'],
+                         'test_failure_report_keeps_trace_but_redacts_credentials_and_urls')
+        self.assertFalse(report['activated'])
 
 
 if __name__=='__main__':unittest.main()
