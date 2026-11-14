@@ -165,6 +165,49 @@ class LiveFeedbackTests(unittest.TestCase):
             refresh.assert_called_once()
             train.assert_called_once()
 
+    def test_approved_correction_attachment_recovers_without_retraining(self):
+        client,base=MemoryClient(),artifact()
+        store=feedback.FeedbackStore(client,base)
+        active=simple_model()
+        store.write(learner.ROOT+'nba/active.json.gz',active)
+        store.write(learner.ROOT+'nba/weekly_learning.json.gz',dict(
+            schema=1,week_start='2026-11-16',graded_games=180,last_training={'trained':True}))
+        with patch.object(learner,'train',side_effect=AssertionError('Do not train again')):
+            report=feedback.learn(client,base,state(180),now='2026-11-18T12:00:00Z')
+        self.assertFalse(report['trained'])
+        self.assertTrue(report['correction_changed'])
+        self.assertEqual(client.data[unified.ARTIFACT]['live_feedback']['model_id'],'approved-feedback')
+        again=feedback.learn(client,base,state(180),now='2026-11-18T13:00:00Z')
+        self.assertFalse(again['correction_changed'])
+
+    def test_actual_learned_correction_reaches_next_prediction_and_frozen_record(self):
+        client,base=MemoryClient(),artifact()
+        data=state(180)
+        for row in data['results'].values():
+            row['feedback_context']={'team_rest_days_diff':1. if row['outcome'] else -1.}
+        learned=feedback.learn(client,base,data)
+        self.assertTrue(learned['trained'])
+        self.assertTrue(learned['activated'])
+        now=pd.Timestamp.now(tz='UTC');start=now+pd.Timedelta(days=1)
+        base.update(schema=2,trained_at=(now-pd.Timedelta(days=2)).isoformat(),
+                    context_refreshed_at=now.isoformat(),aliases={'home':'H','away':'A'},
+                    games=[],columns=['original_probability'],correction_gain=1.,checks_passed=True,
+                    tree_model={'initial_logit':0.,'learning_rate':1.,'trees':[], 'uses_original_offset':True})
+        with patch.object(unified,'player_features',return_value={k:1. for k in unified.PLAYER_FEATURES}),patch(
+                'dual_agent.shared_experience.attach',return_value={}):
+            result=unified.predict(base,pd.DataFrame([{'rest_days_diff':1.}]),.52,.55,'Home','Away',start)
+        self.assertEqual(result['live_feedback_status'],'applied')
+        self.assertEqual(result['model_id'],learned['model_id'])
+        self.assertNotAlmostEqual(result['combined_home_probability'],.52)
+        self.assertEqual(result['feedback_context']['team_rest_days_diff'],1.)
+        unified.save_forecasts(client,pd.DataFrame([dict(event_id='next-game',home_team='Home',away_team='Away',
+                                                   commence_time=start,unified_forecast=result)]))
+        saved=next(v for k,v in client.data.items() if k.startswith(unified.ROOT+'forecasts/'))['rows'][0]
+        self.assertEqual(saved['combined_home_probability'],result['combined_home_probability'])
+        self.assertEqual(saved['source_player_model_id'],'base-tree')
+        self.assertEqual(saved['base_connected_home_probability'],.52)
+        self.assertLess(pd.Timestamp(saved['captured_at']),pd.Timestamp(saved['start_time']))
+
     def test_failed_candidate_never_overwrites_active(self):
         client, base = MemoryClient(), artifact()
         store = feedback.FeedbackStore(client, base)
