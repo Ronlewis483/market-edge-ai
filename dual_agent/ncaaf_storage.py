@@ -133,7 +133,8 @@ def freeze_games(games,store=None,now=None):
         start=stamp(game.get('commence_time'))
         if not start or start<=now:continue
         identity=digest([str(game['game_id']),game['model_id']])
-        row=dict(game,captured_at=now.isoformat(),schema=1)
+        from dual_agent.ncaaf_selection import tag
+        row=dict(tag(game),captured_at=now.isoformat(),schema=1)
         saved+=int(store.write(PREFIX+'forecasts/'+identity+'.json.gz',row))
     return saved
 
