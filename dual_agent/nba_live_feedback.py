@@ -13,7 +13,8 @@ import pandas as pd
 
 ROOT = 'nba/connected_winner_v2/'
 TEAM_FIELDS = ('win_pct_diff', 'avg_point_diff_diff', 'recent_5_win_pct_diff',
-               'recent_5_point_diff_diff', 'rest_diff')
+               'recent_5_point_diff_diff', 'rest_diff', 'margin_diff', 'recent_5_diff',
+               'recent_10_diff', 'venue_win_pct_diff', 'rest_days_diff')
 
 
 def timestamp(value):
