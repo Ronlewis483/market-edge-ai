@@ -117,6 +117,14 @@ def compact_games(checkpoint, samples):
 
 def scores(y, p):
     from sklearn.metrics import accuracy_score, brier_score_loss, log_loss
+    y = np.asarray(y)
+    p = np.asarray(p, dtype=float)
+    if y.ndim != 1 or p.ndim != 1 or len(y) != len(p) or len(y) == 0:
+        raise ValueError('Scoring requires equally sized nonempty outcome and probability vectors')
+    if not np.isfinite(p).all() or ((p < 0) | (p > 1)).any():
+        raise ValueError('Scoring requires finite probabilities between zero and one')
+    if not np.isin(y, [0, 1]).all():
+        raise ValueError('Scoring requires binary outcomes')
     return {'games': len(y), 'accuracy': float(accuracy_score(y, p >= .5)),
             'brier': float(brier_score_loss(y, p)), 'log_loss': float(log_loss(y, p, labels=[0, 1]))}
 
