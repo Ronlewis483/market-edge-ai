@@ -2936,6 +2936,9 @@ def _render_nfl_generation_progress():
             st.caption('Initial NFL team forecasts are visible. Current context and the approved learned correction are still pending; use Check for updated NFL results to display completed work.')
         else:
             st.caption('These are saved initial NFL forecasts. Generate NFL predictions to update current context and the approved learned correction.')
+    if not current.get('connected_context_pending') and current.get('predictions') is not None:
+        from dual_agent.nfl_selection import render_panel
+        render_panel(st, current['predictions'])
     if current.get('prediction_errors'):
         with st.expander('NFL matchups that could not be predicted'):
             for error in current['prediction_errors']:
