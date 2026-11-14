@@ -216,15 +216,19 @@ def run(mode='collect',max_weeks=8,store=None,now=None):
             prop_input=storage.digest(history)
             attempted=read('last_training_inputs.json',{})
             if attempted.get('winner')!=winner_input:
-                winner,report['winner_training']=train_winner(records,winner,now,25,store=store)
-                report['training_performed']=True
+                from dual_agent.ncaaf_selection import weekly_winner
+                winner,report['winner_training']=weekly_winner(read,write,
+                    lambda:train_winner(records,winner,now,25,store=store),winner,now)
+                report['training_performed']=bool(report['winner_training'].get('candidate_id'))
             else:report['winner_training']={'status':'unchanged_history_skipped'}
             if history and attempted.get('props')!=prop_input:
                 props,report['prop_training']=train_props(history,props,80);report['training_performed']=True
             else:report['prop_training']={'status':'unchanged_or_missing_history_skipped'}
-            write('last_training_inputs.json',{'winner':winner_input,'props':prop_input})
+            write('last_training_inputs.json',{'winner':winner_input if report['winner_training'].get('candidate_id') else attempted.get('winner'), 'props':prop_input})
         counts=grade(store,records,now)
         report['prospective_results']=counts
+        from dual_agent.ncaaf_selection import summarize
+        report['winner_selection']=summarize(list(read('forecast_results_v1.json',{'records':{}})['records'].values()))
         report['shared_experience']=read('shared_experience_report.json',{'status':'not_published'})
         report['prop_results']=grade_props(store,history,now)
         # Generate daily pregame forecasts using saved weights only, no odds calls.
@@ -238,7 +242,7 @@ def run(mode='collect',max_weeks=8,store=None,now=None):
         manifest=storage.save_state(store,previous)
         bundle={'schema':1,'checked_at':now.isoformat(),'records':records,'teams':teams,'issues':report['issues'],
                 'winner':winner,'props':props,'player_history':runtime_history(history,now),
-                'training_report':report,'prospective_results':counts,'prop_results':report['prop_results']}
+                'training_report':report,'winner_selection':report['winner_selection'],'prospective_results':counts,'prop_results':report['prop_results']}
         storage.publish_runtime(store,bundle)
     except Exception as exc:
         report['status']='failed';report['issues'].append(type(exc).__name__+': '+str(exc))
