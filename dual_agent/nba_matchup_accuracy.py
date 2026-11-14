@@ -7,6 +7,9 @@ import argparse
 import copy
 import json
 import os
+import re
+import traceback
+from importlib.metadata import version
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -56,6 +59,7 @@ class EvaluationStore:
         self.http = source.http
         self.overlay = {}
         self.downloads = 0
+        self.last_read = None
 
     def headers(self):
         return self.source.headers()
@@ -66,6 +70,7 @@ class EvaluationStore:
         if path == winner.ROOT + 'controller_readiness.json.gz':
             # A diagnostic should actually evaluate, not exit on unchanged inputs.
             return None
+        self.last_read = path
         self.downloads += 1
         if self.downloads % 100 == 0:
             print(f'Read {self.downloads} saved objects for evaluation', flush=True)
@@ -78,8 +83,8 @@ class EvaluationStore:
 def evaluate(source):
     original_http = source.http
     source.http = StorageReadsOnly(original_http, source.env['SUPABASE_URL'], source.bucket)
+    sandbox = EvaluationStore(source)
     try:
-        sandbox = EvaluationStore(source)
         report = copy.deepcopy(winner.train(sandbox))
         report['would_activate_under_training_rules'] = bool(report.pop('activated', False))
         report['activated'] = False
@@ -93,8 +98,29 @@ def evaluate(source):
             'This diagnostic does not reserve a new test window or promote any model; repeated '
             'inspection means these results must not be described as an untouched benchmark.')
         return report
+    except Exception as exc:
+        exc.nba_evaluation_diagnostics = {
+            "saved_objects_read": sandbox.downloads, "last_read_path": sandbox.last_read}
+        raise
     finally:
         source.http = original_http
+
+
+def failure_report(exc):
+    """Retain useful failure evidence without exposing credentials or request URLs."""
+    message = str(exc)
+    for name, value in os.environ.items():
+        if value and (any(token in name.upper() for token in ('KEY', 'TOKEN', 'SECRET', 'PASSWORD'))
+                      or name == 'SUPABASE_URL'):
+            message = message.replace(value, '[redacted]')
+    message = re.sub(r'https?://[^\s\"\']+', '[redacted-url]', message)
+    frames = [{'file': Path(frame.filename).name, 'function': frame.name, 'line': frame.lineno}
+              for frame in traceback.extract_tb(exc.__traceback__)]
+    return {'evaluation_only': True, 'activated': False, 'live_model_changed': False,
+            'status': 'evaluation_failed', 'error_type': type(exc).__name__,
+            'error_message': message[:1000], 'error_trace': frames,
+            'dependencies': {name: version(name) for name in ('numpy', 'pandas', 'scikit-learn')},
+            **getattr(exc, 'nba_evaluation_diagnostics', {})}
 
 
 def main():
@@ -108,8 +134,7 @@ def main():
         env['BALLDONTLIE_API_KEY'] = 'unused-offline-evaluation'
         result = evaluate(Client(env=env))
     except Exception as exc:
-        result = {'evaluation_only': True, 'activated': False, 'live_model_changed': False,
-                  'status': 'evaluation_failed', 'error_type': type(exc).__name__}
+        result = failure_report(exc)
         destination.write_text(json.dumps(result, indent=2))
         print(json.dumps(result), flush=True)
         return 1
