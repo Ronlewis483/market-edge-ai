@@ -1,6 +1,9 @@
 name: NBA unified winner
 
 on:
+  schedule:
+    # Monday morning in Houston; exact local hour shifts with daylight saving.
+    - cron: '23 11 * * 1'
   workflow_dispatch:
   workflow_run:
     workflows: ['NBA pregame snapshot collector']
@@ -15,7 +18,7 @@ concurrency:
 
 jobs:
   combine:
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
@@ -29,12 +32,12 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install dependencies
-        run: python -m pip install requests==2.32.5 numpy==2.3.5 pandas scipy==1.17.0 scikit-learn==1.8.0
+        run: python -m pip install requests==2.32.5 numpy==2.3.5 pandas==2.2.3 scipy==1.17.0 scikit-learn==1.8.0
       - name: Verify live NBA feedback safeguards
         run: python -m unittest discover -s tests -p 'test_nba_*.py'
-      - name: Grade saved forecasts and train connected engine
-        if: ${{ github.event_name == 'workflow_dispatch' }}
+      - name: Weekly grade, live feedback and historical candidate training
+        if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' }}
         run: python -u -m dual_agent.nba_unified_winner
-      - name: Refresh context, grade and readiness-train NBA experiments
+      - name: Refresh context, grade results and check weekly feedback readiness
         if: ${{ github.event_name == 'workflow_run' }}
-        run: python -u -m dual_agent.nba_unified_winner --refresh
+        run: python -u -m dual_agent.nba_unified_winner --refresh-only
