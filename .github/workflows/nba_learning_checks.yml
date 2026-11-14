@@ -3,6 +3,8 @@ name: NBA learning checks
 on:
   pull_request:
     paths:
+      - 'dual_agent/nba_matchup_context.py'
+      - 'tests/test_nba_matchup_context.py'
       - 'dual_agent/nba_live_feedback.py'
       - 'dual_agent/nba_unified_winner.py'
       - 'dual_agent/sports_connected_winner.py'
@@ -26,4 +28,4 @@ jobs:
       - name: Install offline test dependencies
         run: python -m pip install requests==2.32.5 numpy==2.3.5 pandas scipy==1.17.0 scikit-learn==1.8.0
       - name: Check learning, promotion and frozen-forecast safeguards
-        run: python -m unittest discover -s tests -p 'test_nba_live_feedback.py' -v
+        run: python -m unittest discover -s tests -p 'test_nba_*.py' -v
