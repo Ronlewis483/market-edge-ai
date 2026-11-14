@@ -221,14 +221,16 @@ def render_prediction_cards(games, result):
     import streamlit as st
     from html import escape
     st.markdown('<div class="me-workspace-header"><div class="me-eyebrow">PREDICTION WORKSPACE \xb7 NCAA FOOTBALL</div><h2>Find your next pick</h2><p>Select a game to review its winner forecast and available player props.</p></div>', unsafe_allow_html=True)
+    from dual_agent.ncaaf_selection import render_panel
+    render_panel(st,games)
     controls = st.columns([2,2,3])
     with controls[0]:
         window = st.selectbox('Game window', ['Next 7 days', 'Today'], key='ncaaf_card_window')
     with controls[1]:
-        threshold = st.selectbox('Winner confidence', ['All predictions','70% or higher','80% or higher'], key='ncaaf_card_confidence')
+        threshold = st.selectbox('Winner confidence', ['All predictions','65% or higher','70% or higher','80% or higher'], key='ncaaf_card_confidence')
     with controls[2]:
         search = st.text_input('Find a team', key='ncaaf_card_search', placeholder='Search either team\u2026').strip().casefold()
-    minimum = .8 if threshold.startswith('80') else .7 if threshold.startswith('70') else 0
+    minimum = .8 if threshold.startswith('80') else .7 if threshold.startswith('70') else .65 if threshold.startswith('65') else 0
     filtered = [g for g in games if float(g['model_confidence']) >= minimum and
                 (not search or search in g['home_team'].casefold() or search in g['away_team'].casefold())]
     groups = card_groups(filtered,today_only=window=='Today')
