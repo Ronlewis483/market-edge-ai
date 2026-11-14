@@ -20,7 +20,10 @@ ARTIFACT = ROOT + 'latest.json.gz'
 STATS = ('pts', 'reb', 'ast', 'stl', 'blk', 'turnover')
 HALF_LIVES = dict(zip(STATS, (21., 45., 30., 60., 60., 45.)))
 PLAYER_FIELDS = tuple('projected_' + s for s in STATS) + ('top2_production', 'role_support', 'minute_uncertainty')
-FEATURES = [side + '_' + f for side in ('home', 'away', 'difference') for f in PLAYER_FIELDS]
+PLAYER_FEATURES = [side + '_' + f for side in ('home', 'away', 'difference') for f in PLAYER_FIELDS]
+
+from .nba_matchup_context import COLUMNS as MATCHUP_FEATURES, VERSION as MATCHUP_VERSION, features as matchup_features
+FEATURES = PLAYER_FEATURES + MATCHUP_FEATURES
 
 
 def add_players(games, samples):
@@ -212,10 +215,11 @@ def prior_original_forecasts(targets, history, columns, block_size=50):
     return pd.concat(output,ignore_index=True) if output else targets.iloc[:0].copy()
 
 
-def correction_inputs(frame, original_probabilities):
+def correction_inputs(frame, original_probabilities, columns=None):
     p = np.clip(np.asarray(original_probabilities,dtype=float),1e-7,1-1e-7)
     neural = np.clip(frame.neural_probability.to_numpy(dtype=float),1e-7,1-1e-7)
-    x = frame[FEATURES].copy()
+    requested = FEATURES if columns is None else [c for c in columns if c not in ('neural_logit_gap', 'original_probability')]
+    x = frame[requested].copy()
     x['neural_logit_gap'] = np.log(neural/(1-neural))-np.log(p/(1-p))
     # Last column is the unmodified original probability used by the offset.
     x['original_probability'] = p
@@ -245,10 +249,11 @@ def training_rows(games):
         if pd.Timestamp(g['date']).date() <= calibration_end:
             continue
         extra = player_features(games,*g['teams'],g['date'])
-        if extra is None:
+        matchup = matchup_features(games,*g['teams'],g['date'])
+        if extra is None or matchup is None:
             continue
         neural = predict(pd.DataFrame([r]),pd.Timestamp(g['date'],tz='UTC'))['learning_home_probability']
-        rows.append(dict(r,neural_probability=neural,**extra))
+        rows.append(dict(r,neural_probability=neural,**extra,**matchup))
     return pd.DataFrame(rows), research['NBA_LIVE_FEATURE_COLUMNS'], base
 
 
@@ -284,18 +289,18 @@ def train(client=None):
     from . import experiment_controller as controller
     from .sports_connected_winner import digest
     sample_report=client.read('nba/historical_player_sample_v1/latest_report.json') or {}
-    source_signature=digest([controller.VERSION,checkpoint.get('games',{}),sorted(checkpoint.get('stats',{})),sample_report.get('total_saved_games')])
+    source_signature=digest([controller.VERSION,MATCHUP_VERSION,checkpoint.get('games',{}),sorted(checkpoint.get('stats',{})),sample_report.get('total_saved_games')])
     readiness=client.read(ROOT+'controller_readiness.json.gz',compressed=True) or {}
-    if readiness.get('controller_version')==controller.VERSION and readiness.get('status')=='complete' and readiness.get('signature')==source_signature:
+    if readiness.get('matchup_version')==MATCHUP_VERSION and readiness.get('controller_version')==controller.VERSION and readiness.get('status')=='complete' and readiness.get('signature')==source_signature:
         result={'status':'unchanged_controller_source_skipped','training_performed':False,'sports_api_requests':0}
         print(json.dumps(result));return result
     # Context refresh is frequent; full saved-box reconstruction waits for new finals.
     from .nba_pregame_snapshots import final
     completed=sum(final(g) for g in checkpoint.get('games',{}).values())
-    if readiness.get('controller_version')==controller.VERSION and readiness.get('status')=='complete' and completed<int(readiness.get('completed_games',0))+25 and sample_report.get('total_saved_games')==readiness.get('saved_boxes'):
+    if readiness.get('matchup_version')==MATCHUP_VERSION and readiness.get('controller_version')==controller.VERSION and readiness.get('status')=='complete' and completed<int(readiness.get('completed_games',0))+25 and sample_report.get('total_saved_games')==readiness.get('saved_boxes'):
         result={'status':'waiting_for_25_new_completed_games','training_performed':False,'sports_api_requests':0}
         print(json.dumps(result));return result
-    marker={'controller_version':controller.VERSION,'signature':source_signature,'completed_games':completed,'saved_boxes':sample_report.get('total_saved_games'),'status':'running'}
+    marker={'matchup_version':MATCHUP_VERSION,'controller_version':controller.VERSION,'signature':source_signature,'completed_games':completed,'saved_boxes':sample_report.get('total_saved_games'),'status':'running'}
     client.write(ROOT+'controller_readiness.json.gz',marker,compressed=True,replace=True)
     def complete_readiness():
         client.write(ROOT+'controller_readiness.json.gz',dict(marker,status='complete'),compressed=True,replace=True)
@@ -311,11 +316,12 @@ def train(client=None):
     frame, base_columns, original_history = training_rows(games)
     groups = partition_by_game_count(frame)
     report = {'schema':2,'architecture':'original_offset_neural_player_residual','status':'waiting_for_history','training_performed':False,
-              'usable_games':len(frame),'partition_games':dict(zip(('train','validation','test'),map(len,groups))),
+              'matchup_version':MATCHUP_VERSION,'matchup_features':MATCHUP_FEATURES,'usable_games':len(frame),'partition_games':dict(zip(('train','validation','test'),map(len,groups))),
               'sports_api_requests':0,'live_model_changed':False,'reasons':[],
               'limitations':['Retrospective reconstruction, not an untouched benchmark.',
                             'Historical availability unknown; prior appearances are not confirmed lineups.',
                             'Player strength features are box-production projections, not RAPM.',
+                            'Matchup interactions use prior team boxes; no defender assignments or verified historical lineups.',
                             'Fixed statistic-specific decay with support shrinkage; half-lives not optimized.',
                             'Historical original component reconstructs the team-form algorithm, not archived app forecasts.']}
     for label,g,n in zip(('train','validation','test'),groups,(500,50,50)):
@@ -325,7 +331,7 @@ def train(client=None):
     if report['reasons']:
         complete_readiness();client.write(ROOT+'latest_report.json',report,replace=True)
         print(json.dumps(report));return report
-    cohort='original_offset_neural_player_residual|nba_winner_neural_v1'
+    cohort='original_offset_neural_player_residual|nba_winner_neural_v1|matchup_v'+str(MATCHUP_VERSION)
     experiment,control=controller.prepare('NBA',cohort,_experiment_rows(frame,cohort),
         [_experiment_rows(g,cohort) for g in groups],NBAExperimentStore(client))
     if experiment is None:
@@ -381,7 +387,8 @@ def train(client=None):
     _,exported,gain,selected,vq,importance=min(fitted,key=lambda r:r[0])
     diagnosis=controller.diagnose(groups[1].home_win.to_numpy(),vq,vp,selected['validation'],scores(groups[1].home_win,vp))
     controller.claim_test(experiment)
-    report['learned_context_usage']={'player_features':float(sum(importance[:-2])),
+    report['learned_context_usage']={'player_features':float(sum(importance[:len(PLAYER_FEATURES)])),
+        'matchup_features':float(sum(importance[len(PLAYER_FEATURES):-2])),
         'existing_neural_gap':float(importance[-2]),'original_probability':float(importance[-1])}
     passed=True;incumbent=client.read(ARTIFACT,compressed=True)
     for label,g in zip(('validation','test'),groups[1:]):
@@ -398,11 +405,12 @@ def train(client=None):
         held=held[dates>after]
         if len(held)<50:
             activate=False;report['activation_reason']='Need 50 fresh later games for incumbent comparison'
-        elif incumbent.get('columns')!=columns:
+        elif not set(incumbent.get('columns',[])).issubset(columns):
             activate=False;report['activation_reason']='Incumbent input columns differ; retained pending a compatible comparison'
         else:
             p=original_probabilities(functions,original,held,base_columns);inputs=correction_inputs(held,p).to_numpy()
-            oldp=[tree_probability(incumbent['tree_model'],r,gain=incumbent['correction_gain']) for r in inputs]
+            old_inputs=correction_inputs(held,p,incumbent['columns'])[incumbent['columns']].to_numpy()
+            oldp=[tree_probability(incumbent['tree_model'],r,gain=incumbent['correction_gain']) for r in old_inputs]
             newp=[tree_probability(exported,r,gain=gain) for r in inputs]
             oldm,newm=scores(held.home_win,oldp),scores(held.home_win,newp)
             report['incumbent_comparison']={'incumbent':oldm,'candidate':newm}
@@ -414,7 +422,7 @@ def train(client=None):
         report['activation_reason']='Retained live-feedback incumbent pending a frozen-forecast comparison'
     now=datetime.now(timezone.utc).isoformat()
     artifact={'schema':2,'architecture':'original_offset_neural_player_residual',
-              'trained_at':now,'context_refreshed_at':now,'columns':columns,'base_columns':base_columns,
+              'matchup_version':MATCHUP_VERSION,'trained_at':now,'context_refreshed_at':now,'columns':columns,'base_columns':base_columns,
               'tree_model':exported,'correction_gain':gain,'checks_passed':bool(passed),
               'games':games,'aliases':aliases,'availability':{},'training_games':len(correction_train),
               'source_neural_model':'nba_winner_neural_v1','experiment_config':selected['config']}
@@ -467,8 +475,12 @@ def predict(artifact, base_features, original_probability, neural_probability, h
     if not h or not a or h==a:return None
     extra=player_features(artifact['games'],h,a,start)
     if extra is None:return None
+    if any(c in MATCHUP_FEATURES for c in artifact['columns']):
+        matchup=matchup_features(artifact['games'],h,a,start)
+        if matchup is None:return None
+        extra.update(matchup)
     row=dict(extra,neural_probability=float(probs[1]))
-    inputs=correction_inputs(pd.DataFrame([row]),[probs[0]])
+    inputs=correction_inputs(pd.DataFrame([row]),[probs[0]],artifact['columns'])
     values=inputs[artifact['columns']].iloc[0].to_numpy()
     delta=tree_probability(artifact['tree_model'],values,raw=True)
     connected=float(bounded_probability(probs[0],delta,artifact['correction_gain']))
@@ -477,7 +489,7 @@ def predict(artifact, base_features, original_probability, neural_probability, h
     if availability and pd.Timedelta(0)<=now-pd.Timestamp(availability['captured_at'])<=pd.Timedelta(hours=6) and abs((start-pd.Timestamp(availability['scheduled_start'])).total_seconds())<=900:
         scenario=player_features(artifact['games'],h,a,start,availability['teams'])
         if scenario is not None:
-            sx=correction_inputs(pd.DataFrame([dict(scenario,neural_probability=float(probs[1]))]),[probs[0]])
+            sx=correction_inputs(pd.DataFrame([{**extra,**scenario,'neural_probability':float(probs[1])}]),[probs[0]],artifact['columns'])
             conditional=tree_probability(artifact['tree_model'],sx[artifact['columns']].iloc[0].to_numpy(),gain=artifact['correction_gain'])
             status='Fresh availability scenario separate; historical injury effect not validated'
     result={'model_id':artifact['model_id'],'source_player_model_id':artifact.get('family_id',artifact['model_id']),
@@ -486,7 +498,8 @@ def predict(artifact, base_features, original_probability, neural_probability, h
             'connected_home_probability':connected,'combined_home_probability':connected,
             'correction_gain':artifact['correction_gain'],'probability_averaging':False,
             'availability_scenario_home_probability':conditional,'availability_status':status,
-            'checks_passed':bool(artifact['checks_passed'])}
+            'checks_passed':bool(artifact['checks_passed']),
+            'matchup_context_status':'Prior completed-game opponent interactions' if artifact.get('matchup_version') else 'Legacy player context; matchup model not activated'}
 
     result['experience_context']={**extra,'availability_scenario_known':int(conditional is not None)}
     from .nba_live_feedback import frozen_context, apply
