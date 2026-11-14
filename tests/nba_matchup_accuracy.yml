@@ -1,0 +1,67 @@
+name: NBA matchup accuracy evaluation
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'dual_agent/nba_matchup_accuracy.py'
+      - '.github/workflows/nba_matchup_accuracy.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nba-matchup-accuracy-evaluation
+  cancel-in-progress: false
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+      NBA_SNAPSHOT_BUCKET: market-edge-data
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install evaluation dependencies
+        run: python -m pip install requests==2.32.5 numpy==2.3.5 pandas scipy==1.17.0 scikit-learn==1.8.0
+      - name: Check matchup features and read-only evaluation
+        run: python -m unittest discover -s tests -p 'test_nba_*.py' -v
+      - name: Evaluate new NBA matchup model using saved history
+        run: python -u -m dual_agent.nba_matchup_accuracy
+      - name: Upload accuracy results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nba-matchup-accuracy
+          path: nba_accuracy_report.json
+          if-no-files-found: warn
+      - name: Show results in run summary
+        if: always()
+        run: |
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          p = Path('nba_accuracy_report.json')
+          if not p.exists():
+              raise SystemExit(0)
+          report = json.loads(p.read_text())
+          lines = ['## NBA matchup accuracy', '', 'Read-only evaluation; no live model changes.', '',
+                   'Status: ' + report.get('status', 'unknown'), '',
+                   '| Partition | Base accuracy | New matchup accuracy | Games |',
+                   '|---|---:|---:|---:|']
+          for name in ('validation', 'test'):
+              part = report.get(name, {})
+              old, new = part.get('original_engine', {}), part.get('connected_engine', {})
+              if 'accuracy' in old and 'accuracy' in new:
+                  lines.append(f"| {name} | {old['accuracy']:.2%} | {new['accuracy']:.2%} | {new['games']} |")
+          lines += ['', 'Reasons: ' + '; '.join(report.get('reasons', [])), '',
+                    'Retrospective diagnostic. Does not establish live accuracy or betting profitability.']
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as output:
+              output.write('\n'.join(lines) + '\n')
+          PY
