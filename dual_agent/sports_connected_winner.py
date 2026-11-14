@@ -101,7 +101,7 @@ def load_model(sport,base_id):
         cached=_CACHE.get(cache_key)
         if cached and time.monotonic()-cached[0]<(600 if cached[1] else 60):return cached[1]
     artifact=Store().read(ROOT+sport.lower()+'/active.json.gz')
-    if artifact and (artifact.get('sport')!=sport or artifact.get('base_id')!=base_id or artifact.get('schema')!=1):artifact=None
+    if artifact and (artifact.get('sport')!=sport or artifact.get('base_id')!=base_id or artifact.get('schema')!=1 or sport=='NFL' and not artifact.get('checks_passed')):artifact=None
     with _LOCK:_CACHE[cache_key]=(time.monotonic(),artifact)
     return artifact
 
@@ -431,7 +431,11 @@ def run(sport,store=None,budget=None,train_models=True):
             if row.get('base_id')!=base_id or row.get('outcome') not in (0,1):continue
             key=(clean_team(row['home_team'],sport),clean_team(row['away_team'],sport),row['start_time'])
             merged[key]=row
-        report=train(sport,base_id,list(merged.values()),store)
+        if sport == 'NFL':
+            from .nfl_weekly_learning import weekly_attempt
+            report=weekly_attempt(store,base_id,lambda:train(sport,base_id,list(merged.values()),store))
+        else:
+            report=train(sport,base_id,list(merged.values()),store)
         report['prospective_graded_games']=sum(r.get('source')!='historical_reconstruction' for r in merged.values())
         reports.append(report)
         # Independent base cohorts never silently activate a correction for another model.
@@ -440,6 +444,9 @@ def run(sport,store=None,budget=None,train_models=True):
              'calibration':{'original':calibration(valid,'original_probability'),'connected':calibration(valid,'connected_probability')},
              'frozen_unique_games':len(earliest),'graded_games':len(valid),'pending':len(earliest)-len(state['graded']),
              'paid_sports_api_requests':0,'training':reports,'shared_experience':experience_report,'score_lookup_budget_remaining':budget['remaining']}
+    if sport == 'NFL':
+        from .nfl_weekly_learning import review
+        summary.update(review(valid))
     store.write(prefix+'latest_report.json.gz',summary,replace=True)
     print(json.dumps(summary));return summary
 
