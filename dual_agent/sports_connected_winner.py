@@ -159,6 +159,9 @@ def correct(sport,base_id,original,context,at=None,start_time=None):
     result=_correct(sport,base_id,original,context,at,start_time)
     from .shared_experience import attach
     result['evidence_confidence']=attach(sport,result,at)
+    if sport == 'NFL':
+        from .nfl_selection import decision
+        result['winner_selection']=decision(result['connected_probability'])
     return result
 
 
@@ -198,6 +201,14 @@ def nfl_context(features,context):
         output[side+'_qb_out']=int(status in ('out','inactive','suspended')) if verified else None
         output[side+'_qb_uncertain']=int(status in ('doubtful','questionable','gtd')) if verified else None
         output[side+'_reported_out']=sum(str(r.get('status','')).lower()=='out' for r in team.get('injuries',[])) if fresh and team.get('injuries') else None
+    market=context.get('market') or {}
+    try:
+        market_fresh=pd.Timedelta(0)<=pd.Timestamp.now(tz='UTC')-stamp(market.get('fetched_at'))<=pd.Timedelta(hours=6)
+    except Exception:
+        market_fresh=False
+    market_p=number(market.get('home_probability'))
+    output['market_home_probability']=market_p if market_fresh and market_p is not None and 0<market_p<1 else None
+    output['market_book_count']=len(market.get('books') or []) if output['market_home_probability'] is not None else None
     weather=context.get('weather') or {}
     outdoor=str(weather.get('roof_type','')).strip().lower() in ('outdoors','outdoor','open')
     for name in ('temperature_f','wind_mph','rain_chance'):
@@ -447,6 +458,8 @@ def run(sport,store=None,budget=None,train_models=True):
     if sport == 'NFL':
         from .nfl_weekly_learning import review
         summary.update(review(valid))
+        from .nfl_selection import summarize
+        summary['winner_selection']=summarize(valid)
     store.write(prefix+'latest_report.json.gz',summary,replace=True)
     print(json.dumps(summary));return summary
 
