@@ -361,8 +361,10 @@ def run(sport,mode='cycle',store=None,now=None):
     finals=report['stages']['final_results'].get('games',[])
     if mode=='backfill':
         if sport=='NFL':
-            from dual_agent.nfl_historical_learning import run as historical
-            stage('historical_training',lambda:historical(store=store,now=now,activate=True))
+            from dual_agent.nfl_historical_learning import run as historical, base_identity
+            from dual_agent.nfl_weekly_learning import weekly_attempt
+            stage('historical_training',lambda:weekly_attempt(store,base_identity(),
+                lambda:historical(store=store,now=now,activate=True),now=now,historical=True))
         else:stage('historical_training',lambda:mlb_historical(store,now))
     from dual_agent.sports_connected_winner import run as learn
     stage('grade_and_train',lambda:learn(sport,store=store,budget={'remaining':12},train_models=True))
