@@ -52,7 +52,7 @@ class StorageReadsOnly:
 
 
 class EvaluationStore:
-    """Preserve production reads and experiment history; divert writes to memory."""
+    """Isolate a retrospective replay; production controller history stays untouched."""
     def __init__(self, source):
         self.source = source
         self.env, self.bucket = source.env, source.bucket
@@ -67,6 +67,10 @@ class EvaluationStore:
     def read(self, path, **kwargs):
         if path in self.overlay:
             return copy.deepcopy(self.overlay[path])
+        replay_root = 'sports/connected_winners_v1/nba/experiments_v1/'
+        if path.startswith(replay_root) and (path.endswith('/state.json.gz') or '/claims/' in path):
+            # Replay only within this in-memory diagnostic. Never erase live test claims.
+            return None
         if path == winner.ROOT + 'controller_readiness.json.gz':
             # A diagnostic should actually evaluate, not exit on unchanged inputs.
             return None
@@ -90,13 +94,15 @@ def evaluate(source):
         report['activated'] = False
         report['live_model_changed'] = False
         report['evaluation_only'] = True
+        report['retrospective_replay'] = True
         report['storage_writes'] = 0
         report['saved_objects_read'] = sandbox.downloads
         report['interpretation'] = (
             'Retrospective candidate versus reconstructed base model on chronological later games. '
-            'Configuration selection uses validation only. Existing experiment history is retained. '
-            'This diagnostic does not reserve a new test window or promote any model; repeated '
-            'inspection means these results must not be described as an untouched benchmark.')
+            'Configuration selection uses validation only. Experiment state is isolated in memory '
+            'to replay previously claimed data after an interrupted training run. Production '
+            'claims remain untouched. This diagnostic neither reserves a new test window nor '
+            'promotes a model. These reused historical results are not an untouched benchmark.')
         return report
     except Exception as exc:
         exc.nba_evaluation_diagnostics = {
