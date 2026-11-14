@@ -642,7 +642,18 @@ def learn_from_results(client, artifact, state):
     return learn(client, artifact, state)
 
 
-if __name__=='__main__':
-    # Manual and collector-triggered runs both grade/learn before readiness training.
+def run_learning_cycle(refresh_only=False):
+    # Collector runs refresh and grade frequently; historical fitting runs weekly.
     refresh()
-    train()
+    if not refresh_only:
+        train()
+
+
+if __name__=='__main__':
+    import argparse
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--refresh-only', action='store_true',
+                        help='Refresh context and grade outcomes; fit live feedback only when its weekly cycle is due')
+    parser.add_argument('--refresh', action='store_true', help='Legacy full refresh and readiness training')
+    args = parser.parse_args()
+    run_learning_cycle(refresh_only=args.refresh_only)
