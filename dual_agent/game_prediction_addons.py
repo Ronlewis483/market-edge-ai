@@ -12,7 +12,7 @@ from scipy.stats import skellam, poisson
 
 NFL_FEATURES = ['win_pct_diff', 'avg_point_diff_diff', 'recent_5_win_pct_diff',
                 'recent_5_point_diff_diff', 'rest_diff']
-SPORTS = {'NFL': 'americanfootball_nfl', 'MLB': 'baseball_mlb'}
+SPORTS = {'NFL': 'americanfootball_nfl', 'MLB': 'baseball_mlb', 'NBA':'basketball_nba'}
 
 
 def records(value):
@@ -60,7 +60,7 @@ def fetch_spread_events(league, key):
 
 
 def paired_spread_lines(event, now):
-    """Require two distinct books offering the same opposite-sided fresh line."""
+    """Accept at least one book with a fresh, paired opposite-sided line."""
     home, away, _ = game_fields(event)
     grouped = defaultdict(dict)
     for book in event.get('bookmakers', []):
@@ -86,7 +86,7 @@ def paired_spread_lines(event, now):
             if not all(np.isfinite(v) for v in (line, other, hp, ap)) or abs(line+other) > 1e-8 or min(hp, ap) <= 1:
                 continue
             grouped[line][book_id] = (hp, ap)
-    return [(line, books) for line, books in grouped.items() if len(books) >= 2]
+    return [(line, books) for line, books in grouped.items() if len(books) >= 1]
 
 
 def nfl_margin_model(history, now):
@@ -247,7 +247,7 @@ def generate_spread_picks(league, predictions, events, history=None, now=None):
             continue
         lines = paired_spread_lines(matches[0], now)
         if not lines:
-            issues.append(f'{away} @ {home}: need two fresh books at the same spread.')
+            issues.append(f'{away} @ {home}: need a fresh paired sportsbook spread.')
             continue
         try:
             if league == 'NFL':
@@ -408,7 +408,7 @@ def nfl_prop_market_diagnostics(event, lines, history, forecasts, source_issue=N
 
 def automatic_nfl_props(predictions, key, on_props=None, on_status=None):
     """Reuse existing NFL prop guards/ranking, scoped to predicted games."""
-    from dual_agent.nfl_player_props_ui import cached_events, cached_props, cached_player_history, upcoming_week_events
+    from dual_agent.nfl_player_props_ui import cached_events, cached_props, cached_player_history, cached_player_inputs, upcoming_week_events
     from dual_agent.nfl_player_props import MARKETS, normalize_props
     import importlib
     pipeline_module = importlib.import_module('dual_agent.nfl_player_prop_prediction_pipeline')
@@ -428,6 +428,8 @@ def automatic_nfl_props(predictions, key, on_props=None, on_status=None):
         return sorted({m['key'] for b in payload.get('bookmakers',[]) for m in b.get('markets',[])
                        if str(m.get('key','')).startswith('player_')})
     if on_status: on_status('Matching this game to sportsbook player-prop events')
+    from time import perf_counter
+    scan_started = perf_counter(); first_picks_at = None; scoring_seconds = 0.0; history_seconds = None
     now = pd.Timestamp.now(tz='UTC')
     predicted = records(predictions)
     selected = [event for event in upcoming_week_events(cached_events(key), now)
@@ -465,6 +467,8 @@ def automatic_nfl_props(predictions, key, on_props=None, on_status=None):
     history_index = None
     processed = set()
     def score_ready(event_id, group):
+        nonlocal first_picks_at, scoring_seconds
+        score_started = perf_counter()
         if on_status: on_status(f'Calculating NFL props from {len(group)} returned listings')
         try:
             props = run_nfl_player_prop_prediction_pipeline(group, history,
@@ -489,6 +493,8 @@ def automatic_nfl_props(predictions, key, on_props=None, on_status=None):
         except Exception as exc:
             event = next((e for e in selected if e['id'] == event_id), {})
             issues.append(f"{event.get('away_team')} @ {event.get('home_team')}: prop model unavailable ({type(exc).__name__}).")
+        scoring_seconds += perf_counter()-score_started
+        if forecasts and first_picks_at is None: first_picks_at = perf_counter()-scan_started
         if on_props and forecasts:
             on_props(pd.concat(forecasts, ignore_index=True))
 
@@ -497,16 +503,16 @@ def automatic_nfl_props(predictions, key, on_props=None, on_status=None):
     with ThreadPoolExecutor(max_workers=6) as quote_pool, ThreadPoolExecutor(max_workers=4) as pool:
         season = now.year if now.month >= 8 else now.year-1
         if on_status: on_status('Loading cached NFL player history and current prop quotes')
-        history_job = pool.submit(cached_player_history, (season-1, season))
+        history_job = pool.submit(cached_player_inputs, (season-1, season))
         pending = {pool.submit(load, event): event for event in selected}
         for future in as_completed([history_job, *pending]):
             if future is history_job:
                 try:
-                    history = future.result()
+                    history, history_index = future.result()
+                    history_seconds = perf_counter()-scan_started
                     if history is None:
                         history = pd.DataFrame()
                     if not history.empty:
-                        history_index = pipeline_module.build_player_history_index(history)
                         if on_status: on_status(f'NFL history ready: {len(history)} rows; calculating listed props')
                 except Exception as exc:
                     history = pd.DataFrame()
@@ -544,36 +550,39 @@ def automatic_nfl_props(predictions, key, on_props=None, on_status=None):
             settle_nfl(history)
         except Exception:
             pass
-    combined.attrs['prop_diagnostics'] = [row for event in selected
-        for row in nfl_prop_market_diagnostics(event, frames_by_event.get(event['id']), history,
-            combined.loc[combined.event_id.eq(event['id'])] if not combined.empty else combined,
-            fetch_errors.get(event['id']), history_index=history_index)]
-    combined.attrs['prop_diagnostics'].extend(row for game in predicted
-        if not matching_game_rows(game, selected)
-        for row in nfl_prop_market_diagnostics(game, None, None, None,
-            'No exact upcoming sportsbook event matched this game card. No prop requests were made for it.'))
+    # Do not rerun history selection and probability calculations solely to
+    # explain excluded markets. The scoring pass has already done that work.
+    combined.attrs['prop_diagnostics'] = []
     combined.attrs['qb_forecast_lines'] = lines
+    combined.attrs['loading_timings_seconds'] = dict(history_ready=history_seconds,first_picks=first_picks_at,scoring=scoring_seconds,total=perf_counter()-scan_started)
     return combined, issues
 
 
-def enhance_result(league, result, key, history=None, on_props=None):
+def enhance_result(league, result, key, history=None, on_props=None, on_spreads=None, prepared_nfl_props=None):
     """Failures in add-ons never discard working winner predictions."""
     result = dict(result)
     predictions = result.get('all_predictions', result.get('predictions'))
     if not records(predictions):
         return result
-    try:
-        events = fetch_spread_events(league, key)
-        result['spreads'] = generate_spread_picks(league, predictions, events, history)
-    except Exception as exc:
-        result['spreads'] = {'picks': [], 'issues': [f'Spread estimates unavailable: {exc}' if isinstance(exc, ValueError) else f'Spread estimates unavailable ({type(exc).__name__}).']}
-        if league == 'MLB':
-            result['spreads'] = generate_mlb_run_lines(predictions, [], pd.Timestamp.now(tz='UTC'))
-            result['spreads']['issues'].append('Sportsbook run-line quotes unavailable; model-only forecasts shown.')
+    def collect_spreads():
+        try:
+            events = fetch_spread_events(league, key)
+            result['spreads'] = generate_spread_picks(league, predictions, events, history)
+        except Exception as exc:
+            result['spreads'] = {'picks': [], 'issues': [f'Spread estimates unavailable: {exc}' if isinstance(exc, ValueError) else f'Spread estimates unavailable ({type(exc).__name__}).']}
+            if league == 'MLB':
+                result['spreads'] = generate_mlb_run_lines(predictions, [], pd.Timestamp.now(tz='UTC'))
+                result['spreads']['issues'].append('Sportsbook run-line quotes unavailable; model-only forecasts shown.')
+        if on_spreads: on_spreads(result.get('spreads', {}))
+    spread_pool = ThreadPoolExecutor(max_workers=1)
+    spread_job = spread_pool.submit(collect_spreads)
     if league == 'NFL':
         try:
-            props, issues = automatic_nfl_props(predictions, key, on_props=on_props)
+            props, issues = (prepared_nfl_props.result() if prepared_nfl_props is not None
+                             else automatic_nfl_props(predictions, key, on_props=on_props))
             result['prop_diagnostics'] = props.attrs.pop('prop_diagnostics', [])
+            result.setdefault('nfl_stage_timings_seconds', {}).update(
+                {'props_'+name: value for name,value in props.attrs.get('loading_timings_seconds', {}).items()})
             result['nfl_player_props'], result['prop_issues'] = props, issues
         except Exception as exc:
             result['nfl_player_props'] = pd.DataFrame()
@@ -581,14 +590,18 @@ def enhance_result(league, result, key, history=None, on_props=None):
                 else f'Player props unavailable ({type(exc).__name__}).']
     if league == 'NFL':
         try:
-            from dual_agent.nfl_player_props_ui import cached_player_history
+            from dual_agent.nfl_player_props_ui import cached_player_inputs
             props = result.get('nfl_player_props',pd.DataFrame())
             lines = props.attrs.pop('qb_forecast_lines',None)
             now = pd.Timestamp.now(tz='UTC')
             season = now.year if now.month >= 8 else now.year-1
-            enriched = attach_qb_forecasts(predictions,cached_player_history((season-1,season)),lines)
+            enriched = attach_qb_forecasts(predictions,cached_player_inputs((season-1,season))[0],lines)
             result['predictions'] = enriched
             if 'all_predictions' in result:result['all_predictions'] = enriched
         except Exception as exc:
             result['qb_forecast_issue'] = 'Quarterback forecast unavailable ('+type(exc).__name__+'); game predictions are preserved.'
+    try:
+        spread_job.result()
+    finally:
+        spread_pool.shutdown(wait=True)
     return result
