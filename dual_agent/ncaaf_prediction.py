@@ -239,6 +239,11 @@ def generate_predictions(cfbd_key, odds_key=None, now=None):
             market_games=load_markets(odds_key)['games']
         except Exception as exc:issues.append('Market comparison unavailable: '+str(exc))
     result['games']=attach_markets(result['games'],market_games,teams)
+    try:
+        from dual_agent.point_spread_predictions import ncaaf_spreads
+        result['games']=ncaaf_spreads(result['games'],records,now)
+    except (ValueError,KeyError,TypeError):
+        pass
     from dual_agent.ncaaf_selection import tag
     result['games']=[tag(g) for g in result['games']]
     result.update(checked_at=now.isoformat(),issues=issues)
