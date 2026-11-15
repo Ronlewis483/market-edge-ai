@@ -322,7 +322,7 @@ def nba_foreground_scan():
 
 
 
-def _nba_history_batches(names, api_key, status=None, foreground=False, cold_batch_size=1):
+def _nba_history_batches(names, api_key, status=None, foreground=False, cold_batch_size=8):
     # Readers and provider requests never hold the archive writer lock.
     # A slow full-slate request cannot prevent another game's cache read.
     if not isinstance(cold_batch_size, int) or not 1 <= cold_batch_size <= 8:
@@ -382,7 +382,7 @@ def _nba_cached_rows(entry, now):
     return sorted(valid.values(), key=lambda row:(row['source_date'],str(row['game']['id'])))
 
 
-def _nba_history_batches_locked(names, api_key, status=None, cold_batch_size=1):
+def _nba_history_batches_locked(names, api_key, status=None, cold_batch_size=8):
     """Yield completed player histories; never cache an incomplete stats batch."""
     now = pd.Timestamp.now(tz='UTC')
     root = Path('nba_player_history_cache'); root.mkdir(exist_ok=True)
@@ -549,15 +549,18 @@ def _nba_history_batches_locked(names, api_key, status=None, cold_batch_size=1):
                 notify('Player-history scan stopped: '+issue)
                 return  # Retrying other players cannot repair denied API access.
             continue
+        ready_batch = []
         for name, pid in batch:
             previous = known[name].get('rows', [])
             rows = list({r['game']['id']: r for r in previous+rows_by_id[pid] if pd.Timestamp(r['source_date']) > now-pd.Timedelta(days=365)}.values())
             rows.sort(key=lambda r:(r['source_date'], r['game']['id']))
             entries[nba_identity_key(name)] = {'player_id': pid, 'checked_at': now.isoformat(), 'rows': rows}
-            # Checkpoint each completed player locally; partial batches are never saved.
-            save(archive_path, archive)
             returned = [dict(row, history_checked_at=now.isoformat(), history_refresh_pending=False) for row in rows]
-            yield name, returned, None if rows else 'No completed played-game statistics returned for '+name+'.'
+            ready_batch.append((name, returned, None if rows else 'No completed played-game statistics returned for '+name+'.'))
+
+        # Persist a complete batch once, before publishing any of its players.
+        save(archive_path, archive)
+        yield from ready_batch
 
     _nba_save_remote_history_archive(archive)
     save(archive_path, archive)
@@ -1272,6 +1275,8 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
         last_scored = -1
         last_publish = 0.0
         last_partial = {}
+        scored_players = {}
+        dirty_players = set()
         def publish(stage):
             nonlocal last_scored, last_publish, calculation_seconds, last_partial
             if not progress: return
@@ -1288,10 +1293,19 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
                 ready.update(history_by_name)
                 ready_groups = {key: group for key, group in groups.items() if star_key(key[1]) in by_key}
                 scoring_started = time.perf_counter()
-                partial = _rank_prop_candidates('NBA', games, ready_groups,
-                    ready, list(errors), star_rosters, {}, {}, nba_context=nba_context)
+                # Re-score changed players only; estimates depend on their own
+                # history/context, not on how many other players have loaded.
+                for player_key in list(dirty_players):
+                    player_groups = {key:group for key,group in ready_groups.items() if star_key(key[1]) == player_key}
+                    scored_players[player_key] = _rank_prop_candidates('NBA', games, player_groups,
+                        ready, [], {}, {}, {}, nba_context=nba_context)
+                dirty_players.clear()
+                chosen = [pick for value in scored_players.values() for pick in value.get('game_picks', [])]
+                chosen.sort(key=lambda r:(-r['Estimated chance'],-r['Prior games'],r['Player']))
+                partial = dict(game_picks=chosen,picks=chosen[:10],errors=list(errors),
+                    exclusions=[row for value in scored_players.values() for row in value.get('exclusions', [])],
+                    probability_source='player_history',statistics_source='BALLDONTLIE')
                 calculation_seconds += time.perf_counter()-scoring_started
-                partial.update(probability_source='player_history', statistics_source='BALLDONTLIE')
                 last_partial = partial
                 last_scored = history_revision
             last_publish = tick
@@ -1310,6 +1324,7 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
             if history or player not in history_by_name:
                 history_by_name[player] = history
                 history_revision += 1
+                dirty_players.add(star_key(player))
             processed_players.add(star_key(player))
             completed = len(processed_players)
             if error: errors.append(error)
