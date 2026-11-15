@@ -372,6 +372,16 @@ def render_props_panel(game):
         return
     picks=[r for r in result.get('picks',[]) if stamp(r.get('quote_time')) and timedelta(0)<=now-stamp(r['quote_time'])<=timedelta(minutes=30)
            and stamp(r.get('commence_time')) and now<stamp(r['commence_time'])]
+    from dual_agent.prop_platform_selection import platform_key, side_rank
+    platform=st.session_state.get('prop_platform','DraftKings')
+    wanted=platform_key(platform)
+    ranking=st.session_state.get('prop_ranking','Probability and price')
+    picks=[r for r in picks if wanted is None or r['book']==wanted]
+    def rank_offer(row):
+        return side_rank({'Best sportsbook':row['book'], 'Best decimal odds':row['decimal_odds'],
+            'Estimated chance':row['historical_support'], 'Estimated push chance':row.get('estimated_push_chance',0)},ranking,platform)
+    picks.sort(key=lambda row:(rank_offer(row),row['player'],row['line']))
+    st.caption('Offers: '+platform+' · '+ranking)
     labels=['All supported markets']+sorted({r['label'] for r in picks})
     selected=st.selectbox('Prop category',labels,key='ncaaf_prop_market_'+gid)
     if selected!='All supported markets':picks=[r for r in picks if r['label']==selected]
@@ -379,7 +389,7 @@ def render_props_panel(game):
     if not picks:
         st.info('No fresh modeled props are available for this selection. See the input/training details below.')
     else:
-        st.caption(f'{len(picks)} fresh listed offers \xb7 strongest estimated cover chances first')
+        st.caption(f'{len(picks)} fresh listed offers \xb7 ranked for your selected platform')
         for row in picks[:20]:
             with st.container(border=True):
                 st.markdown('**'+row['player']+' \xb7 '+row['side'].upper()+f" {row['line']:g} "+row['label']+'**')
@@ -401,4 +411,5 @@ if __name__=='__main__':
     parser.add_argument('--max-weeks',type=int,default=8)
     args=parser.parse_args()
     print(json.dumps(prepare_history(os.environ.get('CFBD_API_KEY'),args.max_weeks),indent=2))
+
 
