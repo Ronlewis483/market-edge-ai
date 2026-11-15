@@ -27,14 +27,36 @@ def enrich_result(result, feature_games, odds_key, progress_queue=None, context=
         add_script_run_ctx(threading.current_thread(),context)
     from dual_agent.sports_prop_workspace import merge_result,checkpoint,track
     previous = copy.deepcopy(result)
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+    publication_lock = threading.Lock()
+    publication = {'base': copy.deepcopy(result), 'props': None}
     def publish_props(props):
-        partial = merge_result('NFL',previous,dict(result,nfl_player_props=props))
+        with publication_lock:
+            publication['props'] = props.copy(deep=True)
+            base = copy.deepcopy(publication['base'])
+        partial = merge_result('NFL',previous,dict(base,nfl_player_props=props))
         partial.update(workspace_pending=True,enrichment_pending=True)
         if progress_queue is not None: progress_queue.put(copy.deepcopy(partial))
         try:
             checkpoint('NFL',partial); track('NFL',partial)
         except Exception:
             partial['workspace_issue'] = 'NFL predictions are ready; local saving is unavailable.'
+    def publish_spreads(spreads):
+        result['spreads'] = spreads
+        if progress_queue is not None:
+            progress_queue.put(copy.deepcopy(result))
+    # Player forecasts use their own prior-game inputs; team context is not
+    # a prerequisite. Keep winner correction and final QB forecasts in order.
+    def collect_props():
+        if context is not None:
+            from streamlit.runtime.scriptrunner import add_script_run_ctx
+            add_script_run_ctx(threading.current_thread(), context)
+        from dual_agent.game_prediction_addons import automatic_nfl_props
+        return automatic_nfl_props(previous.get('all_predictions', previous.get('predictions')),
+                                   odds_key, on_props=publish_props)
+    prop_pool = ThreadPoolExecutor(max_workers=1)
+    prop_job = prop_pool.submit(collect_props)
     from time import perf_counter
     context_clock = perf_counter()
     try:
@@ -52,6 +74,10 @@ def enrich_result(result, feature_games, odds_key, progress_queue=None, context=
     result.setdefault('nfl_stage_timings_seconds', {})['connected_finalization'] = round(perf_counter()-correction_clock, 3)
     result['nfl_generation_stage'] = ('Initial team forecasts retained; connected update unavailable; player props are loading'
         if result.get('connected_context_pending') else 'Winner predictions ready; player props are loading')
+    with publication_lock:
+        if publication['props'] is not None:
+            result['nfl_player_props'] = publication['props']
+        publication['base'] = copy.deepcopy(result)
     result = merge_result('NFL',previous,result)
     if progress_queue is not None:
         progress_queue.put(copy.deepcopy(result))
@@ -64,9 +90,11 @@ def enrich_result(result, feature_games, odds_key, progress_queue=None, context=
     props_clock = perf_counter()
     try:
         from dual_agent.game_prediction_addons import enhance_result
-        result = enhance_result("NFL", result, odds_key, feature_games,on_props=publish_props)
+        result = enhance_result("NFL", result, odds_key, feature_games,on_props=publish_props,on_spreads=publish_spreads,prepared_nfl_props=prop_job)
     except Exception as exc:
         result['prop_issues'] = ['NFL add-ons unavailable ('+type(exc).__name__+'); winner predictions are preserved.']
+    finally:
+        prop_pool.shutdown(wait=True)
     result.setdefault('nfl_stage_timings_seconds', {})['player_props_and_spreads'] = round(perf_counter()-props_clock, 3)
     result['nfl_generation_stage'] = ('NFL scan complete; initial forecasts retained because the connected update is unavailable'
         if result.get('connected_context_pending') else 'NFL scan complete')
@@ -77,12 +105,6 @@ def enrich_result(result, feature_games, odds_key, progress_queue=None, context=
         track('NFL',result); checkpoint('NFL',result)
     except Exception:
         result['workspace_issue'] = 'NFL predictions are ready; local saving is unavailable.'
-    try:
-        from dual_agent.nfl_player_props_ui import cached_player_history
-        from dual_agent.sports_prop_workspace import settle_nfl
-        year = pd.Timestamp.now(tz='UTC').year
-        settle_nfl(cached_player_history((year-1,year)))
-    except Exception: pass
     try: checkpoint('NFL',result,remote=True)
     except Exception: pass
     return result
