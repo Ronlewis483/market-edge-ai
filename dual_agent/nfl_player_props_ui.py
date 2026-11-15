@@ -26,6 +26,13 @@ def cached_player_history(seasons):
     return history
 
 
+@st.cache_resource(ttl=900, show_spinner=False)
+def cached_player_inputs(seasons):
+    from dual_agent.nfl_player_prop_prediction_pipeline import build_player_history_index
+    history = cached_player_history(seasons)
+    return history, build_player_history_index(history)
+
+
 
 @st.cache_data(ttl=180, show_spinner=False)
 def cached_nfl_pick_statuses(api_key):
