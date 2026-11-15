@@ -2457,6 +2457,17 @@ def enrich_nba_props(result, odds_key, nba_key, updates, context=None):
         import threading
         add_script_run_ctx(threading.current_thread(), context)
     result = copy.deepcopy(result)
+    from concurrent.futures import ThreadPoolExecutor
+    from dual_agent.point_spread_predictions import nba_spreads
+    spread_pool = ThreadPoolExecutor(max_workers=1)
+    def publish_nba_spreads():
+        try:
+            result['spreads'] = nba_spreads(result, odds_key)
+            updates.put(copy.deepcopy(result))
+        except Exception:
+            pass
+    spread_job = spread_pool.submit(publish_nba_spreads)
+    spread_job.add_done_callback(lambda future: spread_pool.shutdown(wait=False))
     try:
         from dual_agent.sports_player_prop_predictions import generate_player_prop_picks, save_nba_prop_results
         from time import monotonic
@@ -3270,27 +3281,21 @@ def render_game_addons(league, game, result):
             else:
                 st.caption('No matching preferred-platform run-line offer found. Reference forecasts above are informational, not verified bets.')
             st.caption('Cover estimates exclude pushes. Run-line accuracy is not established.')
-    if league == "NFL":
-        spreads = matching_game_rows(game, st.session_state.get(spread_key))
-        with st.expander("📏 Spread prediction" if league == "NFL" else "📏 Run-line prediction", expanded=False):
-            if spreads:
-                spread = spreads[0]
-                kickoff = pd.to_datetime(spread["commence_time"], utc=True, errors="coerce")
-                captured = pd.to_datetime(spread.get("captured_at"), utc=True, errors="coerce")
-                current = pd.Timestamp.now(tz="UTC")
-                fresh = pd.notna(captured) and pd.Timedelta(0) <= current-captured <= pd.Timedelta(minutes=30)
-                if kickoff <= current or fresh:
-                    st.markdown(f"**{spread['spread_team']} {spread['spread_line']:+g}**")
-                    st.metric("Estimated cover chance · excludes pushes", f"{spread['cover_chance']:.1%}")
-                    st.caption(f"Push chance {spread['push_chance']:.1%} · {spread['books']} sportsbooks at this line")
-                    st.caption(f"Projected home margin: {spread['projected_home_margin']:+.1f}")
-                    st.caption("New spread estimate; accuracy is not established. " + spread["method"] + ".")
-                else:
-                    st.info("Spread line is stale. Generate again for a fresh estimate.")
-            else:
-                reasons = (result or {}).get("spreads", {}).get("issues", [])
-                text = next((r for r in reasons if str(game.get("away_team", "")) in r and str(game.get("home_team", "")) in r), None)
-                st.info(text or (reasons[0] if reasons and len(reasons)==1 else "No eligible spread estimate: two fresh matching books and complete model inputs are required."))
+    if league == 'NFL':
+        rows = matching_game_rows(game, st.session_state.get(spread_key))
+        if rows:
+            spread = rows[0]
+            captured = pd.to_datetime(spread.get('captured_at'),utc=True,errors='coerce')
+            kickoff = pd.to_datetime(spread.get('commence_time'),utc=True,errors='coerce')
+            now = pd.Timestamp.now(tz='UTC')
+            if kickoff <= now or pd.notna(captured) and pd.Timedelta(0) <= now-captured <= pd.Timedelta(minutes=30):
+                from dual_agent.point_spread_predictions import render_spread
+                render_spread(st,spread)
+    if league == 'NBA':
+        rows = matching_game_rows(game, (result or {}).get('spreads', {}).get('picks', []))
+        if rows:
+            from dual_agent.point_spread_predictions import render_spread
+            render_spread(st, rows[0])
     if league in ('NFL', 'MLB', 'NBA'):
         import hashlib
         refresh_identity = '|'.join(str(game.get(k, '')) for k in ('home_team', 'away_team', 'commence_time'))
