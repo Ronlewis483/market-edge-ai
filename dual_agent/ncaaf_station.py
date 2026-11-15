@@ -289,6 +289,8 @@ def render_prediction_cards(games, result):
                 st.write('Away win chance:', f"{chosen['model_away_probability']:.1%}")
                 st.caption('Connected NCAA engine \xb7 '+str(result['model_id']))
                 st.caption('Winner inputs: team history, rest and neutral venues. Individual player-strength and injury corrections are not inputs to this winner model.')
+            from dual_agent.point_spread_predictions import render_spread
+            render_spread(st,chosen.get('spread_prediction'))
             props_panel = _player_ui('render_props_panel')
             if props_panel is not None:
                 props_panel(chosen)
