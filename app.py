@@ -1807,6 +1807,10 @@ with st.sidebar:
     page = st.session_state["main_navigation"]
     st.divider()
     st.caption("Calendar dates & game times shown in Central time")
+    from dual_agent.prop_platform_selection import OPTIONS
+    st.selectbox('Player-prop sportsbook', OPTIONS, key='prop_platform')
+    st.selectbox('Prop ranking', ['Probability and price', 'Highest probability'], key='prop_ranking')
+    st.caption('Uses collected exact offers; changing these controls does not start a scan.')
 
 
 def prediction_api_key(name, alternate=None):
@@ -2997,7 +3001,7 @@ def render_prop_category_buttons(markets, state_key, all_label):
                           on_click=select_prop_category, args=(state_key, label))
 
 
-def prop_comparisons(props):
+def prop_comparisons(props, platform="All platforms", ranking="Highest probability"):
     """Pair saved outcomes by exact game/player/market/line without new data calls."""
     from dual_agent.preferred_sportsbooks import allowed
     pairs = {}
@@ -3010,6 +3014,8 @@ def prop_comparisons(props):
                    'Best sportsbook':original.get('best_sportsbook'),
                    'Best decimal odds':original.get('best_decimal_odds'),
                    'Prior games':original.get('sample_size',0),
+                   'Sportsbook offers':original.get('sportsbook_offers', []),
+                   'Estimated push chance':original.get('estimated_push_chance',0),
                    'Probability reliability':original.get('history_reliability') if isinstance(original.get('history_reliability'),str) else None,
                    'Game':str(original.get('away_team',''))+' @ '+str(original.get('home_team','')),
                    'start_time':original.get('game_time'), '_nfl_original':original})
@@ -3019,7 +3025,7 @@ def prop_comparisons(props):
                 if not isinstance(outcome, dict): continue
                 detail = dict(prop, Pick=outcome.get('side'),
                     **{'Estimated chance':outcome.get('chance'), 'Best sportsbook':outcome.get('book'),
-                       '_offered':bool(outcome.get('listed')), '_comparison':True})
+                       '_offered':bool(outcome.get('listed')), '_comparison':True, 'Sportsbook offers':[]})
                 price = outcome.get('american_odds')
                 try:
                     price = float(price)
@@ -3038,7 +3044,10 @@ def prop_comparisons(props):
                     'Best sportsbook':None,'Best decimal odds':None,'_offered':False,'_comparison':True})
                 detail.pop('Historical wins',None)
                 candidates.append(detail)
+    from dual_agent.prop_platform_selection import select_offer, rank_pairs, side_rank
     for prop in candidates:
+        prop = select_offer(prop, platform)
+        if prop is None: continue
         raw_side = str(prop.get('Pick','')).upper()
         side = {'OVER':'Over','YES':'Over','UNDER':'Under','NO':'Under'}.get(raw_side)
         if not side: continue
@@ -3056,13 +3065,10 @@ def prop_comparisons(props):
             'binary':str(prop['Market']).lower() == 'anytime touchdown', 'identity':identity})
         candidate = dict(prop, _offered=bool(offered), _raw_side=raw_side)
         prior = pair['sides'].get(side)
-        if prior is None or (offered, chance) > (prior.get('_offered',False),float(prior['Estimated chance'])):
+        if prior is None or side_rank(candidate,ranking,platform) < side_rank(prior,ranking,platform):
             pair['sides'][side] = candidate
     rows = [pair for pair in pairs.values() if any(p.get('_offered') for p in pair['sides'].values())]
-    # Forecast-only outcomes cannot outrank actually listed bets.
-    rows.sort(key=lambda pair:(-max(float(p['Estimated chance']) for p in pair['sides'].values() if p.get('_offered')),
-                               str(pair['player']),str(pair['market']),pair['line']))
-    return rows
+    return rank_pairs(rows, ranking, platform)
 
 
 def record_nfl_comparison_prop(prop, pair, scope):
@@ -3089,7 +3095,16 @@ def record_nfl_comparison_prop(prop, pair, scope):
 
 def render_prop_comparisons(props, pending=False, limit=5, scope='main'):
     """Shared YES/NO card renderer; probabilities keep their original source."""
-    rows = prop_comparisons(props)[:limit]
+    platform = st.session_state.get('prop_platform','DraftKings')
+    ranking = st.session_state.get('prop_ranking','Probability and price')
+    rows = prop_comparisons(props,platform,ranking)[:limit]
+    st.caption('Offers: '+platform+' · '+ranking)
+    if platform in ('PrizePicks','Underdog'):
+        st.caption('Ranked by probability. Entry payout and combination rules are needed to evaluate pick’em value.')
+    elif platform == 'All platforms':
+        st.caption('Ranked by probability across platforms; returns use different platform rules.')
+    elif ranking == 'Probability and price':
+        st.caption('Positive model-estimated returns first, then highest cover chance. Model estimates are not verified returns.')
     if not rows:
         st.caption('Still collecting sportsbook props…' if pending else 'No priced sportsbook sides are available for this selection.')
         return
@@ -3104,8 +3119,7 @@ def render_prop_comparisons(props, pending=False, limit=5, scope='main'):
                     prop = pair['sides'].get(side)
                     st.markdown('**'+label+'**')
                     if prop is None:
-                        st.write('Probability unavailable')
-                        st.caption('No saved probability for this side. This does not mean 0%.')
+                        st.write('Not listed in the collected offers')
                         continue
                     st.markdown(f"### {float(prop['Estimated chance']):.1%}")
                     st.caption(('Scores at least one touchdown' if side=='Over' else 'Does not score a touchdown') if pair['binary'] else side+' '+format(pair['line'],'g'))
@@ -3114,6 +3128,10 @@ def render_prop_comparisons(props, pending=False, limit=5, scope='main'):
                         st.caption(str(prop['Best sportsbook']) + (' · '+decimal_to_american_label(float(price)) if price is not None and np.isfinite(float(price)) and float(price)>1 else ''))
                     else:
                         st.caption('Forecast only · no matching sportsbook bet found')
+                    if prop.get('Selected quote UTC'): st.caption('Quote checked: '+str(prop['Selected quote UTC']))
+                    from dual_agent.prop_platform_selection import expected_return
+                    value = expected_return(prop)
+                    if value is not None: st.caption(f'Model-estimated return per unit stake: {value:+.1%}')
                     if prop.get('Statistics source'): st.caption('Statistics: '+prop['Statistics source'])
                     if prop.get('History refresh pending'):
                         st.caption('Uses saved completed-game history; latest results have not yet been verified. History checked: '+str(prop.get('History checked UTC') or 'unknown'))
@@ -3142,7 +3160,7 @@ def render_prop_comparisons(props, pending=False, limit=5, scope='main'):
             if len(offered)==2 and abs(offered[0][1]-offered[1][1])<1e-9:
                 st.caption('Even probabilities')
             else:
-                st.caption('Higher-probability listed side: '+('YES' if best[0]=='Over' else 'NO'))
+                st.caption('Top-ranked listed side: '+('YES' if pair.get('recommended_side',best[0])=='Over' else 'NO'))
             if pair['source']=='sportsbook_implied' and any('margin remains' in str(p.get('Estimate method','')) for p in sides.values()):
                 st.caption('One-sided quoted prices include margin; displayed percentages may not total 100%.')
 
@@ -3154,7 +3172,7 @@ def render_prop_category_rankings(props, league):
         return
     with st.expander('Best player props by category', expanded=True):
         market_only = any(p.get('Probability source') == 'sportsbook_implied' for p in props)
-        st.caption('Ranked by sportsbook-implied probability, not an independent player model.' if market_only else 'Each category ranks by estimated cover chance. Odds are reference only; one exact listed offer is enough.')
+        st.caption('Uses the selected player-prop sportsbook and ranking from the sidebar.')
         for market in markets:
             group = [p for p in props if str(p.get('market', '')) == market]
             with st.expander(market, expanded=False):
@@ -4832,3 +4850,4 @@ if page == "🏈 NCAA Football":
 
 if page == "📐 Model Accuracy":
     render_model_accuracy()
+
