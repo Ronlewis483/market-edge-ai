@@ -12,10 +12,27 @@ import os
 import subprocess
 import sys
 import time
+import traceback
 
 import numpy as np
 import pandas as pd
 from dual_agent.sports_connected_winner import ROOT, Store, digest, clean_team
+
+
+def _stage_failure(sport, stage, exc):
+    """Preserve the real cause in Actions, without logging configured secrets."""
+    def redact(text):
+        for name, value in os.environ.items():
+            if (name.upper().endswith(('_KEY', '_TOKEN', '_SECRET', '_PASSWORD'))
+                    or name.upper() == 'SUPABASE_URL') and len(value) >= 8:
+                text = text.replace(value, '[REDACTED]')
+        return text
+    message = redact(str(exc))
+    detail = redact(''.join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
+    print(sport+' stage failed: '+stage+' ('+type(exc).__name__+'): '+message, flush=True)
+    print(detail, flush=True)
+    return {'status':'failed', 'error_type':type(exc).__name__,
+            'error_message':message[:2000]}
 
 
 def stamp(value):
@@ -352,7 +369,8 @@ def run(sport,mode='cycle',store=None,now=None):
         report['stages'][name]={'status':'running'};checkpoint()
         try:report['stages'][name]=action()
         except Exception as exc:
-            failures.append(name);report['stages'][name]={'status':'failed','error_type':type(exc).__name__}
+            failures.append(name)
+            report['stages'][name]=_stage_failure(sport,name,exc)
         report['stages'][name]['duration_seconds']=round(time.monotonic()-started,2)
         checkpoint()
         print(sport+' stage finished: '+name+' ('+str(report['stages'][name]['duration_seconds'])+' seconds)',flush=True)
@@ -411,3 +429,4 @@ if __name__=='__main__':
             raise SystemExit(1)
         Path('mlb_player_history_stage.json').write_text(json.dumps(result,indent=2,allow_nan=False))
     else:run(args.sport,args.mode)
+
