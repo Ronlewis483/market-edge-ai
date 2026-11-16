@@ -150,9 +150,54 @@ def connected_delta(model,original,context):
                 delta+=model['learning_rate']*tree['value'][node];break
             f=tree['feature'][node]
             if not 0<=f<len(x):raise ValueError('Invalid NFL residual tree')
-            node=tree['left'][node] if x[f]<=tree['threshold'][node] else tree['right'][node]
+            # Preserve sklearn's float32-input / float64-threshold comparison.
+            node=tree['left'][node] if float(x[f])<=float(tree['threshold'][node]) else tree['right'][node]
         else:raise ValueError('Invalid NFL residual cycle')
     return float(np.clip(model['correction_gain']*delta,-.7,.7))
+
+
+
+def _learning_rows(rows, base_id):
+    """Validate and normalize copies; never rewrite frozen forecast records."""
+    from .sports_connected_winner import stamp, number
+    result=[]
+    for row in rows:
+        if row.get('base_id') != base_id:continue
+        identity=str(row.get('event_id','unknown'))
+        def invalid(reason):
+            raise ValueError('Invalid NFL learning row '+identity+': '+reason)
+        p=number(row.get('original_probability'))
+        if p is None or not 0<p<1:invalid('original_probability must be finite and strictly between 0 and 1')
+        if row.get('outcome') not in (0,1):invalid('outcome must be 0 or 1')
+        if not isinstance(row.get('context'),dict):invalid('context must be a dictionary')
+        times={}
+        for field in ('start_time','captured_at','label_observed_at'):
+            try:times[field]=stamp(row.get(field))
+            except (TypeError,ValueError,OverflowError):invalid(field+' must be a valid timestamp')
+        if not times['captured_at']<times['start_time']:invalid('forecast was not captured before kickoff')
+        if not times['label_observed_at']>times['start_time']:invalid('result was not observed after kickoff')
+        result.append(dict(row,event_id=identity,original_probability=p,
+            **{field:at.isoformat() for field,at in times.items()}))
+    return result
+
+
+def _verify_residual_export(model, residual, rows):
+    """Compare independent sklearn inference to the JSON-roundtripped artifact.
+
+    Uses only forecast inputs, never outcome labels or performance metrics.
+    """
+    import json
+    restored=json.loads(json.dumps(model,allow_nan=False))
+    matrix=np.array([_residual_x(model['encoder'],row,_brain_delta(model['brain'],row))
+                     for row in rows],dtype=np.float32)
+    if not np.isfinite(matrix).all():raise ValueError('Non-finite NFL residual export inputs')
+    raw=sum(residual.learning_rate*tree.predict(matrix) for tree in residual.estimators_[:,0])
+    expected=np.clip(model['correction_gain']*raw,-.7,.7)
+    actual=np.array([connected_delta(restored,row['original_probability'],row['context']) for row in rows])
+    if not np.isfinite(actual).all() or not np.allclose(expected,actual,atol=1e-10,rtol=0):
+        difference=float(np.max(np.abs(expected-actual)))
+        raise ValueError('NFL residual export mismatch after JSON roundtrip; max_abs_delta='+str(difference))
+    return restored
 
 
 def train_connected(sport,base_id,rows,store):
@@ -162,7 +207,7 @@ def train_connected(sport,base_id,rows,store):
     from sklearn.ensemble import GradientBoostingClassifier
     from .sports_connected_winner import ROOT,partitions,stamp,metrics,probability,digest
     if sport!='NFL':raise ValueError('NFL learner cannot train another sport')
-    rows=[r for r in rows if r['base_id']==base_id];groups=partitions(rows)
+    rows=_learning_rows(rows,base_id);groups=partitions(rows)
     report={'sport':'NFL','base_id':base_id,'architecture':'original_offset_neural_context_residual_v2',
             'status':'waiting_for_graded_forecasts','graded_games':len(rows),'trained':False,'activated':False,
             'partition_games':dict(zip(('train','validation','test'),map(len,groups))),
@@ -211,11 +256,12 @@ def train_connected(sport,base_id,rows,store):
         model={'schema':1,'kind':'nfl_offset_tree_v2','sport':'NFL','base_id':base_id,'brain':brain,'encoder':encoder,
             'trees':trees,'learning_rate':float(residual.learning_rate),'correction_gain':gain,
             'trained_at':datetime.now(timezone.utc).isoformat(),'experiment_config':config}
-        exported=np.array([connected_delta(model,r['original_probability'],r['context']) for r in val])
-        if not np.allclose(np.clip(gain*raw,-.7,.7),exported,atol=1e-10,rtol=0):raise ValueError('NFL residual export mismatch')
+        model=_verify_residual_export(model,residual,val)
         trial={'config':config,'correction_gain':gain,'validation':score}
-        trials.append(trial);fitted.append((controller.rank(score),model,trial,q))
-    _,model,selected,vq=min(fitted,key=lambda value:value[0])
+        trials.append(trial);fitted.append((controller.rank(score),model,trial,q,residual))
+    _,model,selected,vq,selected_residual=min(fitted,key=lambda value:value[0])
+    # Validate final-window feature inference before claiming/scoring its labels.
+    model=_verify_residual_export(model,selected_residual,groups[2])
     diagnosis=controller.diagnose(vy,vq,vp,selected['validation'],metrics(vy,vp))
     # Only the selected development winner gets a final-test evaluation.
     controller.claim_test(experiment)
@@ -236,3 +282,4 @@ def train_connected(sport,base_id,rows,store):
     report['controller']=controller.finish(experiment,trials,selected,diagnosis,report.copy())
     store.write(ROOT+'nfl/training_report.json.gz',report,replace=True)
     return report
+
