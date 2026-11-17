@@ -977,8 +977,10 @@ def ticket_prop_candidates(results, now=None, diagnostics=None):
 def build_suggested_ticket(candidates, book, legs, same_game=True,
                            include_specialty=False, diversify_markets=True):
     """Select the strongest listed distinct-player offers without game quotas."""
-    if legs not in range(2, 11):
-        raise ValueError('Choose 2 to 10 legs.')
+    if legs not in range(1, 11):
+        raise ValueError('Choose 1 to 10 selections.')
+    if book in ('underdog','prizepicks') and legs<2:
+        return []
     pool = [c for c in candidates if c['book'] == book and
             (include_specialty or ticket_is_standard(c['sport'], c['market']))]
     from dual_agent.ticket_value import rank_offers
@@ -1270,11 +1272,20 @@ def ticket_quote_status(diagnostics, sports, book):
 def render_ai_ticket_builder():
     from dual_agent.preferred_sportsbooks import PLATFORMS
     st.title('🎫 AI Ticket Builder')
-    st.caption('Build 2–10 legs from listed sportsbook props. NFL supports upcoming and active regulation games; live estimates use current stats and clock. Standard prop categories are preferred. Cover chances are estimates, not guarantees.')
+    mode=st.radio('Ticket type',['Game winners (moneylines)','Player props'],key='ai_ticket_mode',horizontal=True)
+    if mode=='Game winners (moneylines)':
+        from dual_agent.moneyline_tickets import render_moneyline_builder
+        render_moneyline_builder(st,prediction_api_key('ODDS_API_KEY','THE_ODDS_API_KEY'))
+        return
+    st.caption('Build 1–10 sportsbook selections from listed props; pick’em requires at least two. NFL supports upcoming and active regulation games; live estimates use current stats and clock. Standard prop categories are preferred. Cover chances are estimates, not guarantees.')
     columns=st.columns(2)
-    with columns[0]: legs=st.selectbox('Ticket size',list(range(2,11)),index=1,format_func=lambda n:f'{n} legs',key='ai_ticket_legs')
+    with columns[0]: legs=st.selectbox('Ticket size',list(range(1,11)),index=1,format_func=lambda n:'Single' if n==1 else f'{n} legs',key='ai_ticket_legs')
     with columns[1]: sport=st.selectbox('Sports',['All sports','NFL','NBA','MLB'],key='ai_ticket_sport')
     st.caption('Checking all configured platforms: '+', '.join(PLATFORMS.values())+'. Each ticket stays within one platform; feed coverage can vary.')
+    platform_options=list(PLATFORMS.values())+['Compare all platforms']
+    default_platform=st.session_state.get('prop_platform','DraftKings')
+    default_index=platform_options.index(default_platform) if default_platform in platform_options else 0
+    st.selectbox('Ticket sportsbook',platform_options,index=default_index,key='ai_ticket_platform')
     st.checkbox('Include specialty / defensive markets (e.g. assisted tackles)',value=False,key='ai_ticket_specialty')
     with st.expander('Optional actual pick’em payouts'):
         for platform in ('underdog','prizepicks'):
@@ -1399,12 +1410,15 @@ def _render_ai_ticket_results():
     from dual_agent.ticket_value import choose_book_ticket
     payouts = {b:st.session_state.get('ai_ticket_return_'+b,0.0) for b in ('underdog','prizepicks')}
     choices = []
+    preferred_platform=st.session_state.get('ai_ticket_platform','Compare all platforms')
     for platform in PLATFORMS:
+        if preferred_platform!='Compare all platforms' and PLATFORMS[platform]!=preferred_platform:
+            continue
         picks = build_suggested_ticket(candidates, platform, legs, same_game, include_specialty, diversify_markets)
         choices.append({'book':platform,'legs':picks})
     selected, comparisons = choose_book_ticket(choices, legs, payouts)
     book = selected['book']
-    st.caption('Automatic platform comparison · '+('strongest listed selection: '+PLATFORMS[book] if candidates else 'no current listed offers loaded'))
+    st.caption(('Platform comparison · '+PLATFORMS[book]) if preferred_platform=='Compare all platforms' else 'Selected sportsbook: '+PLATFORMS[book])
     with st.expander('Compare tickets across platforms', expanded=True):
         st.dataframe(pd.DataFrame([{'Platform':PLATFORMS[r['book']], 'Listed legs':r['count'],
             'Value assessment':r['status'].replace('_',' '), 'Estimated net per $1':r['return_per_unit']} for r in comparisons]), hide_index=True)
@@ -1620,7 +1634,7 @@ def _render_ai_ticket_results():
     ticket = st.session_state.get('ai_suggested_ticket')
     if not ticket:
         return
-    if (ticket.get('sport') != sport or
+    if (ticket.get('book') != book or ticket.get('sport') != sport or
             ticket.get('requested') != legs or ticket.get('same_game') != same_game or
             ticket.get('include_specialty') != include_specialty or
             ticket.get('diversify_markets') != diversify_markets or
@@ -4850,4 +4864,5 @@ if page == "🏈 NCAA Football":
 
 if page == "📐 Model Accuracy":
     render_model_accuracy()
+
 
