@@ -653,7 +653,8 @@ if __name__=='__main__':
     import argparse
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--refresh-only', action='store_true',
-                        help='Refresh context and grade outcomes; fit live feedback only when its weekly cycle is due')
+                        help='Refresh context, grade outcomes and train live feedback when new eligible results are ready')
     parser.add_argument('--refresh', action='store_true', help='Legacy full refresh and readiness training')
     args = parser.parse_args()
     run_learning_cycle(refresh_only=args.refresh_only)
+
