@@ -6,6 +6,7 @@ are associations in recorded inputs, never explanations of what caused a loss.
 from collections import Counter
 from datetime import datetime, timezone
 import hashlib
+import json
 import math
 
 import numpy as np
@@ -142,39 +143,41 @@ def learn(client, artifact, state, now=None):
     local = now.tz_convert('America/Chicago')
     monday = local.normalize() - pd.Timedelta(days=local.weekday())
     week_start = monday.date().isoformat()
-    next_week = (monday + pd.DateOffset(weeks=1)).tz_convert('UTC').isoformat()
+    # Key attempts to eligible data, never the calendar. A waiting attempt must
+    # not block the first fit when more final results arrive later this week.
+    signature = hashlib.sha256(json.dumps(rows, sort_keys=True, allow_nan=False,
+                                         separators=(',', ':')).encode()).hexdigest()
+    # Retain the existing path so deployed weekly state migrates automatically.
     schedule_path = SPORTS_ROOT + 'nba/weekly_learning.json.gz'
     previous = store.read(schedule_path) or {}
     if previous and previous.get('schema') != 1:
         raise ValueError('Invalid NBA weekly learning state')
-    if previous.get('week_start') == week_start:
-        report = dict(status='weekly_training_not_due', trained=False, activated=False,
-                      minimum_games={'train':80,'validation':25,'test':25},
-                      last_training=previous.get('last_training'))
-    elif previous and len(rows) <= previous.get('graded_games', 0):
-        report = dict(status='weekly_waiting_for_new_results', trained=False, activated=False,
+    if previous.get('data_signature') == signature:
+        report = dict(status='waiting_for_new_results', trained=False, activated=False,
                       minimum_games={'train':80,'validation':25,'test':25},
                       last_training=previous.get('last_training'))
     else:
         # Keep cumulative history and existing fresh-test/activation safeguards.
-        # Exceptions do not mark the week complete, allowing a later retry.
+        # Exceptions do not mark these data complete, allowing a later retry.
         report = train('NBA', identity(artifact), rows, store)
         summary = {k:report.get(k) for k in (
             'status','trained','activated','model_id','checks_passed','partition_games',
             'validation','test','activation_reason')}
         summary['attempted_at'] = now.isoformat()
+        report['last_training'] = summary
         store.write(schedule_path, dict(schema=1, week_start=week_start,
-                    graded_games=len(rows), last_training=summary), replace=True)
+                    data_signature=signature, graded_games=len(rows),
+                    last_training=summary), replace=True)
     recent = [r for r in rows if now-pd.Timedelta(days=7) <= timestamp(r['label_observed_at']) <= now]
-    report.update(learning_cadence='weekly', learning_timezone='America/Chicago',
-                  learning_week_start=week_start, next_week_start=next_week,
+    report.update(learning_cadence='when_new_eligible_results_arrive', learning_timezone='America/Chicago',
+                  learning_week_start=week_start,
                   weekly_error_review=error_review(recent))
     report.update(graded_unique_games=len(rows), rejected_records=rejected,
                   baseline_description='Frozen connected forecasts before live feedback',
                   error_review=error_review(rows), sports_api_requests=0)
     active = store.read(SPORTS_ROOT + 'nba/active.json.gz')
     # A fit may have saved its approved artifact before a network failure while
-    # attaching it. Retry that handoff even when this week's fitting is complete.
+    # attaching it. Retry that handoff even when these data were already fitted.
     changed = bool(active and active.get('base_id') == identity(artifact) and active.get('checks_passed')
                    and active != artifact.get('live_feedback'))
     if changed:
@@ -210,3 +213,4 @@ def apply(artifact, baseline, context, start, now=None):
         return float(probability(baseline, np.clip(delta, -.7, .7))), model['model_id'], 'applied'
     except (KeyError, TypeError, ValueError, OverflowError):
         return baseline, None, 'live_feedback_unavailable'
+
