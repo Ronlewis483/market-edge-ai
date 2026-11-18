@@ -1,6 +1,8 @@
 """Offline checks for frozen live NBA feedback, promotion and serving."""
 import copy
+import hashlib
 import io
+import json
 import unittest
 from contextlib import redirect_stdout
 from datetime import datetime, timezone
@@ -104,7 +106,7 @@ class LiveFeedbackTests(unittest.TestCase):
             active_before = copy.deepcopy(base['live_feedback'])
             again = feedback.learn(client, base, state(180), now='2026-11-18T12:00:00Z')
         self.assertFalse(again['trained'])
-        self.assertEqual(again['status'], 'weekly_training_not_due')
+        self.assertEqual(again['status'], 'waiting_for_new_results')
         self.assertEqual(base['live_feedback'], active_before)
         self.assertFalse(report['controller']['planner_uses_final_test_metrics'])
         # Only genuinely later holdout outcomes can authorize another experiment.
@@ -112,21 +114,21 @@ class LiveFeedbackTests(unittest.TestCase):
         self.assertFalse(expanded['trained'])
         self.assertIn(expanded['status'], ('waiting_for_25_new_results', 'waiting_for_fresh_test_results'))
 
-    def test_weekly_fit_reuses_all_history_and_reviews_results_between_fits(self):
+    def test_new_results_trigger_same_week_readiness_checks(self):
         client, base = MemoryClient(), artifact()
         outcome={'status':'candidate_saved','trained':True,'activated':False,'checks_passed':False}
         with patch.object(learner,'train',return_value=outcome.copy()) as fit:
             first=feedback.learn(client,base,state(140),now='2026-11-16T12:00:00Z')
             same=feedback.learn(client,base,state(150),now='2026-11-20T12:00:00Z')
-            self.assertEqual(fit.call_count,1)
-            self.assertEqual(same['status'],'weekly_training_not_due')
+            self.assertEqual(fit.call_count,2)
+            self.assertEqual(same['status'],'candidate_saved')
             self.assertEqual(same['graded_unique_games'],150)
             self.assertEqual(same['error_review']['games'],150)
             self.assertIn('last_training',same)
             feedback.learn(client,base,state(180),now='2026-11-23T12:00:00Z')
-            self.assertEqual(fit.call_count,2)
+            self.assertEqual(fit.call_count,3)
             self.assertEqual(len(fit.call_args.args[2]),180)
-        self.assertEqual(first['learning_cadence'],'weekly')
+        self.assertEqual(first['learning_cadence'],'when_new_eligible_results_arrive')
         self.assertNotIn(unified.ARTIFACT,client.data)
 
     def test_no_new_outcomes_does_not_retrain_and_failed_attempt_can_retry(self):
@@ -141,19 +143,31 @@ class LiveFeedbackTests(unittest.TestCase):
             feedback.learn(client,base,state(140),now='2026-11-16T13:00:00Z')
             waiting=feedback.learn(client,base,state(140),now='2026-11-23T12:00:00Z')
             self.assertEqual(fit.call_count,1)
-            self.assertEqual(waiting['status'],'weekly_waiting_for_new_results')
+            self.assertEqual(waiting['status'],'waiting_for_new_results')
             feedback.learn(client,base,state(180),now='2026-11-24T12:00:00Z')
             self.assertEqual(fit.call_count,2)
 
-    def test_week_boundary_uses_houston_not_utc(self):
-        client,base=MemoryClient(),artifact()
-        outcome={'status':'waiting_for_graded_forecasts','trained':False,'activated':False}
-        with patch.object(learner,'train',return_value=outcome) as fit:
-            sunday=feedback.learn(client,base,state(90),now='2026-11-16T05:30:00Z')
-            self.assertEqual(sunday['learning_week_start'],'2026-11-09')
-            monday=feedback.learn(client,base,state(100),now='2026-11-16T06:30:00Z')
-            self.assertEqual(monday['learning_week_start'],'2026-11-16')
-            self.assertEqual(fit.call_count,2)
+    def test_legacy_waiting_attempt_does_not_block_ready_data_same_week(self):
+        client, base = MemoryClient(), artifact()
+        store = feedback.FeedbackStore(client, base)
+        store.write(learner.ROOT+'nba/weekly_learning.json.gz', dict(
+            schema=1, week_start='2026-11-16', graded_games=127,
+            last_training={'status':'waiting_for_graded_forecasts','trained':False}))
+        with patch('requests.sessions.Session.request', side_effect=AssertionError('No HTTP')):
+            report = feedback.learn(client, base, state(140), now='2026-11-18T12:00:00Z')
+        self.assertTrue(report['trained'], report)
+        self.assertEqual(sum(report['partition_games'].values()), 140)
+        self.assertNotIn('next_week_start', report)
+
+    def test_insufficient_data_can_train_later_the_same_day(self):
+        client, base = MemoryClient(), artifact()
+        first = feedback.learn(client, base, state(127), now='2026-11-18T10:00:00Z')
+        self.assertFalse(first['trained'])
+        ready = feedback.learn(client, base, state(140), now='2026-11-18T12:00:00Z')
+        self.assertTrue(ready['trained'], ready)
+        with patch.object(learner, 'train', side_effect=AssertionError('Unchanged data')):
+            again = feedback.learn(client, base, state(140), now='2026-11-18T13:00:00Z')
+        self.assertEqual(again['status'], 'waiting_for_new_results')
 
     def test_collector_refresh_does_not_fit_full_historical_candidate(self):
         with patch.object(unified,'refresh') as refresh,patch.object(unified,'train') as train:
@@ -171,7 +185,11 @@ class LiveFeedbackTests(unittest.TestCase):
         active=simple_model()
         store.write(learner.ROOT+'nba/active.json.gz',active)
         store.write(learner.ROOT+'nba/weekly_learning.json.gz',dict(
-            schema=1,week_start='2026-11-16',graded_games=180,last_training={'trained':True}))
+            schema=1,week_start='2026-11-16',graded_games=180,
+            data_signature=hashlib.sha256(json.dumps(
+                feedback.normalize(base,state(180),now='2026-11-18T12:00:00Z')[0],
+                sort_keys=True,allow_nan=False,separators=(',',':')).encode()).hexdigest(),
+            last_training={'trained':True}))
         with patch.object(learner,'train',side_effect=AssertionError('Do not train again')):
             report=feedback.learn(client,base,state(180),now='2026-11-18T12:00:00Z')
         self.assertFalse(report['trained'])
@@ -291,3 +309,4 @@ class LiveFeedbackTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
