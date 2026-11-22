@@ -112,7 +112,7 @@ def checkpoint(league, result, remote=False):
     """Local first; remote backup is optional and uses existing private storage."""
     with _LOCK:
         keys = ['predictions','all_predictions','opportunities','nfl_player_props','player_props',
-                'spreads','prop_diagnostics','prop_issues','message','pipeline_version','created_at',
+                'spreads','prop_diagnostics','prop_pipeline_diagnostics','prop_issues','message','pipeline_version','created_at',
                 'validation_summary','model_source']
         if league == 'NFL':
             keys += ['nfl_generation_stage','nfl_winner_revision','connected_context_pending',
