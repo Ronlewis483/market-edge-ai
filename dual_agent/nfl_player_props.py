@@ -51,29 +51,73 @@ def event_props(key, event_id, markets, regions='us'):
                       regions=regions, markets=','.join(markets), oddsFormat='american', dateFormat='iso')
 
 def normalize_props(event):
-    rows=[]
-    for book in event.get('bookmakers', []):
-        if not allowed(book.get('key')):
+    """Normalize independent offers; one malformed outcome cannot drop a batch.
+
+    Exclusion counts travel with the frame for diagnostics without rescanning.
+    Full-game history must never be used for quarter/half markets.
+    """
+    from collections import Counter
+    rejected = Counter()
+    rows = []
+    source_count = 0
+    supported = set(MARKETS.values())
+    if not isinstance(event, dict):
+        frame = pd.DataFrame()
+        frame.attrs['normalization'] = {'source_listings': 0, 'normalized_listings': 0,
+                                       'rejections': {'invalid_response': 1}}
+        return frame
+    for book in event.get('bookmakers') or []:
+        if not isinstance(book, dict):
+            rejected['invalid_bookmaker'] += 1
             continue
-        for market in book.get('markets', []):
-            for outcome in market.get('outcomes', []):
+        book_key = str(book.get('key') or '').strip().lower()
+        for market in book.get('markets') or []:
+            if not isinstance(market, dict):
+                rejected['invalid_market'] += 1
+                continue
+            market_key = str(market.get('key') or '').removesuffix('_alternate')
+            for outcome in market.get('outcomes') or []:
+                source_count += 1
+                if not allowed(book_key):
+                    rejected['unsupported_bookmaker'] += 1
+                    continue
+                if market_key not in supported:
+                    rejected['unsupported_market'] += 1
+                    continue
+                if not isinstance(outcome, dict):
+                    rejected['invalid_outcome'] += 1
+                    continue
                 player = outcome.get('description')
-                if not player: continue
-                side = outcome.get('name','')
-                if side not in ('Over','Under','Yes','No'): continue
+                side = str(outcome.get('name') or '').strip().upper()
+                if not isinstance(player, str) or not player.strip():
+                    rejected['missing_player'] += 1
+                    continue
+                if side not in ('OVER', 'UNDER', 'YES', 'NO'):
+                    rejected['unsupported_side'] += 1
+                    continue
                 point = outcome.get('point')
-                if side in ('Over','Under') and point is None: continue
-                # Numeric Yes/No totals need their actual threshold. Never
-                # silently turn a missing passing/rushing/etc. line into 0.5.
-                market_key = str(market.get('key','')).removesuffix('_alternate')
-                if point is None and market_key != 'player_anytime_td': continue
+                if point is None and market_key == 'player_anytime_td':
+                    point = .5
+                try:
+                    point = float(point)
+                except (TypeError, ValueError, OverflowError):
+                    rejected['invalid_line'] += 1
+                    continue
+                if not math.isfinite(point) or (
+                        market_key == 'player_anytime_td' and point != .5):
+                    rejected['invalid_line'] += 1
+                    continue
                 rows.append({'event_id':event.get('id'), 'game_time':event.get('commence_time'),
-                  'home_team':event.get('home_team'), 'away_team':event.get('away_team'),
-                  'bookmaker':book.get('title'), 'bookmaker_key':book.get('key'),
-                  'market_key':market_key, 'player':player, 'side':side,
-                  'line':float(point) if point is not None else 0.5,
-                  'american_odds':outcome.get('price'), 'last_update':market.get('last_update') or book.get('last_update')})
-    return pd.DataFrame(rows)
+                    'home_team':event.get('home_team'), 'away_team':event.get('away_team'),
+                    'bookmaker':book.get('title'), 'bookmaker_key':book_key,
+                    'market_key':market_key, 'player':player.strip(), 'side':side.title(),
+                    'line':point, 'american_odds':outcome.get('price'),
+                    'last_update':market.get('last_update') or book.get('last_update')})
+    frame = pd.DataFrame(rows)
+    frame.attrs['normalization'] = {'source_listings': source_count,
+        'normalized_listings': len(frame), 'rejections': dict(rejected)}
+    return frame
+
 
 def implied_probability(american):
     a=float(american)
