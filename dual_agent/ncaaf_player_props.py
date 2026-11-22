@@ -303,10 +303,12 @@ def generate_props(game, cfbd_key, odds_key, now=None):
     quotes=collect_quotes(game,odds_key,cfbd_key,now,supported_markets=eligible)
     if not quotes: return {'picks':[],'issues':['No fresh supported player lines returned by the configured sportsbooks.'],'checked_at':now.isoformat()}
     season=now.year if now.month>=7 else now.year-1
-    roster=[]
-    for side in ('home','away'):
+    from concurrent.futures import ThreadPoolExecutor
+    def roster_side(side):
         people=_cfbd('/roster',{'team':game[side+'_team'],'year':season},cfbd_key,86400)
-        roster.extend(dict(p,team_id=str(game[side+'_id'])) for p in people)
+        return [dict(p,team_id=str(game[side+'_id'])) for p in people]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        roster=[person for team in pool.map(roster_side, ('home','away')) for person in team]
     picks,issues=score_quotes(game,quotes,roster,history,now)
     result={'picks':picks,'issues':issues,'listed_offers':len(quotes),'checked_at':now.isoformat(),
         'limitations':'Only explicitly recorded category results are used; missing appearances are not zero. College injury/lineup availability is unverified. Probabilities are experimental, not established betting accuracy.'}
@@ -346,6 +348,11 @@ def _ui_pool():
 
 
 def render_props_panel(game):
+    import streamlit as st
+    return st.fragment(run_every='2s')(_render_props_panel)(game)
+
+
+def _render_props_panel(game):
     import streamlit as st
     from dual_agent.ncaaf_prediction import stamp
     now=datetime.now(timezone.utc); gid=str(game['game_id'])
@@ -390,6 +397,9 @@ def render_props_panel(game):
         st.info('No fresh modeled props are available for this selection. See the input/training details below.')
     else:
         st.caption(f'{len(picks)} fresh listed offers \xb7 ranked for your selected platform')
+        st.dataframe(__import__('pandas').DataFrame(picks)[[k for k in ('player','label','side','line','historical_support','projection','sportsbook','decimal_odds') if k in picks[0]]],hide_index=True,use_container_width=True)
+        if not st.checkbox('Show detailed prop cards',key='ncaaf_prop_details_'+gid):
+            return
         for row in picks[:20]:
             with st.container(border=True):
                 st.markdown('**'+row['player']+' \xb7 '+row['side'].upper()+f" {row['line']:g} "+row['label']+'**')
@@ -411,5 +421,3 @@ if __name__=='__main__':
     parser.add_argument('--max-weeks',type=int,default=8)
     args=parser.parse_args()
     print(json.dumps(prepare_history(os.environ.get('CFBD_API_KEY'),args.max_weeks),indent=2))
-
-
