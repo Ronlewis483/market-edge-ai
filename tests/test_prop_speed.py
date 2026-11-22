@@ -69,7 +69,8 @@ class SpeedTests(unittest.TestCase):
             ns={'st':ui,'_render_cross_prop_cards':MagicMock(),'_render_nba_live_prop_cards':MagicMock()}
             exec(compile(ast.Module(body=[fn],type_ignores=[]),'app.py','exec'),ns)
             ns[name](*(['NFL',{},{}] if name=='render_cross_prop_cards' else [{},{}]))
-            ui.fragment.assert_called_once_with(run_every='2s')
+            ui.fragment.assert_not_called()
+            ns['_render_cross_prop_cards' if name=='render_cross_prop_cards' else '_render_nba_live_prop_cards'].assert_called_once()
 
     def test_nfl_alternate_lines_reuse_one_historical_sample(self):
         from dual_agent import nfl_player_prop_prediction_pipeline as pipeline
