@@ -2064,7 +2064,7 @@ def collect_nfl_game_prop_updates(game):
 
 
 def render_cross_prop_cards(league, game, fallback):
-    interval = None  # Display updates only on user interaction.
+    interval = '2s'  # Read completed queues; never restart provider work.
     return st.fragment(run_every=interval)(_render_cross_prop_cards)(league, game, fallback)
 
 
@@ -2092,7 +2092,7 @@ def _render_cross_prop_cards(league, game, fallback):
         if scoped is not None:
             st.caption(current.get('game_prop_stage') or 'Selected-game NFL prop scan')
             if scoped.get('game_prop_scan_pending'):
-                st.caption('Use Show completed NFL props to display progress; this panel does not refresh itself.')
+                st.caption('Completed player props appear automatically.')
         elif current.get('workspace_pending') or current.get('enrichment_pending'):
             st.caption('Refreshing in the background · saved cards remain visible.')
         for issue in current.get('prop_issues', [])[-6:]:
@@ -2117,13 +2117,11 @@ def _render_cross_prop_cards(league, game, fallback):
         if not shown and selected != 'All supported markets':
             st.caption(f'No completed {selected} props are loaded for this game yet. {len(props)} props are loaded across all categories.'+
                        (' The scan is still running; changing categories does not restart it. Use Show completed '+league+' props to display new results.' if pending else ' Check the category details below or refresh this game’s props.'))
-        display_limit = 5
-        if league == 'NFL':
-            display_limit = None if st.checkbox('Show all completed props in this category',key=scope+'_show_all_props') else 20
+        display_limit = None
         render_prop_comparisons(shown,pending=pending,scope=scope,limit=display_limit)
         if league=='MLB':
             mapped = [dict(r,market=r.get('Market'),player=r.get('Player')) for r in props]
-            render_prop_category_rankings(mapped,league)
+            # The complete table above already supports category filtering.
         else:
             reasons = [r for r in current.get('prop_diagnostics',[]) if r.get('home_team')==game.get('home_team') and r.get('away_team')==game.get('away_team')
                        and (selected=='All supported markets' or r.get('market')==selected)]
@@ -2370,8 +2368,8 @@ def collect_nba_game_prop_updates(game):
 
 
 def render_nba_live_prop_cards(game, fallback):
-    # Background work only publishes to its queue; explicit checks render it.
-    interval = None  # Background work never schedules a display redraw.
+    # Background work publishes to its queue; game-local polling renders it.
+    interval = '2s'  # Refresh only game-local completed results.
     return st.fragment(run_every=interval)(_render_nba_live_prop_cards)(game, fallback)
 
 
@@ -2458,7 +2456,7 @@ def _render_nba_live_prop_cards(game, fallback):
                 st.caption('No completed estimates match this game yet. The scan-wide total above may belong to other games; completed results appear here as they arrive.')
         else:
             st.info('No eligible priced props were produced for this selection. See the input issues and eligibility checks above.')
-        render_prop_category_rankings(normalized, 'NBA')
+        # The complete table above already supports category filtering.
 
 
 @st.cache_resource(show_spinner=False)
@@ -3107,11 +3105,12 @@ def record_nfl_comparison_prop(prop, pair, scope):
         st.rerun()
 
 
-def render_prop_comparisons(props, pending=False, limit=5, scope='main'):
+def render_prop_comparisons(props, pending=False, limit=None, scope='main'):
     """Shared YES/NO card renderer; probabilities keep their original source."""
     platform = st.session_state.get('prop_platform','DraftKings')
     ranking = st.session_state.get('prop_ranking','Probability and price')
-    rows = prop_comparisons(props,platform,ranking)[:limit]
+    all_rows = prop_comparisons(props,platform,ranking)
+    rows = all_rows if limit is None else all_rows[:limit]
     st.caption('Offers: '+platform+' · '+ranking)
     if platform in ('PrizePicks','Underdog'):
         st.caption('Ranked by probability. Entry payout and combination rules are needed to evaluate pick’em value.')
@@ -3123,7 +3122,21 @@ def render_prop_comparisons(props, pending=False, limit=5, scope='main'):
         st.caption('Still collecting sportsbook props…' if pending else 'No priced sportsbook sides are available for this selection.')
         return
     st.caption('For numeric props, YES means above the line and NO means below it; equality may be a push. For anytime touchdowns, YES means scores at least one and NO means scores none. No 65% cutoff applies.')
-    for rank, pair in enumerate(rows,1):
+    st.caption(f'{len(all_rows)} player/market lines available')
+    table = []
+    for pair in all_rows:
+        for side, prop in pair['sides'].items():
+            if prop is not None and prop.get('_offered'):
+                table.append({'Player':pair['player'], 'Market':pair['market'],
+                    'Side':side, 'Line':pair['line'], 'Chance':prop['Estimated chance'],
+                    'Sportsbook':prop.get('Best sportsbook'), 'Decimal odds':prop.get('Best decimal odds'),
+                    'History checked':prop.get('History checked UTC'), 'Availability':prop.get('Availability status')})
+    if table:
+        st.dataframe(pd.DataFrame(table), hide_index=True, use_container_width=True)
+    # Detail cards are optional and bounded; the complete ranked table is above.
+    if not st.checkbox('Show detailed prop cards',key=scope+'_details'):
+        return
+    for rank, pair in enumerate(rows[:20],1):
         with st.container(border=True):
             title = f"{pair['player']} · {pair['market']}" if pair['binary'] else f"{pair['player']} · {pair['line']:g} {pair['market']}"
             st.markdown(f'**#{rank} · {title}**')
@@ -4864,5 +4877,3 @@ if page == "🏈 NCAA Football":
 
 if page == "📐 Model Accuracy":
     render_model_accuracy()
-
-
