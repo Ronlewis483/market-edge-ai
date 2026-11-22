@@ -2064,8 +2064,9 @@ def collect_nfl_game_prop_updates(game):
 
 
 def render_cross_prop_cards(league, game, fallback):
-    interval = '2s'  # Read completed queues; never restart provider work.
-    return st.fragment(run_every=interval)(_render_cross_prop_cards)(league, game, fallback)
+    # The prediction workspace already owns a fragment. Render inside it;
+    # independently timed child fragments repeatedly clear this same panel.
+    return _render_cross_prop_cards(league, game, fallback)
 
 
 def _render_cross_prop_cards(league, game, fallback):
@@ -2092,7 +2093,7 @@ def _render_cross_prop_cards(league, game, fallback):
         if scoped is not None:
             st.caption(current.get('game_prop_stage') or 'Selected-game NFL prop scan')
             if scoped.get('game_prop_scan_pending'):
-                st.caption('Completed player props appear automatically.')
+                st.caption('Use Show completed NFL props to display the latest completed batch.')
         elif current.get('workspace_pending') or current.get('enrichment_pending'):
             st.caption('Refreshing in the background · saved cards remain visible.')
         for issue in current.get('prop_issues', [])[-6:]:
@@ -2368,9 +2369,9 @@ def collect_nba_game_prop_updates(game):
 
 
 def render_nba_live_prop_cards(game, fallback):
-    # Background work publishes to its queue; game-local polling renders it.
-    interval = '2s'  # Refresh only game-local completed results.
-    return st.fragment(run_every=interval)(_render_nba_live_prop_cards)(game, fallback)
+    # The parent workspace owns display updates. Drain all completed rows
+    # together on interaction, without registering another timed fragment.
+    return _render_nba_live_prop_cards(game, fallback)
 
 
 def _render_nba_live_prop_cards(game, fallback):
