@@ -355,26 +355,42 @@ def _estimate_prop(
     }
 
 
-def _compare_prop_outcomes(values, line, market, offered_sides, cutoff=None):
-    """Score both outcomes; only exact offered sides can qualify."""
+def _estimate_for_side(estimate, side):
+    """Reuse one line forecast for both directions without repeating inference."""
+    if estimate is None or side not in {'YES', 'NO', 'OVER', 'UNDER'}:
+        return None
+    result = dict(estimate)
+    support = result['over_support'] if side in {'YES', 'OVER'} else result['under_support']
+    result.update(model_pick=side, historical_support=float(support),
+        prediction_score=float(np.clip(.55*support + .20*result['normalized_edge']
+            + .15*min(result['sample_size']/12., 1.) + .10*result['consistency'], 0., 1.)))
+    return result
+
+
+def _compare_prop_outcomes(values, line, market, offered_sides, cutoff=None, estimate=None):
+    """Score a line once; only exact offered sides can qualify."""
+    if estimate is None:
+        estimate = _estimate_prop(values, line, market, cutoff=cutoff)
+    if estimate is None:
+        return []
     outcomes = []
     sides = ('YES', 'NO') if market == 'Anytime touchdown' else ('OVER', 'UNDER')
     aliases = ('OVER', 'UNDER') if market == 'Anytime touchdown' else ('YES', 'NO')
     sides += tuple(side for side in aliases if side in offered_sides)
     for side in sides:
-        estimate = _estimate_prop(values, line, market, side=side, cutoff=cutoff)
-        if estimate is None:
-            continue
+        selected = _estimate_for_side(estimate, side)
         offers = offered_sides.get(side, [])
-        row = {'side': side, 'chance': estimate['historical_support'],
+        row = {'side': side, 'chance': selected['historical_support'],
                'listed': bool(offers), 'qualifies': False,
                'reason': 'No matching sportsbook bet found'}
         if offers:
             best = _best_offer(offers)
             price = _decimal_price(best)
-            push = 0.0 if market == 'Anytime touchdown' else float(np.mean(values == line))
+            push = selected.get('estimated_push_chance',
+                0.0 if market == 'Anytime touchdown' else float(np.mean(values == line)))
             value = (1-push) * (row['chance'] * price - 1) if price is not None else None
             row.update(book=best['bookmaker_key'], american_odds=best['american_odds'],
+                       sportsbook_offers=offers,
                        positive_value=bool(value > 0) if value is not None else None)
             row['qualifies'] = True
             row['reason'] = 'Exact side offered with sufficient history; ranked by cover chance without a probability cutoff.'
@@ -383,44 +399,57 @@ def _compare_prop_outcomes(values, line, market, offered_sides, cutoff=None):
 
 
 def _select_consensus_props(prop_lines):
-    """Select a real, fresh offered line; never synthesize median handicaps."""
+    """Select real offers and retain exclusive rejection counts at each guard."""
     keys = ['event_id', 'game_time', 'home_team', 'away_team', 'player', 'market_key']
     required = keys + ['line', 'side', 'bookmaker_key', 'last_update']
-    if any(c not in prop_lines for c in required):
-        return pd.DataFrame()
-    props = prop_lines.reindex(columns=required+['american_odds']).copy()
-    props['bookmaker_key']=props['bookmaker_key'].astype(str).str.strip().str.lower()
-    props = props.loc[props['bookmaker_key'].map(allowed)]
+    counts = {'source_listings': len(prop_lines)}
+    missing = [c for c in required if c not in prop_lines]
+    if missing:
+        result = pd.DataFrame()
+        result.attrs['quote_checks'] = dict(counts, missing_columns=missing, accepted_listings=0)
+        return result
+    props = prop_lines.reindex(columns=required+['american_odds']).reset_index(drop=True).copy()
+    props['bookmaker_key'] = props['bookmaker_key'].astype(str).str.strip().str.lower()
     props['line'] = pd.to_numeric(props['line'], errors='coerce')
-    missing_price=props['american_odds'].isna()
+    missing_price = props['american_odds'].isna()
     props['american_odds'] = pd.to_numeric(props['american_odds'], errors='coerce')
-    props['side'] = props['side'].astype(str).str.upper()
+    props['side'] = props['side'].astype(str).str.strip().str.upper()
     updated = pd.to_datetime(props['last_update'], utc=True, errors='coerce')
     age = pd.Timestamp.now(tz='UTC') - updated
-    props = props.loc[age.between(pd.Timedelta(0), pd.Timedelta(minutes=30))
-        & props['side'].isin(['OVER','UNDER','YES','NO'])
-        & np.isfinite(props['line'])
-        & ((np.isfinite(props['american_odds']) & (props['american_odds'].abs() >= 100))
-           | (props['bookmaker_key'].isin(PICKEM) & missing_price))].dropna(subset=keys+['bookmaker_key'])
-    props = props.loc[props.bookmaker_key.astype(str).str.strip().ne('')]
+    remaining = pd.Series(True, index=props.index)
+    checks = [
+        ('unsupported_bookmaker', props['bookmaker_key'].map(allowed)),
+        ('invalid_identity', props[keys].notna().all(axis=1) & props[keys].astype(str).apply(lambda c:c.str.strip().ne('')).all(axis=1)),
+        ('unsupported_market', props['market_key'].isin(MARKETS.values())),
+        ('invalid_side', props['side'].isin(['OVER','UNDER','YES','NO'])),
+        ('invalid_line', np.isfinite(props['line'])),
+        ('missing_update', updated.notna()),
+        ('future_update', age.ge(pd.Timedelta(0))),
+        ('expired_quote', age.le(pd.Timedelta(minutes=30))),
+        ('invalid_price', (np.isfinite(props['american_odds']) & props['american_odds'].abs().ge(100))
+            | (props['bookmaker_key'].isin(PICKEM) & missing_price)),
+    ]
+    for reason, valid in checks:
+        counts[reason] = int((remaining & ~valid).sum())
+        remaining &= valid
+    props = props.loc[remaining].assign(_quote_updated=updated.loc[remaining])
+    counts['accepted_listings'] = len(props)
     rows = []
     for identity, candidates in props.groupby(keys, dropna=False):
-        lines = []
         for line, offers in candidates.groupby('line'):
             sides = {}
             for side, quotes in offers.groupby('side'):
-                quotes = quotes.drop_duplicates('bookmaker_key', keep='last')
-                if len(quotes) >= 1:
-                    sides[side] = quotes[['bookmaker_key','american_odds','last_update']].to_dict('records')
+                quotes = quotes.sort_values('_quote_updated', kind='stable').drop_duplicates('bookmaker_key', keep='last')
+                exact = dict(zip(keys, identity), line=float(line), side=side)
+                sides[side] = [dict(quote, **exact) for quote in
+                    quotes[['bookmaker_key','american_odds','last_update']].to_dict('records')]
             if sides:
-                lines.append((max(len(q) for q in sides.values()), float(line), sides))
-        if not lines:
-            continue
-        # Score each real offered line; ranking later retains one per market.
-        for _, line, sides in sorted(lines, key=lambda v:(-v[0], v[1])):
-            rows.append(dict(zip(keys, identity), line=line,
-                sportsbook_line_count=max(len(q) for q in sides.values()), offered_sides=sides))
-    return pd.DataFrame(rows)
+                rows.append(dict(zip(keys, identity), line=float(line),
+                    sportsbook_line_count=max(len(q) for q in sides.values()), offered_sides=sides))
+    result = pd.DataFrame(rows)
+    counts['accepted_lines'] = len(result)
+    result.attrs['quote_checks'] = counts
+    return result
 
 
 def run_nfl_player_prop_prediction_pipeline(
@@ -489,12 +518,15 @@ def run_nfl_player_prop_prediction_pipeline(
 
     if consensus_props.empty:
         empty = pd.DataFrame()
-        empty.attrs['reason'] = 'No listed lines passed side, freshness and price checks. Sportsbooks need valid odds; pick’em platforms may omit individual prices.'
+        empty.attrs['quote_checks'] = consensus_props.attrs.get('quote_checks', {})
+        rejected = ', '.join(f'{name}={count}' for name,count in empty.attrs['quote_checks'].items()
+            if name not in {'source_listings', 'accepted_listings', 'accepted_lines'} and count)
+        empty.attrs['reason'] = 'No usable offered lines after quote checks: '+(rejected or 'no eligible listings')
         return empty
 
     rows = []
     samples = {}
-    exclusions = {'insufficient_history': 0, 'unoffered_direction': 0}
+    exclusions = {'insufficient_history': 0, 'unoffered_direction': 0, 'invalid_kickoff': 0, 'outside_horizon': 0, 'unsupported_market': 0}
 
     for _, prop in (
         consensus_props.iterrows()
@@ -507,11 +539,13 @@ def run_nfl_player_prop_prediction_pipeline(
         )
 
         if pd.isna(kickoff):
+            exclusions['invalid_kickoff'] += 1
             continue
 
         # Never forecast a game
         # that has already started.
         if kickoff <= current_time:
+            exclusions['outside_horizon'] += 1
             continue
 
         if horizon_days==1:
@@ -519,6 +553,7 @@ def run_nfl_player_prop_prediction_pipeline(
             if kickoff.tz_convert('America/Chicago').date()!=current_time.tz_convert('America/Chicago').date():
                 continue
         elif kickoff>forecast_end:
+            exclusions['outside_horizon'] += 1
             continue
 
         market = market_lookup.get(
@@ -526,6 +561,7 @@ def run_nfl_player_prop_prediction_pipeline(
         )
 
         if not market:
+            exclusions['unsupported_market'] += 1
             continue
 
         line = pd.to_numeric(
@@ -554,18 +590,16 @@ def run_nfl_player_prop_prediction_pipeline(
             )
         )
 
-        outcome_comparison = _compare_prop_outcomes(values, float(line), market, prop['offered_sides'], cutoff=kickoff)
+        base_estimate = _estimate_prop(values, float(line), market, cutoff=kickoff)
+        if base_estimate is None:
+            exclusions['insufficient_history'] += 1
+            continue
+        outcome_comparison = _compare_prop_outcomes(values, float(line), market, prop['offered_sides'], cutoff=kickoff, estimate=base_estimate)
         valid_sides = {'YES','NO','OVER','UNDER'}
         for offered_side in prop['offered_sides']:
             if offered_side not in valid_sides:
                 continue
-            estimate = _estimate_prop(
-                values=values,
-                line=float(line),
-                market=market,
-                side=offered_side,
-                cutoff=kickoff,
-            )
+            estimate = _estimate_for_side(base_estimate, offered_side)
 
             if estimate is None:
                 exclusions['insufficient_history'] += 1
@@ -591,7 +625,8 @@ def run_nfl_player_prop_prediction_pipeline(
             best_offer = _best_offer(offered)
             value_eligible = False
             best_decimal = _decimal_price(best_offer)
-            push_chance = 0.0 if market == 'Anytime touchdown' else float(np.mean(values == float(line)))
+            push_chance = estimate.get('estimated_push_chance',
+                0.0 if market == 'Anytime touchdown' else float(np.mean(values == float(line))))
             expected_return = ((1-push_chance) * (estimate['historical_support'] * best_decimal - 1)
                                if best_decimal is not None else None)
 
@@ -688,6 +723,10 @@ def run_nfl_player_prop_prediction_pipeline(
     results = pd.DataFrame(
         rows
     )
+
+    results.attrs['quote_checks'] = consensus_props.attrs.get('quote_checks', {})
+    results.attrs['exclusions'] = exclusions
+    results.attrs['scored_predictions'] = len(results)
 
     if results.empty:
         results.attrs['exclusions'] = exclusions
