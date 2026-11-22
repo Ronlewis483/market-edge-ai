@@ -348,8 +348,8 @@ def _ui_pool():
 
 
 def render_props_panel(game):
-    import streamlit as st
-    return st.fragment(run_every='2s')(_render_props_panel)(game)
+    # Render one stable panel; the button below collects the entire finished job.
+    return _render_props_panel(game)
 
 
 def _render_props_panel(game):
