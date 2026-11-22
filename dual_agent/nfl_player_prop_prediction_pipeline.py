@@ -493,6 +493,7 @@ def run_nfl_player_prop_prediction_pipeline(
         return empty
 
     rows = []
+    samples = {}
     exclusions = {'insufficient_history': 0, 'unoffered_direction': 0}
 
     for _, prop in (
@@ -535,16 +536,12 @@ def run_nfl_player_prop_prediction_pipeline(
         if pd.isna(line):
             continue
 
-        games = (
-            _historical_player_games(
-                history=player_history,
-                player=prop["player"],
-                market=market,
-                kickoff=kickoff,
-                window=window,
-                history_index=history_index,
-            )
-        )
+        sample_key = (prop["player"], market, kickoff.isoformat())
+        if sample_key not in samples:
+            samples[sample_key] = _historical_player_games(
+                history=player_history, player=prop["player"], market=market,
+                kickoff=kickoff, window=window, history_index=history_index)
+        games = samples[sample_key]
 
         if games.empty:
             exclusions['insufficient_history'] += 1
