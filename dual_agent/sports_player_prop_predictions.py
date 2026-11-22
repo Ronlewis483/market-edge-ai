@@ -777,6 +777,19 @@ def nba_availability(rows, context):
 
 
 def nba_points_defense(rows, matchup, context, cutoff):
+    # Context belongs to one scoring pass; reuse the expensive opponent scan
+    # across all markets, alternate lines and both sides for the same player.
+    if context is None:
+        return _nba_points_defense(rows, matchup, context, cutoff)
+    ids = tuple(sorted(str(r.get('player', {}).get('id')) for r in rows[-1:]))
+    key = (ids, matchup.get('home_team'), matchup.get('away_team'), cutoff.isoformat())
+    cache = context.setdefault('_points_defense_cache', {})
+    if key not in cache:
+        cache[key] = _nba_points_defense(rows, matchup, context, cutoff)
+    return cache[key]
+
+
+def _nba_points_defense(rows, matchup, context, cutoff):
     """Conservative points-only allowance adjustment, not defense by position."""
     context=context or {}; teams=context.get('teams',{})
     def team_key(value):
@@ -1201,6 +1214,15 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
             except Exception as exc:
                 quotes, errors = [], [f'NBA sportsbook lines unavailable: {type(exc).__name__}: {exc}.']
             try:
+                # Quote collection is enough to score every available saved
+                # player. Do not wait for optional roster/network work to finish
+                # before showing the complete cached slate. Known injury blocks
+                # are retained; unavailable fresh checks remain explicitly marked.
+                if progress and quotes and not context_job.done():
+                    cached_context = load_nba_matchup_context(nba_key, cache_only=True)
+                    cached_histories = nba_cached_histories(q['player'] for q in quotes)
+                    progress(nba_score_cached_quotes(games, quotes, cached_histories,
+                        context=cached_context, errors=errors))
                 prepared_nba_context, timings['Injury and opponent context'] = context_job.result()
             except Exception as exc:
                 prepared_nba_context = {'issue': 'NBA availability/opponent context unavailable: '+type(exc).__name__}
@@ -1283,6 +1305,8 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
             tick = time.monotonic()
             # A network-page update is progress even before a player completes.
             # Reuse scored rows rather than silently dropping these updates.
+            if history_revision != last_scored and last_scored >= 0 and tick-last_publish < 2:
+                return
             if history_revision == last_scored:
                 if tick-last_publish < 1:
                     return
@@ -1291,14 +1315,17 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
                 by_key = {star_key(name): rows for name, rows in history_by_name.items()}
                 ready = {q['player']: by_key[star_key(q['player'])] for q in quotes if star_key(q['player']) in by_key}
                 ready.update(history_by_name)
-                ready_groups = {key: group for key, group in groups.items() if star_key(key[1]) in by_key}
+                ready_groups = {}
+                for key, group in groups.items():
+                    player_key = star_key(key[1])
+                    if player_key in by_key and player_key in dirty_players:
+                        ready_groups.setdefault(player_key, {})[key] = group
                 scoring_started = time.perf_counter()
-                # Re-score changed players only; estimates depend on their own
-                # history/context, not on how many other players have loaded.
+                # Re-score changed players only; group once instead of repeatedly
+                # walking the entire slate's market dictionary for each player.
                 for player_key in list(dirty_players):
-                    player_groups = {key:group for key,group in ready_groups.items() if star_key(key[1]) == player_key}
-                    scored_players[player_key] = _rank_prop_candidates('NBA', games, player_groups,
-                        ready, [], {}, {}, {}, nba_context=nba_context)
+                    scored_players[player_key] = _rank_prop_candidates('NBA', games,
+                        ready_groups.get(player_key, {}), ready, [], {}, {}, {}, nba_context=nba_context)
                 dirty_players.clear()
                 chosen = [pick for value in scored_players.values() for pick in value.get('game_picks', [])]
                 chosen.sort(key=lambda r:(-r['Estimated chance'],-r['Prior games'],r['Player']))
@@ -1317,11 +1344,17 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
             progress(partial)
         history_started = time.perf_counter()
         history_scoring_before = calculation_seconds
-        publish('Checking saved player histories')
+        # Publish the entire cached slate once before the first cold download.
+        history_by_name.update(nba_cached_histories(names))
+        processed_players.update(star_key(name) for name, rows in history_by_name.items() if rows)
+        dirty_players.update(processed_players)
+        completed = len(processed_players)
+        history_revision += 1
+        publish('Scoring all saved player histories')
         # One loader first emits ALL saved players, then does incremental
         # updates. A refreshed player replaces its own sample, not its counter.
         for player, history, error in _nba_history_batches(names, nba_key, status=publish, foreground=foreground):
-            if history or player not in history_by_name:
+            if (history or player not in history_by_name) and history_by_name.get(player) != history:
                 history_by_name[player] = history
                 history_revision += 1
                 dirty_players.add(star_key(player))
@@ -1392,6 +1425,7 @@ def generate_player_prop_picks(league, games, odds_key, player_logs=None, snapsh
 
 def _rank_prop_candidates(league, games, groups, history_by_name, errors,
                           star_rosters, identities, mlb_histories, nba_context=None):
+    nba_context = dict(nba_context or {})
     if league == 'NBA' and star_rosters:
         from dual_agent.nba_star_spotlight import build_star_spotlights
     picks = []; exclusions = []; pitcher_forecasts = []
