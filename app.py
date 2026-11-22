@@ -1991,6 +1991,10 @@ def merge_nfl_game_props(current, scoped, game):
     merged['prop_issues'] = scoped.get('prop_issues', [])
     if scoped.get('prop_diagnostics'):
         merged['prop_diagnostics'] = scoped['prop_diagnostics']
+    if scoped.get('prop_pipeline_diagnostics'):
+        incoming_ids = {r.get('event_id') for r in scoped['prop_pipeline_diagnostics']}
+        merged['prop_pipeline_diagnostics'] = [r for r in merged.get('prop_pipeline_diagnostics', [])
+            if r.get('event_id') not in incoming_ids]+scoped['prop_pipeline_diagnostics']
     merged['game_prop_scan_pending'] = scoped.get('game_prop_scan_pending',False)
     merged['game_prop_stage'] = scoped.get('game_prop_stage')
     return merged
@@ -2012,7 +2016,8 @@ def generate_nfl_game_props(game, odds_key, updates, context=None):
         props, issues = automatic_nfl_props(pd.DataFrame([dict(game)]),odds_key,
             on_props=lambda props:publish(props=props),on_status=lambda stage:publish(stage=stage))
         current.update(nfl_player_props=props,prop_issues=issues,
-            prop_diagnostics=props.attrs.get('prop_diagnostics',[]))
+            prop_diagnostics=props.attrs.get('prop_diagnostics',[]),
+            prop_pipeline_diagnostics=props.attrs.get('pipeline_diagnostics',[]))
     except Exception as exc:
         current['prop_issues'].append('NFL selected-game props failed: '+type(exc).__name__+': '+str(exc))
     current.update(game_prop_scan_pending=False,game_prop_stage='Selected-game NFL prop scan finished')
@@ -2059,7 +2064,15 @@ def collect_nfl_game_prop_updates(game):
         job.pop('future',None);job.pop('updates',None);changed = True
     if changed:
         current = st.session_state.get('nfl_prediction_pipeline_result') or {}
-        st.session_state['nfl_prediction_pipeline_result'] = merge_nfl_game_props(current,job['result'],game)
+        merged = merge_nfl_game_props(current,job['result'],game)
+        st.session_state['nfl_prediction_pipeline_result'] = merged
+        if not job['result'].get('game_prop_scan_pending'):
+            from dual_agent.sports_prop_workspace import checkpoint, track
+            try:
+                checkpoint('NFL',merged)
+                track('NFL',merged)
+            except Exception:
+                merged['workspace_issue'] = 'NFL props are available in this session; saving is unavailable.'
     return job['result']
 
 
@@ -3038,7 +3051,11 @@ def prop_comparisons(props, platform="All platforms", ranking="Highest probabili
                 if not isinstance(outcome, dict): continue
                 detail = dict(prop, Pick=outcome.get('side'),
                     **{'Estimated chance':outcome.get('chance'), 'Best sportsbook':outcome.get('book'),
-                       '_offered':bool(outcome.get('listed')), '_comparison':True, 'Sportsbook offers':[]})
+                       '_offered':bool(outcome.get('listed')), '_comparison':True,
+                       'Sportsbook offers':outcome.get('sportsbook_offers', []),
+                       '_nfl_original':dict(original, model_pick=outcome.get('side'),
+                           historical_support=outcome.get('chance'), best_sportsbook=outcome.get('book'),
+                           sportsbook_offers=outcome.get('sportsbook_offers', []))})
                 price = outcome.get('american_odds')
                 try:
                     price = float(price)
