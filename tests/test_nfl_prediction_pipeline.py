@@ -67,10 +67,11 @@ class NflPipelineTests(unittest.TestCase):
         self.assertEqual(pipeline.call_args.kwargs['feature_games'],'features')
 
     def run_enrichment(self, fail_props=False, fail_connected=False):
-        updates=Queue(); order=[]
+        updates=Queue(); order=[]; props_started=threading.Event()
         incoming=dict(predictions=forecast(),connected_context_pending=True,
                       enrichment_pending=True,workspace_pending=True)
         def attach(predictions,odds):
+            self.assertTrue(props_started.wait(timeout=2),'Props must start alongside context')
             order.append('context')
             result=predictions.copy()
             result['game_context']=[{'home':{'qb':{'name':'Verified feed starter'}}}]
@@ -82,8 +83,17 @@ class NflPipelineTests(unittest.TestCase):
             result['predictions']=result['predictions'].assign(confidence=.65)
             result['connected_context_pending']=False
             return result
-        def enhance(league,result,key,features,on_props):
+        def collect_props(predictions,key,on_props):
+            order.append('collect_props')
+            props_started.set()
+            return pd.DataFrame(),[]
+        def enhance(league,result,key,features,on_props,on_spreads,prepared_nfl_props):
             order.append('props')
+            self.assertIsNotNone(prepared_nfl_props)
+            prepared,issues=prepared_nfl_props.result(timeout=2)
+            self.assertTrue(prepared.empty)
+            self.assertEqual(issues,[])
+            self.assertEqual(order.count('collect_props'),1)
             self.assertEqual(updates.qsize(),1)
             self.assertEqual(updates.queue[0]['predictions'].iloc[0].confidence,.6 if fail_connected else .65)
             self.assertEqual(updates.queue[0]['connected_context_pending'],fail_connected)
@@ -94,13 +104,13 @@ class NflPipelineTests(unittest.TestCase):
         modules={
             'dual_agent.nfl_live_context':types.SimpleNamespace(attach_context=attach),
             'dual_agent.nfl_connected_engine':types.SimpleNamespace(finalize_connected_result=finalize),
-            'dual_agent.game_prediction_addons':types.SimpleNamespace(enhance_result=enhance),
+            'dual_agent.game_prediction_addons':types.SimpleNamespace(enhance_result=enhance,automatic_nfl_props=collect_props),
             'dual_agent.nfl_player_props_ui':types.SimpleNamespace(cached_player_history=lambda years:pd.DataFrame()),
         }
         with patch.dict('sys.modules',modules),patch.object(workspace,'checkpoint') as save, \
              patch.object(workspace,'track'),patch.object(workspace,'settle_nfl'):
             result=jobs.enrich_result(incoming,'features','odds',updates)
-        self.assertEqual(order,['context','connected','props'])
+        self.assertEqual(order,['collect_props','context','connected','props'])
         self.assertEqual(result['all_predictions'].iloc[0].confidence,.6 if fail_connected else .65)
         self.assertFalse(result['workspace_pending'])
         self.assertFalse(result['enrichment_pending'])
