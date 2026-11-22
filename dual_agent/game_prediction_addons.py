@@ -437,6 +437,7 @@ def automatic_nfl_props(predictions, key, on_props=None, on_status=None):
     selected.sort(key=lambda e:e.get('commence_time',''))
     frames, issues = [], []
     frames_by_event, fetch_errors = {}, {}
+    scan_diagnostics = {}
     if not selected:
         empty = pd.DataFrame()
         empty.attrs['prop_diagnostics'] = [row for game in predicted
@@ -458,10 +459,32 @@ def automatic_nfl_props(predictions, key, on_props=None, on_status=None):
         jobs = [quote_pool.submit(cached_props, key, event['id'], tuple(supported[start:start+10]))
                 for start in range(0,len(supported),10)]
         frames = []
-        for job in jobs:
-            data, _ = job.result()
-            frames.append(normalize_props(data))
-        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(), notes
+        normalization = {'source_listings': 0, 'normalized_listings': 0, 'rejections': {}}
+        failed_batches = 0
+        for job in as_completed(jobs):
+            try:
+                data, _ = job.result()
+                # A successful HTTP response still has to belong to this event.
+                if not isinstance(data, dict) or data.get('id') != event['id'] or not matching_game_rows(event, [data]):
+                    raise ValueError('Mismatched sportsbook event')
+                frame = normalize_props(data)
+                detail = frame.attrs.get('normalization', {})
+                normalization['source_listings'] += detail.get('source_listings', 0)
+                normalization['normalized_listings'] += len(frame)
+                for reason, count in detail.get('rejections', {}).items():
+                    normalization['rejections'][reason] = normalization['rejections'].get(reason, 0)+count
+                if not frame.empty:
+                    # Per-batch attrs are collected above, not compared by concat.
+                    frame.attrs = {}
+                    frames.append(frame)
+            except Exception as exc:
+                failed_batches += 1
+                notes.append('One market batch unavailable ('+type(exc).__name__+'); other returned offers retained.')
+        combined = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        combined.attrs['collection'] = dict(normalization, requested_batches=len(jobs),
+            failed_batches=failed_batches, unsupported_markets=unsupported)
+        return combined, notes
+
     forecasts = []
     history = None
     history_index = None
@@ -473,7 +496,10 @@ def automatic_nfl_props(predictions, key, on_props=None, on_status=None):
         try:
             props = run_nfl_player_prop_prediction_pipeline(group, history,
                 window=12, max_results=200, horizon_days=7, retain_all_qualified=True, include_value_candidates=True, history_index=history_index)
+            scan_diagnostics[event_id].update(quote_checks=props.attrs.get('quote_checks', {}),
+                exclusions=props.attrs.get('exclusions', {}), scored_predictions=len(props))
             if not props.empty:
+                props.attrs = {}
                 forecasts.append(props)
             else:
                 event = next((e for e in selected if e['id'] == event_id), {})
@@ -521,6 +547,10 @@ def automatic_nfl_props(predictions, key, on_props=None, on_status=None):
                 event = pending[future]
                 try:
                     frame, notes = future.result()
+                    scan_diagnostics[event['id']] = dict(event_id=event['id'],
+                        home_team=event.get('home_team'), away_team=event.get('away_team'),
+                        **frame.attrs.get('collection', {}))
+                    frame.attrs = {}
                     frames_by_event[event['id']] = frame
                     issues.extend(f"{event.get('away_team')} @ {event.get('home_team')}: {note}" for note in notes)
                     if not frame.empty:
@@ -553,6 +583,7 @@ def automatic_nfl_props(predictions, key, on_props=None, on_status=None):
     # Do not rerun history selection and probability calculations solely to
     # explain excluded markets. The scoring pass has already done that work.
     combined.attrs['prop_diagnostics'] = []
+    combined.attrs['pipeline_diagnostics'] = list(scan_diagnostics.values())
     combined.attrs['qb_forecast_lines'] = lines
     combined.attrs['loading_timings_seconds'] = dict(history_ready=history_seconds,first_picks=first_picks_at,scoring=scoring_seconds,total=perf_counter()-scan_started)
     return combined, issues
@@ -581,6 +612,7 @@ def enhance_result(league, result, key, history=None, on_props=None, on_spreads=
             props, issues = (prepared_nfl_props.result() if prepared_nfl_props is not None
                              else automatic_nfl_props(predictions, key, on_props=on_props))
             result['prop_diagnostics'] = props.attrs.pop('prop_diagnostics', [])
+            result['prop_pipeline_diagnostics'] = props.attrs.get('pipeline_diagnostics', [])
             result.setdefault('nfl_stage_timings_seconds', {}).update(
                 {'props_'+name: value for name,value in props.attrs.get('loading_timings_seconds', {}).items()})
             result['nfl_player_props'], result['prop_issues'] = props, issues
