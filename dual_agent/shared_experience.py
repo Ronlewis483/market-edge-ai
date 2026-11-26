@@ -135,16 +135,19 @@ def build(sport,records,now=None):
 
 
 def publish(sport,records,store,now=None):
+    records=list(records)
+    from .learning_memory import record_outcomes
+    memory=record_outcomes(sport,records,store,now)
     report=build(sport,records,now);path=ROOT+sport.lower()+'/latest.json.gz'
     previous=store.read(path)
     if previous and previous.get('input_fingerprint')==report['input_fingerprint']:
-        return {'status':'unchanged_experience_skipped','unique_games':report['unique_games']}
+        return {'status':'unchanged_experience_skipped','unique_games':report['unique_games'],'learning_memory':memory}
     # Own-sport daily objects avoid cross-sport read/modify/write collisions.
     day=at(report['published_at']).date().isoformat()
     store.write(ROOT+sport.lower()+'/daily/'+day+'.json.gz',report,replace=True)
     store.write(path,report,replace=True)
     with _LOCK:_CACHE.pop(sport,None)
-    return {'status':'experience_published','unique_games':report['unique_games'],'model_groups':len(report['models'])}
+    return {'status':'experience_published','unique_games':report['unique_games'],'model_groups':len(report['models']),'learning_memory':memory}
 
 
 def profile(sport):
