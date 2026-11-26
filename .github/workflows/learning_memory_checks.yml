@@ -1,0 +1,36 @@
+name: All-sport learning memory checks
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'dual_agent/learning_memory.py'
+      - 'dual_agent/experiment_controller.py'
+      - 'dual_agent/shared_experience.py'
+      - 'dual_agent/sports_connected_winner.py'
+      - 'dual_agent/nba_context_residual.py'
+      - 'tests/test_learning_memory.py'
+      - '.github/workflows/learning_memory_checks.yml'
+  pull_request:
+    paths:
+      - 'dual_agent/**'
+      - 'tests/**'
+      - '.github/workflows/learning_memory_checks.yml'
+permissions:
+  contents: read
+jobs:
+  offline-checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install numpy pandas scipy scikit-learn requests streamlit
+      - name: Verify memory, training gates and regressions
+        run: |
+          python -m unittest discover -s tests -p 'test_learning_memory.py'
+          python -m unittest discover -s tests -p 'test_nba_live_feedback.py'
+          python -m unittest discover -s tests -p 'test_nfl_weekly_learning.py'
+          python -m unittest discover -s tests -p 'test_ncaaf_selection.py'
+          python -m unittest discover -s tests -p 'test_nba_matchup_context.py'
