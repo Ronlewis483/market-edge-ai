@@ -150,7 +150,7 @@ def predict(package,features,base_probability,base_model_id,captured_at,schedule
             'status':'experimental bounded adjustment to trained neural model'}
 
 
-def fit(groups,trained_at=None):
+def fit(groups,trained_at=None,penalties=None):
     import numpy as np
     from scipy.optimize import minimize
     if __package__:
@@ -163,7 +163,7 @@ def fit(groups,trained_at=None):
     p0={name:np.array([r['base_probability'] for r in rows]) for name,rows in groups.items()}
     y={name:np.array([r['label'] for r in rows]) for name,rows in groups.items()}
     limit=RULES['max_logit_change'];best=None;trials=[]
-    for penalty in RULES['penalties']:
+    for penalty in (penalties or RULES['penalties']):
         def objective(coef):
             z=x['train']@coef;t=np.tanh(z/limit);p=probabilities(coef,x['train'],p0['train'],limit)
             logloss=-np.mean(y['train']*np.log(np.clip(p,1e-12,1))+(1-y['train'])*np.log(np.clip(1-p,1e-12,1)))
@@ -187,7 +187,7 @@ def fit(groups,trained_at=None):
     # Inspect the held-out test only after validation passes; it cannot tune parameters.
     report['test']=metrics(y['test'],probabilities(best[1],x['test'],p0['test'],limit))
     report['test_neural_base']=metrics(y['test'],p0['test'])
-    training_id=hashed({'rows':groups,'rules':RULES});available=trained_at or datetime.now(timezone.utc)
+    training_id=hashed({'rows':groups,'rules':RULES,'penalties':penalties or RULES['penalties']});available=trained_at or datetime.now(timezone.utc)
     available=max([available]+[stamp(r['label_observed_at']) for rows in groups.values() for r in rows])
     meta={'model_id':'nba_neural_adjustment_'+training_id[:20],'base_model_id':BASE_MODEL,'feature_version':FEATURE_VERSION,
           'fields':list(FIELDS),'max_logit_change':limit,'available_after':available.isoformat(),'rules':RULES}
@@ -214,10 +214,24 @@ def run_early(client,now=None):
         'partition_games':{k:len(v) for k,v in groups.items()},'reasons':reasons,**diagnostics,
         'live_model_changed':False,'sports_api_requests':0,'minimum_partition_games':RULES['minimum_games']}
     if reasons:status.update(status='waiting_for_early_learning_data',training_performed=False);return status
-    identity=hashed({'groups':groups,'rules':RULES});path=ROOT+'candidates/early_'+identity+'.json.gz'
+    memory_context,lessons,penalties=early_memory(client,groups)
+    status['learning_memory']=lessons
+    identity=hashed({'groups':groups,'rules':RULES,'penalties':penalties});path=ROOT+'candidates/early_'+identity+'.json.gz'
+    memory_context['run_id']=identity
     package=client.read(path,compressed=True);trained=package is None
     if package is None:
-        package,report=fit(groups,now)
+        package,report=fit(groups,now,penalties)
+        from .learning_memory import remember_experiment
+        baseline=report['validation_neural_base']
+        trials=[]
+        for trial in report['penalty_trials']:
+            score=trial['validation']
+            rejected=[]
+            if score['brier']>=baseline['brier']-1e-8:rejected.append('brier_not_improved')
+            if score['log_loss']>baseline['log_loss']:rejected.append('log_loss_regression')
+            if score['accuracy']<baseline['accuracy']:rejected.append('accuracy_regression')
+            trials.append(dict(config={'penalty':trial['penalty']},validation=score,validation_rejections=rejected))
+        remember_experiment(memory_context,trials,{})
         if package is None:
             status.update(status='early_adjustment_no_validation_gain',training_performed=True,validation_report=report)
             return status
@@ -231,3 +245,22 @@ def run_early(client,now=None):
     status.update(status='early_adjustment_candidate_saved',training_performed=trained,
         candidate_path=path,model_id=package['metadata']['model_id'],validation_report=report)
     return status
+
+
+def early_memory(client,groups):
+    """Development-only lessons for the separate bounded NBA correction trainer."""
+    from .learning_memory import development
+    class Store:
+        def read(self,path):return client.read(path,compressed=True)
+        def write(self,path,value,replace=False):return client.write(path,value,compressed=True,replace=replace)
+    cohort=BASE_MODEL+'|bounded_context_v1'
+    converted=[[dict(base_id=cohort,event_id=str(r['game_id']),captured_at=r['forecast_time'],
+        start_time=r['start_time'],label_observed_at=r['label_observed_at'],
+        original_probability=r['base_probability'],outcome=r['label'],context=r['features'])
+        for r in groups[name]] for name in ('train','validation','test')]
+    store=Store();prefix=ROOT+'early_adjustment/'
+    lessons=development('NBA',cohort,converted,store,prefix)
+    penalties=list(RULES['penalties'])
+    if lessons['hypotheses'] or any(n>=2 for n in lessons['repeated_validation_failures'].values()):
+        penalties.append(300.)
+    return dict(sport='NBA',base_id=cohort,groups=converted,store=store,prefix=prefix),lessons,penalties
