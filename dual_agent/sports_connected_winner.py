@@ -330,6 +330,8 @@ def train(sport,base_id,rows,store):
         trial={'config':config,'validation':score};trials.append(trial)
         fitted.append((controller.rank(score),params,trial,q))
     if not fitted:
+        from .learning_memory import remember_experiment
+        remember_experiment(experiment,trials,{})
         store.write(experiment['prefix']+'failed/'+experiment['run_id']+'.json.gz',{'trials':trials})
         return dict(report,status='numerical_fit_failed')
     _,params,selected,vq=min(fitted,key=lambda value:value[0]);config=selected['config']
