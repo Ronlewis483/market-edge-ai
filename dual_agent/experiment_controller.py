@@ -23,9 +23,13 @@ def prepare(sport,base_id,rows,groups,store):
     prefix=ROOT+sport.lower()+'/experiments_v1/'+digest(base_id)[:24]+'/'
     state=store.read(prefix+'state.json.gz') or {'schema':VERSION,'rounds':0}
     if state.get('schema')!=VERSION:raise ValueError('Experiment state schema mismatch')
+    groups=[list(g) for g in groups]
+    from .learning_memory import development
+    memory=development(sport,base_id,groups,store,prefix)
     identity=fingerprint(rows)
     report={'controller_version':VERSION,'dataset_fingerprint':identity,'experiment_prefix':prefix,
-        'maximum_trials':MAX_TRIALS,'planner_uses_final_test_metrics':False}
+        'maximum_trials':MAX_TRIALS,'planner_uses_final_test_metrics':False,
+        'learning_memory':memory}
     if state.get('last_dataset')==identity:
         return None,dict(report,status='unchanged_experiment_data_skipped',last_model_id=state.get('last_model_id'))
     groups=[list(g) for g in groups]
@@ -44,7 +48,7 @@ def prepare(sport,base_id,rows,groups,store):
     if store.read(claim):
         return None,dict(report,status='interrupted_experiment_requires_fresh_results')
     ctx={'sport':sport,'base_id':base_id,'prefix':prefix,'state':state,'groups':groups,'run_id':run_id,
-         'dataset':identity,'rows':len(rows),'store':store,'report':report}
+         'dataset':identity,'rows':len(rows),'store':store,'report':report,'learning_memory':memory}
     # Other-sport evidence must already have existed before this test window.
     try:
         from .shared_experience import lessons
@@ -77,10 +81,29 @@ def plan(context,kind):
     unique=[]
     for value in candidates:
         if value not in unique:unique.append(value)
-    # Keep the conservative hypothesis in the trial budget even when an older
-    # development winner is prepended as an additional anchor.
-    if conservative and len(unique)>MAX_TRIALS:return unique[:MAX_TRIALS-1]+[unique[-1]]
-    return unique[:MAX_TRIALS]
+    # Retained development associations and rejected validation trials guide
+    # exploration. No outcome audit or final-test report is read by this planner.
+    from .learning_memory import digest
+    memory=context.get('learning_memory',{})
+    actions={r['action'] for r in memory.get('hypotheses',[])}
+    failures=memory.get('repeated_validation_failures',{})
+    repeated=any(count>=2 for count in failures.values())
+    if actions or repeated:
+        recency=90 if 'test_shorter_recency_window' in actions else None
+        if kind=='MLB':
+            exploration={'penalty':300.,'half_life_days':recency,'scale':.25}
+        else:
+            exploration={'depth':1,'trees':60,'leaf':60,'half_life_days':recency,'gain_cap':.25}
+        # Preserve the leading anchors, then prefer less repeatedly rejected
+        # development choices and one explicitly testable alternative.
+        tail=sorted(unique[1:],key=lambda c:failures.get(digest(c),0))
+        unique=[unique[0]]+[c for c in tail if c!=exploration][:MAX_TRIALS-2]+[exploration]
+    elif conservative and len(unique)>MAX_TRIALS:
+        unique=unique[:MAX_TRIALS-1]+[unique[-1]]
+    distinct=[]
+    for config in unique:
+        if config not in distinct:distinct.append(config)
+    return distinct[:MAX_TRIALS]
 
 
 def weights(rows,half_life):
@@ -136,6 +159,8 @@ def finish(context,trials,selected,diagnosis,report):
         'run_id':context['run_id'],'checked_at':datetime.now(timezone.utc).isoformat(),
         'dataset_fingerprint':context['dataset'],'trials':trials,'selected_config':selected['config'],
         'development_diagnosis':diagnosis,'evaluation':report,'test_metrics_used_for_search':False}
+    from .learning_memory import remember_experiment
+    remember_experiment(context,trials,diagnosis)
     context['store'].write(context['prefix']+'runs/'+context['run_id']+'.json.gz',audit)
     context['store'].write(context['prefix']+'state.json.gz',state,replace=True)
     return dict(context['report'],run_id=context['run_id'],trials=trials,selected_config=selected['config'],
